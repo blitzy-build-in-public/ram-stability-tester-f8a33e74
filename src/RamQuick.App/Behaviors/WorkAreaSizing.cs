@@ -86,8 +86,10 @@ public static class WorkAreaSizing
         typeof(WorkAreaSizing),
         new PropertyMetadata(null));
 
-    // A measured non-client height within one DIP of the estimate changes neither the layout nor a visible pixel,
-    // so it does not justify a second sizing pass.
+    // Loaded deliberately keeps the estimate when the measured non-client height is within one DIP of it: that gap is
+    // rounding or theme noise, not worth a second pass that re-applies the initial and minimum sizes. It is no
+    // guarantee of an identical result: later recomputes keep the estimate too, near the exact 380/280-DIP thresholds
+    // it can select another layout than the measured height would, and one DIP can be two physical pixels at 200 %.
     private const double NonClientHeightTolerance = 1;
 
     /// <summary>Gets whether the behavior is attached to an element.</summary>
@@ -242,11 +244,26 @@ public static class WorkAreaSizing
         // WPF applies the rectangle Windows suggests for the new DPI after raising this event, so a shrink-to-fit
         // run now would judge a size that is about to change. The work runs once that rectangle is in place, at
         // the DPI the event reports, which is the one the rectangle was computed for.
-        DpiScale newDpi = e.NewDpi;
-        bool applyInitialSize = !state.IsLoaded;
+        //
+        // Only the latest change's DPI may be used. The work area is queried when the work runs, so an earlier
+        // change's DPI would be paired with the monitor the window has since moved to and give a false bound; once
+        // the window has loaded, a size shrunk to that bound is never enlarged again. Each change therefore replaces
+        // the pending values, and the flag coalesces the changes that arrive before the work runs.
+        state.PendingDpi = e.NewDpi;
+        state.PendingDpiAppliesInitialSize = !state.IsLoaded;
+        if (state.DpiRecomputeQueued)
+        {
+            return;
+        }
+
+        state.DpiRecomputeQueued = true;
         window.Dispatcher.BeginInvoke(
             DispatcherPriority.Loaded,
-            new Action(() => RecomputeIfCurrent(window, state, newDpi, applyInitialSize)));
+            new Action(() =>
+            {
+                state.DpiRecomputeQueued = false;
+                RecomputeIfCurrent(window, state, state.PendingDpi, state.PendingDpiAppliesInitialSize);
+            }));
     }
 
     private static void OnLocationChanged(object? sender, EventArgs e)
@@ -447,6 +464,12 @@ public static class WorkAreaSizing
         public bool HasApplied { get; set; }
 
         public bool RecomputeQueued { get; set; }
+
+        public DpiScale PendingDpi { get; set; }
+
+        public bool PendingDpiAppliesInitialSize { get; set; }
+
+        public bool DpiRecomputeQueued { get; set; }
     }
 }
 

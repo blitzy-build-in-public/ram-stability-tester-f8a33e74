@@ -13,6 +13,7 @@
  * next launch reports the run through journal recovery.
  */
 #include <windows.h>
+#include <intrin.h>
 
 #include "core/runner/worker_pool.h"
 #include "core/clock.h"
@@ -20,8 +21,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <system_error>
@@ -108,6 +112,32 @@ void sleep_on(CONDITION_VARIABLE& cv, SRWLOCK& lock) {
 /** Whether worker_index runs a phase posted with set. */
 bool is_active(active_set set, uint32_t worker_index) noexcept {
     return set == active_set::all || worker_index % 2u == 0u;
+}
+
+/**
+ * Ends the process because shutdown() could not confirm that a worker exited.
+ *
+ * A worker whose join is unconfirmed may still be running: it uses the pool's lock, condition
+ * variables and counter and the task's captures, all of which the owner frees once shutdown()
+ * returns. Continuing could let a live pinned worker write freed memory, and a memory tester must
+ * never report a verdict over state that may be corrupted. So the process ends here, as it does
+ * for an SEH fault, and the next launch reports the run through journal recovery; std::thread
+ * likewise terminates rather than abandon a joinable thread.
+ *
+ * __fastfail rather than std::terminate or abort(): it runs no handler, atexit function or static
+ * destructor, any of which could touch the state in question. The diagnostic goes to the debugger
+ * first, because the C API cannot carry it once the process is gone. _snwprintf_s with _TRUNCATE
+ * cuts an overlong line instead of raising the CRT invalid-parameter handler.
+ */
+[[noreturn]] void fail_unconfirmed_join(std::size_t worker_index, DWORD wait_result,
+                                        DWORD error) noexcept {
+    wchar_t buffer[192];
+    _snwprintf_s(buffer, std::size(buffer), _TRUNCATE,
+                 L"RAMQuick engine: worker_pool::shutdown could not confirm that worker %zu exited "
+                 L"(wait result 0x%08lX, Windows error %lu); ending the process\n",
+                 worker_index, wait_result, error);
+    OutputDebugStringW(buffer);
+    __fastfail(FAST_FAIL_FATAL_APP_EXIT);
 }
 
 }  // namespace
@@ -473,25 +503,48 @@ bool worker_pool::wait_phase(uint32_t timeout_ms) {
     // ticks its observer between calls.
     using steady = std::chrono::steady_clock;
     const steady::time_point deadline = steady::now() + std::chrono::milliseconds(timeout_ms);
-    srw_exclusive hold(pool.lock);
-    for (;;) {
-        if (pool.remaining.load(std::memory_order_acquire) == 0) {
-            return true;
-        }
-        const steady::time_point now = steady::now();
-        if (now >= deadline) {
-            return false;
-        }
-        // Rounded up, so a sub-millisecond remainder does not become a zero-length wait loop.
-        const auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
-        const DWORD wait_ms = static_cast<DWORD>(left.count());
-        if (SleepConditionVariableSRW(&pool.done_cv, &pool.lock, wait_ms, 0) == FALSE &&
-            GetLastError() != ERROR_TIMEOUT) {
-            // Only a broken process fails an SRW wait; report the barrier as it stands rather
-            // than retrying a call that cannot succeed.
-            return pool.remaining.load(std::memory_order_acquire) == 0;
+    uint32_t wait_error = 0;
+    {
+        srw_exclusive hold(pool.lock);
+        for (;;) {
+            if (pool.remaining.load(std::memory_order_acquire) == 0) {
+                return true;
+            }
+            const steady::time_point now = steady::now();
+            if (now >= deadline) {
+                return false;
+            }
+            // Rounded up, so a sub-millisecond remainder does not become a zero-length wait loop.
+            const auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
+            const DWORD wait_ms = static_cast<DWORD>(left.count());
+            if (SleepConditionVariableSRW(&pool.done_cv, &pool.lock, wait_ms, 0) == FALSE) {
+                // Read at once, before any other call can overwrite the thread's last error.
+                const uint32_t error = last_error_or_general_failure();
+                if (error != static_cast<uint32_t>(ERROR_TIMEOUT)) {
+                    wait_error = error;
+                    break;
+                }
+            }
         }
     }
+
+    // Only a broken process fails an SRW wait other than by timing out, and the barrier can then
+    // never be crossed. An ordinary false return would let the step runner retry forever without
+    // a fault, so this becomes an internal-fault stop, raised with the pool lock released:
+    // running tasks return within one 1 MiB block and the session's shutdown joins them
+    // promptly. os_error stays 0, which the C API reserves for affinity, memory and
+    // thread-creation faults, so the Windows error travels in the detail and the exception. The
+    // phase stays outstanding.
+    char detail[RQ_END_DETAIL_SIZE];
+    std::snprintf(detail, sizeof(detail),
+                  "worker_pool::wait_phase: SleepConditionVariableSRW failed (Windows error %lu)",
+                  static_cast<unsigned long>(wait_error));
+    // start() sets stop, and a phase can be outstanding only after start() returned ok.
+    if (pool.stop != nullptr) {
+        pool.request_internal_fault(detail);
+    }
+    throw std::system_error(static_cast<int>(wait_error), std::system_category(),
+                            "worker_pool::wait_phase: SleepConditionVariableSRW failed");
 }
 
 uint32_t worker_pool::worker_count() const noexcept {
@@ -513,9 +566,17 @@ void worker_pool::shutdown() noexcept {
     WakeAllConditionVariable(&pool.work_cv);
 
     // One handle at a time: WaitForMultipleObjects accepts at most 64 handles, fewer than a
-    // multi-group machine has workers.
-    for (const unique_handle& thread : pool.threads) {
-        WaitForSingleObject(thread.get(), INFINITE);
+    // multi-group machine has workers. Only WAIT_OBJECT_0 proves the thread has exited; after
+    // any other result its liveness is unknown, so nothing it may still use is freed.
+    for (std::size_t i = 0; i < pool.threads.size(); ++i) {
+        unique_handle& thread = pool.threads[i];
+        const DWORD wait = WaitForSingleObject(thread.get(), INFINITE);
+        // Read at once, before any other call can overwrite the thread's last error.
+        const DWORD error = wait == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+        if (wait != WAIT_OBJECT_0) {
+            fail_unconfirmed_join(i, wait, error);
+        }
+        thread.reset();
     }
     pool.threads.clear();
 

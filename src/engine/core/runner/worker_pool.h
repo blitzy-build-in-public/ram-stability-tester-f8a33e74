@@ -273,9 +273,19 @@ public:
      * tasks did happens-before the owner's next action, so coverage_counter totals and
      * error_collector state read after it are exact.
      *
+     * A condition-variable wait that fails other than by timing out means the barrier can never
+     * be crossed, so it is never reported as an incomplete phase. wait_phase first requests an
+     * RQ_END_INTERNAL_FAULT stop, stop.request(RQ_END_INTERNAL_FAULT, 0, detail), so running
+     * tasks return within one 1 MiB block; then it throws. os_error is 0, and the detail reads
+     * "worker_pool::wait_phase: SleepConditionVariableSRW failed (Windows error n)". The phase
+     * stays outstanding.
+     *
      * @param timeout_ms Upper bound on the wait, in milliseconds of real time; 0 only polls.
      * @return true when no phase is outstanding: the posted phase has completed, none has been
      *         posted, or shutdown() has run. false when the timeout elapsed first.
+     * @throws std::system_error when the condition-variable wait fails other than by timing out,
+     *         carrying the Windows error. The coordinator converts it to RQ_END_INTERNAL_FAULT,
+     *         and the stop requested first keeps this diagnostic as the first writer.
      */
     bool wait_phase(uint32_t timeout_ms);
 
@@ -295,7 +305,13 @@ public:
     /**
      * Signals exit, wakes every idle worker and joins every thread, one handle at a time:
      * WaitForMultipleObjects accepts at most 64 handles, fewer than a multi-group machine has
-     * workers. Then closes every handle.
+     * workers. Each handle is closed once its worker is joined.
+     *
+     * A worker counts as joined only when WaitForSingleObject returns WAIT_OBJECT_0. Any other
+     * result leaves its liveness unknown, and a live worker would use the pool and task state
+     * this call frees, so shutdown writes an OutputDebugStringW diagnostic and fails the process
+     * fast (__fastfail(FAST_FAIL_FATAL_APP_EXIT)): it never returns with a worker of unknown
+     * liveness. The next launch then reports the run through journal recovery.
      *
      * Idempotent: safe after a failed start, twice, and from the destructor. Owning thread only;
      * from a phase task it would deadlock. It does not request a stop: tasks already running are
