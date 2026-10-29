@@ -408,10 +408,15 @@ public static class UiText
 
     /// <summary>
     /// Composite format of a cause hint item: {0} <see cref="HintPrefix"/>, {1} the cause title,
-    /// {2} the likelihood percentage, {3} the suggestion. Example: "Hint: Row/bank timings — 64 % —
-    /// Loosen tRCD…".
+    /// {2} the likelihood as formatted by <c>DisplayFormat.WholePercent</c>, {3} the suggestion.
+    /// Example: "Hint: Row/bank timings — 64 % — Loosen tRCD…".
     /// </summary>
-    public const string CauseHintFormat = "{0} {1} — {2} % — {3}";
+    /// <remarks>
+    /// The template carries no % sign of its own: <c>DisplayFormat.WholePercent</c> already
+    /// appends it, and the item shows that same text as its likelihood, so a literal % here would
+    /// render "64 % %".
+    /// </remarks>
+    public const string CauseHintFormat = "{0} {1} — {2} — {3}";
 
     /// <summary>
     /// Composite format of a grouped error item: {0} the word address, {1} the error count (see

@@ -1,0 +1,1004 @@
+using System.Diagnostics;
+using Microsoft.Extensions.Time.Testing;
+using RamQuick.App.Tests.Fakes;
+using Xunit;
+
+namespace RamQuick.Sensors.Tests;
+
+/// <summary>
+/// Tests for <see cref="SensorMonitor"/>: one dedicated background thread owns the source and reads it
+/// once per simulated second, a tick during an in-flight read is skipped, a reading older than 3 s is
+/// re-marked <see cref="SensorStatus.Stale"/>, a read outstanding for 5 s marks the source
+/// <see cref="SensorStatus.Hung"/> for good, each sensor's availability stays independent, and
+/// <see cref="SensorMonitor.Dispose"/> returns within 1 s and closes the source only on the sensor thread.
+/// </summary>
+/// <remarks>
+/// Polling and every age run on a <see cref="FakeTimeProvider"/>, whose <c>Advance</c> runs the monitor's
+/// timer callback on the test thread. Snapshots are posted to a queued
+/// <see cref="ImmediateSynchronizationContext"/> that the test thread drains, so it plays the UI thread.
+/// Real time is spent only waiting for work already due on the sensor thread, each wait bounded by a
+/// safety timeout rather than a sleep.
+/// </remarks>
+public sealed class SensorMonitorTests
+{
+    private static readonly TimeSpan _safetyTimeout = TimeSpan.FromSeconds(5);
+
+    // Margin over DisposeTimeout so a heavily loaded host does not fail a correct monitor.
+    private static readonly TimeSpan _disposeBound = SensorMonitor.DisposeTimeout + TimeSpan.FromSeconds(1);
+
+    // The timer callback runs inside Advance on the UI-like thread, so it must never wait on a read.
+    private static readonly TimeSpan _advanceBound = TimeSpan.FromMilliseconds(500);
+
+    private static readonly int _ticksUntilHung = (int)(SensorMonitor.HungAfter / SensorMonitor.PollInterval);
+
+    [Fact]
+    public void Constants_MatchAap()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(1), SensorMonitor.PollInterval);
+        Assert.Equal(TimeSpan.FromSeconds(3), SensorMonitor.StaleAfter);
+        Assert.Equal(TimeSpan.FromSeconds(5), SensorMonitor.HungAfter);
+        Assert.Equal(TimeSpan.FromSeconds(1), SensorMonitor.DisposeTimeout);
+    }
+
+    [Fact]
+    public void Constructor_NullArgument_ThrowsArgumentNullException()
+    {
+        using var source = new FakeSensorSource();
+
+        Assert.Throws<ArgumentNullException>("source", () => new SensorMonitor(null!, TimeProvider.System));
+        Assert.Throws<ArgumentNullException>("timeProvider", () => new SensorMonitor(source, null!));
+    }
+
+    [Fact]
+    public void Current_UntilFirstReadCompletes_IsStaleForBoth()
+    {
+        using var h = new Harness();
+        AssertBothUnavailable(h.Monitor.Current, SensorStatus.Stale);
+        Assert.False(h.Monitor.IsHung);
+
+        h.Source.BlockReads();
+        h.Start(expectFirstRead: false);
+        Assert.True(
+            h.Source.WaitForReadCount(1, _safetyTimeout),
+            $"The first read did not start within {_safetyTimeout}; reads entered: {h.Source.ReadCount}.");
+
+        AssertBothUnavailable(h.Monitor.Current, SensorStatus.Stale);
+        Assert.Null(ThermalLimits.Evaluate(h.Monitor.Current));
+
+        h.ReleaseReadsAndWait();
+
+        AssertAvailable(h.Monitor.Current.Cpu, FakeSensorSource.DefaultCpuCelsius);
+        AssertAvailable(h.Monitor.Current.Ram, FakeSensorSource.DefaultRamCelsius);
+    }
+
+    [Fact]
+    public void Start_OpensSourceOnceOnDedicatedBackgroundThread()
+    {
+        using var h = new Harness(decorate: inner => new InstrumentedSource(inner));
+        h.Start();
+        h.Tick(3);
+
+        Assert.Equal(1, h.Source.OpenCount);
+        int sensorThreadId = Assert.NotNull(h.Source.OpenThreadId);
+        Assert.NotEqual(Environment.CurrentManagedThreadId, sensorThreadId);
+        Assert.Equal(sensorThreadId, h.Source.LastReadThreadId);
+
+        var recorder = Assert.IsType<InstrumentedSource>(h.MonitoredSource);
+        Assert.True(recorder.OpenedOnBackgroundThread, "The source was opened on a foreground thread, which a hung read would keep alive.");
+        Assert.False(recorder.OpenedOnThreadPoolThread, "The source was opened on a thread-pool thread rather than a dedicated one.");
+    }
+
+    [Fact]
+    public void Start_Twice_ThrowsInvalidOperationExceptionAndKeepsOneOpen()
+    {
+        using var h = new Harness();
+        h.Start();
+
+        Assert.Throws<InvalidOperationException>(() => h.Monitor.Start(h.Context));
+
+        h.Tick();
+        Assert.Equal(1, h.Source.OpenCount);
+    }
+
+    [Fact]
+    public void Start_NullContext_ThrowsArgumentNullExceptionAndStartsNothing()
+    {
+        using var h = new Harness();
+
+        Assert.Throws<ArgumentNullException>("context", () => h.Monitor.Start(null!));
+        Assert.Equal(0, h.Source.OpenCount);
+
+        h.Start();
+        AssertAvailable(h.Monitor.Current.Cpu, FakeSensorSource.DefaultCpuCelsius);
+    }
+
+    [Fact]
+    public void Start_AfterDispose_ThrowsObjectDisposedException()
+    {
+        using var h = new Harness();
+        h.Monitor.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => h.Monitor.Start(h.Context));
+        Assert.Equal(0, h.Source.OpenCount);
+    }
+
+    [Fact]
+    public void Tick_EachSimulatedSecond_RaisesReadingsChangedOnCapturedContext()
+    {
+        using var h = new Harness();
+        h.Start();
+        int readsBefore = h.Source.ReadCount;
+        int eventsBefore = h.EventCount;
+
+        h.Tick(5);
+
+        Assert.True(h.EventCount - eventsBefore >= 5, $"Expected at least 5 events in 5 simulated seconds; observed {h.EventCount - eventsBefore}.");
+        Assert.Equal(readsBefore + 5, h.Source.ReadCount);
+        Assert.All(h.Events, received =>
+        {
+            Assert.Same(h.Monitor, received.Sender);
+            Assert.Same(h.Context, received.Context);
+            Assert.Equal(Environment.CurrentManagedThreadId, received.ThreadId);
+        });
+
+        SensorReadings current = h.Monitor.Current;
+        AssertAvailable(current.Cpu, FakeSensorSource.DefaultCpuCelsius);
+        AssertAvailable(current.Ram, FakeSensorSource.DefaultRamCelsius);
+        Assert.Equal(h.Time.GetUtcNow(), current.Cpu.CapturedAt);
+        Assert.Same(current, h.LastReadings);
+    }
+
+    [Fact]
+    public void Tick_ValuesChange_PublishesNewValues()
+    {
+        using var h = new Harness();
+        h.Start();
+
+        h.Source.SetCpu(71.5);
+        h.Source.SetRam(48.0);
+        h.Tick();
+
+        SensorReadings published = Assert.IsType<SensorReadings>(h.LastReadings);
+        AssertAvailable(published.Cpu, 71.5);
+        AssertAvailable(published.Ram, 48.0);
+        Assert.Same(published, h.Monitor.Current);
+    }
+
+    [Fact]
+    public void Tick_DuringSlowRead_IsSkippedAndNeverOverlaps()
+    {
+        using var h = new Harness();
+        h.Start();
+        int readsEntered = h.BlockNextRead();
+        Assert.Equal(1, h.Source.CurrentConcurrentReads);
+
+        // Two more ticks while the read is in flight: 2 s outstanding, below HungAfter.
+        h.Tick(2, expectRead: false);
+
+        Assert.Equal(readsEntered, h.Source.ReadCount);
+        Assert.Equal(1, h.Source.MaxConcurrentReads);
+        Assert.False(h.Monitor.IsHung);
+
+        h.ReleaseReadsAndWait();
+        Assert.Equal(readsEntered, h.Source.ReadCount);
+
+        for (int tick = 1; tick <= 3; tick++)
+        {
+            h.Tick();
+            Assert.Equal(readsEntered + tick, h.Source.ReadCount);
+        }
+
+        Assert.Equal(1, h.Source.MaxConcurrentReads);
+        AssertAvailable(h.Monitor.Current.Cpu, FakeSensorSource.DefaultCpuCelsius);
+    }
+
+    // Readings at both limits, so a reading that stays fresh trips and one re-marked Stale does not.
+    [Theory]
+    [InlineData(0)]
+    [InlineData(2000)]
+    [InlineData(3000)]
+    public void Current_ReadingNoOlderThanStaleAfter_StaysAvailable(int ageMilliseconds)
+    {
+        using var h = new Harness();
+        ScriptReadingsAtLimits(h.Source, TimeSpan.FromMilliseconds(ageMilliseconds));
+        h.Start();
+        h.Tick();
+
+        SensorReadings current = h.Monitor.Current;
+        AssertAvailable(current.Cpu, ThermalLimits.CpuLimitCelsius);
+        AssertAvailable(current.Ram, ThermalLimits.RamLimitCelsius);
+        Assert.Equal(
+            new ThermalVerdict(ThermalSensor.Cpu, ThermalLimits.CpuLimitCelsius, ThermalLimits.CpuLimitCelsius),
+            ThermalLimits.Evaluate(current));
+    }
+
+    [Theory]
+    [InlineData(3001)]
+    [InlineData(4000)]
+    public void Current_ReadingOlderThanStaleAfter_IsStaleAndNeverTrips(int ageMilliseconds)
+    {
+        TimeSpan age = TimeSpan.FromMilliseconds(ageMilliseconds);
+        using var h = new Harness();
+        ScriptReadingsAtLimits(h.Source, age);
+        h.Start();
+        h.Tick();
+
+        SensorReadings current = h.Monitor.Current;
+        AssertBothUnavailable(current, SensorStatus.Stale);
+        Assert.Equal(h.Time.GetUtcNow() - age, current.Cpu.CapturedAt);
+        Assert.Null(ThermalLimits.Evaluate(current));
+        Assert.Same(current, h.LastReadings);
+        Assert.False(h.Monitor.IsHung);
+    }
+
+    [Fact]
+    public void Current_NoFreshReadForMoreThanStaleAfter_BecomesStaleThenRecovers()
+    {
+        using var h = new Harness();
+        h.Start();
+        DateTimeOffset freshAt = h.Monitor.Current.Cpu.CapturedAt;
+        int readsEntered = h.BlockNextRead();
+
+        // 3 s after the last fresh reading: exactly StaleAfter old, still available.
+        h.Tick(2, expectRead: false);
+        AssertAvailable(h.Monitor.Current.Cpu, FakeSensorSource.DefaultCpuCelsius);
+        AssertAvailable(h.Monitor.Current.Ram, FakeSensorSource.DefaultRamCelsius);
+
+        // 4 s after it, with the read outstanding 3 s: stale, not yet hung.
+        h.Tick(expectRead: false);
+        AssertBothUnavailable(h.Monitor.Current, SensorStatus.Stale);
+        Assert.Equal(freshAt, h.Monitor.Current.Cpu.CapturedAt);
+        Assert.False(h.Monitor.IsHung);
+        h.PumpUntil(() => h.LastReadings?.Cpu.Status == SensorStatus.Stale, "Expected a Stale snapshot to be raised");
+        AssertBothUnavailable(Assert.IsType<SensorReadings>(h.LastReadings), SensorStatus.Stale);
+
+        h.ReleaseReadsAndWait();
+        AssertAvailable(h.Monitor.Current.Cpu, FakeSensorSource.DefaultCpuCelsius);
+        Assert.Equal(h.Time.GetUtcNow(), h.Monitor.Current.Cpu.CapturedAt);
+
+        h.Tick();
+        AssertAvailable(h.Monitor.Current.Cpu, FakeSensorSource.DefaultCpuCelsius);
+        AssertAvailable(h.Monitor.Current.Ram, FakeSensorSource.DefaultRamCelsius);
+        Assert.Equal(readsEntered + 1, h.Source.ReadCount);
+        Assert.False(h.Monitor.IsHung);
+    }
+
+    [Fact]
+    public void Read_NotReturningWithinHungAfter_MarksSourceHungPermanently()
+    {
+        using var h = new Harness();
+        h.Start();
+        int readsEntered = h.BlockNextRead();
+
+        TimeSpan slowestAdvance = h.Tick(_ticksUntilHung - 1, expectRead: false);
+        Assert.False(h.Monitor.IsHung, $"The source was marked hung with its read outstanding less than {SensorMonitor.HungAfter}.");
+
+        slowestAdvance = Max(slowestAdvance, h.Tick(expectRead: false));
+        Assert.True(h.Monitor.IsHung, $"The source was not marked hung with its read outstanding {SensorMonitor.HungAfter}.");
+        AssertBothUnavailable(h.Monitor.Current, SensorStatus.Hung);
+        h.PumpUntil(
+            () => h.LastReadings is { Cpu.Status: SensorStatus.Hung, Ram.Status: SensorStatus.Hung },
+            "Expected the Hung snapshot to be raised");
+
+        // The UI-like thread stays live while the read stays blocked.
+        bool probeRan = false;
+        h.Context.Post(_ => probeRan = true, null);
+        h.Context.RunPending();
+        Assert.True(probeRan, "A post to the context was not serviced while the read was hung.");
+
+        slowestAdvance = Max(slowestAdvance, h.Tick(10, expectRead: false));
+        Assert.True(
+            slowestAdvance < _advanceBound,
+            $"The slowest Advance took {slowestAdvance.TotalMilliseconds:F0} ms; the timer callback must never wait on a read.");
+        Assert.Equal(readsEntered, h.Source.ReadCount);
+
+        int eventsWhenHung = h.EventCount;
+        h.Source.ReleaseReads();
+        Assert.True(
+            SpinWait.SpinUntil(() => h.Source.CompletedReadCount == readsEntered, _safetyTimeout),
+            $"The released read did not return within {_safetyTimeout}; completed reads: {h.Source.CompletedReadCount}.");
+        h.Tick(3, expectRead: false);
+        h.Context.RunPending();
+
+        Assert.Equal(readsEntered, h.Source.ReadCount);
+        Assert.Equal(1, h.Source.MaxConcurrentReads);
+        Assert.True(h.Monitor.IsHung);
+        AssertBothUnavailable(h.Monitor.Current, SensorStatus.Hung);
+        Assert.Equal(eventsWhenHung, h.EventCount);
+        Assert.Equal(0, h.Source.DisposeCount);
+    }
+
+    [Fact]
+    public void Read_FirstReadNotReturning_MarksSourceHungAndNeverReadsAgain()
+    {
+        using var h = new Harness();
+        h.Source.BlockReads();
+        h.Start(expectFirstRead: false);
+        Assert.True(
+            h.Source.WaitForReadCount(1, _safetyTimeout),
+            $"The first read did not start within {_safetyTimeout}; reads entered: {h.Source.ReadCount}.");
+
+        h.Tick(_ticksUntilHung - 1, expectRead: false);
+        Assert.False(h.Monitor.IsHung);
+        AssertBothUnavailable(h.Monitor.Current, SensorStatus.Stale);
+
+        h.Tick(expectRead: false);
+        Assert.True(h.Monitor.IsHung, $"The first read was outstanding {SensorMonitor.HungAfter} without the source being marked hung.");
+        AssertBothUnavailable(h.Monitor.Current, SensorStatus.Hung);
+
+        h.Source.ReleaseReads();
+        Assert.True(
+            SpinWait.SpinUntil(() => h.Source.CompletedReadCount == 1, _safetyTimeout),
+            $"The released first read did not return within {_safetyTimeout}.");
+        h.Tick(3, expectRead: false);
+        h.Context.RunPending();
+
+        Assert.Equal(1, h.Source.ReadCount);
+        AssertBothUnavailable(h.Monitor.Current, SensorStatus.Hung);
+        Assert.Equal(0, h.Source.DisposeCount);
+    }
+
+    [Fact]
+    public void ReadingsChanged_OlderSnapshotArrivingAfterNewerOne_IsDropped()
+    {
+        var time = new FakeTimeProvider();
+        using var source = new FakeSensorSource(time);
+        var context = new CapturingSynchronizationContext();
+        using var monitor = new SensorMonitor(source, time);
+        var raised = new List<SensorReadings>();
+        monitor.ReadingsChanged += (_, readings) => raised.Add(readings);
+
+        monitor.Start(context);
+        Assert.True(context.WaitForPosts(1, _safetyTimeout), $"The first read was not posted within {_safetyTimeout}.");
+        source.SetCpu(71.5);
+        time.Advance(SensorMonitor.PollInterval);
+        Assert.True(context.WaitForPosts(2, _safetyTimeout), $"The second read was not posted within {_safetyTimeout}.");
+
+        context.Run(1);
+        context.Run(0);
+
+        SensorReadings delivered = Assert.Single(raised);
+        AssertAvailable(delivered.Cpu, 71.5);
+        Assert.Same(monitor.Current, delivered);
+    }
+
+    [Fact]
+    public void Dispose_WhileReadHung_ReturnsWithinDisposeTimeoutWithoutClosingSource()
+    {
+        using var h = new Harness();
+        h.StartAndHang();
+
+        TimeSpan took = Measure(h.Monitor.Dispose);
+
+        Assert.True(took < _disposeBound, $"Dispose took {took.TotalMilliseconds:F0} ms with the source hung.");
+        Assert.Equal(0, h.Source.DisposeCount);
+        Assert.Equal(1, h.Source.CurrentConcurrentReads);
+    }
+
+    [Fact]
+    public void Dispose_WhileReadBlockedButNotHung_ReturnsWithinDisposeTimeout()
+    {
+        using var h = new Harness();
+        h.Start();
+        h.BlockNextRead();
+        h.Tick(expectRead: false);
+        Assert.False(h.Monitor.IsHung);
+        h.Context.RunPending();
+        int eventsBefore = h.EventCount;
+
+        TimeSpan took = Measure(h.Monitor.Dispose);
+
+        Assert.True(took < _disposeBound, $"Dispose took {took.TotalMilliseconds:F0} ms with a read blocked.");
+        Assert.Equal(0, h.Source.DisposeCount);
+
+        // The read completes in the background, then the sensor thread closes the source.
+        h.Source.ReleaseReads();
+        Assert.True(
+            SpinWait.SpinUntil(() => h.Source.DisposeCount == 1, _safetyTimeout),
+            $"The sensor thread did not close the source within {_safetyTimeout} of the read returning; DisposeCount: {h.Source.DisposeCount}.");
+        Assert.Equal(h.Source.OpenThreadId, h.Source.DisposeThreadId);
+        h.Context.RunPending();
+        Assert.Equal(eventsBefore, h.EventCount);
+    }
+
+    [Fact]
+    public void Dispose_Healthy_ClosesSourceOnSensorThread()
+    {
+        using var h = new Harness();
+        h.Start();
+        h.Tick(2);
+        int readsBefore = h.Source.ReadCount;
+        int postsBefore = h.Context.PostCount;
+        int eventsBefore = h.EventCount;
+
+        TimeSpan took = Measure(h.Monitor.Dispose);
+
+        Assert.True(took < _disposeBound, $"Dispose took {took.TotalMilliseconds:F0} ms.");
+        Assert.Equal(1, h.Source.DisposeCount);
+        Assert.Equal(h.Source.OpenThreadId, h.Source.DisposeThreadId);
+        Assert.NotEqual(Environment.CurrentManagedThreadId, h.Source.DisposeThreadId);
+
+        h.Tick(3, expectRead: false);
+        h.Context.RunPending();
+        Assert.Equal(readsBefore, h.Source.ReadCount);
+        Assert.Equal(postsBefore, h.Context.PostCount);
+        Assert.Equal(eventsBefore, h.EventCount);
+
+        h.Monitor.Dispose();
+        Assert.Equal(1, h.Source.DisposeCount);
+    }
+
+    [Fact]
+    public void Dispose_BeforeStart_DoesNotThrowOrCloseUnopenedSource()
+    {
+        using var h = new Harness();
+
+        h.Monitor.Dispose();
+        h.Monitor.Dispose();
+
+        Assert.Equal(0, h.Source.OpenCount);
+        Assert.Equal(0, h.Source.DisposeCount);
+    }
+
+    [Fact]
+    public void Dispose_WithSnapshotStillQueued_RaisesNothingAfterwards()
+    {
+        using var h = new Harness();
+        h.Start();
+        int eventsBefore = h.EventCount;
+
+        h.Tick(expectRead: false);
+        Assert.True(h.Context.WaitForPending(_safetyTimeout), $"The read's snapshot was not posted within {_safetyTimeout}.");
+        h.Monitor.Dispose();
+
+        Assert.True(h.Context.RunPending() >= 1);
+        Assert.Equal(eventsBefore, h.EventCount);
+    }
+
+    [Fact]
+    public void Dispose_FromHandlerOnInlineContext_ReturnsWithoutWaitingOnItsOwnThread()
+    {
+        // Inline posts run the handler on the sensor thread itself, which Dispose must not join.
+        using var h = new Harness(queuePosts: false);
+        long disposeTicks = -1;
+        int handlerThreadId = 0;
+        h.Monitor.ReadingsChanged += (_, _) =>
+        {
+            // Runs on the sensor thread, where an exception would end the process: it only records.
+            long startedAt = Stopwatch.GetTimestamp();
+            h.Monitor.Dispose();
+            Interlocked.Exchange(ref disposeTicks, Stopwatch.GetElapsedTime(startedAt).Ticks);
+            Volatile.Write(ref handlerThreadId, Environment.CurrentManagedThreadId);
+        };
+
+        h.Start();
+        Assert.True(
+            SpinWait.SpinUntil(() => h.Source.DisposeCount == 1, _safetyTimeout),
+            $"The sensor thread did not close the source within {_safetyTimeout}; DisposeCount: {h.Source.DisposeCount}.");
+
+        TimeSpan took = TimeSpan.FromTicks(Interlocked.Read(ref disposeTicks));
+        Assert.True(took >= TimeSpan.Zero, "The handler did not record its Dispose call.");
+        Assert.True(took < SensorMonitor.DisposeTimeout, $"Dispose from the sensor thread took {took.TotalMilliseconds:F0} ms; it must not wait on itself.");
+        Assert.Equal(h.Source.OpenThreadId, Volatile.Read(ref handlerThreadId));
+        Assert.Equal(h.Source.OpenThreadId, h.Source.DisposeThreadId);
+
+        int readsAtDispose = h.Source.ReadCount;
+        h.Tick(2, expectRead: false);
+        Assert.Equal(readsAtDispose, h.Source.ReadCount);
+    }
+
+    // A slow sensor-library open, interrupted by the window closing right after launch.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Dispose_WhileOpenInProgress_ReturnsWithinDisposeTimeoutAndClosesSourceWithoutReading(bool openThrows)
+    {
+        using var h = new Harness(decorate: inner => new InstrumentedSource(inner, holdOpen: true));
+        var instrumented = Assert.IsType<InstrumentedSource>(h.MonitoredSource);
+        if (openThrows)
+        {
+            h.Source.OpenException = new InvalidOperationException("Simulated driver open failure.");
+        }
+
+        h.Monitor.Start(h.Context);
+        Assert.True(instrumented.WaitForOpenEntered(_safetyTimeout), $"The sensor thread did not begin opening the source within {_safetyTimeout}.");
+
+        TimeSpan took = Measure(h.Monitor.Dispose);
+        Assert.True(took < _disposeBound, $"Dispose took {took.TotalMilliseconds:F0} ms with Open in progress.");
+
+        instrumented.ReleaseOpen();
+        Assert.True(
+            SpinWait.SpinUntil(() => h.Source.DisposeCount == 1, _safetyTimeout),
+            $"The sensor thread did not close the source within {_safetyTimeout} of Open returning; DisposeCount: {h.Source.DisposeCount}.");
+        Assert.Equal(1, h.Source.OpenCount);
+        Assert.Equal(0, h.Source.ReadCount);
+        Assert.Equal(h.Source.OpenThreadId, h.Source.DisposeThreadId);
+        Assert.Equal(0, h.Context.PostCount);
+    }
+
+    [Fact]
+    public void Dispose_SourceDisposeThrows_ExceptionStaysContainedOnSensorThread()
+    {
+        using var h = new Harness(
+            decorate: inner => new InstrumentedSource(inner, disposeException: new InvalidOperationException("Simulated driver close failure.")));
+        h.Start();
+        h.Tick();
+
+        TimeSpan took = Measure(h.Monitor.Dispose);
+
+        Assert.True(took < _disposeBound, $"Dispose took {took.TotalMilliseconds:F0} ms.");
+        Assert.Equal(1, h.Source.DisposeCount);
+        Assert.Equal(h.Source.OpenThreadId, h.Source.DisposeThreadId);
+    }
+
+    [Fact]
+    public void Read_Throws_ReportsFailedAndKeepsPolling()
+    {
+        using var h = new Harness();
+        h.Start();
+        int readsBefore = h.Source.ReadCount;
+
+        h.Source.ReadException = new InvalidOperationException("Simulated sensor read failure.");
+        h.Tick(2);
+
+        SensorReadings current = h.Monitor.Current;
+        AssertBothUnavailable(current, SensorStatus.Failed);
+        Assert.Equal(h.Time.GetUtcNow(), current.Cpu.CapturedAt);
+        Assert.Null(ThermalLimits.Evaluate(current));
+        Assert.False(h.Monitor.IsHung);
+        Assert.Equal(readsBefore + 2, h.Source.ReadCount);
+
+        h.Source.ReadException = null;
+        h.Tick();
+
+        AssertAvailable(h.Monitor.Current.Cpu, FakeSensorSource.DefaultCpuCelsius);
+        AssertAvailable(h.Monitor.Current.Ram, FakeSensorSource.DefaultRamCelsius);
+    }
+
+    [Fact]
+    public void Open_Throws_ReportsFailedAndPerformsNoReads()
+    {
+        using var h = new Harness();
+        h.Source.OpenException = new InvalidOperationException("Simulated driver open failure.");
+
+        h.Start(expectFirstRead: false);
+        h.WaitForEvents(1);
+
+        AssertBothUnavailable(h.Monitor.Current, SensorStatus.Failed);
+        Assert.False(h.Monitor.IsHung);
+
+        // Failed values carry no temperature, so they are never re-marked Stale either.
+        h.Tick(4, expectRead: false);
+        h.Context.RunPending();
+        Assert.Equal(0, h.Source.ReadCount);
+        AssertBothUnavailable(h.Monitor.Current, SensorStatus.Failed);
+
+        // The source contract lets Dispose follow an Open that threw, to release a partial open.
+        TimeSpan took = Measure(h.Monitor.Dispose);
+        Assert.True(took < _disposeBound, $"Dispose took {took.TotalMilliseconds:F0} ms after a failed open.");
+        Assert.Equal(1, h.Source.DisposeCount);
+        Assert.Equal(h.Source.OpenThreadId, h.Source.DisposeThreadId);
+    }
+
+    [Theory]
+    [InlineData(SensorStatus.DriverUnavailable)]
+    [InlineData(SensorStatus.NoSensor)]
+    [InlineData(SensorStatus.Failed)]
+    public void Read_BothSensorsUnavailable_ReportsSourceStatusAndNeverTrips(SensorStatus status)
+    {
+        using var h = new Harness(createSource: time => FakeSensorSource.AllUnavailable(status, time));
+        h.Start();
+        h.Tick(2);
+
+        SensorReadings current = h.Monitor.Current;
+        AssertBothUnavailable(current, status);
+        Assert.Null(ThermalLimits.Evaluate(current));
+        Assert.False(h.Monitor.IsHung);
+    }
+
+    // CPU-only and RAM-only availability share one theory: the cases differ only in which sensor is scripted.
+    [Theory]
+    [InlineData(ThermalSensor.Cpu, SensorStatus.NoSensor)]
+    [InlineData(ThermalSensor.Cpu, SensorStatus.DriverUnavailable)]
+    [InlineData(ThermalSensor.Ram, SensorStatus.DriverUnavailable)]
+    [InlineData(ThermalSensor.Ram, SensorStatus.NoSensor)]
+    public void Read_OnlyOneSensorAvailable_ItsThermalLimitStaysActive(ThermalSensor available, SensorStatus missingStatus)
+    {
+        ThermalSensor missing = available == ThermalSensor.Cpu ? ThermalSensor.Ram : ThermalSensor.Cpu;
+        double limit = LimitFor(available);
+        using var h = new Harness();
+        SetTemperature(h.Source, available, limit);
+        SetStatus(h.Source, missing, missingStatus);
+        h.Start();
+        h.Tick();
+
+        SensorReadings current = h.Monitor.Current;
+        AssertAvailable(ValueOf(current, available), limit);
+        AssertUnavailable(ValueOf(current, missing), missingStatus);
+        Assert.Equal(new ThermalVerdict(available, limit, limit), ThermalLimits.Evaluate(current));
+    }
+
+    private static void ScriptReadingsAtLimits(FakeSensorSource source, TimeSpan age)
+    {
+        source.SetCpu(ThermalLimits.CpuLimitCelsius);
+        source.SetRam(ThermalLimits.RamLimitCelsius);
+        source.CapturedAtOffset = -age;
+    }
+
+    private static double LimitFor(ThermalSensor sensor) => sensor switch
+    {
+        ThermalSensor.Cpu => ThermalLimits.CpuLimitCelsius,
+        ThermalSensor.Ram => ThermalLimits.RamLimitCelsius,
+        _ => throw new ArgumentOutOfRangeException(nameof(sensor), sensor, null),
+    };
+
+    private static SensorValue ValueOf(SensorReadings readings, ThermalSensor sensor) => sensor switch
+    {
+        ThermalSensor.Cpu => readings.Cpu,
+        ThermalSensor.Ram => readings.Ram,
+        _ => throw new ArgumentOutOfRangeException(nameof(sensor), sensor, null),
+    };
+
+    private static void SetTemperature(FakeSensorSource source, ThermalSensor sensor, double celsius)
+    {
+        switch (sensor)
+        {
+            case ThermalSensor.Cpu:
+                source.SetCpu(celsius);
+                break;
+            case ThermalSensor.Ram:
+                source.SetRam(celsius);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(sensor), sensor, null);
+        }
+    }
+
+    private static void SetStatus(FakeSensorSource source, ThermalSensor sensor, SensorStatus status)
+    {
+        switch (sensor)
+        {
+            case ThermalSensor.Cpu:
+                source.SetCpu(status);
+                break;
+            case ThermalSensor.Ram:
+                source.SetRam(status);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(sensor), sensor, null);
+        }
+    }
+
+    private static void AssertAvailable(SensorValue value, double celsius)
+    {
+        Assert.Equal(SensorStatus.Available, value.Status);
+        Assert.True(value.IsAvailable);
+        Assert.Equal(celsius, Assert.NotNull(value.Celsius));
+    }
+
+    private static void AssertUnavailable(SensorValue value, SensorStatus status)
+    {
+        Assert.Equal(status, value.Status);
+        Assert.False(value.IsAvailable);
+        Assert.Null(value.Celsius);
+    }
+
+    private static void AssertBothUnavailable(SensorReadings readings, SensorStatus status)
+    {
+        AssertUnavailable(readings.Cpu, status);
+        AssertUnavailable(readings.Ram, status);
+    }
+
+    private static TimeSpan Measure(Action action)
+    {
+        long startedAt = Stopwatch.GetTimestamp();
+        action();
+        return Stopwatch.GetElapsedTime(startedAt);
+    }
+
+    private static TimeSpan Max(TimeSpan first, TimeSpan second) => first > second ? first : second;
+
+    private static string Describe(SensorReadings? readings) =>
+        readings is null ? "none" : $"CPU {Describe(readings.Cpu)}, RAM {Describe(readings.Ram)}";
+
+    private static string Describe(SensorValue value) =>
+        value.Celsius is double celsius ? $"{celsius} °C ({value.Status})" : value.Status.ToString();
+
+    // One ReadingsChanged invocation as the handler saw it.
+    private readonly record struct ReceivedEvent(object? Sender, SensorReadings Readings, SynchronizationContext? Context, int ThreadId);
+
+    // A monitor over a FakeSensorSource on a fake clock, posting to a context the test thread drains.
+    private sealed class Harness : IDisposable
+    {
+        private readonly object _eventsGate = new();
+        private readonly List<ReceivedEvent> _events = [];
+        private bool _disposed;
+
+        public Harness(
+            Func<TimeProvider, FakeSensorSource>? createSource = null,
+            Func<ISensorSource, ISensorSource>? decorate = null,
+            bool queuePosts = true)
+        {
+            Time = new FakeTimeProvider();
+            Source = createSource?.Invoke(Time) ?? new FakeSensorSource(Time);
+            MonitoredSource = decorate?.Invoke(Source) ?? Source;
+            Context = new ImmediateSynchronizationContext(queuePosts);
+            Monitor = new SensorMonitor(MonitoredSource, Time);
+        }
+
+        public FakeTimeProvider Time { get; }
+
+        public FakeSensorSource Source { get; }
+
+        // The source the monitor owns: Source itself, or the decorator wrapped around it.
+        public ISensorSource MonitoredSource { get; }
+
+        public ImmediateSynchronizationContext Context { get; }
+
+        public SensorMonitor Monitor { get; }
+
+        public int EventCount
+        {
+            get
+            {
+                lock (_eventsGate)
+                {
+                    return _events.Count;
+                }
+            }
+        }
+
+        public IReadOnlyList<ReceivedEvent> Events
+        {
+            get
+            {
+                lock (_eventsGate)
+                {
+                    return _events.ToArray();
+                }
+            }
+        }
+
+        public SensorReadings? LastReadings
+        {
+            get
+            {
+                lock (_eventsGate)
+                {
+                    return _events.Count == 0 ? null : _events[^1].Readings;
+                }
+            }
+        }
+
+        // Starts the monitor and waits until the sensor thread has opened the source and, when
+        // expected, until the immediate first read has been raised.
+        public void Start(bool expectFirstRead = true)
+        {
+            Monitor.ReadingsChanged += OnReadingsChanged;
+            Monitor.Start(Context);
+            Assert.True(
+                SpinWait.SpinUntil(() => Source.OpenCount == 1, _safetyTimeout),
+                $"The sensor thread did not open the source within {_safetyTimeout}; OpenCount: {Source.OpenCount}.");
+            if (expectFirstRead)
+            {
+                WaitForEvents(1);
+            }
+        }
+
+        // Advances the fake clock one PollInterval at a time. When a read is expected, waits after each
+        // tick for that read's snapshot to be raised, which also proves the sensor thread is idle again.
+        // Returns the longest real time a single Advance took.
+        public TimeSpan Tick(int seconds = 1, bool expectRead = true)
+        {
+            TimeSpan slowestAdvance = TimeSpan.Zero;
+            for (int second = 0; second < seconds; second++)
+            {
+                Context.RunPending();
+                int completedBefore = Source.CompletedReadCount;
+                int eventsBefore = EventCount;
+
+                slowestAdvance = Max(slowestAdvance, Measure(() => Time.Advance(SensorMonitor.PollInterval)));
+
+                if (expectRead)
+                {
+                    WaitForEvents(eventsBefore + 1);
+                    Assert.True(
+                        Source.CompletedReadCount > completedBefore,
+                        $"A snapshot was raised without a completed read; completed reads: {Source.CompletedReadCount}.");
+                }
+            }
+
+            return slowestAdvance;
+        }
+
+        // Blocks reads, then ticks once so the next read starts and stays in flight. Returns the reads entered.
+        public int BlockNextRead()
+        {
+            Context.RunPending();
+            int readsEntered = Source.ReadCount + 1;
+            Source.BlockReads();
+            Tick(expectRead: false);
+            Assert.True(
+                Source.WaitForReadCount(readsEntered, _safetyTimeout),
+                $"The blocked read did not start within {_safetyTimeout}; reads entered: {Source.ReadCount}.");
+            return readsEntered;
+        }
+
+        // Lets the blocked read finish and waits for its snapshot to be raised.
+        public void ReleaseReadsAndWait()
+        {
+            Context.RunPending();
+            int eventsBefore = EventCount;
+            Source.ReleaseReads();
+            WaitForEvents(eventsBefore + 1);
+        }
+
+        // Starts, blocks the next read and ticks until it has been outstanding HungAfter.
+        public void StartAndHang()
+        {
+            Start();
+            BlockNextRead();
+            Tick(_ticksUntilHung, expectRead: false);
+            Assert.True(Monitor.IsHung, $"The source was not marked hung; last snapshot: {Describe(LastReadings)}.");
+        }
+
+        public void WaitForEvents(int count) =>
+            Assert.True(
+                Context.RunUntil(() => EventCount >= count, _safetyTimeout),
+                $"Expected {count} ReadingsChanged event(s) within {_safetyTimeout}; observed {EventCount}, " +
+                $"reads entered {Source.ReadCount}, completed {Source.CompletedReadCount}.");
+
+        public void PumpUntil(Func<bool> condition, string expectation) =>
+            Assert.True(
+                Context.RunUntil(condition, _safetyTimeout),
+                $"{expectation} within {_safetyTimeout}; last snapshot: {Describe(LastReadings)}.");
+
+        // Releases a held Open and blocked reads first, so no sensor thread stays parked after the test.
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            (MonitoredSource as InstrumentedSource)?.ReleaseOpen();
+            Source.ReleaseReads();
+            Monitor.Dispose();
+            Source.Dispose();
+        }
+
+        // Runs wherever the context runs posts: the test thread when queued, the sensor thread when
+        // inline, where an exception would end the process. It only records.
+        private void OnReadingsChanged(object? sender, SensorReadings readings)
+        {
+            var received = new ReceivedEvent(sender, readings, SynchronizationContext.Current, Environment.CurrentManagedThreadId);
+            lock (_eventsGate)
+            {
+                _events.Add(received);
+            }
+        }
+    }
+
+    // Adds only what FakeSensorSource does not offer: it records the kind of thread that opens the
+    // source, can hold Open until released, and can throw from Dispose. Every call reaches the fake.
+    private sealed class InstrumentedSource : ISensorSource
+    {
+        private readonly ISensorSource _inner;
+        private readonly Exception? _disposeException;
+        private readonly object _gate = new();
+        private bool _holdOpen;
+        private bool _openEntered;
+        private volatile bool _openedOnBackgroundThread;
+        private volatile bool _openedOnThreadPoolThread;
+
+        public InstrumentedSource(ISensorSource inner, bool holdOpen = false, Exception? disposeException = null)
+        {
+            _inner = inner;
+            _holdOpen = holdOpen;
+            _disposeException = disposeException;
+        }
+
+        // Written before the inner Open counts the call, so they are visible once OpenCount is.
+        public bool OpenedOnBackgroundThread => _openedOnBackgroundThread;
+
+        public bool OpenedOnThreadPoolThread => _openedOnThreadPoolThread;
+
+        public bool WaitForOpenEntered(TimeSpan timeout)
+        {
+            long startedAt = Stopwatch.GetTimestamp();
+            lock (_gate)
+            {
+                while (!_openEntered)
+                {
+                    TimeSpan remaining = timeout - Stopwatch.GetElapsedTime(startedAt);
+                    if (remaining <= TimeSpan.Zero)
+                    {
+                        return false;
+                    }
+
+                    System.Threading.Monitor.Wait(_gate, remaining);
+                }
+
+                return true;
+            }
+        }
+
+        public void ReleaseOpen()
+        {
+            lock (_gate)
+            {
+                _holdOpen = false;
+                System.Threading.Monitor.PulseAll(_gate);
+            }
+        }
+
+        public void Open()
+        {
+            Thread thread = Thread.CurrentThread;
+            _openedOnBackgroundThread = thread.IsBackground;
+            _openedOnThreadPoolThread = thread.IsThreadPoolThread;
+            lock (_gate)
+            {
+                _openEntered = true;
+                System.Threading.Monitor.PulseAll(_gate);
+                while (_holdOpen)
+                {
+                    System.Threading.Monitor.Wait(_gate);
+                }
+            }
+
+            _inner.Open();
+        }
+
+        public SensorReadings Read() => _inner.Read();
+
+        public void Dispose()
+        {
+            _inner.Dispose();
+            if (_disposeException is not null)
+            {
+                throw _disposeException;
+            }
+        }
+    }
+
+    // Holds every post until the test runs it, in any order, so a late delivery can be staged.
+    private sealed class CapturingSynchronizationContext : SynchronizationContext
+    {
+        private readonly object _gate = new();
+        private readonly List<(SendOrPostCallback Callback, object? State)> _posts = [];
+
+        public int PostCount
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _posts.Count;
+                }
+            }
+        }
+
+        public override void Post(SendOrPostCallback d, object? state)
+        {
+            lock (_gate)
+            {
+                _posts.Add((d, state));
+            }
+        }
+
+        public bool WaitForPosts(int count, TimeSpan timeout) => SpinWait.SpinUntil(() => PostCount >= count, timeout);
+
+        public void Run(int index)
+        {
+            (SendOrPostCallback Callback, object? State) post;
+            lock (_gate)
+            {
+                post = _posts[index];
+            }
+
+            post.Callback(post.State);
+        }
+    }
+}

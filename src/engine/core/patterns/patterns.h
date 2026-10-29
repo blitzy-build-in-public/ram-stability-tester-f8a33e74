@@ -438,19 +438,26 @@ public:
           step_(direction < 0 ? std::uint64_t{0} - std::uint64_t{lanes} : std::uint64_t{lanes}),
           mode_(mode_of(spec.kind)) {
         std::uint64_t lane_values[lanes] = {};
+        // The lane loops below stay scalar (loop(no_vector)). They run once per cursor, so
+        // vectorising them gains nothing, and MSVC's auto-vectorizer would otherwise compile the
+        // 64-bit multiply as an AVX-512 VPMULLQ path behind its own __isa_available check even in
+        // the SSE2 and AVX2 units, putting instructions above each unit's level into its object.
         if (mode_ == mode::random) {
             const std::uint64_t key = pattern_pass_key<Isa>(spec.seed, spec.pass);
+#pragma loop(no_vector)
             for (std::size_t k = 0; k < lanes; ++k) {
                 lane_values[k] = key + k_splitmix_gamma * (block_first_word + k + 1);
             }
             counter_ = detail::vec_load_lanes<Isa>(lane_values);
             counter_step_ = detail::vec_splat<Isa>(k_splitmix_gamma * step_);
         } else if (mode_ == mode::alternating) {
+#pragma loop(no_vector)
             for (std::size_t k = 0; k < lanes; ++k) {
                 lane_values[k] = pattern_word<Isa>(spec, block_first_word + k);
             }
             alt_current_ = detail::vec_load_lanes<Isa>(lane_values);
             // The next block in either direction: w + lanes and w - lanes have the same parity.
+#pragma loop(no_vector)
             for (std::size_t k = 0; k < lanes; ++k) {
                 lane_values[k] = pattern_word<Isa>(spec, block_first_word + lanes + k);
             }
