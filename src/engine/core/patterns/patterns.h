@@ -560,9 +560,8 @@ private:
  * in patterns.cpp at the SSE2 baseline.
  *
  * The ground truth the vector generators must match. Used for re-read expectations, by
- * tests/engine.tests/fakes/fault_injecting_memory_access.cpp and counting_memory_access.cpp,
- * and by the tests. Callable from every unit, the AVX ones included, because its code is
- * baseline code.
+ * tests/engine.tests/fakes/fault_injecting_memory_access.cpp and by the tests. Callable from
+ * every unit, the AVX ones included, because its code is baseline code.
  */
 std::uint64_t expected_value(const pattern_spec& spec, std::uint64_t word_index) noexcept;
 
