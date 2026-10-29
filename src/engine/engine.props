@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Shared native build settings. This is the only place native toolset, compiler, linker and
+    output settings are defined, for the four native projects in RamQuick.sln:
+      src\engine\engine_core.vcxproj                             static library
+      src\engine\ramquick_engine.vcxproj                         production DLL
+      tests\engine.tests\engine.tests.vcxproj                    GoogleTest executable
+      tests\engine.tests\test_dll\ramquick_engine_test.vcxproj   test-only DLL
+    RamQuickNativeOutRoot and RamQuickNativeIntRoot come from the repository's root
+    Directory.Build.props, which Microsoft.Cpp.Default.props imports before this file.
+
+    Import contract, followed by every native project:
+    - Import this file exactly once, by relative path:
+        <Import Project="<relative path>\engine.props" />
+    - Place the import after <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+      and after the project's own PropertyGroup Label="Configuration" groups, which set only
+      ConfigurationType and UseDebugLibraries.
+    - Place it immediately before <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />.
+      PlatformToolset, WindowsTargetPlatformVersion, CharacterSet and WholeProgramOptimization
+      must be known before Microsoft.Cpp.props selects the toolset props. The toolset's
+      ClCompile and Link defaults apply only to empty metadata, so the item definitions below
+      survive them.
+    - Never redefine a property or item-definition metadata set here. The one sanctioned
+      override is EnableEnhancedInstructionSet in engine_core.vcxproj, set per file and only for
+      core\kernels\kernels_avx2.cpp (AdvancedVectorExtensions2) and
+      core\kernels\kernels_avx512.cpp (AdvancedVectorExtensions512).
+    - TargetName, ConfigurationType, UseDebugLibraries, SubSystem and the vcpkg properties
+      belong to each project: the test projects set VcpkgEnableManifest and
+      VcpkgTriplet=x64-windows-static, and the production projects disable vcpkg.
+
+    Include convention for all native code, tests included: the public API as
+    #include "ramquick_engine.h", internal headers by their path from src\engine, for example
+    #include "core/memory/memory_access.h".
+  -->
+
+  <ImportGroup Label="PropertySheets" />
+  <PropertyGroup Label="UserMacros" />
+
+  <!--
+    The sentinel guards this group against a repeated import. MSBuild evaluates
+    ItemDefinitionGroup conditions only after every property, when the sentinel is already
+    set, so it cannot gate the item definitions below; MSBuild itself skips a repeated import
+    of the same file (warning MSB4011), which keeps them from being applied twice.
+  -->
+  <PropertyGroup Condition="'$(RamQuickEnginePropsImported)' != 'true'">
+    <RamQuickEnginePropsImported>true</RamQuickEnginePropsImported>
+    <!-- Ends with a backslash, e.g. $(RamQuickEngineDir)api\api.cpp. -->
+    <RamQuickEngineDir>$(MSBuildThisFileDirectory)</RamQuickEngineDir>
+
+    <!--
+      VS 2022 v143. VCToolsVersion is deliberately not pinned: v143 resolves the newest
+      installed 14.4x compiler, so the build does not depend on one servicing folder name.
+    -->
+    <PlatformToolset>v143</PlatformToolset>
+    <!-- Any 10.0.26100.x servicing build of the SDK installs to this folder. -->
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <CharacterSet>Unicode</CharacterSet>
+    <!--
+      Never /GL or /LTCG. Link-time code generation can inline across translation units built
+      with different /arch levels, so AVX2 or AVX-512 code could run before ISA dispatch has
+      selected it. It also keeps engine_core.lib linkable into both DLLs and the test exe.
+    -->
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+
+    <!--
+      One output folder per configuration for all four projects: engine_core.lib,
+      ramquick_engine.dll (with its import .lib and .pdb), ramquick_engine_test.dll and
+      engine.tests.exe. The managed projects copy the DLLs from here. Intermediates are per
+      project, so object files and vc143.pdb never collide.
+    -->
+    <OutDir>$(RamQuickNativeOutRoot)$(Configuration)\</OutDir>
+    <IntDir>$(RamQuickNativeIntRoot)$(MSBuildProjectName)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <ConformanceMode>true</ConformanceMode>
+      <!--
+        /EHsc, never /EHa. The engine boundary converts C++ exceptions to result codes with
+        catch (...), and under /EHsc that catches C++ exceptions only: SEH faults (access
+        violations, in-page errors) must terminate the process, never be swallowed.
+      -->
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <!-- The x64 SSE2 baseline; only the two kernel files override it (see the contract). -->
+      <EnableEnhancedInstructionSet>NotSet</EnableEnhancedInstructionSet>
+      <AdditionalIncludeDirectories>$(RamQuickEngineDir)include;$(RamQuickEngineDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!--
+        No min/max macros to break <algorithm>; Windows 10 declarations for
+        SetThreadGroupAffinity, GetLogicalProcessorInformationEx and SetProcessWorkingSetSizeEx.
+      -->
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;_WIN32_WINNT=0x0A00;WINVER=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <!-- /Zi in both configurations, so Release binaries carry PDBs too. -->
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <!--
+      Lib has no settings: a static library does not use Link metadata, so every project that
+      links engine_core.lib gets advapi32 (OpenProcessToken, LookupPrivilegeValueW,
+      AdjustTokenPrivileges, GetTokenInformation) from these Link definitions.
+    -->
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>kernel32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!--
+    Static CRT in both configurations (/MTd, /MT): the portable folder cannot rely on an
+    installed Visual C++ Redistributable, and the x64-windows-static vcpkg triplet builds
+    GoogleTest the same way. Never introduce /MD or /MDd: it fails to link (LNK2038).
+  -->
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Debug'">
+    <ClCompile>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <Optimization>Disabled</Optimization>
+      <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Release'">
+    <ClCompile>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <Optimization>MaxSpeed</Optimization>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <!-- /OPT:ICF folds only byte-identical functions, so it is safe across /arch levels. -->
+    <Link>
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!--
+    Fails fast, before PrepareForBuild creates any folder, when the settings above cannot hold.
+    The configuration check exists because the static CRT is defined for Debug and Release
+    only; any other configuration would silently fall back to the toolset's /MD default.
+  -->
+  <Target Name="RamQuickValidateNativeLayout" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(RamQuickNativeOutRoot)' == '' or '$(RamQuickNativeIntRoot)' == ''"
+           Text="$(MSBuildProjectName): RamQuickNativeOutRoot or RamQuickNativeIntRoot is not defined, so the repository's root Directory.Build.props was not imported. Build the project from inside the RAMQuick repository." />
+    <Error Condition="'$(Platform)' != 'x64'"
+           Text="$(MSBuildProjectName): RAMQuick native projects build for x64 only (Windows 10/11 x64), but Platform is '$(Platform)'. Build with -p:Platform=x64." />
+    <Error Condition="'$(Configuration)' != 'Debug' and '$(Configuration)' != 'Release'"
+           Text="$(MSBuildProjectName): RAMQuick native projects define the static CRT for the Debug and Release configurations only, but Configuration is '$(Configuration)'." />
+  </Target>
+</Project>
