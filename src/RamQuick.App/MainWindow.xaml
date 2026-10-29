@@ -1,0 +1,457 @@
+<!--
+    The single window of RAMQuick. Bindings only: MainViewModel, the window's only DataContext, makes every value,
+    visibility and enablement decision, and MainWindow.xaml.cs holds nothing but InitializeComponent.
+
+    RootGrid rows: 0 FixedArea (control row, live readings, detected memory, notice), which never scrolls; 1
+    ResultHeader (verdict badge, reason, first error); 2 a separator above DetailScroller (cause hints first, then
+    the grouped error list). WorkAreaSizing sizes the window from its own monitor's work area and publishes the layout of rows 0 and 1
+    as the inherited WorkAreaSizing.Layout, which the styles below switch on:
+      Regular  rows 0 + 1 within 340 DIPs.
+      Compact  rows 0 + 1 within 240 DIPs: readings in three columns, the memory summary on one line, the notice
+               and the first-error message on one line each, their full text opening the detail area.
+      Minimal  only the control row and the one-line status stay fixed; everything else scrolls.
+    MainWindowLayoutTests measure those budgets with the longest texts, so fixed rows carry no fixed heights.
+
+    Exactly three input controls: the test type selector, Stop on error and the Start/Stop toggle. Lists are
+    read-only ItemsControls rather than ListBox or DataGrid, and every ContentControl and ItemsControl is
+    Focusable="False" (both default to True), so the tab order is selector, checkbox, toggle, detail area.
+-->
+<Window x:Class="RamQuick.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:app="clr-namespace:RamQuick.App"
+        xmlns:behaviors="clr-namespace:RamQuick.App.Behaviors"
+        xmlns:viewModels="clr-namespace:RamQuick.App.ViewModels"
+        mc:Ignorable="d"
+        d:DataContext="{d:DesignInstance Type=viewModels:MainViewModel, IsDesignTimeCreatable=False}"
+        Title="{x:Static app:UiText.AppTitle}"
+        Width="560"
+        Height="680"
+        ResizeMode="CanResize"
+        WindowStartupLocation="CenterScreen"
+        UseLayoutRounding="True"
+        behaviors:WorkAreaSizing.IsEnabled="True">
+
+    <Window.Resources>
+        <!-- Layout switches. Each binds the layout WorkAreaSizing sets on the window. -->
+        <Style x:Key="HiddenInMinimalStyle" TargetType="FrameworkElement">
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="Visibility" Value="Collapsed" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="MinimalOnlyStyle" TargetType="FrameworkElement">
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- Compact and Minimal: the full text of what the fixed rows shorten or omit. -->
+        <Style x:Key="CondensedOnlyStyle" TargetType="FrameworkElement">
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Compact}">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!--
+            The toggle's command, content and automation name come only from this style: a local value would
+            outrank the trigger, and the button would never turn into Stop. Enablement is each command's CanExecute.
+        -->
+        <Style x:Key="StartStopButtonStyle" TargetType="Button">
+            <Setter Property="Command" Value="{Binding StartCommand}" />
+            <Setter Property="Content" Value="{x:Static app:UiText.StartLabel}" />
+            <Setter Property="AutomationProperties.Name" Value="{x:Static app:UiText.StartAutomationName}" />
+            <Setter Property="Padding" Value="12,0" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsRunInProgress}" Value="True">
+                    <Setter Property="Command" Value="{Binding StopCommand}" />
+                    <Setter Property="Content" Value="{x:Static app:UiText.StopLabel}" />
+                    <Setter Property="AutomationProperties.Name" Value="{x:Static app:UiText.StopAutomationName}" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- One label/value pair; the value takes the remaining width and ends in an ellipsis when it is too long. -->
+        <Style x:Key="FieldPairStyle" TargetType="DockPanel">
+            <Setter Property="Margin" Value="0,1,12,1" />
+        </Style>
+
+        <Style x:Key="ReadingsGridStyle" TargetType="UniformGrid">
+            <Setter Property="Columns" Value="2" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Compact}">
+                    <Setter Property="Columns" Value="3" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="MemoryGridStyle" TargetType="UniformGrid">
+            <Setter Property="Columns" Value="3" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Compact}">
+                    <Setter Property="Visibility" Value="Collapsed" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="MemoryLineStyle" TargetType="TextBlock">
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Setter Property="TextWrapping" Value="NoWrap" />
+            <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Compact}">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- Later triggers win, so Minimal hides the line even while a notice applies. -->
+        <Style x:Key="NoticeLineStyle" TargetType="TextBlock">
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="Margin" Value="0,6,0,0" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding HasNotice}" Value="True">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Compact}">
+                    <Setter Property="TextWrapping" Value="NoWrap" />
+                    <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="Visibility" Value="Collapsed" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="FirstErrorLineStyle" TargetType="TextBlock">
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="Margin" Value="0,4,0,0" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding HasFirstError}" Value="True">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Compact}">
+                    <Setter Property="TextWrapping" Value="NoWrap" />
+                    <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!--
+            The minimal fallback keeps only the control row and the one-line status fixed, so the result header
+            collapses there and its verdict, reason and first error open the detail area instead.
+        -->
+        <Style x:Key="ResultHeaderStyle" TargetType="StackPanel">
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Setter Property="Margin" Value="0,8,0,0" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding HasResult}" Value="True">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding HasFirstError}" Value="True">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="Visibility" Value="Collapsed" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="DetailTextStyle" TargetType="TextBlock">
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="Margin" Value="0,0,0,6" />
+        </Style>
+
+        <Style x:Key="EvidenceTextStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" />
+            <Setter Property="FontSize" Value="11" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="Margin" Value="12,1,0,0" />
+        </Style>
+
+        <!-- Shared by the fixed area and, in the minimal layout, the detail area. -->
+        <DataTemplate x:Key="LiveReadingsTemplate">
+            <StackPanel>
+                <DockPanel Style="{StaticResource FieldPairStyle}">
+                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.CurrentStepLabel}" />
+                    <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding CurrentStepText}" />
+                </DockPanel>
+                <UniformGrid Style="{StaticResource ReadingsGridStyle}">
+                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.RamTemperatureLabel}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding RamTemperatureText}" />
+                    </DockPanel>
+                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.CpuTemperatureLabel}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding CpuTemperatureText}" />
+                    </DockPanel>
+                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.ElapsedLabel}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding ElapsedText}" />
+                    </DockPanel>
+                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.RemainingLabel}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding RemainingText}" />
+                    </DockPanel>
+                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.CoverageLabel}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding CoverageText}" />
+                    </DockPanel>
+                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.ErrorsLabel}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding ErrorCountText}" />
+                    </DockPanel>
+                </UniformGrid>
+            </StackPanel>
+        </DataTemplate>
+
+        <DataTemplate x:Key="MemorySummaryTemplate">
+            <StackPanel>
+                <UniformGrid Style="{StaticResource MemoryGridStyle}">
+                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.InstalledLabel}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding InstalledText}" />
+                    </DockPanel>
+                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.TestedLabel}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding TestedText}" />
+                    </DockPanel>
+                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.SpeedLabel}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding SpeedText}" />
+                    </DockPanel>
+                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.ChannelsLabel}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding ChannelsText}" />
+                    </DockPanel>
+                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.DimmsLabel}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding DimmsText}" />
+                    </DockPanel>
+                </UniformGrid>
+                <!--
+                    Whitespace between inline elements renders as one space, so each label is followed by a space
+                    and each value runs straight into the separator; the line breaks sit inside the Run tags.
+                -->
+                <TextBlock Style="{StaticResource MemoryLineStyle}"><Run
+                    Text="{x:Static app:UiText.InstalledLabel}" Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" /> <Run
+                    Text="{Binding InstalledText, Mode=OneWay}" FontWeight="SemiBold" /><Run
+                    Text="{x:Static app:UiText.NoticeSeparator}" /><Run
+                    Text="{x:Static app:UiText.TestedLabel}" Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" /> <Run
+                    Text="{Binding TestedText, Mode=OneWay}" FontWeight="SemiBold" /><Run
+                    Text="{x:Static app:UiText.NoticeSeparator}" /><Run
+                    Text="{x:Static app:UiText.SpeedLabel}" Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" /> <Run
+                    Text="{Binding SpeedText, Mode=OneWay}" FontWeight="SemiBold" /><Run
+                    Text="{x:Static app:UiText.NoticeSeparator}" /><Run
+                    Text="{x:Static app:UiText.ChannelsLabel}" Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" /> <Run
+                    Text="{Binding ChannelsText, Mode=OneWay}" FontWeight="SemiBold" /><Run
+                    Text="{x:Static app:UiText.NoticeSeparator}" /><Run
+                    Text="{x:Static app:UiText.DimmsLabel}" Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" /> <Run
+                    Text="{Binding DimmsText, Mode=OneWay}" FontWeight="SemiBold" /></TextBlock>
+            </StackPanel>
+        </DataTemplate>
+
+        <!-- Verdict badge and reason side by side, so a wrapped reason costs no extra row next to the badge. -->
+        <DataTemplate x:Key="ResultTemplate">
+            <Grid Visibility="{Binding HasResult, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Border Style="{StaticResource VerdictBadgeStyle}"
+                        Background="{Binding State, Converter={StaticResource RunStateToBrush}}"
+                        VerticalAlignment="Center">
+                    <TextBlock Text="{Binding VerdictText}" />
+                </Border>
+                <TextBlock Grid.Column="1"
+                           Margin="8,0,0,0"
+                           VerticalAlignment="Center"
+                           TextWrapping="Wrap"
+                           Text="{Binding ResultReasonText}" />
+            </Grid>
+        </DataTemplate>
+    </Window.Resources>
+
+    <Grid x:Name="RootGrid" Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <StackPanel x:Name="FixedArea" Grid.Row="0">
+            <!--
+                BLITZY [A11Y]: the three controls are 32 DIPs tall, below the 44-DIP touch-target recommendation.
+                The minimal layout's 72-DIP fixed-row budget allots the control row about 40 DIPs, and the regular
+                and compact budgets are shared with every live field; flagged for designer review.
+            -->
+            <DockPanel LastChildFill="False">
+                <ComboBox x:Name="TestTypeSelector"
+                          DockPanel.Dock="Left"
+                          MinWidth="170"
+                          MinHeight="32"
+                          VerticalContentAlignment="Center"
+                          TabIndex="0"
+                          AutomationProperties.Name="{x:Static app:UiText.TestTypeAutomationName}"
+                          ItemsSource="{Binding TestTypeOptions}"
+                          DisplayMemberPath="Text"
+                          SelectedValuePath="Value"
+                          SelectedValue="{Binding SelectedTestType}"
+                          IsEnabled="{Binding CanChangeSettings}" />
+                <CheckBox x:Name="StopOnErrorCheckBox"
+                          DockPanel.Dock="Left"
+                          Margin="12,0,0,0"
+                          MinHeight="32"
+                          VerticalAlignment="Center"
+                          VerticalContentAlignment="Center"
+                          TabIndex="1"
+                          AutomationProperties.Name="{x:Static app:UiText.StopOnErrorAutomationName}"
+                          Content="{x:Static app:UiText.StopOnErrorLabel}"
+                          IsChecked="{Binding StopOnError}"
+                          IsEnabled="{Binding CanChangeSettings}" />
+                <Button x:Name="StartStopButton"
+                        DockPanel.Dock="Right"
+                        MinWidth="88"
+                        MinHeight="32"
+                        TabIndex="2"
+                        Style="{StaticResource StartStopButtonStyle}" />
+            </DockPanel>
+
+            <TextBlock Style="{StaticResource MinimalOnlyStyle}"
+                       Margin="0,8,0,0"
+                       TextWrapping="NoWrap"
+                       TextTrimming="CharacterEllipsis"
+                       Text="{Binding StatusLineText}" />
+
+            <ContentControl Style="{StaticResource HiddenInMinimalStyle}"
+                            Margin="0,8,0,0"
+                            Focusable="False"
+                            AutomationProperties.Name="{x:Static app:UiText.LiveReadingsAutomationName}"
+                            Content="{Binding}"
+                            ContentTemplate="{StaticResource LiveReadingsTemplate}" />
+
+            <ContentControl Style="{StaticResource HiddenInMinimalStyle}"
+                            Margin="0,6,0,0"
+                            Focusable="False"
+                            AutomationProperties.Name="{x:Static app:UiText.MemorySummaryAutomationName}"
+                            Content="{Binding}"
+                            ContentTemplate="{StaticResource MemorySummaryTemplate}" />
+
+            <!--
+                A text element's automation name is its text unless a name is set, so the region name goes in
+                HelpText: a name would replace the notice itself for screen reader users.
+            -->
+            <TextBlock Style="{StaticResource NoticeLineStyle}"
+                       AutomationProperties.HelpText="{x:Static app:UiText.NoticeAutomationName}"
+                       Text="{Binding NoticeText}" />
+        </StackPanel>
+
+        <StackPanel x:Name="ResultHeader"
+                    Grid.Row="1"
+                    Style="{StaticResource ResultHeaderStyle}"
+                    AutomationProperties.Name="{x:Static app:UiText.ResultAutomationName}">
+            <ContentControl Focusable="False"
+                            Content="{Binding}"
+                            ContentTemplate="{StaticResource ResultTemplate}" />
+            <TextBlock Style="{StaticResource FirstErrorLineStyle}" Text="{Binding FirstErrorText}" />
+        </StackPanel>
+
+        <!-- The separator marks where scrolling starts, so scrolled text never reads as part of the fixed rows. -->
+        <DockPanel Grid.Row="2" Margin="0,4,0,0">
+            <Separator DockPanel.Dock="Top" Margin="0,2,0,2" />
+            <ScrollViewer x:Name="DetailScroller"
+                          VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollBarVisibility="Disabled"
+                          Focusable="True"
+                          IsTabStop="True"
+                          TabIndex="3">
+                <StackPanel>
+                    <ContentControl Style="{StaticResource MinimalOnlyStyle}"
+                                    Margin="0,4,0,6"
+                                    Focusable="False"
+                                    AutomationProperties.Name="{x:Static app:UiText.ResultAutomationName}"
+                                    Content="{Binding}"
+                                    ContentTemplate="{StaticResource ResultTemplate}" />
+
+                    <StackPanel Style="{StaticResource CondensedOnlyStyle}" Margin="0,4,0,0">
+                        <TextBlock Style="{StaticResource DetailTextStyle}"
+                                   Visibility="{Binding HasNotice, Converter={StaticResource BoolToVisibility}}"
+                                   AutomationProperties.HelpText="{x:Static app:UiText.NoticeAutomationName}"
+                                   Text="{Binding NoticeText}" />
+                        <TextBlock Style="{StaticResource DetailTextStyle}"
+                                   Visibility="{Binding HasFirstError, Converter={StaticResource BoolToVisibility}}"
+                                   Text="{Binding FirstErrorText}" />
+                    </StackPanel>
+
+                    <StackPanel Style="{StaticResource MinimalOnlyStyle}">
+                        <ContentControl Focusable="False"
+                                        AutomationProperties.Name="{x:Static app:UiText.LiveReadingsAutomationName}"
+                                        Content="{Binding}"
+                                        ContentTemplate="{StaticResource LiveReadingsTemplate}" />
+                        <ContentControl Margin="0,6,0,0"
+                                        Focusable="False"
+                                        AutomationProperties.Name="{x:Static app:UiText.MemorySummaryAutomationName}"
+                                        Content="{Binding}"
+                                        ContentTemplate="{StaticResource MemorySummaryTemplate}" />
+                    </StackPanel>
+
+                    <!-- Hints come first so a long error list never pushes them out of view. -->
+                    <StackPanel Visibility="{Binding HasCauseHints, Converter={StaticResource BoolToVisibility}}">
+                        <TextBlock Style="{StaticResource SectionHeaderStyle}" Text="{Binding CauseHintsHeader}" />
+                        <ItemsControl Focusable="False"
+                                      AutomationProperties.Name="{x:Static app:UiText.CauseHintsAutomationName}"
+                                      ItemsSource="{Binding CauseHints}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Margin="0,0,0,6">
+                                        <TextBlock TextWrapping="Wrap" Text="{Binding Text}" />
+                                        <TextBlock Style="{StaticResource EvidenceTextStyle}" Text="{Binding Evidence}" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+
+                    <StackPanel Visibility="{Binding HasErrorGroups, Converter={StaticResource BoolToVisibility}}">
+                        <TextBlock Style="{StaticResource SectionHeaderStyle}" Text="{Binding ErrorGroupsHeader}" />
+                        <ItemsControl Focusable="False"
+                                      AutomationProperties.Name="{x:Static app:UiText.ErrorGroupsAutomationName}"
+                                      ItemsSource="{Binding ErrorGroups}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Margin="0,0,0,2" TextWrapping="Wrap" Text="{Binding Text}" />
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+                </StackPanel>
+            </ScrollViewer>
+        </DockPanel>
+    </Grid>
+</Window>
