@@ -33,7 +33,7 @@ public sealed class FileJournalStorage : IJournalStorage
 
     // No byte-order mark, and invalid input never throws: unpaired surrogates are written and
     // malformed bytes are read as U+FFFD, so a damaged line reaches the parser, which rejects it.
-    private static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
+    private static readonly UTF8Encoding _utf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
 
     private readonly string _path;
     private readonly string? _directory;
@@ -176,7 +176,7 @@ public sealed class FileJournalStorage : IJournalStorage
                 FileMode.Open,
                 FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete);
-            using StreamReader reader = new(stream, Utf8, detectEncodingFromByteOrderMarks: false);
+            using StreamReader reader = new(stream, _utf8, detectEncodingFromByteOrderMarks: false);
             content = reader.ReadToEnd();
         }
         catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
@@ -238,13 +238,13 @@ public sealed class FileJournalStorage : IJournalStorage
     private static byte[] EncodeRecord(string line, bool startOnNewLine)
     {
         int prefixLength = startOnNewLine ? 1 : 0;
-        byte[] record = new byte[prefixLength + Utf8.GetByteCount(line) + 1];
+        byte[] record = new byte[prefixLength + _utf8.GetByteCount(line) + 1];
         if (startOnNewLine)
         {
             record[0] = LineTerminator;
         }
 
-        Utf8.GetBytes(line, 0, line.Length, record, prefixLength);
+        _utf8.GetBytes(line, 0, line.Length, record, prefixLength);
         record[^1] = LineTerminator;
         return record;
     }

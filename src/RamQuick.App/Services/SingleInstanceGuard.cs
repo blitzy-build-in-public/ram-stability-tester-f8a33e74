@@ -1,3 +1,5 @@
+using System.IO;
+
 namespace RamQuick.App.Services;
 
 /// <summary>
@@ -30,9 +32,16 @@ public sealed class SingleInstanceGuard : IDisposable
     /// </summary>
     public const string MutexName = @"Local\RamQuick.SingleInstance";
 
+    // HRESULT_FROM_WIN32 of ERROR_PATH_NOT_FOUND, ERROR_INVALID_NAME, ERROR_BAD_PATHNAME and
+    // ERROR_FILENAME_EXCED_RANGE, the HResults of the exceptions the Mutex constructor throws for them.
+    private const int PathNotFoundHResult = unchecked((int)0x80070003);
+    private const int InvalidNameHResult = unchecked((int)0x8007007B);
+    private const int BadPathNameHResult = unchecked((int)0x800700A1);
+    private const int FileNameTooLongHResult = unchecked((int)0x800700CE);
+
     // WaitHandle.WaitOne rejects timeouts above int.MaxValue milliseconds. Checking the range before
     // the mutex is opened means a bad argument never leaves an unowned handle behind.
-    private static readonly TimeSpan MaxTimeout = TimeSpan.FromMilliseconds(int.MaxValue);
+    private static readonly TimeSpan _maxTimeout = TimeSpan.FromMilliseconds(int.MaxValue);
 
     private readonly Mutex _mutex;
 
@@ -65,8 +74,11 @@ public sealed class SingleInstanceGuard : IDisposable
     /// name so they never contend with a running RAMQuick.
     /// </param>
     /// <returns>
-    /// A guard whose mutex is owned by the calling thread, or <see langword="null"/> when another
-    /// instance still holds the mutex after the wait, or holds it with access rights this process lacks.
+    /// A guard whose mutex is owned by the calling thread, or <see langword="null"/> when this process
+    /// cannot become the single instance: another instance still holds the mutex after the wait, or
+    /// holds it with access rights this process lacks; another kind of named object, such as an event
+    /// or a semaphore, already uses the name; or Windows otherwise refuses to create or open the mutex,
+    /// for example for lack of kernel resources.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="mutexName"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException"><paramref name="mutexName"/> is empty.</exception>
@@ -74,13 +86,17 @@ public sealed class SingleInstanceGuard : IDisposable
     /// <paramref name="timeout"/> is negative and not <see cref="Timeout.InfiniteTimeSpan"/>, or exceeds
     /// <see cref="int.MaxValue"/> milliseconds.
     /// </exception>
+    /// <exception cref="IOException">
+    /// <paramref name="mutexName"/> is not a valid kernel object name: for example it names a namespace
+    /// that does not exist, has nothing after its namespace prefix, or is too long.
+    /// </exception>
     public static SingleInstanceGuard? TryAcquire(TimeSpan timeout, string mutexName = MutexName)
     {
         ArgumentException.ThrowIfNullOrEmpty(mutexName);
         if (timeout != Timeout.InfiniteTimeSpan)
         {
             ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero);
-            ArgumentOutOfRangeException.ThrowIfGreaterThan(timeout, MaxTimeout);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(timeout, _maxTimeout);
         }
 
         Mutex mutex;
@@ -94,8 +110,20 @@ public sealed class SingleInstanceGuard : IDisposable
             // cannot open. The mutex exists, so an instance is running.
             return null;
         }
+        catch (WaitHandleCannotBeOpenedException)
+        {
+            // A named event, semaphore or waitable timer holds the name, so no mutex can exist under it
+            // while that object lives, and this process cannot become the single instance.
+            return null;
+        }
+        catch (IOException exception) when (!IsMalformedName(exception))
+        {
+            // Windows refused the mutex for a reason other than its name, such as exhausted kernel
+            // resources. That is a refusal for startup to report, not a defect to crash on.
+            return null;
+        }
 
-        bool acquired;
+        bool acquired = false;
         try
         {
             acquired = mutex.WaitOne(timeout);
@@ -107,14 +135,18 @@ public sealed class SingleInstanceGuard : IDisposable
             // journal is recovered at startup by the crash detector.
             acquired = true;
         }
-
-        if (!acquired)
+        finally
         {
-            mutex.Dispose();
-            return null;
+            // A handle that no guard takes over is closed here on every path, an unexpected wait
+            // exception included, so a refused process never keeps the mutex referenced until
+            // finalization.
+            if (!acquired)
+            {
+                mutex.Dispose();
+            }
         }
 
-        return new SingleInstanceGuard(mutex);
+        return acquired ? new SingleInstanceGuard(mutex) : null;
     }
 
     /// <summary>
@@ -136,4 +168,13 @@ public sealed class SingleInstanceGuard : IDisposable
 
         _mutex.Dispose();
     }
+
+    // The Win32 errors with which Windows rejects a malformed object name: a namespace or directory
+    // that does not exist, an empty or badly separated name, or one too long for the object manager.
+    // The name comes from the caller, so these are programming errors and propagate.
+    private static bool IsMalformedName(IOException exception) =>
+        exception.HResult is PathNotFoundHResult
+            or InvalidNameHResult
+            or BadPathNameHResult
+            or FileNameTooLongHResult;
 }

@@ -32,13 +32,13 @@ namespace RamQuick.App.Converters;
 [ValueConversion(typeof(RunState), typeof(Brush))]
 public sealed class RunStateToBrushConverter : IValueConverter
 {
-    private static readonly SolidColorBrush DefaultPassedBrush = CreateFrozen(0x1E, 0x7B, 0x34);
-    private static readonly SolidColorBrush DefaultFailedBrush = CreateFrozen(0xB3, 0x26, 0x1E);
-    private static readonly SolidColorBrush DefaultAbortedBrush = CreateFrozen(0xA1, 0x5C, 0x00);
+    private static readonly SolidColorBrush _defaultPassedBrush = CreateFrozen(0x1E, 0x7B, 0x34);
+    private static readonly SolidColorBrush _defaultFailedBrush = CreateFrozen(0xB3, 0x26, 0x1E);
+    private static readonly SolidColorBrush _defaultAbortedBrush = CreateFrozen(0xA1, 0x5C, 0x00);
 
-    private Brush _passedBrush = DefaultPassedBrush;
-    private Brush _failedBrush = DefaultFailedBrush;
-    private Brush _abortedBrush = DefaultAbortedBrush;
+    private Brush _passedBrush = _defaultPassedBrush;
+    private Brush _failedBrush = _defaultFailedBrush;
+    private Brush _abortedBrush = _defaultAbortedBrush;
     private Brush _neutralBrush = Brushes.Transparent;
 
     /// <summary>

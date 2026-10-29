@@ -64,7 +64,8 @@ dotnet_naming_rule.constants_should_be_pascal_case.symbols = constants
 dotnet_naming_rule.constants_should_be_pascal_case.style = pascal_case
 dotnet_naming_rule.constants_should_be_pascal_case.severity = error
 
-# static readonly fields of any accessibility: PascalCase.
+# Non-private static readonly fields are part of a type's surface: PascalCase, like its other
+# members. Private ones are private fields first, so they follow the _camelCase rule below.
 dotnet_naming_rule.static_readonly_fields_should_be_pascal_case.symbols = static_readonly_fields
 dotnet_naming_rule.static_readonly_fields_should_be_pascal_case.style = pascal_case
 dotnet_naming_rule.static_readonly_fields_should_be_pascal_case.severity = error
@@ -85,7 +86,8 @@ dotnet_naming_rule.type_parameters_should_begin_with_t.symbols = type_parameters
 dotnet_naming_rule.type_parameters_should_begin_with_t.style = type_parameter_style
 dotnet_naming_rule.type_parameters_should_begin_with_t.severity = error
 
-# Private and internal fields, instance and static non-readonly alike: _camelCase.
+# Private fields of every kind, static readonly included, and internal fields: _camelCase.
+# Constants and internal static readonly fields match the more specific rules above first.
 dotnet_naming_rule.private_internal_fields_should_be_underscore_camel_case.symbols = private_internal_fields
 dotnet_naming_rule.private_internal_fields_should_be_underscore_camel_case.style = private_field_style
 dotnet_naming_rule.private_internal_fields_should_be_underscore_camel_case.severity = error
@@ -116,7 +118,7 @@ dotnet_naming_symbols.constants.applicable_accessibilities = *
 dotnet_naming_symbols.constants.required_modifiers = const
 
 dotnet_naming_symbols.static_readonly_fields.applicable_kinds = field
-dotnet_naming_symbols.static_readonly_fields.applicable_accessibilities = *
+dotnet_naming_symbols.static_readonly_fields.applicable_accessibilities = public, internal, protected, protected_internal, private_protected
 dotnet_naming_symbols.static_readonly_fields.required_modifiers = static, readonly
 
 dotnet_naming_symbols.async_methods.applicable_kinds = method, local_function

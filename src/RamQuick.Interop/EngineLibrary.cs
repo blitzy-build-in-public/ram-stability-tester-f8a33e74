@@ -38,7 +38,7 @@ public static class EngineLibrary
     /// </summary>
     public const string DefaultFileName = "ramquick_engine.dll";
 
-    private static readonly object Gate = new();
+    private static readonly object _gate = new();
 
     private static string _boundFileName = DefaultFileName;
     private static bool _bound;
@@ -54,7 +54,7 @@ public static class EngineLibrary
     {
         get
         {
-            lock (Gate)
+            lock (_gate)
             {
                 return _boundFileName;
             }
@@ -87,7 +87,7 @@ public static class EngineLibrary
                 nameof(fileName));
         }
 
-        lock (Gate)
+        lock (_gate)
         {
             if (_bound)
             {
@@ -116,7 +116,7 @@ public static class EngineLibrary
     /// </remarks>
     internal static void EnsureResolverRegistered()
     {
-        lock (Gate)
+        lock (_gate)
         {
             // Closed first, so a failed registration cannot leave binding open after the engine type was touched.
             _engineImportsArmed = true;
@@ -147,7 +147,7 @@ public static class EngineLibrary
         }
 
         string fileName;
-        lock (Gate)
+        lock (_gate)
         {
             _engineResolved = true;
             fileName = _boundFileName;

@@ -14,7 +14,7 @@ namespace RamQuick.Logging.Tests;
 internal sealed class TestDataRoot : IDisposable
 {
     private const int DeleteAttempts = 5;
-    private static readonly TimeSpan DeleteBackOff = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan _deleteBackOff = TimeSpan.FromMilliseconds(100);
 
     /// <summary>
     /// Creates the folder and a <see cref="DataDirectory"/> rooted in it.
@@ -83,7 +83,7 @@ internal sealed class TestDataRoot : IDisposable
                 // hold a file for a moment after a test ends.
                 if (attempt < DeleteAttempts)
                 {
-                    Thread.Sleep(DeleteBackOff * attempt);
+                    Thread.Sleep(_deleteBackOff * attempt);
                 }
             }
         }
