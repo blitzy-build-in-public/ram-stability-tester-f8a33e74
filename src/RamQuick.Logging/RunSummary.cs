@@ -23,11 +23,20 @@ namespace RamQuick.Logging;
 /// </para>
 /// <para>
 /// Deserialization: every type is parameterless-constructible, with init-only properties and no
-/// <see langword="required"/> member. The .NET 8 System.Text.Json source generator assigns default(T) to every
+/// <see langword="required"/> member; the one get-only property, <see cref="SummaryCauseHints.Label"/>, is
+/// written but never read back. The .NET 8 System.Text.Json source generator assigns default(T) to every
 /// init-only property a document omits, so the init accessors of non-nullable reference properties restore
 /// their empty value, and a summary read back never holds <see langword="null"/> where its type says it
 /// cannot. Value equality compares list members element by element, so a summary read back equals the one
 /// that was written whenever its timestamps are whole milliseconds.
+/// </para>
+/// <para>
+/// Immutability: every list-valued member of these records and of <see cref="RunSummarySource"/> is a
+/// read-only snapshot taken at construction. Its init accessor copies the supplied list, whether
+/// <see cref="Build"/>, an object initializer, a <see langword="with"/> expression or deserialization
+/// supplies it, and exposes the copy through a wrapper that cannot be cast back to a writable list. A
+/// summary therefore cannot change while it is published on a background thread, and its equality and
+/// hash code stay fixed.
 /// </para>
 /// </remarks>
 public sealed record RunSummary
@@ -105,7 +114,7 @@ public sealed record RunSummary
     public IReadOnlyList<SummaryStep> Steps
     {
         get => _steps;
-        init => _steps = value ?? Array.Empty<SummaryStep>();
+        init => _steps = JournalValues.ReadOnlySnapshot(value);
     }
 
     /// <summary>
@@ -211,13 +220,24 @@ public sealed record RunSummary
     /// <remarks>
     /// <para>
     /// Pure and deterministic: the same source always yields an equal summary. Every value comes from the
-    /// source, and a value it does not hold is <see langword="null"/>.
+    /// source, and a value it does not hold is <see langword="null"/>: a missing record, a nullable field a
+    /// record left empty, a timestamp a record omitted (<c>default(DateTimeOffset)</c>), or a 0 where no run
+    /// can measure 0 (a processor count, the tested bytes).
+    /// </para>
+    /// <para>
+    /// Times: <see cref="SummaryRun.DurationSeconds"/> is the engine's measured test time from the result
+    /// (the last heartbeat's for an unfinished run), never a difference of wall-clock stamps. The UTC stamps
+    /// come from their records: <see cref="SummaryRun.EndedUtc"/> from the result's Completed stamp, or for
+    /// an unfinished run from the last heartbeat's stamp alone. <see cref="SummaryRun.TimeToVerdictSeconds"/>
+    /// is the interval between the Start-accepted and verdict stamps.
     /// </para>
     /// <para>
     /// A run without a <see cref="RunSummarySource.Result"/> never reached a verdict. It is reported as
     /// <c>FAIL</c> with end reason <see cref="RunEndReason.PreviousRunUnfinished"/>, an end detail naming
-    /// where it stopped and which times are approximate, its time and totals taken from the last
-    /// heartbeat, and an <see cref="UnfinishedRun"/> section.
+    /// where it stopped and which times are approximate or unknown, its end time, duration and totals taken
+    /// from the last heartbeat, and an <see cref="UnfinishedRun"/> section. A time the last heartbeat did not
+    /// capture, and both times when no heartbeat was written, are <see langword="null"/>; no other record's
+    /// stamp stands in for one.
     /// </para>
     /// <para>
     /// Steps: one entry per started step, in step order. A finished step is the last
@@ -247,17 +267,29 @@ public sealed record RunSummary
         JournalPrepared? prepared = source.Prepared;
         JournalResult? result = source.Result;
         JournalBeat? lastBeat = source.LastBeat;
-        ulong? testedBytes = prepared?.TestedBytes;
+
+        // A prepared region is never empty, so 0 is what a prepared record that omitted the field reads back
+        // as: not captured.
+        ulong? testedBytes = prepared?.TestedBytes is { } tested && tested > 0 ? tested : null;
         Dictionary<int, JournalStep> definitions = DefinitionsByNumber(begin);
         IReadOnlyList<JournalStepEnd> finishedSteps = LatestPerStep(source.FinishedSteps);
         int stepCount = begin.Steps.Count > 0 ? begin.Steps.Count : source.UnfinishedStep?.Count ?? 0;
         (int? lastStepNumber, string? lastStepName) = LastPosition(definitions, finishedSteps, source.UnfinishedStep);
 
-        DateTimeOffset? startedUtc = prepared?.Utc;
-        DateTimeOffset? endedUtc = result?.CompletedUtc ?? lastBeat?.Utc ?? LatestUtc(source, begin, finishedSteps);
-        DateTimeOffset? verdictUtc = result?.VerdictUtc;
+        DateTimeOffset? startRequestedUtc = CapturedUtc(begin.StartRequestedUtc);
+        DateTimeOffset? startedUtc = CapturedUtc(prepared?.Utc);
+        DateTimeOffset? lastBeatUtc = CapturedUtc(lastBeat?.Utc);
+
+        // A finished run's end is the Completed stamp its result captured, never an approximation. An
+        // unfinished run's end is the last heartbeat's stamp alone: another record's stamp is not a time the
+        // journal captured as the end, so without a stamped heartbeat the end is not captured.
+        DateTimeOffset? endedUtc = result is not null ? CapturedUtc(result.CompletedUtc) : lastBeatUtc;
+        DateTimeOffset? verdictUtc = CapturedUtc(result?.VerdictUtc);
+
+        // The engine's monotonic test time, Running to Completed (0 when preparation failed), not the
+        // difference of two wall-clock stamps that a clock correction or a dispatcher delay can skew.
         double? durationSeconds = result is not null
-            ? SecondsBetween(startedUtc, endedUtc)
+            ? Seconds(result.ElapsedMs)
             : lastBeat is null ? null : Seconds(lastBeat.ElapsedMs);
 
         var run = new SummaryRun
@@ -268,14 +300,19 @@ public sealed record RunSummary
             Verdict = result is null ? FailVerdict : VerdictOf(result),
             EndReason = result is null ? nameof(RunEndReason.PreviousRunUnfinished) : result.EndReason.ToString(),
             EndDetail = result is null
-                ? UnfinishedDetail(lastStepNumber, stepCount, lastStepName, lastBeat is not null)
+                ? UnfinishedDetail(
+                    lastStepNumber,
+                    stepCount,
+                    lastStepName,
+                    lastBeat is not null,
+                    lastBeatUtc is not null)
                 : result.EndDetail,
-            StartRequestedUtc = begin.StartRequestedUtc,
+            StartRequestedUtc = startRequestedUtc,
             StartedUtc = startedUtc,
             EndedUtc = endedUtc,
             VerdictUtc = verdictUtc,
             DurationSeconds = durationSeconds,
-            TimeToVerdictSeconds = SecondsBetween(begin.StartRequestedUtc, verdictUtc),
+            TimeToVerdictSeconds = SecondsBetween(startRequestedUtc, verdictUtc),
             FirstErrorSeconds = result?.FirstErrorMs is { } firstErrorMs ? Seconds(firstErrorMs) : null,
             Recovered = source.Recovered,
             Partial = source.Partial,
@@ -300,7 +337,7 @@ public sealed record RunSummary
             App = new SummaryApp { Name = source.AppName, Version = begin.AppVersion },
             Run = run,
             System = BuildSystem(begin.System, prepared),
-            Memory = BuildMemory(begin, prepared, source.Released),
+            Memory = BuildMemory(begin, prepared, testedBytes, source.Released),
             Plan = new SummaryPlan
             {
                 TargetSeconds = Finite(begin.TargetSeconds),
@@ -323,7 +360,7 @@ public sealed record RunSummary
                     LastStepIndex = lastStepNumber,
                     LastStepName = lastStepName,
                     StepCount = stepCount,
-                    LastHeartbeatUtc = lastBeat?.Utc,
+                    LastHeartbeatUtc = lastBeatUtc,
                     LastCoveragePercent = FiniteOrNull(lastBeat?.Coverage),
                 },
         };
@@ -336,7 +373,12 @@ public sealed record RunSummary
     private static string VerdictOf(JournalResult result) =>
         result.Verdict.Length > 0 ? result.Verdict : result.TerminalState.ToVerdictText() ?? FailVerdict;
 
-    private static string UnfinishedDetail(int? lastStepNumber, int stepCount, string? lastStepName, bool hasHeartbeat)
+    private static string UnfinishedDetail(
+        int? lastStepNumber,
+        int stepCount,
+        string? lastStepName,
+        bool hasHeartbeat,
+        bool heartbeatStamped)
     {
         string position = lastStepNumber is not { } number
             ? "while preparing memory (before step 1)"
@@ -344,10 +386,14 @@ public sealed record RunSummary
                 ? string.Create(CultureInfo.InvariantCulture, $"at step {number} of {stepCount}")
                 : string.Create(CultureInfo.InvariantCulture, $"at step {number} of {stepCount} ({lastStepName})");
 
-        // The schema has no field for approximate values, so the detail labels them.
-        string approximation = hasHeartbeat
-            ? "endedUtc and durationSeconds are approximate (last heartbeat)."
-            : "No heartbeat was recorded: endedUtc is approximate (last journal record) and durationSeconds is unknown.";
+        // The schema has no field for approximate values, so the detail labels them. Both times come from the
+        // last heartbeat alone: its elapsed time gives durationSeconds and its stamp gives endedUtc, and a
+        // value the heartbeat did not capture is null, which the detail calls unknown.
+        string approximation = !hasHeartbeat
+            ? "No heartbeat was recorded: endedUtc and durationSeconds are unknown."
+            : heartbeatStamped
+                ? "endedUtc and durationSeconds are approximate (last heartbeat)."
+                : "durationSeconds is approximate (last heartbeat) and endedUtc is unknown.";
 
         return $"The previous test did not finish {position}, which likely indicates severe instability. {approximation}";
     }
@@ -373,7 +419,13 @@ public sealed record RunSummary
         };
     }
 
-    private static SummaryMemory BuildMemory(JournalBegin begin, JournalPrepared? prepared, JournalReleased? released)
+    // The begin record's quantities are nullable, so one it never captured stays null here and a captured 0
+    // stays 0. testedBytes is Build's: null when preparation never finished or its record lacked the size.
+    private static SummaryMemory BuildMemory(
+        JournalBegin begin,
+        JournalPrepared? prepared,
+        ulong? testedBytes,
+        JournalReleased? released)
     {
         JournalMemoryInfo memory = begin.Memory;
         return new SummaryMemory
@@ -381,7 +433,7 @@ public sealed record RunSummary
             InstalledBytes = memory.InstalledBytes,
             AvailableBytesAtStart = begin.AvailableBytes,
             PlannedBytes = begin.PlannedBytes,
-            TestedBytes = prepared?.TestedBytes,
+            TestedBytes = testedBytes,
             ReleaseSeconds = released is null ? null : Seconds(released.ReleaseMs),
             PageMode = prepared is null ? null : DefinedNameOrNull(prepared.PageMode),
             AddressKind = prepared is null ? null : DefinedNameOrNull(prepared.AddressKind),
@@ -548,11 +600,12 @@ public sealed record RunSummary
         Count = group.Count,
         BitMaskUnion = SummaryFormat.Hex64(group.BitMaskUnion),
         FirstStepName = group.FirstStepName,
-        FirstTimeIntoTestSeconds = group.FirstTimeIntoTest.TotalSeconds,
-        LastTimeIntoTestSeconds = group.LastTimeIntoTest.TotalSeconds,
+        FirstTimeIntoTest = group.FirstTimeIntoTest.TotalSeconds,
+        LastTimeIntoTest = group.LastTimeIntoTest.TotalSeconds,
     };
 
-    // Core's step and pass indices are 0-based; every persisted step and pass number is 1-based.
+    // An error record keeps Core's member names and its 0-based step and pass indices, so a reader maps it
+    // straight back to the plan; the step's 1-based steps[] number is stepIndex + 1.
     private static SummaryErrorRecord ToSummaryRecord(ErrorRecord record) => new()
     {
         Sequence = record.Sequence,
@@ -565,40 +618,22 @@ public sealed record RunSummary
         BitMask = SummaryFormat.Hex64(record.BitMask),
         BitPositions = record.BitPositions,
         RereadOutcome = record.RereadOutcome.ToString(),
-        StepIndex = record.StepIndex + 1,
+        StepIndex = record.StepIndex,
         StepName = record.StepName,
-        PassIndex = record.PassIndex + 1,
+        PassIndex = record.PassIndex,
         AccessType = record.AccessType.ToString(),
-        TimeSinceWriteSeconds = record.TimeSinceWrite.TotalSeconds,
-        TimeIntoTestSeconds = record.TimeIntoTest.TotalSeconds,
+        TimeSinceWrite = record.TimeSinceWrite.TotalSeconds,
+        TimeIntoTest = record.TimeIntoTest.TotalSeconds,
         WorkerIndex = record.WorkerIndex,
         LogicalProcessor = record.LogicalProcessor,
         ProcessorGroup = record.ProcessorGroup,
         ActiveWorkers = record.ActiveWorkers,
     };
 
-    // The end time of an unfinished run that wrote no heartbeat: the latest stamp among its records, with the
-    // accepted Start as the floor for a begin record whose own stamp was lost.
-    private static DateTimeOffset LatestUtc(
-        RunSummarySource source,
-        JournalBegin begin,
-        IReadOnlyList<JournalStepEnd> finishedSteps)
-    {
-        DateTimeOffset latest = Later(begin.StartRequestedUtc, begin.Utc);
-        latest = Later(latest, source.Prepared?.Utc);
-        foreach (JournalStepEnd step in finishedSteps)
-        {
-            latest = Later(latest, step.Utc);
-        }
-
-        latest = Later(latest, source.UnfinishedStep?.Utc);
-        latest = Later(latest, source.Result?.Utc);
-        latest = Later(latest, source.Released?.Utc);
-        return Later(latest, source.LastBeat?.Utc);
-    }
-
-    private static DateTimeOffset Later(DateTimeOffset current, DateTimeOffset? candidate) =>
-        candidate is { } value && value > current ? value : current;
+    // A record that omits a timestamp reads it back as default(DateTimeOffset), 0001-01-01T00:00Z, which no
+    // clock produces; the summary reports such a stamp as not captured.
+    private static DateTimeOffset? CapturedUtc(DateTimeOffset? stamp) =>
+        stamp is { } value && value != default ? value : null;
 
     // Persisted durations are whole milliseconds and never negative.
     private static double Seconds(long milliseconds) => Math.Max(0L, milliseconds) / 1000.0;
@@ -706,41 +741,47 @@ public sealed record SummaryRun
 
     /// <summary>
     /// Gets the end reason's diagnostic detail, or <see langword="null"/> when there is none. For an
-    /// unfinished run it states where the run stopped and which times are approximate.
+    /// unfinished run it states where the run stopped and which times are approximate or unknown.
     /// </summary>
     public string? EndDetail { get; init; }
 
     /// <summary>
-    /// Gets the UTC time Start was accepted, the origin of <see cref="TimeToVerdictSeconds"/>.
+    /// Gets the UTC time Start was accepted, the origin of <see cref="TimeToVerdictSeconds"/>, or
+    /// <see langword="null"/> when the journal did not capture it.
     /// </summary>
-    public DateTimeOffset StartRequestedUtc { get; init; }
+    public DateTimeOffset? StartRequestedUtc { get; init; }
 
     /// <summary>
-    /// Gets the UTC time the run entered Running, or <see langword="null"/> when preparation never finished.
+    /// Gets the UTC time the run entered Running, or <see langword="null"/> when preparation never finished
+    /// or the journal did not capture the time.
     /// </summary>
     public DateTimeOffset? StartedUtc { get; init; }
 
     /// <summary>
-    /// Gets the UTC time the engine reported Completed. For an unfinished run it is approximate: the last
-    /// heartbeat, else the latest journal record.
+    /// Gets the UTC time the engine reported Completed, or <see langword="null"/> when the journal did not
+    /// capture it. For an unfinished run it is the last heartbeat's time and approximate;
+    /// <see langword="null"/> when no heartbeat was written or the last one captured no time.
     /// </summary>
     public DateTimeOffset? EndedUtc { get; init; }
 
     /// <summary>
     /// Gets the UTC time the terminal state was shown, or <see langword="null"/> when the run never reached
-    /// a verdict.
+    /// a verdict or the journal did not capture the time.
     /// </summary>
     public DateTimeOffset? VerdictUtc { get; init; }
 
     /// <summary>
-    /// Gets the time from entering Running to Completed, in seconds. For an unfinished run it is the last
-    /// heartbeat's elapsed time and approximate; <see langword="null"/> when unknown.
+    /// Gets the engine's measured test time from entering Running to Completed, in seconds: its monotonic
+    /// elapsed time, which no wall-clock correction skews, and 0 when preparation failed. For an unfinished
+    /// run it is the last heartbeat's elapsed time and approximate; <see langword="null"/> when no
+    /// heartbeat was written.
     /// </summary>
     public double? DurationSeconds { get; init; }
 
     /// <summary>
     /// Gets the time from Start accepted to the verdict shown, in seconds, or <see langword="null"/> when
-    /// there was no verdict. This is the fail-fast acceptance measure.
+    /// there was no verdict or the journal did not capture either time. This is the fail-fast acceptance
+    /// measure.
     /// </summary>
     public double? TimeToVerdictSeconds { get; init; }
 
@@ -813,17 +854,20 @@ public sealed record SummaryMemory
     public ulong? InstalledBytes { get; init; }
 
     /// <summary>
-    /// Gets the physical memory available at Start, in bytes.
+    /// Gets the physical memory available at Start, in bytes, or <see langword="null"/> when the journal did
+    /// not capture it.
     /// </summary>
     public ulong? AvailableBytesAtStart { get; init; }
 
     /// <summary>
-    /// Gets the region size planned before locking, in bytes.
+    /// Gets the region size planned before locking, in bytes, or <see langword="null"/> when the journal did
+    /// not capture it.
     /// </summary>
     public ulong? PlannedBytes { get; init; }
 
     /// <summary>
-    /// Gets the bytes actually locked and tested, or <see langword="null"/> when preparation never finished.
+    /// Gets the bytes actually locked and tested, or <see langword="null"/> when preparation never finished
+    /// or the journal did not capture the size.
     /// </summary>
     public ulong? TestedBytes { get; init; }
 
@@ -863,7 +907,7 @@ public sealed record SummaryMemory
     public int? Channels { get; init; }
 
     /// <summary>
-    /// Gets the number of populated DIMMs.
+    /// Gets the number of populated DIMMs, or <see langword="null"/> when the journal did not capture it.
     /// </summary>
     public int? Dimms { get; init; }
 }
@@ -1195,7 +1239,7 @@ public sealed record SummaryErrors
     public IReadOnlyList<SummaryErrorGroup> Groups
     {
         get => _groups;
-        init => _groups = value ?? Array.Empty<SummaryErrorGroup>();
+        init => _groups = JournalValues.ReadOnlySnapshot(value);
     }
 
     /// <summary>
@@ -1204,7 +1248,7 @@ public sealed record SummaryErrors
     public IReadOnlyList<SummaryErrorRecord> Records
     {
         get => _records;
-        init => _records = value ?? Array.Empty<SummaryErrorRecord>();
+        init => _records = JournalValues.ReadOnlySnapshot(value);
     }
 
     /// <summary>
@@ -1296,23 +1340,26 @@ public sealed record SummaryErrorGroup
     }
 
     /// <summary>
-    /// Gets the time into the test of the word's earliest stored error, in seconds.
+    /// Gets the time into the test of the word's earliest stored error, in seconds:
+    /// <see cref="ErrorGroup.FirstTimeIntoTest"/> under the same name, as a number.
     /// </summary>
-    public double FirstTimeIntoTestSeconds { get; init; }
+    public double FirstTimeIntoTest { get; init; }
 
     /// <summary>
-    /// Gets the time into the test of the word's latest stored error, in seconds.
+    /// Gets the time into the test of the word's latest stored error, in seconds:
+    /// <see cref="ErrorGroup.LastTimeIntoTest"/> under the same name, as a number.
     /// </summary>
-    public double LastTimeIntoTestSeconds { get; init; }
+    public double LastTimeIntoTest { get; init; }
 }
 
 /// <summary>
 /// One stored error record: an element of the summary's <c>errors.records</c> array.
 /// </summary>
 /// <remarks>
-/// It carries every <see cref="ErrorRecord"/> field under the same name. Raw 64-bit values are
-/// <see cref="SummaryFormat.Hex64"/> text, durations are seconds, step and pass numbers are 1-based, and
-/// worker and processor identifiers are the engine's raw values.
+/// It carries every <see cref="ErrorRecord"/> member except the grouping key
+/// <see cref="ErrorRecord.WordAddress"/> under the same name, so its camelCase JSON names are Core's. Raw
+/// 64-bit values are <see cref="SummaryFormat.Hex64"/> text, durations are numbers of seconds, step and pass
+/// indices keep Core's 0-based values, and worker and processor identifiers are the engine's raw values.
 /// </remarks>
 public sealed record SummaryErrorRecord
 {
@@ -1398,7 +1445,7 @@ public sealed record SummaryErrorRecord
     public IReadOnlyList<int> BitPositions
     {
         get => _bitPositions;
-        init => _bitPositions = value ?? Array.Empty<int>();
+        init => _bitPositions = JournalValues.ReadOnlySnapshot(value);
     }
 
     /// <summary>
@@ -1413,7 +1460,9 @@ public sealed record SummaryErrorRecord
     }
 
     /// <summary>
-    /// Gets the 1-based number of the step that found the error.
+    /// Gets the 0-based index, in the plan's step array, of the step that found the error:
+    /// <see cref="ErrorRecord.StepIndex"/> unchanged. The step's <c>steps[]</c> entry has
+    /// <see cref="SummaryStep.Index"/> <c>stepIndex + 1</c>.
     /// </summary>
     public int StepIndex { get; init; }
 
@@ -1427,7 +1476,8 @@ public sealed record SummaryErrorRecord
     }
 
     /// <summary>
-    /// Gets the 1-based number, within the step, of the pass that found the error.
+    /// Gets the 0-based index, within the step, of the pass that found the error:
+    /// <see cref="ErrorRecord.PassIndex"/> unchanged.
     /// </summary>
     public int PassIndex { get; init; }
 
@@ -1441,14 +1491,16 @@ public sealed record SummaryErrorRecord
     }
 
     /// <summary>
-    /// Gets the time from the last write of the word's range to the verification load, in seconds.
+    /// Gets the time from the last write of the word's range to the verification load, in seconds:
+    /// <see cref="ErrorRecord.TimeSinceWrite"/> under the same name, as a number.
     /// </summary>
-    public double TimeSinceWriteSeconds { get; init; }
+    public double TimeSinceWrite { get; init; }
 
     /// <summary>
-    /// Gets the test time at which the error was confirmed, in seconds from entering Running.
+    /// Gets the test time at which the error was confirmed, in seconds from entering Running:
+    /// <see cref="ErrorRecord.TimeIntoTest"/> under the same name, as a number.
     /// </summary>
-    public double TimeIntoTestSeconds { get; init; }
+    public double TimeIntoTest { get; init; }
 
     /// <summary>
     /// Gets the engine's index of the worker that verified the word.
@@ -1493,8 +1545,8 @@ public sealed record SummaryErrorRecord
             && StepName == other.StepName
             && PassIndex == other.PassIndex
             && AccessType == other.AccessType
-            && TimeSinceWriteSeconds.Equals(other.TimeSinceWriteSeconds)
-            && TimeIntoTestSeconds.Equals(other.TimeIntoTestSeconds)
+            && TimeSinceWrite.Equals(other.TimeSinceWrite)
+            && TimeIntoTest.Equals(other.TimeIntoTest)
             && WorkerIndex == other.WorkerIndex
             && LogicalProcessor == other.LogicalProcessor
             && ProcessorGroup == other.ProcessorGroup
@@ -1525,8 +1577,8 @@ public sealed record SummaryErrorRecord
         hash.Add(StepName);
         hash.Add(PassIndex);
         hash.Add(AccessType);
-        hash.Add(TimeSinceWriteSeconds);
-        hash.Add(TimeIntoTestSeconds);
+        hash.Add(TimeSinceWrite);
+        hash.Add(TimeIntoTest);
         hash.Add(WorkerIndex);
         hash.Add(LogicalProcessor);
         hash.Add(ProcessorGroup);
@@ -1540,20 +1592,19 @@ public sealed record SummaryErrorRecord
 /// The ranked cause hints, the summary's <c>causeHints</c> object.
 /// </summary>
 /// <remarks>
-/// Hints are always labelled as hints: <see cref="Label"/> is <see cref="HintLabel"/> unless a caller
-/// supplies its own label, and an empty or white-space label becomes <see cref="HintLabel"/> on every
-/// construction path, deserialization included.
+/// Hints are always labelled as hints: <see cref="Label"/> is the constant <see cref="HintLabel"/> on every
+/// instance. It is neither settable nor stored, so no object initializer, <see langword="with"/> expression
+/// or deserialized document can give a summary another label; System.Text.Json writes it as
+/// <c>causeHints.label</c> and ignores the member when reading.
 /// </remarks>
 public sealed record SummaryCauseHints
 {
     /// <summary>
-    /// The label every cause-hint list carries, with an em dash (U+2014). It equals
-    /// <c>RamQuick.Analysis.CauseHints.Label</c>, which this library cannot reference: a normal run supplies
-    /// the analyzer's label, and recovered summaries use this constant.
+    /// The label every cause-hint list carries, <c>"Hint — not a diagnosis"</c> with an em dash (U+2014). It
+    /// equals <c>RamQuick.Analysis.CauseHints.HintLabel</c>, which this library cannot reference, so normal
+    /// and recovered summaries alike carry the analyzer's label.
     /// </summary>
     public const string HintLabel = "Hint \u2014 not a diagnosis";
-
-    private readonly string _label = HintLabel;
 
     // See RunSummary: the init accessor keeps the list non-null when a document omits it.
     private readonly IReadOnlyList<SummaryCauseHint> _items = Array.Empty<SummaryCauseHint>();
@@ -1564,13 +1615,10 @@ public sealed record SummaryCauseHints
     public static SummaryCauseHints Empty { get; } = new();
 
     /// <summary>
-    /// Gets the label written above the hints, <see cref="HintLabel"/> by default.
+    /// Gets the label written above the hints: always <see cref="HintLabel"/>, on every instance,
+    /// <see cref="Empty"/> included.
     /// </summary>
-    public string Label
-    {
-        get => _label;
-        init => _label = string.IsNullOrWhiteSpace(value) ? HintLabel : value;
-    }
+    public string Label => HintLabel;
 
     /// <summary>
     /// Gets the hints in rank order, most likely first; empty when no error detail was analysed.
@@ -1578,18 +1626,18 @@ public sealed record SummaryCauseHints
     public IReadOnlyList<SummaryCauseHint> Items
     {
         get => _items;
-        init => _items = value ?? Array.Empty<SummaryCauseHint>();
+        init => _items = JournalValues.ReadOnlySnapshot(value);
     }
 
     /// <summary>
-    /// Returns whether <paramref name="other"/> holds the same values, comparing <see cref="Items"/> element
-    /// by element.
+    /// Returns whether <paramref name="other"/> holds the same items, compared element by element;
+    /// <see cref="Label"/> is the same constant on every instance.
     /// </summary>
     /// <param name="other">The section to compare with.</param>
-    /// <returns><see langword="true"/> when every value is equal.</returns>
+    /// <returns><see langword="true"/> when every item is equal.</returns>
     public bool Equals(SummaryCauseHints? other) =>
         ReferenceEquals(this, other)
-        || (other is not null && Label == other.Label && Items.SequenceEqual(other.Items));
+        || (other is not null && Items.SequenceEqual(other.Items));
 
     /// <summary>
     /// Returns a hash code consistent with <see cref="Equals(SummaryCauseHints)"/>.
@@ -1598,7 +1646,6 @@ public sealed record SummaryCauseHints
     public override int GetHashCode()
     {
         var hash = default(HashCode);
-        hash.Add(Label);
         foreach (SummaryCauseHint item in Items)
         {
             hash.Add(item);
@@ -1681,7 +1728,8 @@ public sealed record SummaryUnfinishedRun
     public int StepCount { get; init; }
 
     /// <summary>
-    /// Gets the UTC time of the last heartbeat, or <see langword="null"/> when none was written.
+    /// Gets the UTC time of the last heartbeat, or <see langword="null"/> when none was written or it did
+    /// not capture its time.
     /// </summary>
     public DateTimeOffset? LastHeartbeatUtc { get; init; }
 
@@ -1761,7 +1809,9 @@ public static class SummaryFormat
 /// <para>
 /// A normal run passes every record it journalled, <see cref="ErrorDetailAvailable"/>
 /// <see langword="true"/>, its stored error records (at most <see cref="ErrorGrouping.StoredDetailCap"/>),
-/// the temperatures it folded from every reading, and its cause hints with the analyzer's label.
+/// the temperatures it folded from every reading, and the analyzer's ranked items as its cause hints. Every
+/// <see cref="SummaryCauseHints"/> carries the constant label <see cref="SummaryCauseHints.HintLabel"/>, so
+/// no caller supplies one.
 /// </para>
 /// <para>
 /// Recovery passes the records read back from the journal, no error detail, the temperatures folded from
@@ -1799,7 +1849,7 @@ public sealed record RunSummarySource
     public IReadOnlyList<JournalStepEnd> FinishedSteps
     {
         get => _finishedSteps;
-        init => _finishedSteps = value ?? Array.Empty<JournalStepEnd>();
+        init => _finishedSteps = JournalValues.ReadOnlySnapshot(value);
     }
 
     /// <summary>
@@ -1830,7 +1880,7 @@ public sealed record RunSummarySource
     public IReadOnlyList<ErrorRecord> StoredErrors
     {
         get => _storedErrors;
-        init => _storedErrors = value ?? Array.Empty<ErrorRecord>();
+        init => _storedErrors = JournalValues.ReadOnlySnapshot(value);
     }
 
     /// <summary>

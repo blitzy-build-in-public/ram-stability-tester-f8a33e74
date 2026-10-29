@@ -34,8 +34,8 @@ public enum SensorStatus
     Stale = 4,
 
     /// <summary>
-    /// A read has not returned within 5 s (<c>SensorMonitor.HungAfter</c>). No further reads are
-    /// made for the lifetime of the process.
+    /// Opening the source or a read has not returned within 5 s (<c>SensorMonitor.HungAfter</c>). No
+    /// further reads are made for the lifetime of the process.
     /// </summary>
     Hung = 5,
 }

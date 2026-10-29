@@ -39,6 +39,12 @@ public interface ISensorSource : IDisposable
     /// rather than by throwing. If it throws anyway, the monitor publishes
     /// <see cref="SensorStatus.Failed"/> for both readings and performs no reads.
     /// </para>
+    /// <para>
+    /// The call may block. The monitor's 5 s watchdog covers it as it covers <see cref="Read"/>: if it
+    /// has not returned after 5 s, the monitor marks the source <see cref="SensorStatus.Hung"/>. When the
+    /// call returns or throws after that, its outcome is ignored, and the source is never read or
+    /// disposed.
+    /// </para>
     /// </remarks>
     void Open();
 

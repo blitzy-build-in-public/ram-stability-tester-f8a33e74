@@ -14,8 +14,9 @@ namespace RamQuick.Analysis;
 /// Every consumer must display <see cref="Label"/> together with the items, never the items alone. The UI result
 /// panel heads the list "Probable cause (hint)" and prefixes each item with "Hint:", both strings owned by
 /// <c>src/RamQuick.App/UiText.cs</c>; <c>TextSummaryFormatter</c> writes the label above the list; and the JSON
-/// summary writes it as <c>causeHints.label</c>. The logging library does not reference this one, so
-/// <c>RunController</c> copies <see cref="HintLabel"/> into the summary.
+/// summary writes it as <c>causeHints.label</c>. The logging library does not reference this one, so its
+/// <c>SummaryCauseHints</c> carries an equal constant label of its own, and <c>RunController</c> copies only the
+/// items into the summary.
 /// </para>
 /// <para>
 /// The UI shows <see cref="Top"/>, the first <see cref="AnalyzerThresholds.DisplayedHintCount"/> items; the text and

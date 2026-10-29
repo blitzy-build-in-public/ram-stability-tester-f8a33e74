@@ -21,7 +21,6 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
-#include <mutex>
 #include <system_error>
 
 #include "ramquick_engine.h"
@@ -81,6 +80,14 @@ inline void copy_utf8_truncated(char* dst, size_t dst_size, const char* src) noe
  *   coordinator records RQ_END_COMPLETED through request() once every step has run, which closes
  *   the race between "all steps finished" and a late stop or first error.
  *
+ * Requesting a stop never waits. rq_session_stop is promised non-blocking, and the worker that
+ * confirms the first mismatch must stop the run without waiting, so no requester takes a lock:
+ * one that did could be held behind a descheduled holder, and a throwing lock acquisition would
+ * terminate the process from a noexcept call. Instead the end reason doubles as the reservation.
+ * A compare-exchange from 0 elects exactly one writer, which alone then writes os_error and
+ * detail and publishes them through a ready flag. Only snapshot() may wait, and only for that
+ * single fixed-size copy to finish.
+ *
  * Every member is callable from any thread. The signal must outlive every thread that polls or
  * waits on it; the session owns it.
  */
@@ -120,14 +127,26 @@ public:
     /**
      * Records an end reason if none has been recorded yet, then raises the flag and the event.
      *
-     * The reason, os_error and detail are written together under the lock, so snapshot() never
-     * sees a reason without its detail. The flag and the event are raised by every valid call,
-     * first writer or not, and only after the reason is recorded: a thread woken by the event,
-     * or one that runs after rq_session_stop has returned (the managed step gate, which reads
-     * rq_test_pending_stop_reason in tests), therefore always finds the reason in place.
+     * The reason is claimed by a compare-exchange from 0, so exactly one call wins, and the
+     * reason is visible through pending_reason() from the moment of the claim. A losing call has
+     * read the earlier claim, so pending_reason() is nonzero once any valid call returns, winner
+     * or not. The winner alone then writes os_error and detail and sets the ready flag that
+     * snapshot() waits for, so snapshot() never pairs a reason with another call's diagnostics or
+     * with a half-written detail. A losing call writes nothing.
      *
-     * Allocates nothing; called from workers (first error), the coordinator (faults, gate abort,
-     * completion) and host threads (rq_session_stop).
+     * The flag and the event are raised by every valid call, and only after the claim: a thread
+     * woken by the event, or one that runs after rq_session_stop has returned (the managed step
+     * gate, which reads rq_test_pending_stop_reason in tests), therefore always finds the reason
+     * in place.
+     *
+     * A failed SetEvent leaves the reason, the raised flag and the return value as they are; its
+     * Windows error is kept in signal_error() for the coordinator to report. Waiters still see
+     * the stop because qpc_clock::wait_for_stop rechecks the flag between bounded wait slices,
+     * and every later valid call retries SetEvent.
+     *
+     * Takes no lock, never waits and allocates nothing, so it is safe from workers (first
+     * error), the coordinator (faults, gate abort, completion) and host threads
+     * (rq_session_stop) alike.
      *
      * @param end_reason An RQ_END_* value. 0 or a value above RQ_END_INTERNAL_FAULT is ignored:
      *        nothing is recorded or raised.
@@ -141,18 +160,24 @@ public:
         if (end_reason == 0 || end_reason > RQ_END_INTERNAL_FAULT) {
             return false;
         }
-        bool recorded = false;
-        {
-            std::lock_guard<std::mutex> lock(detail_mutex_);
-            if (reason_.load(std::memory_order_relaxed) == 0) {
-                os_error_ = os_error;
-                copy_utf8_truncated(detail_, sizeof(detail_), detail);
-                reason_.store(end_reason, std::memory_order_release);
-                recorded = true;
-            }
+        uint32_t expected = 0;
+        const bool recorded = reason_.compare_exchange_strong(
+            expected, end_reason, std::memory_order_acq_rel, std::memory_order_acquire);
+        if (recorded) {
+            os_error_ = os_error;
+            copy_utf8_truncated(detail_, sizeof(detail_), detail);
+            details_ready_.store(true, std::memory_order_release);
         }
         stopped_.store(true, std::memory_order_release);
-        SetEvent(event_);
+        if (!SetEvent(event_)) {
+            const DWORD error = GetLastError();
+            // A failure must never read as success, so an unset last error is reported as
+            // ERROR_GEN_FAILURE. Only the first failure is kept, as the root one.
+            uint32_t no_error = 0;
+            signal_error_.compare_exchange_strong(
+                no_error, static_cast<uint32_t>(error != 0 ? error : ERROR_GEN_FAILURE),
+                std::memory_order_acq_rel, std::memory_order_acquire);
+        }
         return recorded;
     }
 
@@ -166,32 +191,78 @@ public:
     uint32_t pending_reason() const noexcept { return reason_.load(std::memory_order_acquire); }
 
     /**
-     * The manual-reset event, signalled by the first valid request() and never reset. For
+     * The manual-reset event, signalled by every valid request() and never reset. For
      * qpc_clock::wait_for_stop and any other wait that must wake on a stop; never close it.
+     * The event stays unsignalled if every SetEvent failed (signal_error() != 0), so a wait on it
+     * must also recheck stop_requested() at bounded intervals, as qpc_clock::wait_for_stop does.
      */
     HANDLE event_handle() const noexcept { return event_; }
 
     /**
-     * Copies the reason, os_error and detail under the lock, so the three always belong to the
-     * same request. The coordinator fills rq_run_result.end_reason, os_error and end_detail from
-     * it.
+     * The Windows error of the first SetEvent that failed in request(), or 0 while every one has
+     * succeeded. Lock-free. The stop itself is unaffected; the coordinator reads this as a
+     * diagnostic for the run result, because a signalling failure would otherwise leave no trace
+     * beyond the added stop latency of a wait that had to recheck the flag.
+     */
+    uint32_t signal_error() const noexcept { return signal_error_.load(std::memory_order_acquire); }
+
+    /**
+     * Copies the reason with the os_error and detail its winning request() recorded, so the three
+     * always belong to the same request; with no reason recorded, a zero end_info with an empty
+     * detail. The coordinator fills rq_run_result.end_reason, os_error and end_detail from it.
+     *
+     * Between the winner's claim and its ready flag the reason is already visible but its
+     * diagnostics are still being written, so snapshot() waits for the flag: a few pause spins,
+     * then yields of the processor, then 1 ms sleeps. That wait is safe because in this window
+     * the winner runs only one fixed-size copy, with no lock, allocation or system call, so only
+     * its own descheduling can delay it, and the backoff hands it the processor. Only the
+     * coordinator calls snapshot(), once the workers have joined; requesters and mismatch
+     * workers never call it, so none of them ever waits.
      */
     end_info snapshot() const noexcept {
         end_info info{};
-        std::lock_guard<std::mutex> lock(detail_mutex_);
-        info.reason = reason_.load(std::memory_order_relaxed);
+        info.reason = reason_.load(std::memory_order_acquire);
+        if (info.reason == 0) {
+            return info;
+        }
+        uint32_t attempts = 0;
+        while (!details_ready_.load(std::memory_order_acquire)) {
+            if (attempts < k_ready_spins) {
+                YieldProcessor();
+                ++attempts;
+            } else if (attempts < k_ready_spins + k_ready_yields) {
+                SwitchToThread();
+                ++attempts;
+            } else {
+                Sleep(1);
+            }
+        }
         info.os_error = os_error_;
         std::memcpy(info.detail, detail_, sizeof(detail_));
         return info;
     }
 
 private:
+    // snapshot()'s backoff while the winner finishes its copy: pause spins cover the usual
+    // nanoseconds-long window, yields cover a winner preempted on a busy processor, and 1 ms
+    // sleeps keep a longer delay from costing the coordinator a busy core.
+    static constexpr uint32_t k_ready_spins = 64;
+    static constexpr uint32_t k_ready_yields = 16;
+
+    // Polling hint for workers and memory preparation; raised after the claim.
     std::atomic<bool> stopped_{false};
+    // The first-writer reservation and the recorded RQ_END_* value at once, so a reason is
+    // visible the moment it is claimed: 0 until a valid request() claims it, never changed after.
     std::atomic<uint32_t> reason_{0};
-    // Written only by the first writer, under detail_mutex_.
+    // Set (release) by the winner once os_error_ and detail_ are complete; snapshot() reads those
+    // two only after observing it (acquire), which is the only ordering they need.
+    std::atomic<bool> details_ready_{false};
+    // Written once, by the winner, between its claim and details_ready_.
     uint32_t os_error_ = 0;
     char detail_[RQ_END_DETAIL_SIZE] = {};
-    mutable std::mutex detail_mutex_;
+    // First SetEvent failure, kept separate from os_error_ so it never displaces the diagnostics
+    // of the end reason itself.
+    std::atomic<uint32_t> signal_error_{0};
     HANDLE event_ = nullptr;
 };
 
@@ -216,7 +287,9 @@ public:
     virtual uint64_t now_ns() const noexcept = 0;
 
     /**
-     * Waits up to timeout_ms or until the signal is stopped, whichever comes first.
+     * Waits up to timeout_ms or until the signal is stopped, whichever comes first. A stop must
+     * end the wait even when its event could not be signalled (stop_signal::signal_error), so an
+     * implementation observes stop_requested() rather than relying on the event alone.
      *
      * @return true when the signal is stopped; false when the timeout elapsed without a stop.
      * @throws std::system_error when the wait itself fails. The coordinator and worker entry
@@ -252,17 +325,36 @@ public:
 
     /**
      * Blocks on the stop event rather than sleeping, so a stop wakes a 5, 30 or 120 s hold at
-     * once and the run still reaches Completed within 2 s of the request. Timeouts beyond one
-     * WaitForSingleObject call are waited in slices; INFINITE is never passed.
+     * once and the run still reaches Completed within 2 s of the request.
+     *
+     * The timeout is waited in slices of at most k_stop_recheck_ms, and the flag is rechecked
+     * after each one, because the event stays unsignalled when SetEvent failed in
+     * stop_signal::request (stop_signal::signal_error). Such a stop then ends the wait within one
+     * slice instead of at the timeout.
+     *
+     * The wait ends at a deadline fixed on now_ns() when it starts, and each slice waits only
+     * what is left of it. WaitForSingleObject rounds every timeout up to the system timer tick
+     * (about 15.6 ms by default), so counting slices by their nominal length would make each
+     * 100 ms slice cost about 109 ms and stretch a 120 s hold by about 10 s. Measured against the
+     * deadline, the wait overruns by at most about one tick, whatever its length. What is left is
+     * rounded up to whole milliseconds, so a sub-millisecond remainder blocks for 1 ms instead of
+     * spinning on zero-length polls. A timeout of 0 is a single poll; INFINITE is never passed.
      */
     bool wait_for_stop(const stop_signal& signal, uint64_t timeout_ms) override {
         if (signal.stop_requested()) {
             return true;
         }
-        uint64_t left_ms = timeout_ms;
-        do {
+        uint64_t now = now_ns();
+        // A timeout beyond the nanosecond range (centuries) saturates the deadline, so the wait
+        // then runs until a stop instead of wrapping to an early deadline.
+        const uint64_t deadline_ns = timeout_ms <= (UINT64_MAX - now) / k_ns_per_ms
+                                         ? now + timeout_ms * k_ns_per_ms
+                                         : UINT64_MAX;
+        for (;;) {
+            const uint64_t left_ns = deadline_ns - now;
+            const uint64_t left_ms = left_ns / k_ns_per_ms + (left_ns % k_ns_per_ms != 0 ? 1 : 0);
             const DWORD slice_ms =
-                static_cast<DWORD>(left_ms < k_max_wait_slice_ms ? left_ms : k_max_wait_slice_ms);
+                static_cast<DWORD>(left_ms < k_stop_recheck_ms ? left_ms : k_stop_recheck_ms);
             const DWORD rc = WaitForSingleObject(signal.event_handle(), slice_ms);
             if (rc == WAIT_OBJECT_0) {
                 return true;
@@ -271,15 +363,24 @@ public:
                 throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
                                         "WaitForSingleObject on the stop event failed");
             }
-            left_ms -= slice_ms;
-        } while (left_ms > 0);
-        // The flag is raised before the event is set, so a stop racing the timeout is seen here.
-        return signal.stop_requested();
+            // The flag is raised before the event is set, so this also catches a stop that races
+            // the slice's timeout, not only one whose event was never signalled.
+            if (signal.stop_requested()) {
+                return true;
+            }
+            now = now_ns();
+            if (now >= deadline_ns) {
+                return false;
+            }
+        }
     }
 
 private:
     static constexpr uint64_t k_ns_per_second = 1'000'000'000;
-    static constexpr DWORD k_max_wait_slice_ms = INFINITE - 1;
+    static constexpr uint64_t k_ns_per_ms = 1'000'000;
+    // Bounds the extra stop latency when the stop event could not be signalled: 100 ms is well
+    // within the 2 s stop bound and costs each waiter only ten wakeups per second.
+    static constexpr DWORD k_stop_recheck_ms = 100;
 
     uint64_t frequency_ = 1;
 };

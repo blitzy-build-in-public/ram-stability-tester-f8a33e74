@@ -11,7 +11,9 @@
       2. Native style          clang-format --style=file --dry-run --Werror over every *.h and
                                *.cpp file under src/engine and tests/engine.tests (root
                                .clang-format), in batches of 50 files.
-      3. Validation self-test  scripts/Summarize-ValidationRuns.ps1 -SelfTest.
+      3. Validation self-test  scripts/Summarize-ValidationRuns.ps1 -SelfTest, run in its own
+                               PowerShell process. It passes only on exit code 0 with at least
+                               one PASS case and no FAIL case.
       4. Build                 Visual Studio's MSBuild on RamQuick.sln with -restore, Platform
                                x64 and the chosen configuration. A failed build ends the run
                                here, because there is nothing to test.
@@ -20,11 +22,14 @@
                                THIRD-PARTY-NOTICES.txt entry with its package ID, its exact
                                version and a non-empty Source.
       6. Native tests          artifacts/bin/native/<Configuration>/engine.tests.exe (GoogleTest).
-                               Tests skipped with GTEST_SKIP (missing CPU features or
-                               SeLockMemoryPrivilege) count as skipped, not failed.
+                               It passes only when engine.tests.xml shows at least one test that
+                               ran and no failure. Tests skipped with GTEST_SKIP (missing CPU
+                               features or SeLockMemoryPrivilege) are allowed.
       7. Managed tests         vstest.console.exe over each of the six managed test projects,
                                one step per project, excluding Category=Long unless
-                               -IncludeLong is given.
+                               -IncludeLong is given. A step passes only when its TRX shows at
+                               least one passed test and no failure. Requires=Hardware tests
+                               that skip are allowed.
       8. Coverage              With -Coverage only: line coverage merged across every suite's
                                Cobertura report and gated per library (see -Coverage).
 
@@ -94,8 +99,18 @@
       - clang-format bundled with Visual Studio 17.14 (component VC.Llvm.Clang).
       - Windows PowerShell 5.1.
 
-    Exit codes: 0 = every step passed (skipped steps allowed); 1 = at least one step failed;
-    2 = a preflight or toolchain problem stopped the run before any step.
+    Exit codes: 0 = every step passed (skipped steps allowed); 1 = at least one step failed,
+    or an unexpected error ended the run; 2 = a preflight or toolchain problem, such as a
+    repository root that cannot be resolved or a missing tool, stopped the run before any step.
+
+    Every run the script itself ends closes with a Write-Host line that begins "build:": the
+    step summary, "build: preflight failed: ..." or "build: unexpected error: ...".
+    PowerShell rejects a malformed command line (a -Configuration other than Release or
+    Debug, an unknown parameter, a parameter without its value) before any script code runs:
+    powershell.exe -File then exits 1, and an in-process call raises a ParameterBindingException
+    that leaves $LASTEXITCODE unchanged. powershell.exe -File also exits 0 for -? without
+    printing anything. A caller therefore tells a rejected command line, or -?, from a run of
+    the script by the absence of that closing "build:" line, not by the exit code alone.
 
     Compatible with Windows PowerShell 5.1. The source is ASCII-only because Windows
     PowerShell reads a BOM-less script as ANSI.
@@ -162,7 +177,18 @@ $CoverageGroups = @(
 # Repository paths. Data paths read from reports are combined with [System.IO.Path] instead,
 # because Join-Path fails on a drive that does not exist on this machine.
 $ScriptsDir = $PSScriptRoot
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+# -LiteralPath because a checkout folder such as RAMQuick[dev] is a wildcard pattern to -Path;
+# ProviderPath because Path keeps a PowerShell drive or provider prefix that MSBuild and the
+# .NET file APIs cannot open. This runs before the main error handling, so a root that cannot
+# be resolved (an empty $PSScriptRoot when the text runs outside a script file) is reported
+# here, as a preflight failure.
+try {
+    $RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).ProviderPath
+}
+catch {
+    Write-Host ('build: preflight failed: the repository root above the script folder ''{0}'' could not be resolved: {1}' -f $PSScriptRoot, $_.Exception.Message) -ForegroundColor Red
+    exit 2
+}
 $SolutionPath = Join-Path $RepoRoot 'RamQuick.sln'
 $ArtifactsDir = Join-Path $RepoRoot 'artifacts'
 $TestResultsDir = Join-Path $ArtifactsDir 'test-results'
@@ -499,8 +525,18 @@ function Write-ToolchainBanner {
         [Parameter(Mandatory = $true)]$Vcpkg
     )
 
+    # The probe is the preflight check of the formatter the style gate runs: a clang-format that
+    # cannot report its version would otherwise surface as every native file "not formatted".
+    $clangRepairHint = 'Repair the Visual Studio component Microsoft.VisualStudio.Component.VC.Llvm.Clang.'
     $clangVersion = New-Object 'System.Collections.Generic.List[string]'
-    $null = Invoke-NativeTool -FilePath $Tools.ClangFormat -ArgumentList @('--version') -StepName 'Preflight' -CaptureTo $clangVersion
+    $clangCode = Invoke-NativeTool -FilePath $Tools.ClangFormat -ArgumentList @('--version') -StepName 'Preflight' -CaptureTo $clangVersion
+    if ($clangCode -ne 0) {
+        throw ('clang-format --version failed with exit code {0} ({1}). {2}' -f $clangCode, $Tools.ClangFormat, $clangRepairHint)
+    }
+    $clangVersionText = (@($clangVersion | Where-Object { $_.Trim() }) -join ' ').Trim()
+    if (-not $clangVersionText) {
+        throw ('clang-format --version printed no version ({0}). {1}' -f $Tools.ClangFormat, $clangRepairHint)
+    }
 
     $onOff = @{ $true = 'on'; $false = 'off' }
     Write-Host 'RAMQuick build' -ForegroundColor Cyan
@@ -508,7 +544,7 @@ function Write-ToolchainBanner {
     Write-Host ('  Visual Studio  : {0} ({1})' -f $Tools.Installation, $Tools.DisplayVersion)
     Write-Host ('  MSBuild        : {0}' -f $Tools.MSBuild)
     Write-Host ('  VSTest         : {0}' -f $Tools.VSTest)
-    Write-Host ('  clang-format   : {0} ({1})' -f $Tools.ClangFormat, (($clangVersion | Where-Object { $_.Trim() }) -join ' ').Trim())
+    Write-Host ('  clang-format   : {0} ({1})' -f $Tools.ClangFormat, $clangVersionText)
     Write-Host ('  vcpkg root     : {0} ({1})' -f $Vcpkg.Root, $Vcpkg.Origin)
     Write-Host ('  .NET SDK       : {0} ({1})' -f $Sdk.Version, $Sdk.DotNet)
     Write-Host ('  Configuration  : {0} | x64' -f $Configuration)
@@ -910,9 +946,13 @@ function Invoke-ConstraintsGate {
         throw 'scripts/check-constraints.ps1 was not found.'
     }
 
-    # Hit lines and the summary arrive on the success stream and are printed as they come. The
-    # summary line is required as well as the exit code: a parameter-binding failure would end
-    # the script without running it and leave the exit code unchanged.
+    # Hit lines and the summary arrive on the success stream and are printed as they come. Exit
+    # code 2 is judged before the summary: check-constraints.ps1 reports a failed scan with a
+    # "check-constraints:" error and never prints its summary line then. For any other code the
+    # summary line is required as well as the exit code: a script that ends without scanning can
+    # still leave 0 or 1, and the -1 sentinel marks one that set no code at all. A parameter-
+    # binding failure never gets here: it is statement-terminating, so Invoke-BuildStep's catch
+    # fails the step with its message.
     $ErrorActionPreference = 'Continue'
     $summaryLines = New-Object 'System.Collections.Generic.List[string]'
     $global:LASTEXITCODE = -1
@@ -929,7 +969,10 @@ function Invoke-ConstraintsGate {
         $summary = $summaryLines[$summaryLines.Count - 1]
     }
 
-    if ($null -eq $summary) {
+    if ($code -eq 2) {
+        Write-StepOutcome -Status failed -Detail ('check-constraints.ps1 could not complete its scan (exit code {0}).' -f $code)
+    }
+    elseif ($null -eq $summary) {
         Write-StepOutcome -Status failed -Detail ('check-constraints.ps1 ended (exit code {0}) without its summary line.' -f $code)
     }
     elseif ($code -eq 0) {
@@ -1009,15 +1052,47 @@ function Invoke-ValidationSelfTest {
         throw 'scripts/Summarize-ValidationRuns.ps1 was not found.'
     }
 
-    $ErrorActionPreference = 'Continue'
-    $global:LASTEXITCODE = 0
-    & $scriptPath -SelfTest | Write-HostText
-    $code = $LASTEXITCODE
-    if ($code -eq 0) {
-        Write-StepOutcome -Status passed -Detail 'Summarize-ValidationRuns.ps1 -SelfTest passed.'
+    # Its own process, because run in-process a parameter-binding failure or a script that only
+    # writes non-terminating errors leaves the exit code untouched. Its case lines are required
+    # as well, because a script run with -File can still end with exit code 0 without completing.
+    $powerShellPath = Join-Path $PSHOME 'powershell.exe'
+    if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
+        $powerShellPath = Join-Path $PSHOME 'pwsh.exe'
+    }
+    if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
+        throw ('Neither powershell.exe nor pwsh.exe was found in {0}, so the self-test cannot run in its own process.' -f $PSHOME)
+    }
+
+    # The caller's effective policy keeps the child under exactly this script's policy, never a
+    # weaker one.
+    $arguments = @(
+        '-NoLogo', '-NoProfile', '-NonInteractive',
+        '-ExecutionPolicy', [string](Get-ExecutionPolicy),
+        '-File', $scriptPath, '-SelfTest'
+    )
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $code = Invoke-NativeTool -FilePath $powerShellPath -ArgumentList $arguments -StepName 'Validation self-test' -CaptureTo $lines
+    foreach ($line in $lines) {
+        Write-Host $line
+    }
+
+    $passCount = @($lines | Where-Object { $_ -cmatch '^\W*PASS\b' }).Count
+    $failCount = @($lines | Where-Object { $_ -cmatch '^\W*FAIL\b' }).Count
+    if ($code -ne 0) {
+        $detail = 'Summarize-ValidationRuns.ps1 -SelfTest exited with code {0}.' -f $code
+        if ($failCount -gt 0) {
+            $detail += (' {0} case(s) reported FAIL.' -f $failCount)
+        }
+        Write-StepOutcome -Status failed -Detail $detail
+    }
+    elseif ($failCount -gt 0) {
+        Write-StepOutcome -Status failed -Detail ('Summarize-ValidationRuns.ps1 -SelfTest exited 0 but reported {0} FAIL case(s).' -f $failCount)
+    }
+    elseif ($passCount -eq 0) {
+        Write-StepOutcome -Status failed -Detail 'Summarize-ValidationRuns.ps1 -SelfTest exited 0 without reporting any PASS case, so it did not complete.'
     }
     else {
-        Write-StepOutcome -Status failed -Detail ('Summarize-ValidationRuns.ps1 -SelfTest exited with code {0}.' -f $code)
+        Write-StepOutcome -Status passed -Detail ('Summarize-ValidationRuns.ps1 -SelfTest passed ({0} case(s)).' -f $passCount)
     }
 }
 
@@ -1067,6 +1142,77 @@ function Invoke-NoticesGate {
     }
 }
 
+# Reads one counter attribute of a test report. The suite verdicts are computed from these
+# counters, so a value that is not a plain non-negative integer is a reason to reject the report,
+# never a number to guess at. An optional counter that the format may omit counts as zero.
+function Get-ReportCounter {
+    param(
+        [Parameter(Mandatory = $true)][System.Xml.XmlElement]$Element,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [switch]$Optional
+    )
+
+    if (-not $Element.HasAttribute($Name)) {
+        if ($Optional) {
+            return 0
+        }
+        throw ('the {0} element has no {1} attribute' -f $Element.LocalName, $Name)
+    }
+    $text = $Element.GetAttribute($Name)
+    $value = 0
+    # NumberStyles None admits digits only, so a sign, blanks or a fraction are rejected as well.
+    if (-not [int]::TryParse($text, [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$value)) {
+        throw ('the {0} attribute of the {1} element is "{2}", not a non-negative integer' -f $Name, $Element.LocalName, $text)
+    }
+    return $value
+}
+
+# Reads the run totals of a GoogleTest XML report. The root's tests count includes DISABLED_
+# tests, and GoogleTest 1.18 writes a skipped count only on each testsuite element, so GTEST_SKIP
+# tests are counted from their testcase results when the root carries no skipped total.
+function Get-GTestCounter {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $name = [System.IO.Path]::GetFileName($Path)
+    try {
+        try {
+            $document = Get-XmlDocument -Path $Path
+        }
+        catch {
+            throw ('it could not be read as XML ({0})' -f $_.Exception.GetBaseException().Message)
+        }
+        $root = $document.SelectSingleNode('/testsuites')
+        if ($null -eq $root) {
+            throw ('its root element is {0}, not testsuites' -f $document.DocumentElement.LocalName)
+        }
+        $testCount = Get-ReportCounter -Element $root -Name 'tests'
+        $failureCount = Get-ReportCounter -Element $root -Name 'failures'
+        $disabledCount = Get-ReportCounter -Element $root -Name 'disabled'
+        $errorCount = Get-ReportCounter -Element $root -Name 'errors' -Optional
+        if ($root.HasAttribute('skipped')) {
+            $skippedCount = Get-ReportCounter -Element $root -Name 'skipped'
+        }
+        else {
+            $skippedCount = $root.SelectNodes("//testcase[@result='skipped' or skipped]").Count
+        }
+        if (($disabledCount + $skippedCount) -gt $testCount) {
+            throw ('its {0} disabled and {1} skipped test(s) exceed its {2} test(s)' -f $disabledCount, $skippedCount, $testCount)
+        }
+    }
+    catch {
+        throw ('{0} is not a GoogleTest report: {1}' -f $name, $_.Exception.Message)
+    }
+
+    return [pscustomobject]@{
+        Tests    = $testCount
+        Failures = $failureCount
+        Errors   = $errorCount
+        Disabled = $disabledCount
+        Skipped  = $skippedCount
+        Executed = $testCount - $disabledCount - $skippedCount
+    }
+}
+
 function Invoke-NativeTest {
     $exe = Join-Path (Join-Path $NativeOutDir $Configuration) 'engine.tests.exe'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
@@ -1074,42 +1220,84 @@ function Invoke-NativeTest {
     }
 
     $code = Invoke-NativeTool -FilePath $exe -ArgumentList @(('--gtest_output=xml:{0}' -f $EngineTestsXmlPath)) -StepName 'Native tests'
+
+    # Exit code 0 alone proves nothing: GoogleTest also exits 0 when it finds no test, or when
+    # every test is disabled or skipped. The verdict therefore needs a valid report that shows at
+    # least one test that ran. GTEST_SKIP for a missing CPU feature or privilege stays allowed.
+    $reportWritten = Test-Path -LiteralPath $EngineTestsXmlPath -PathType Leaf
+    $counts = $null
     $detail = 'no XML report was written'
-    if (Test-Path -LiteralPath $EngineTestsXmlPath -PathType Leaf) {
-        $root = (Get-XmlDocument -Path $EngineTestsXmlPath).DocumentElement
-        $skipped = $root.GetAttribute('skipped')
-        if (-not $skipped) {
-            $skipped = $root.SelectNodes("//testcase[@result='skipped' or skipped]").Count
+    if ($reportWritten) {
+        try {
+            $counts = Get-GTestCounter -Path $EngineTestsXmlPath
+            $detail = '{0} tests: {1} failures, {2} errors, {3} disabled, {4} skipped (GTEST_SKIP)' -f $counts.Tests,
+                $counts.Failures, $counts.Errors, $counts.Disabled, $counts.Skipped
         }
-        $detail = '{0} tests: {1} failures, {2} errors, {3} disabled, {4} skipped (GTEST_SKIP)' -f $root.GetAttribute('tests'),
-            $root.GetAttribute('failures'), $root.GetAttribute('errors'), $root.GetAttribute('disabled'), $skipped
+        catch {
+            $detail = $_.Exception.Message
+        }
     }
 
     if ($code -ne 0) {
         Write-StepOutcome -Status failed -Detail ('engine.tests.exe exited with code {0}; {1}.' -f $code, $detail)
     }
-    elseif (-not (Test-Path -LiteralPath $EngineTestsXmlPath -PathType Leaf)) {
+    elseif (-not $reportWritten) {
         Write-StepOutcome -Status failed -Detail 'engine.tests.exe passed but wrote no XML report.'
+    }
+    elseif ($null -eq $counts) {
+        Write-StepOutcome -Status failed -Detail ('engine.tests.exe exited with code 0, but {0}.' -f $detail)
+    }
+    elseif ($counts.Tests -eq 0) {
+        Write-StepOutcome -Status failed -Detail 'engine.tests.exe discovered no tests, so nothing was verified.'
+    }
+    elseif (($counts.Failures + $counts.Errors) -gt 0) {
+        # The report contradicts the exit code, so neither can be trusted as a pass.
+        Write-StepOutcome -Status failed -Detail ('engine.tests.exe exited with code 0, but its report records failures; {0}.' -f $detail)
+    }
+    elseif ($counts.Executed -eq 0) {
+        Write-StepOutcome -Status failed -Detail ('No test ran: all {0} test(s) were disabled or skipped; {1}.' -f $counts.Tests, $detail)
     }
     else {
         Write-StepOutcome -Status passed -Detail $detail
     }
 }
 
+# Reads the result counters of a VSTest TRX report. The TRX logger always writes total, passed,
+# failed and notExecuted. Error, timeout and aborted are read as well where present, because a
+# run can end that way without a single failed test.
 function Get-TrxCounter {
     param([Parameter(Mandatory = $true)][string]$Path)
 
-    $document = Get-XmlDocument -Path $Path
-    $counters = $document.SelectSingleNode("/*[local-name()='TestRun']/*[local-name()='ResultSummary']/*[local-name()='Counters']")
-    if ($null -eq $counters) {
-        return $null
+    $name = [System.IO.Path]::GetFileName($Path)
+    try {
+        try {
+            $document = Get-XmlDocument -Path $Path
+        }
+        catch {
+            throw ('it could not be read as XML ({0})' -f $_.Exception.GetBaseException().Message)
+        }
+        $root = $document.SelectSingleNode("/*[local-name()='TestRun']")
+        if ($null -eq $root) {
+            throw ('its root element is {0}, not TestRun' -f $document.DocumentElement.LocalName)
+        }
+        $counters = $root.SelectSingleNode("*[local-name()='ResultSummary']/*[local-name()='Counters']")
+        if ($null -eq $counters) {
+            throw 'it has no ResultSummary/Counters element'
+        }
+        $result = [pscustomobject]@{
+            Total       = (Get-ReportCounter -Element $counters -Name 'total')
+            Passed      = (Get-ReportCounter -Element $counters -Name 'passed')
+            Failed      = (Get-ReportCounter -Element $counters -Name 'failed')
+            NotExecuted = (Get-ReportCounter -Element $counters -Name 'notExecuted')
+            Error       = (Get-ReportCounter -Element $counters -Name 'error' -Optional)
+            Timeout     = (Get-ReportCounter -Element $counters -Name 'timeout' -Optional)
+            Aborted     = (Get-ReportCounter -Element $counters -Name 'aborted' -Optional)
+        }
     }
-    return [pscustomobject]@{
-        Total       = $counters.GetAttribute('total')
-        Passed      = $counters.GetAttribute('passed')
-        Failed      = $counters.GetAttribute('failed')
-        NotExecuted = $counters.GetAttribute('notExecuted')
+    catch {
+        throw ('{0} has no valid result counters: {1}' -f $name, $_.Exception.Message)
     }
+    return $result
 }
 
 
@@ -1163,23 +1351,48 @@ function Invoke-ManagedTest {
     }
     $code = Invoke-NativeTool -FilePath $script:Toolchain.VSTest -ArgumentList $testArguments -StepName $projectName
 
+    # Exit code 0 alone proves nothing: vstest.console.exe also exits 0 when discovery or the
+    # test case filter yields no test. The verdict therefore needs valid TRX counters that show
+    # at least one passed test. Requires=Hardware tests that skip (not executed) stay allowed.
     $trxPath = Join-Path $TestResultsDir $trxName
+    $trxWritten = Test-Path -LiteralPath $trxPath -PathType Leaf
+    $counters = $null
     $detail = 'no TRX report was written'
-    if (Test-Path -LiteralPath $trxPath -PathType Leaf) {
-        $counters = Get-TrxCounter -Path $trxPath
-        if ($null -ne $counters) {
+    if ($trxWritten) {
+        try {
+            $counters = Get-TrxCounter -Path $trxPath
             $detail = 'total {0}, passed {1}, failed {2}, not executed {3}' -f $counters.Total, $counters.Passed, $counters.Failed, $counters.NotExecuted
         }
-        else {
-            $detail = 'the TRX report has no result counters'
+        catch {
+            $detail = $_.Exception.Message
         }
     }
 
     if ($code -ne 0) {
         Write-StepOutcome -Status failed -Detail ('vstest.console.exe exited with code {0}; {1}.' -f $code, $detail)
     }
-    elseif (-not (Test-Path -LiteralPath $trxPath -PathType Leaf)) {
+    elseif (-not $trxWritten) {
         Write-StepOutcome -Status failed -Detail ('vstest.console.exe passed but wrote no {0}.' -f $trxName)
+    }
+    elseif ($null -eq $counters) {
+        Write-StepOutcome -Status failed -Detail ('vstest.console.exe exited with code 0, but {0}.' -f $detail)
+    }
+    elseif ($counters.Total -eq 0) {
+        $scope = ''
+        if (-not $IncludeLong) {
+            $scope = ' matching /TestCaseFilter:Category!=Long'
+        }
+        Write-StepOutcome -Status failed -Detail ('{0}: vstest.console.exe discovered no tests{1}, so nothing was verified.' -f $projectName, $scope)
+    }
+    elseif (($counters.Failed + $counters.Error + $counters.Timeout + $counters.Aborted) -gt 0) {
+        # The report contradicts the exit code, so neither can be trusted as a pass.
+        Write-StepOutcome -Status failed -Detail ('vstest.console.exe exited with code 0, but its report records failed {0}, error {1}, timeout {2}, aborted {3}; {4}.' -f $counters.Failed,
+            $counters.Error, $counters.Timeout, $counters.Aborted, $detail)
+    }
+    elseif ($counters.Passed -eq 0) {
+        # Stated from total, not notExecuted: the TRX logger counts a skipped xUnit test only in
+        # total, never in notExecuted.
+        Write-StepOutcome -Status failed -Detail ('No test passed: all {0} test(s) were not executed; {1}.' -f $counters.Total, $detail)
     }
     else {
         Write-StepOutcome -Status passed -Detail $detail
@@ -1329,12 +1542,17 @@ try {
     Invoke-RamQuickBuild | Write-HostText
 }
 catch {
-    Write-Host ('build: unexpected error: {0}' -f $_.Exception.Message) -ForegroundColor Red
+    # The stack trace comes first so that the "build:" line stays the last line of every run
+    # the script ends, which is how a caller tells such a run from a rejected command line.
     Write-Host $_.ScriptStackTrace
+    Write-Host ('build: unexpected error: {0}' -f $_.Exception.Message) -ForegroundColor Red
     $script:ExitCode = 1
 }
 finally {
-    Set-Location -LiteralPath $originalLocation.Path
+    # An in-process caller's starting folder can be removed during the run. Failing to return
+    # to it must neither replace the exit code and the closing "build:" line with an error
+    # nor leave VCPKG_ROOT set.
+    Set-Location -LiteralPath $originalLocation.Path -ErrorAction SilentlyContinue
     $env:VCPKG_ROOT = $originalVcpkgRoot
 }
 exit $script:ExitCode

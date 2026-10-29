@@ -33,8 +33,12 @@ namespace RamQuick.Logging;
 /// Recovery: <c>CrashDetector</c> rebuilds a crashed run's summaries from these records alone, never from
 /// the next launch's machine state, so every value a summary needs is captured here. Records are plain data
 /// with no I/O, clock reads or mutable static state. No member is <see langword="required"/>, so a record
-/// with missing fields still parses; missing numbers read as 0 and missing nullable values as
-/// <see langword="null"/>.
+/// with missing fields still parses, and a field it lacks reaches the summary as not captured
+/// (<c>null</c>), never as a measured value. Where a missing value and a captured 0 must stay distinct, the
+/// member is nullable: a missing one reads back as <see langword="null"/>, and a captured 0 stays 0. Other
+/// missing numbers read back as 0, which the summary treats as not captured where no run can measure 0 (a
+/// processor count, the tested bytes). A missing timestamp reads back as <c>default(DateTimeOffset)</c>,
+/// 0001-01-01, which no clock produces, and the summary treats it as not captured.
 /// </para>
 /// </remarks>
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "t")]
@@ -69,6 +73,12 @@ public abstract record JournalRecord
 /// <para>
 /// Value equality compares <see cref="Steps"/> element by element, so a record read back from the journal
 /// equals the one that was written.
+/// </para>
+/// <para>
+/// <see cref="Steps"/> is a snapshot: its init accessor copies the supplied list, so changing that list
+/// after <see cref="Create"/>, an object initializer or deserialization has returned, for example while
+/// the record waits in the writer's queue, changes neither the plan that reaches the journal nor the
+/// record's equality and hash code.
 /// </para>
 /// </remarks>
 public sealed record JournalBegin : JournalRecord
@@ -128,12 +138,13 @@ public sealed record JournalBegin : JournalRecord
     }
 
     /// <summary>
-    /// Gets the full step definitions of the plan, in run order, each numbered from 1.
+    /// Gets the full step definitions of the plan, in run order, each numbered from 1: a read-only copy of
+    /// the list supplied at construction, empty when none was.
     /// </summary>
     public IReadOnlyList<JournalStep> Steps
     {
         get => _steps;
-        init => _steps = value ?? Array.Empty<JournalStep>();
+        init => _steps = JournalValues.ReadOnlySnapshot(value);
     }
 
     /// <summary>
@@ -158,29 +169,34 @@ public sealed record JournalBegin : JournalRecord
 
     /// <summary>
     /// Gets the physical memory available at Start, in bytes; the summary's
-    /// <c>memory.availableBytesAtStart</c>.
+    /// <c>memory.availableBytesAtStart</c>. <see langword="null"/> when the record did not capture it,
+    /// which a captured 0 stays distinct from.
     /// </summary>
-    public ulong AvailableBytes { get; init; }
+    public ulong? AvailableBytes { get; init; }
 
     /// <summary>
     /// Gets the region size planned for the run before locking, in bytes; the summary's
-    /// <c>memory.plannedBytes</c>.
+    /// <c>memory.plannedBytes</c>. <see langword="null"/> when the record did not capture it, which a
+    /// captured 0 stays distinct from.
     /// </summary>
-    public ulong PlannedBytes { get; init; }
+    public ulong? PlannedBytes { get; init; }
 
     /// <summary>
     /// Gets the plan's target duration in seconds: the sum of the steps' time budgets. Derived from
-    /// <see cref="Steps"/> and never serialized.
+    /// <see cref="Steps"/> and never serialized; a <see langword="null"/> entry, which a damaged journal line
+    /// can hold, is skipped.
     /// </summary>
     [JsonIgnore]
-    public double TargetSeconds => Steps.Sum(step => step.TimeBudgetMs) / 1000.0;
+    public double TargetSeconds => Steps.Where(step => step is not null).Sum(step => step.TimeBudgetMs) / 1000.0;
 
     /// <summary>
     /// Gets the plan's coverage target as a percentage: the sum of the steps' coverage budgets. Derived from
-    /// <see cref="Steps"/> and never serialized.
+    /// <see cref="Steps"/> and never serialized; a <see langword="null"/> entry, which a damaged journal line
+    /// can hold, is skipped.
     /// </summary>
     [JsonIgnore]
-    public double TargetCoveragePercent => Steps.Sum(step => (long)step.CoverageBudgetPercent);
+    public double TargetCoveragePercent =>
+        Steps.Where(step => step is not null).Sum(step => (long)step.CoverageBudgetPercent);
 
     /// <summary>
     /// Creates the <c>begin</c> record for a run that is about to start.
@@ -541,9 +557,10 @@ public sealed record JournalMemoryInfo
     public int? Channels { get; init; }
 
     /// <summary>
-    /// Gets the number of populated DIMMs.
+    /// Gets the number of populated DIMMs, or <see langword="null"/> when the record did not capture it; a
+    /// captured 0 stays 0.
     /// </summary>
-    public int Dimms { get; init; }
+    public int? Dimms { get; init; }
 }
 
 /// <summary>
@@ -916,7 +933,9 @@ public sealed record JournalResult : JournalRecord
     public ulong VerifiedBytes { get; init; }
 
     /// <summary>
-    /// Gets the engine's elapsed run time, in whole milliseconds.
+    /// Gets the engine's test time at completion, in whole milliseconds: measured on its monotonic clock
+    /// from the end of preparation (entering Running) to Completed, and 0 when preparation failed. It is
+    /// the summary's <c>run.durationSeconds</c>, which no wall-clock correction can skew.
     /// </summary>
     public long ElapsedMs { get; init; }
 
@@ -1050,7 +1069,8 @@ public sealed record JournalEnd : JournalRecord
 }
 
 /// <summary>
-/// Value conversions shared by the journal records and their writers.
+/// Value conversions and collection snapshots shared by the journal and summary records and their
+/// writers.
 /// </summary>
 internal static class JournalValues
 {
@@ -1061,5 +1081,36 @@ internal static class JournalValues
     /// <param name="value">The duration to convert.</param>
     /// <returns>The duration in whole milliseconds.</returns>
     internal static long WholeMilliseconds(TimeSpan value) => value.Ticks / TimeSpan.TicksPerMillisecond;
+
+    /// <summary>
+    /// Takes the read-only snapshot a list-valued init accessor stores: the elements of
+    /// <paramref name="items"/> copied into a private array, exposed through a wrapper that cannot be cast
+    /// back to a writable array or list.
+    /// </summary>
+    /// <remarks>
+    /// Records are enqueued, compared, hashed and serialized on other threads after construction, so a
+    /// record must never share a collection its caller can still change. The factories, object
+    /// initializers, <see langword="with"/> expressions that set a list, and System.Text.Json
+    /// deserialization all assign through the init accessors that call this; a <see langword="with"/> copy
+    /// that leaves a list unset shares the original's snapshot, which nothing can change. Elements are
+    /// copied as they are, <see langword="null"/> included, so a damaged document still parses and the
+    /// readers that already skip null elements keep doing so.
+    /// </remarks>
+    /// <typeparam name="T">The element type.</typeparam>
+    /// <param name="items">The supplied elements, or <see langword="null"/>.</param>
+    /// <returns>
+    /// The read-only copy, in the supplied order; the shared empty array, which has no element to change,
+    /// when <paramref name="items"/> is <see langword="null"/> or empty.
+    /// </returns>
+    internal static IReadOnlyList<T> ReadOnlySnapshot<T>(IEnumerable<T>? items)
+    {
+        if (items is null)
+        {
+            return Array.Empty<T>();
+        }
+
+        T[] copy = items.ToArray();
+        return copy.Length == 0 ? Array.Empty<T>() : Array.AsReadOnly(copy);
+    }
 }
 
