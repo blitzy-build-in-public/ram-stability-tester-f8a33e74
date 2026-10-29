@@ -129,13 +129,25 @@ struct access_context {
      */
     std::uintptr_t region_base;
     /**
-     * Session-clock reading (IClock::now_ns(), core/clock.h) at which the verified range was
-     * last streamed. The runner stamps it per window in windowed phases, per 1 MiB block in
-     * whole-slice phases and per 4 KiB block in turnaround, so that
-     * time_since_write_us = (now - write_time_ns) / 1000 is exact for every verified word. The
-     * fault-injecting layer applies a delay-dependent fault only where now - write_time_ns
-     * reaches the fault's threshold, 2000 ms by default, which only hold verifications reach.
-     * Consumers read it only on verify, verify_and_stream and reread_word.
+     * Session-clock reading (IClock::now_ns(), core/clock.h) taken right after the runner
+     * finishes streaming the unit that holds the verified range. In windowed and whole-slice
+     * phases that unit is the 1 MiB work group (k_work_group_bytes, core/runner/step_runner.h),
+     * each successive 1 MiB of ranges in issue order; in turnaround it is the 4 KiB block.
+     * Verification walks the same grouping, so each verified group carries the stamp of the
+     * stream that last wrote it. Windowed and hold phases verify in stream order, so the k-th
+     * verified group carries the k-th streamed group's stamp; moving inversion stamps each 1 MiB
+     * block as its base write or sweep streams it, and the next sweep verifies the block under
+     * that stamp in either direction. No single stamp stands for a whole 64 MiB window, and
+     * consumers must not substitute one.
+     *
+     * time_since_write_us = (now - write_time_ns) / 1000 is therefore exact to the group or
+     * block, not to the word: a word stored earlier in its group is older than the figure by up
+     * to the time the rest of the group took to stream. A prefetch fill after the flush can also
+     * precede the verification load, so the figure can overstate the data's age when it was
+     * fetched (see rq_error_record.time_since_write_us). The fault-injecting layer applies a
+     * delay-dependent fault only where now - write_time_ns reaches the fault's threshold,
+     * 2000 ms by default, which only hold verifications reach. Consumers read it only on verify,
+     * verify_and_stream and reread_word.
      */
     std::uint64_t write_time_ns;
 };

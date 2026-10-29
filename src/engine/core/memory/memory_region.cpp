@@ -432,13 +432,29 @@ allocation_outcome memory_region::allocate(const region_options& options, const 
         outcome.large_page_fallbacks = 0;
 
         const region_plan plan = plan_region(bytes, options.worker_count);
-        if (plan.slice_bytes == 0) {
-            // Only a first attempt can get here, since every retry size is a multiple of
-            // worker_count x 2 MiB, and no smaller size could plan a slice either.
+        if (plan.slice_bytes == 0 || plan.tested_bytes < options.min_region_bytes) {
+            // Only a first attempt can get here: every retry size is a multiple of
+            // worker_count x 2 MiB at or above the minimum, so its plan tests all of it.
+            // tested_bytes is the requested size rounded down to that multiple, so when it is 0 or
+            // below the minimum, no size up to the request plans more. The request is an upper
+            // bound the host sized to leave memory free, so it is refused rather than grown, and
+            // before any chunk is allocated. No OS call failed, so os_error stays 0.
             char buffer[256];
-            std::snprintf(buffer, sizeof(buffer),
-                          "Region of %llu MiB cannot give each of %u workers a 2 MiB slice",
-                          bytes / k_mib, options.worker_count);
+            if (plan.slice_bytes == 0) {
+                std::snprintf(buffer, sizeof(buffer),
+                              "Region of %llu MiB cannot give each of %u workers a 2 MiB slice",
+                              bytes / k_mib, options.worker_count);
+            } else {
+                // The minimum is rounded up to whole MiB, so the text never shows a planned size
+                // equal to the minimum it falls below.
+                const std::uint64_t min_mib = options.min_region_bytes / k_mib +
+                                              (options.min_region_bytes % k_mib != 0 ? 1u : 0u);
+                std::snprintf(buffer, sizeof(buffer),
+                              "Region of %llu MiB over %u workers tests %llu MiB, below the %llu "
+                              "MiB minimum",
+                              bytes / k_mib, options.worker_count, plan.tested_bytes / k_mib,
+                              min_mib);
+            }
             copy_utf8_truncated(outcome.end_detail, sizeof(outcome.end_detail), buffer);
             release();
             outcome.status = allocation_status::insufficient_memory;

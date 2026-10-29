@@ -370,7 +370,11 @@ typedef int32_t rq_result;
 #define RQ_END_THERMAL 4u
 /** Stopped by RQ_STOP_HOST_FAULT, or a step gate aborted with no stop reason recorded. */
 #define RQ_END_HOST_FAULT 5u
-/** Locking failed even at min_region_bytes; os_error holds the last Windows error. */
+/**
+ * Locking failed even at min_region_bytes; os_error holds the last Windows error. The engine
+ * never tests fewer than min_region_bytes: a region whose 2 MiB-rounded slices test fewer ends
+ * with this reason before anything is locked, with os_error 0.
+ */
 #define RQ_END_INSUFFICIENT_MEMORY 6u
 /** SetThreadGroupAffinity failed for a worker; no traffic ran. os_error holds the error. */
 #define RQ_END_AFFINITY_FAILED 7u
@@ -476,7 +480,11 @@ typedef struct rq_session_config {
     uint32_t step_def_size;
     /** Planned bytes under test. The engine rounds each worker's slice down to 2 MiB. */
     uint64_t region_bytes;
-    /** Floor for shrink-and-retry when locking fails; > 0 and <= region_bytes. */
+    /**
+     * Floor for shrink-and-retry when locking fails; > 0 and <= region_bytes. The engine never
+     * tests fewer bytes: a region whose 2 MiB-rounded slices test fewer ends with
+     * RQ_END_INSUFFICIENT_MEMORY before anything is locked.
+     */
     uint64_t min_region_bytes;
     /** Seed of the random patterns and of the RQ_ORDER_RANDOM_BLOCKS permutation. */
     uint64_t seed;

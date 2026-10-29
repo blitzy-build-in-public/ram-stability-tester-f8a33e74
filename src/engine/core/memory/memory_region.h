@@ -108,10 +108,12 @@ struct region_plan {
  *
  * The managed sizing (MemorySizing.cs) passes multiples of worker_count x 2 MiB, so in
  * production the first attempt's tested_bytes equals region_bytes. Native tests may pass
- * unrounded sizes, and the first attempt then uses this plan as it is. Examples: 32 GiB over 32
- * workers gives 1024 MiB slices of four full chunks and no final chunk; 30 GiB over 24 workers
- * gives 1280 MiB slices of five full chunks; 1000 MiB over 3 workers gives 332 MiB slices
- * (256 + 76 MiB) and 996 MiB tested.
+ * unrounded sizes. allocate() then uses this plan as it is when its tested_bytes reaches
+ * min_region_bytes, and refuses the request otherwise. Examples: 32 GiB over 32 workers gives
+ * 1024 MiB slices of four full chunks and no final chunk; 30 GiB over 24 workers gives 1280 MiB
+ * slices of five full chunks; 1000 MiB over 3 workers gives 332 MiB slices (256 + 76 MiB) and
+ * 996 MiB tested; 1 GiB over 3 workers gives 340 MiB slices and 1020 MiB tested, which a 1 GiB
+ * minimum refuses.
  *
  * Pure: makes no OS call; callable from any thread.
  *
@@ -226,7 +228,8 @@ struct region_options {
     std::uint64_t region_bytes = 0;
     /**
      * Smallest acceptable region (rq_session_config.min_region_bytes, 1 GiB from the host).
-     * No retry goes below it.
+     * No attempt tests fewer bytes: a first size whose plan falls below it is refused, and no
+     * retry goes below it.
      */
     std::uint64_t min_region_bytes = 0;
     /** Number of slices to build, one per worker; must be non-zero. */
@@ -246,7 +249,11 @@ enum class allocation_status : std::uint32_t {
     ok,
     /** The stop signal was raised before a chunk; everything allocated was released. */
     stopped,
-    /** No attempt down to the minimum could be allocated and locked; everything was released. */
+    /**
+     * No attempt down to the minimum could be allocated and locked, or the first size's plan
+     * has no slice or tests fewer than min_region_bytes and was refused before any allocation.
+     * Everything was released.
+     */
     insufficient_memory,
 };
 
@@ -265,7 +272,8 @@ struct allocation_outcome {
     allocation_status status = allocation_status::ok;
     /**
      * GetLastError() of the call that failed last: SetProcessWorkingSetSizeEx, VirtualAlloc or
-     * VirtualLock (or the lock override). Filled for insufficient_memory only, and 0 otherwise.
+     * VirtualLock (or the lock override). Filled for insufficient_memory only, and 0 otherwise,
+     * including for a refused request, where no OS call failed.
      */
     std::uint32_t os_error = 0;
     /** Sizes attempted: 1 for the first attempt, plus one per retry. */
@@ -274,7 +282,9 @@ struct allocation_outcome {
     std::uint32_t large_page_fallbacks = 0;
     /**
      * English diagnostic for insufficient_memory, naming the failing call and the last size
-     * attempted; UTF-8, NUL-terminated. Empty for ok and stopped.
+     * attempted; for a refused request it names the requested size and worker count, and the
+     * planned and minimum sizes when a slice could be planned. UTF-8, NUL-terminated. Empty for
+     * ok and stopped.
      */
     char end_detail[RQ_END_DETAIL_SIZE] = {};
 };
@@ -321,6 +331,12 @@ public:
     /**
      * Plans, allocates and locks the region, shrinking and retrying until an attempt succeeds
      * or the sequence of next_retry_bytes() is exhausted.
+     *
+     * The first size is options.region_bytes. When its plan has no slice, or its tested_bytes
+     * is below options.min_region_bytes, no size up to it can reach the minimum, so the call
+     * returns insufficient_memory before any allocation, with attempts 1 and os_error 0. Every
+     * retry size plans tested_bytes equal to it and at least the minimum, so no attempt ever
+     * tests fewer bytes than options.min_region_bytes.
      *
      * Each attempt plans its size with plan_region(), raises the minimum working set to
      * tested_bytes + k_working_set_headroom_bytes, and then, slice by slice and chunk by chunk,
