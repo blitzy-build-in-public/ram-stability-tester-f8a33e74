@@ -273,8 +273,7 @@ public static class TestPlans
         TimeBudget = TimeSpan.FromSeconds(300),
         CoverageBudgetPercent = 250,
         PrimaryMechanism = InstabilityMechanism.WriteTimings,
-        Mechanisms = InstabilityMechanism.WriteTimings
-            | InstabilityMechanism.ReadWriteTurnaround,
+        Mechanisms = InstabilityMechanism.WriteTimings,
     };
 
     // E15 extends Q2's bank thrash so dense activations across banks probe tFAW/tRRD at length.
