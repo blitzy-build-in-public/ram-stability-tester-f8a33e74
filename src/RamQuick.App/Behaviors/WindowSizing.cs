@@ -41,9 +41,14 @@ public enum WindowLayout
 /// <param name="MinWidth">Minimum window width: min(560, work-area width).</param>
 /// <param name="MinHeight">
 /// Minimum window height: the layout's fixed-row budget plus 40 DIPs of detail plus the non-client
-/// height, capped at the work-area height so the minimum never exceeds the work area.
+/// height, capped at the work-area height so the minimum never exceeds the work area. It can
+/// exceed <paramref name="InitialHeight"/> only when the non-client height is above 300 DIPs on a
+/// work area taller than 680 DIPs; the window's minimum then still fits the work area.
 /// </param>
-/// <param name="Layout">The layout whose fixed rows fit the initial client height.</param>
+/// <param name="Layout">
+/// The layout whose fixed rows plus 40 DIPs of detail fit the client height the work area can
+/// hold: the work-area height minus the non-client height (H − N).
+/// </param>
 public sealed record WindowSizingResult(
     double InitialWidth,
     double InitialHeight,
@@ -116,8 +121,8 @@ public static class WindowSizing
     /// </param>
     /// <returns>
     /// Initial size min(560, W) × min(680, H); minimum width min(560, W); the layout whose fixed
-    /// rows plus 40 DIPs of detail fit the initial client height min(680, H) − N; and minimum
-    /// height min(F + 40 + N, H), where F is that layout's fixed-row budget.
+    /// rows plus 40 DIPs of detail fit the client height H − N; and minimum height
+    /// min(F + 40 + N, H), where F is that layout's fixed-row budget.
     /// </returns>
     /// <exception cref="ArgumentOutOfRangeException">
     /// <paramref name="workArea"/> has a width or height that is NaN, infinite or not greater than
@@ -127,10 +132,10 @@ public static class WindowSizing
     /// <remarks>
     /// Inputs and outputs are DIPs of the work area of the monitor that holds the window, converted
     /// with that window's DPI; never <c>SystemParameters.WorkArea</c>, which describes only the
-    /// primary monitor. The regular layout applies when the client height holds 340 + 40 DIPs, the
-    /// compact one when it holds 240 + 40 DIPs and the work area is at least 512 × 336 DIPs, and the
-    /// minimal fallback otherwise. The result never exceeds the work area: MinWidth ≤ W,
-    /// MinHeight ≤ H, InitialWidth ≤ W and InitialHeight ≤ H.
+    /// primary monitor. The regular layout applies when the client height H − N holds 340 + 40
+    /// DIPs, the compact one when it holds 240 + 40 DIPs and the work area is at least 512 × 336
+    /// DIPs, and the minimal fallback otherwise. The result never exceeds the work area:
+    /// MinWidth ≤ W, MinHeight ≤ H, InitialWidth ≤ W and InitialHeight ≤ H.
     /// </remarks>
     public static WindowSizingResult Compute(Size workArea, double nonClientHeight)
     {
@@ -156,7 +161,11 @@ public static class WindowSizing
         double initialWidth = Math.Min(PreferredWidth, width);
         double initialHeight = Math.Min(PreferredHeight, height);
         double minWidth = Math.Min(PreferredWidth, width);
-        double clientHeight = initialHeight - nonClientHeight;
+
+        // The layout is chosen from the client height the work area can hold, not from the
+        // opening height: the user may enlarge the window to H, and the minimum height below
+        // reserves the chosen layout's rows while staying within H.
+        double clientHeight = height - nonClientHeight;
 
         WindowLayout layout = SelectLayout(width, height, clientHeight);
 
