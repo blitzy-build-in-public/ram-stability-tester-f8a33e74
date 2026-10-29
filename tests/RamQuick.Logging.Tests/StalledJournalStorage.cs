@@ -83,6 +83,12 @@ public sealed record AppendCall(
 /// <see cref="ClearRules"/> first to stop stalling.
 /// </para>
 /// <para>
+/// <see cref="ReadLines"/> and <see cref="Exists"/> show the current journal, which
+/// <see cref="Delete"/> removes. <see cref="Lines"/>, <see cref="RecordTypesWritten"/> and
+/// <see cref="Calls"/> are the append history, which nothing clears, because the journal's owner
+/// deletes the journal right after writing its final record.
+/// </para>
+/// <para>
 /// After <see cref="Dispose"/>, <see cref="AppendDurable"/> throws <see cref="ObjectDisposedException"/>,
 /// while the observation members, <see cref="ReadLines"/>, <see cref="Exists"/>, <see cref="Delete"/>
 /// and the scripting members keep working, so tests can inspect a journal its owner has disposed.
@@ -131,8 +137,10 @@ public sealed class StalledJournalStorage : IJournalStorage
     public string Location { get; }
 
     /// <summary>
-    /// Gets the lines stored by successful appends, in order, excluding seeded lines.
-    /// <see cref="Delete"/> clears them.
+    /// Gets the append history: every line stored by a successful append since construction, in
+    /// storage order, excluding seeded lines. <see cref="Delete"/> does not clear it, because tests
+    /// observe records written before the journal was deleted; <see cref="ReadLines"/> and
+    /// <see cref="Exists"/> report the current journal.
     /// </summary>
     public IReadOnlyList<string> Lines
     {
@@ -316,16 +324,17 @@ public sealed class StalledJournalStorage : IJournalStorage
     }
 
     /// <summary>
-    /// Deletes the journal: clears the seeded and appended lines, sets <see cref="IsDeleted"/> and
-    /// increments <see cref="DeleteCount"/>. <see cref="Exists"/> then returns <see langword="false"/>
-    /// until a line is seeded or appended.
+    /// Deletes the journal: clears the lines <see cref="ReadLines"/> returns, sets
+    /// <see cref="IsDeleted"/> and increments <see cref="DeleteCount"/>. <see cref="Exists"/> then
+    /// returns <see langword="false"/> until a line is seeded or appended. <see cref="Lines"/>,
+    /// <see cref="RecordTypesWritten"/> and <see cref="Calls"/> keep the append history, so the
+    /// records a run wrote before deleting its journal stay observable.
     /// </summary>
     public void Delete()
     {
         lock (_sync)
         {
             _journalLines.Clear();
-            _durableLines.Clear();
             _journalPresent = false;
             _isDeleted = true;
             _deleteCount++;
@@ -580,9 +589,14 @@ public sealed class StalledJournalStorage : IJournalStorage
 
     /// <summary>
     /// Returns the <c>"t"</c> value of each line in <see cref="Lines"/>, in order, or
-    /// <see langword="null"/> for a line that has none.
+    /// <see langword="null"/> for a line that has none. Like <see cref="Lines"/>, the history is kept
+    /// across <see cref="Delete"/>, so a run that ends by deleting its journal still shows every
+    /// record it wrote.
     /// </summary>
-    /// <returns>A snapshot of the record types of the durable lines.</returns>
+    /// <returns>
+    /// A snapshot of the record types of every line stored by a successful append since
+    /// construction, seeded lines excluded.
+    /// </returns>
     public IReadOnlyList<string?> RecordTypesWritten()
     {
         string[] lines;
@@ -716,4 +730,3 @@ public sealed class StalledJournalStorage : IJournalStorage
         public Exception? Failure { get; set; }
     }
 }
-

@@ -304,3 +304,92 @@ public sealed class DataDirectoryTests
         Assert.False(data.CanWrite());
     }
 }
+
+/// <summary>
+/// Tests for the observation contract of <see cref="StalledJournalStorage"/>:
+/// <see cref="StalledJournalStorage.Lines"/> and <see cref="StalledJournalStorage.RecordTypesWritten"/>
+/// are the append history and survive <see cref="StalledJournalStorage.Delete"/>, because the
+/// journal's owner deletes the journal right after its final <c>end</c> record;
+/// <see cref="StalledJournalStorage.ReadLines"/> and <see cref="StalledJournalStorage.Exists"/>
+/// report the current journal.
+/// </summary>
+public sealed class StalledJournalStorageTests
+{
+    /// <summary>
+    /// Lines seeded before the run, then the record types it appends before deleting the journal:
+    /// a full run writing every record in order, and a recovery that appends only <c>end</c> to a
+    /// crashed run's journal ending in a torn line.
+    /// </summary>
+    public static TheoryData<string[], string[]> DeleteAfterEndCases { get; } = new()
+    {
+        { [], ["begin", "prepared", "step", "stepEnd", "beat", "result", "released", "end"] },
+        {
+            ["{\"t\":\"begin\"}", "{\"t\":\"step\",\"index\":2,\"count\":6}", "{\"t\":\"beat\",\"step\":2,\"elap"],
+            ["end"]
+        },
+    };
+
+    [Theory]
+    [MemberData(nameof(DeleteAfterEndCases))]
+    public void Delete_AfterEnd_KeepsAppendHistoryAndRemovesJournal(string[] seededLines, string[] appendedTypes)
+    {
+        using StalledJournalStorage storage = new();
+        if (seededLines.Length > 0)
+        {
+            storage.Seed(seededLines);
+        }
+
+        string[] appendedLines = appendedTypes.Select(RecordLine).ToArray();
+        foreach (string line in appendedLines)
+        {
+            storage.AppendDurable(line);
+        }
+
+        storage.Delete();
+
+        Assert.Equal(appendedTypes, storage.RecordTypesWritten());
+        Assert.Equal(appendedLines, storage.Lines);
+        Assert.Empty(storage.ReadLines());
+        Assert.False(storage.Exists());
+        Assert.True(storage.IsDeleted);
+        Assert.Equal(1, storage.DeleteCount);
+        Assert.Equal(appendedLines, storage.Calls.Select(call => call.Line));
+        Assert.All(storage.Calls, call => Assert.Equal(AppendOutcome.Succeeded, call.Outcome));
+    }
+
+    [Fact]
+    public void AppendDurable_AfterDelete_StartsNewJournalAndKeepsHistory()
+    {
+        using StalledJournalStorage storage = new();
+        string begin = RecordLine("begin");
+        string end = RecordLine("end");
+        storage.AppendDurable(begin);
+        storage.Delete();
+
+        storage.AppendDurable(end);
+
+        Assert.Equal(end, Assert.Single(storage.ReadLines()));
+        Assert.Equal(new[] { begin, end }, storage.Lines);
+        Assert.True(storage.Exists());
+        Assert.False(storage.IsDeleted);
+    }
+
+    [Fact]
+    public void Delete_AfterFailedAppend_HistoryHoldsOnlySucceededAppends()
+    {
+        using StalledJournalStorage storage = new();
+        storage.AppendDurable(RecordLine("begin"));
+        storage.FailNext("end");
+        Assert.Throws<IOException>(() => storage.AppendDurable(RecordLine("end")));
+
+        storage.Delete();
+
+        Assert.Equal("begin", Assert.Single(storage.RecordTypesWritten()));
+        Assert.Collection(
+            storage.Calls,
+            call => Assert.Equal(AppendOutcome.Succeeded, call.Outcome),
+            call => Assert.Equal(AppendOutcome.Failed, call.Outcome));
+    }
+
+    private static string RecordLine(string recordType) => $"{{\"t\":\"{recordType}\"}}";
+}
