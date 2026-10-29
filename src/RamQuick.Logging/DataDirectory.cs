@@ -73,6 +73,18 @@ public sealed class DataDirectory
     private const string ProbeFilePrefix = ".write-probe-";
     private const string ProbeFileExtension = ".tmp";
 
+    /// <summary>
+    /// The host locations <see cref="Resolve()"/> uses instead of the real ones in the current
+    /// execution flow, or <see langword="null"/> when none is in effect.
+    /// </summary>
+    /// <remarks>
+    /// Tests run in parallel and must exercise <see cref="Resolve()"/> without probing beside
+    /// their own assembly or under the user's profile. A value set in one flow is invisible to
+    /// every flow that does not inherit it, so an override cannot leak into a parallel test, and
+    /// the application, which never sets one, always resolves the real locations.
+    /// </remarks>
+    private static readonly AsyncLocal<HostLocations?> _hostLocationsOverride = new();
+
     private DataDirectory(string rootPath, DataDirectoryKind kind)
     {
         RootPath = rootPath;
@@ -116,6 +128,72 @@ public sealed class DataDirectory
     public string AppErrorsLogPath { get; }
 
     /// <summary>
+    /// Gets the app folder <see cref="Resolve()"/> tries first:
+    /// <see cref="AppContext.BaseDirectory"/>, which ends in a directory separator, or, while an
+    /// <see cref="OverrideHostLocations(string, string?)"/> scope is open in the current execution
+    /// flow, that scope's app folder.
+    /// </summary>
+    /// <remarks>
+    /// Read apart from the probe so that tests can check this location without writing beside
+    /// their own assembly.
+    /// </remarks>
+    internal static string DefaultAppFolder =>
+        _hostLocationsOverride.Value?.AppFolder ?? AppContext.BaseDirectory;
+
+    /// <summary>
+    /// Gets the local application data folder <see cref="Resolve()"/> falls back to: the user's,
+    /// read without verifying that it exists and empty when Windows does not know it, or, while an
+    /// <see cref="OverrideHostLocations(string, string?)"/> scope is open in the current execution
+    /// flow, that scope's folder, which may be <see langword="null"/>.
+    /// </summary>
+    /// <remarks>
+    /// Read apart from the probe so that tests can check this location without writing under the
+    /// user's profile.
+    /// </remarks>
+    internal static string? DefaultLocalAppDataRoot =>
+        _hostLocationsOverride.Value is { } locations
+            ? locations.LocalAppDataRoot
+            : Environment.GetFolderPath(
+                Environment.SpecialFolder.LocalApplicationData,
+                Environment.SpecialFolderOption.DoNotVerify);
+
+    /// <summary>
+    /// Makes <see cref="Resolve()"/>, in the current execution flow and the flows it starts, try
+    /// <paramref name="appFolder"/> and <paramref name="localAppDataRoot"/> in place of the host's
+    /// locations until the returned scope is disposed.
+    /// </summary>
+    /// <param name="appFolder">
+    /// The folder that stands in for <see cref="AppContext.BaseDirectory"/>.
+    /// </param>
+    /// <param name="localAppDataRoot">
+    /// The folder that stands in for the local application data folder; <see langword="null"/>,
+    /// empty or white space stands for a host where Windows does not know that folder.
+    /// </param>
+    /// <returns>
+    /// A scope whose first disposal restores the locations in effect before this call; later
+    /// disposals do nothing.
+    /// </returns>
+    /// <remarks>
+    /// Dispose the scope in the flow that opened it, innermost scope first when scopes nest.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="appFolder"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="appFolder"/> is empty or white space.
+    /// </exception>
+    internal static IDisposable OverrideHostLocations(string appFolder, string? localAppDataRoot)
+    {
+        // Rejected here as Resolve rejects it, so a bad override fails where it is opened rather
+        // than inside a later Resolve call.
+        ArgumentException.ThrowIfNullOrWhiteSpace(appFolder);
+
+        HostLocationsScope scope = new(_hostLocationsOverride.Value);
+        _hostLocationsOverride.Value = new HostLocations(appFolder, localAppDataRoot);
+        return scope;
+    }
+
+    /// <summary>
     /// Resolves the data folder for the running application: <c>&lt;app folder&gt;\data</c> when it
     /// passes the write probe, otherwise <c>%LOCALAPPDATA%\RamQuick</c> when that passes.
     /// </summary>
@@ -128,12 +206,7 @@ public sealed class DataDirectory
     /// folder is read without verifying that it exists, so a missing folder is created by the
     /// probe rather than skipped. Call this off the UI thread: the probe flushes to the device.
     /// </remarks>
-    public static DataDirectory? Resolve() =>
-        Resolve(
-            AppContext.BaseDirectory,
-            Environment.GetFolderPath(
-                Environment.SpecialFolder.LocalApplicationData,
-                Environment.SpecialFolderOption.DoNotVerify));
+    public static DataDirectory? Resolve() => Resolve(DefaultAppFolder, DefaultLocalAppDataRoot);
 
     /// <summary>
     /// Resolves the data folder from explicit locations, trying
@@ -286,4 +359,58 @@ public sealed class DataDirectory
             or NotSupportedException
             or ArgumentException
             or SecurityException;
+
+    /// <summary>
+    /// The locations an <see cref="OverrideHostLocations(string, string?)"/> scope puts in place
+    /// of the host's.
+    /// </summary>
+    /// <param name="AppFolder">
+    /// The folder that stands in for <see cref="AppContext.BaseDirectory"/>.
+    /// </param>
+    /// <param name="LocalAppDataRoot">
+    /// The folder that stands in for the local application data folder, or
+    /// <see langword="null"/> for a host where Windows does not know that folder.
+    /// </param>
+    private sealed record HostLocations(string AppFolder, string? LocalAppDataRoot);
+
+    /// <summary>
+    /// The scope <see cref="OverrideHostLocations(string, string?)"/> returns.
+    /// </summary>
+    private sealed class HostLocationsScope : IDisposable
+    {
+        /// <summary>
+        /// The override this scope reinstates, or <see langword="null"/> for the host's locations.
+        /// </summary>
+        private readonly HostLocations? _previous;
+
+        /// <summary>
+        /// Whether this scope has already restored <see cref="_previous"/>.
+        /// </summary>
+        private bool _disposed;
+
+        /// <summary>
+        /// Creates a scope that restores <paramref name="previous"/> when disposed.
+        /// </summary>
+        /// <param name="previous">
+        /// The override in effect before this scope opened, or <see langword="null"/> for the
+        /// host's locations.
+        /// </param>
+        public HostLocationsScope(HostLocations? previous) => _previous = previous;
+
+        /// <summary>
+        /// Restores the locations in effect before this scope opened, the first time it is called.
+        /// </summary>
+        public void Dispose()
+        {
+            // A second restore would reinstate this scope's predecessor after an outer scope had
+            // already closed, so only the first disposal acts.
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            _hostLocationsOverride.Value = _previous;
+        }
+    }
 }
