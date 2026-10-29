@@ -1,0 +1,85 @@
+<Project>
+  <!--
+    Shared MSBuild properties for every project in RamQuick.sln, native and managed.
+
+    Conventions:
+    - One command builds everything, with Visual Studio's MSBuild:
+        msbuild RamQuick.sln -restore -p:Configuration=Release -p:Platform=x64
+      dotnet build cannot build the .vcxproj projects, so it is not a supported entry point.
+    - Package versions come only from Directory.Packages.props; no project file sets one.
+    - The .vcxproj projects import this file too. Every C#-specific property therefore sits in
+      a group conditioned on the .csproj extension, and native compiler and linker settings
+      live in src/engine/engine.props, never here.
+  -->
+
+  <!--
+    Repository paths, shared by native and managed projects:
+    - RamQuickRepoRoot: the repository root, with a trailing backslash.
+    - RamQuickNativeOutRoot: root of the native binaries. engine.props sets
+      OutDir=$(RamQuickNativeOutRoot)$(Configuration)\ for every native project.
+    - RamQuickNativeIntRoot: root of the native intermediates. engine.props sets
+      IntDir=$(RamQuickNativeIntRoot)$(MSBuildProjectName)\$(Configuration)\ for every native project.
+    RamQuick.App and RamQuick.TestHost copy ramquick_engine.dll, and RamQuick.IntegrationTests
+    copies ramquick_engine_test.dll, from $(RamQuickNativeOutRoot)$(Configuration)\.
+    Everything under artifacts/ is build output and is git-ignored.
+  -->
+  <PropertyGroup>
+    <RamQuickRepoRoot>$(MSBuildThisFileDirectory)</RamQuickRepoRoot>
+    <RamQuickNativeOutRoot>$(RamQuickRepoRoot)artifacts\bin\native\</RamQuickNativeOutRoot>
+    <RamQuickNativeIntRoot>$(RamQuickRepoRoot)artifacts\obj\native\</RamQuickNativeIntRoot>
+  </PropertyGroup>
+
+  <!--
+    Target frameworks. RamQuickTargetFramework is the single retarget point: moving off .NET 8
+    means changing it (for example to net10.0-windows) together with the SDK in global.json.
+    RamQuickNeutralTargetFramework is derived from it, so the two never drift apart.
+    Each project file sets TargetFramework to one of them:
+    - $(RamQuickNeutralTargetFramework): src/RamQuick.Core, src/RamQuick.Plans,
+      src/RamQuick.Analysis, src/RamQuick.Logging.
+    - $(RamQuickTargetFramework): src/RamQuick.Interop, src/RamQuick.Sensors, src/RamQuick.App,
+      and every project under tests/, RamQuick.TestHost included.
+  -->
+  <PropertyGroup Condition="'$(MSBuildProjectExtension)' == '.csproj'">
+    <RamQuickTargetFramework>net8.0-windows</RamQuickTargetFramework>
+    <RamQuickNeutralTargetFramework>$(RamQuickTargetFramework.Replace('-windows', ''))</RamQuickNeutralTargetFramework>
+  </PropertyGroup>
+
+  <!--
+    C# language, analysis and build settings for every managed project.
+    TargetFramework, OutputType, UseWPF, RuntimeIdentifier and SelfContained belong to each
+    project file or its publish profile, and UseArtifactsOutput stays off so managed output
+    remains under each project's bin and obj folders; none of them is set here.
+  -->
+  <PropertyGroup Condition="'$(MSBuildProjectExtension)' == '.csproj'">
+    <LangVersion>12.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <!-- SDK default convention: the common System namespaces are imported implicitly. -->
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <AnalysisLevel>8.0</AnalysisLevel>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <!--
+      Restore writes each project's packages.lock.json. RestoreLockedMode is never set here:
+      scripts verify the committed lock files by passing -p:RestoreLockedMode=true.
+    -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <Product>RAMQuick</Product>
+    <Version>1.0.0</Version>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <!--
+    Test code is every project under tests/. Library and application projects generate XML
+    documentation, so a public member without a doc comment (CS1591) fails the build through
+    TreatWarningsAsErrors; test projects do not generate it.
+  -->
+  <PropertyGroup Condition="'$(MSBuildProjectExtension)' == '.csproj'">
+    <RamQuickIsTestCode>false</RamQuickIsTestCode>
+    <RamQuickIsTestCode Condition="$([MSBuild]::MakeRelative('$(RamQuickRepoRoot)', '$(MSBuildProjectDirectory)').StartsWith('tests'))">true</RamQuickIsTestCode>
+    <GenerateDocumentationFile Condition="'$(RamQuickIsTestCode)' != 'true'">true</GenerateDocumentationFile>
+    <GenerateDocumentationFile Condition="'$(RamQuickIsTestCode)' == 'true'">false</GenerateDocumentationFile>
+  </PropertyGroup>
+</Project>

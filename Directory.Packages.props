@@ -1,0 +1,56 @@
+<Project>
+  <!--
+    Central NuGet package versions for every managed project in RamQuick.sln.
+
+    Conventions:
+    - Project files reference packages as <PackageReference Include="Id" /> with no Version
+      attribute (restore fails with NU1008). VersionOverride is forbidden and disabled below
+      (restore fails with NU1013): this file is the only place a version is set.
+    - Transitive pinning is on, so each PackageVersion below also pins that package wherever it
+      appears transitively. A pin lower than a dependency's minimum fails restore with NU1109;
+      change a pin only together with the package that requires it.
+    - Lock files: every managed project commits the packages.lock.json that restore generates
+      (RestorePackagesWithLockFile=true is set in Directory.Build.props). Lock files are never
+      written by hand. After changing a pin, regenerate them with Visual Studio's MSBuild:
+        msbuild RamQuick.sln -restore -p:Configuration=Release -p:Platform=x64
+      and commit the results. Verification restores with -p:RestoreLockedMode=true.
+
+    Licences, as carried into THIRD-PARTY-NOTICES.txt:
+    - MPL-2.0: LibreHardwareMonitorLib, RAMSPDToolkit-NDD, DiskInfoToolkit.
+    - Apache-2.0: HidSharp.
+    - MIT: CommunityToolkit.Mvvm, System.*, Mono.Posix.NETStandard.
+    - Test-only packages are Apache-2.0 or MIT and are never shipped.
+    PawnIO is deliberately absent: it is a GPL driver that RamQuick never bundles or installs.
+  -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+    <!-- Enforces the no-VersionOverride convention at restore instead of leaving it to review. -->
+    <CentralPackageVersionOverrideEnabled>false</CentralPackageVersionOverrideEnabled>
+  </PropertyGroup>
+
+  <!-- Shipped in the portable build -->
+  <ItemGroup>
+    <PackageVersion Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+    <PackageVersion Include="LibreHardwareMonitorLib" Version="0.9.6" />
+  </ItemGroup>
+
+  <!-- Transitive pins (via LibreHardwareMonitorLib 0.9.6): its net8.0 dependency set -->
+  <ItemGroup>
+    <PackageVersion Include="DiskInfoToolkit" Version="1.1.2" />
+    <PackageVersion Include="HidSharp" Version="2.6.4" />
+    <PackageVersion Include="Mono.Posix.NETStandard" Version="1.0.0" />
+    <PackageVersion Include="RAMSPDToolkit-NDD" Version="1.4.2" />
+    <PackageVersion Include="System.IO.Ports" Version="10.0.3" />
+    <PackageVersion Include="System.Management" Version="10.0.2" />
+    <PackageVersion Include="System.Threading.AccessControl" Version="10.0.3" />
+  </ItemGroup>
+
+  <!-- Test-only, never published -->
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.Extensions.TimeProvider.Testing" Version="9.10.0" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.1" />
+    <PackageVersion Include="xunit.v3" Version="4.0.2" />
+  </ItemGroup>
+</Project>
