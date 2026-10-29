@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>$(RamQuickNeutralTargetFramework)</TargetFramework>
+  </PropertyGroup>
+
+  <!-- ErrorAnalyzer is pure computation over shared records: it references RamQuick.Core only and no packages,
+       so no I/O, sensor, logging, plan or UI layer can leak into the analysis. -->
+  <ItemGroup>
+    <ProjectReference Include="..\RamQuick.Core\RamQuick.Core.csproj" />
+  </ItemGroup>
+
+</Project>

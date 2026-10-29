@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Sensor and memory-inventory library: CPU and DIMM temperatures through LibreHardwareMonitorLib,
+    SMBIOS Type 17 inventory through GetSystemFirmwareTable. Language, analyzer, platform, lock-file
+    and documentation settings come from the root Directory.Build.props; package versions come only
+    from Directory.Packages.props.
+  -->
+  <PropertyGroup>
+    <TargetFramework>$(RamQuickTargetFramework)</TargetFramework>
+    <RootNamespace>RamQuick.Sensors</RootNamespace>
+    <AssemblyName>RamQuick.Sensors</AssemblyName>
+    <!-- The source-generated [LibraryImport] in NativeFirmware.cs takes a byte* buffer and needs unsafe code (SYSLIB1062). -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RamQuick.Core\RamQuick.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The only project that references the sensor library directly; its transitive closure is pinned centrally. -->
+    <PackageReference Include="LibreHardwareMonitorLib" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="RamQuick.Sensors.Tests" />
+  </ItemGroup>
+
+</Project>

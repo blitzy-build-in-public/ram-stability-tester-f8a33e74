@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Managed wrapper over ramquick_engine.dll, and the only home of managed P/Invoke outside RamQuick.Sensors.
+    It targets the Windows TFM because it calls Win32 (user32) as well as the engine. It deliberately has no
+    ProjectReference to the native engine and copies no DLL: build order and DLL copying belong to the
+    executables that load the engine (RamQuick.App, RamQuick.TestHost, RamQuick.IntegrationTests).
+  -->
+  <PropertyGroup>
+    <TargetFramework>$(RamQuickTargetFramework)</TargetFramework>
+    <AssemblyName>RamQuick.Interop</AssemblyName>
+    <RootNamespace>RamQuick.Interop</RootNamespace>
+    <!-- Source-generated LibraryImport, fixed byte buffers and unmanaged function-pointer fields need unsafe code. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RamQuick.Core\RamQuick.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Integration tests check the internal Rq* struct sizes and session internals against the test engine DLL. -->
+    <InternalsVisibleTo Include="RamQuick.IntegrationTests" />
+  </ItemGroup>
+
+</Project>

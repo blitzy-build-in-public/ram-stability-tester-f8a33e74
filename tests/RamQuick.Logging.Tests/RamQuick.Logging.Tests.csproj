@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tests for RunLog (RamQuick.Logging): journal acknowledgment and stalls, crash recovery,
+    crash-consistent publication, results-log names and JSON value types, and the data folder.
+    The target framework is the single retarget property; compiler, analyzer, platform,
+    documentation and lock-file settings come from Directory.Build.props, and package versions
+    only from Directory.Packages.props. xUnit v3 test assemblies are executables (OutputType Exe).
+    Sources are picked up by the default compile glob; StalledJournalStorage.cs in this folder is
+    also linked by the App and integration test projects, so it must stay free of xUnit types.
+    xunit.v3 adds no implicit Xunit using and none is added here: test files declare `using Xunit;`.
+  -->
+  <PropertyGroup>
+    <TargetFramework>$(RamQuickTargetFramework)</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>RamQuick.Logging.Tests</AssemblyName>
+    <RootNamespace>RamQuick.Logging.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
+  </ItemGroup>
+
+  <!-- RamQuick.Core arrives transitively; Logging grants this assembly InternalsVisibleTo. -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RamQuick.Logging\RamQuick.Logging.csproj" />
+  </ItemGroup>
+
+</Project>
