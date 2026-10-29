@@ -86,14 +86,19 @@
  *
  * @par Stress bound
  * The layer adds one plain store per injected word, at a verification opportunity the engine
- * already has. It adds no loop, no flush-and-reload and no other memory traffic, so
- * fault-injection runs stay inside the production stress bound.
+ * already has. It adds no loop, no flush-and-reload, no repeated access to a small address set
+ * and no memory traffic beyond those stores, so fault-injection runs keep the stress bound's
+ * design limits. That is a property of the design, not a measurement.
  *
  * @par Exceptions
- * As in IMemoryAccess, only reread_word is noexcept: the other primitives propagate what the
- * inner layer throws (the counting layer may allocate its log), and the worker entry points turn
- * that into RQ_END_INTERNAL_FAULT. When the layer cannot allocate its own bookkeeping, a target
- * set or a log entry, it skips injection for that call and still forwards it.
+ * As in IMemoryAccess, only reread_word is noexcept: stream_fill, fence, flush, verify and
+ * verify_and_stream propagate whatever an inner IMemoryAccess implementation throws, and the
+ * worker thread entry points turn that into a stop with RQ_END_INTERNAL_FAULT. In the standard
+ * stacks the inner layer is counting_memory_access, whose six overrides are noexcept and which
+ * contains its own log-allocation failure by setting log_overflowed() instead of throwing, so no
+ * primitive exception reaches this layer from it: an exception escaping its inner layer or its
+ * observer calls std::terminate instead. When this layer cannot allocate its own bookkeeping, a
+ * target set or a log entry, it skips injection for that call and still forwards it.
  */
 #pragma once
 

@@ -46,7 +46,8 @@ extern "C" {
  * window's streamed write and fence, after a hold step's slice write, between a moving-inversion
  * sweep's write and the next sweep's verification, after a turnaround block's write and before
  * its verification, and, for RQ_FAULT_DELAY_DEPENDENT, just before the verification load.
- * Injections ride on the engine's own verification opportunities and add no memory traffic.
+ * Injections ride on the engine's own verification opportunities: each adds one store per
+ * corrupted word, and they add no extra verification or flush-and-reload loop.
  * @{
  */
 /** No corruption: the layer passes every access through unchanged. */

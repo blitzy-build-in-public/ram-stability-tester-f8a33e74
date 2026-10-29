@@ -22,9 +22,10 @@
  *   (RefreshRetention).
  *
  * Injections ride only on the engine's normal verification opportunities, after a word's last
- * write and before its next verification. The fault layer therefore adds no memory traffic, no
- * flush-and-reload loop and no repeated access to a small address set, which keeps fault-injection
- * runs inside the same stress bound as production runs.
+ * write and before its next verification. The fault layer therefore adds one plain store per
+ * corrupted word and no extra verification, flush-and-reload loop or repeated access to a small
+ * address set, so fault-injection runs keep the stress bound's design limits. That is a property
+ * of the design, not a measured result.
  */
 #pragma once
 
