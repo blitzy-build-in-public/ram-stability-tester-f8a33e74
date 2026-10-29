@@ -1,0 +1,87 @@
+# RAMQuick ignore rules.
+# Only build output, tool state and local run data are ignored. Source, project files, props,
+# manifests, publish profiles, JSON, scripts and the packages.lock.json files are always tracked:
+# deliberately, no pattern here matches *.props, *.pubxml, *.manifest, *.json or *.ps1.
+
+# --- Repository build artefacts ----------------------------------------------------------------
+# Directory.Build.props roots native output at artifacts/bin/native/ and native intermediates at
+# artifacts/obj/native/. Publish output (artifacts/publish/RamQuick-win-x64/ and its zip), test
+# results (artifacts/test-results/) and coverage reports (artifacts/coverage/) live here as well.
+/artifacts/
+
+# --- .NET build output ---------------------------------------------------------------------------
+# Managed projects keep their output in their own bin/ and obj/ folders.
+[Bb]in/
+[Oo]bj/
+*.binlog
+
+# --- vcpkg manifest installs ---------------------------------------------------------------------
+# Restored from the root vcpkg.json into /vcpkg_installed/. The pattern is unanchored so it also
+# matches at any depth, in case a project overrides VcpkgManifestRoot.
+vcpkg_installed/
+
+# --- MSVC default intermediates ------------------------------------------------------------------
+# Only produced when a native project is built outside src/engine/engine.props.
+[Xx]64/
+[Dd]ebug/
+[Rr]elease/
+ipch/
+*.obj
+*.pdb
+*.ilk
+*.iobj
+*.ipdb
+*.tlog
+*.lastbuildstate
+*.idb
+*.pch
+*.ipch
+*.exp
+# No static library is committed; engine_core.lib is built.
+*.lib
+# No binary is committed; ramquick_engine.dll and ramquick_engine_test.dll are built.
+*.dll
+
+# --- Visual Studio and editor state --------------------------------------------------------------
+# No editor settings are part of the product.
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+*.aps
+.idea/
+.vscode/
+
+# --- Test output ---------------------------------------------------------------------------------
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+*.cobertura.xml
+coverage/
+
+# --- NuGet ---------------------------------------------------------------------------------------
+*.nupkg
+.nuget/
+
+# --- Local run data ------------------------------------------------------------------------------
+# The progress journal and results logs a developer run writes to <exe folder>\data. Only these
+# two subfolders are matched, so no source folder named "data" can ever be hidden.
+**/data/journal/
+**/data/logs/
+
+# --- Operating-system files ----------------------------------------------------------------------
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# --- Always tracked ------------------------------------------------------------------------------
+# Kept last so they override every pattern above.
+# Restore generates each project's packages.lock.json; they are committed to freeze every
+# transitive package version.
+!**/packages.lock.json
+# Synthesised SMBIOS tables are committed test data. No *.bin pattern exists; this is a guard.
+!tests/RamQuick.Sensors.Tests/Fixtures/*.bin
