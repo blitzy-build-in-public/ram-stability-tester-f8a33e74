@@ -472,4 +472,3 @@ public static class WorkAreaSizing
         public bool DpiRecomputeQueued { get; set; }
     }
 }
-

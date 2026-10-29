@@ -1113,4 +1113,3 @@ internal static class JournalValues
         return copy.Length == 0 ? Array.Empty<T>() : Array.AsReadOnly(copy);
     }
 }
-

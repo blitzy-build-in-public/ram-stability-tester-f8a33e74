@@ -155,12 +155,14 @@ public sealed class FakeSensorSource : ISensorSource
     }
 
     /// <summary>
-    /// Gets the number of <see cref="Open"/> calls made before disposal.
+    /// Gets the number of <see cref="Open"/> calls made before disposal. Once a count is observed,
+    /// <see cref="OpenThreadId"/> already reflects at least the call it counts.
     /// </summary>
     public int OpenCount => Volatile.Read(ref _openCount);
 
     /// <summary>
-    /// Gets the number of reads entered, counted on entry before any block or delay.
+    /// Gets the number of reads entered, counted on entry before any block or delay. Once a count is
+    /// observed, <see cref="LastReadThreadId"/> already reflects at least the read it counts.
     /// </summary>
     public int ReadCount => Volatile.Read(ref _readCount);
 
@@ -171,6 +173,8 @@ public sealed class FakeSensorSource : ISensorSource
 
     /// <summary>
     /// Gets the number of <see cref="Dispose"/> calls; every call is counted, repeated ones included.
+    /// Once a count is observed, the source is already disposed and <see cref="DisposeThreadId"/>
+    /// already reflects at least the call it counts.
     /// </summary>
     public int DisposeCount => Volatile.Read(ref _disposeCount);
 
@@ -354,7 +358,7 @@ public sealed class FakeSensorSource : ISensorSource
     }
 
     /// <summary>
-    /// Counts the call, records its thread, then throws <see cref="OpenException"/> when one is set.
+    /// Records its thread, counts the call, then throws <see cref="OpenException"/> when one is set.
     /// </summary>
     /// <exception cref="ObjectDisposedException">The source has been disposed.</exception>
     public void Open()
@@ -362,8 +366,10 @@ public sealed class FakeSensorSource : ISensorSource
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            Interlocked.Increment(ref _openCount);
             Volatile.Write(ref _openThreadId, Environment.CurrentManagedThreadId);
+
+            // Counted last, so a caller that observes the count also observes the thread id.
+            Interlocked.Increment(ref _openCount);
         }
 
         if (OpenException is { } openException)
@@ -384,9 +390,12 @@ public sealed class FakeSensorSource : ISensorSource
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            Interlocked.Increment(ref _readCount);
             RaiseMaxConcurrentReads(Interlocked.Increment(ref _currentConcurrentReads));
             Volatile.Write(ref _lastReadThreadId, Environment.CurrentManagedThreadId);
+
+            // Counted last, so a caller that observes the count also observes this read's thread id
+            // and concurrency.
+            Interlocked.Increment(ref _readCount);
             Monitor.PulseAll(_gate);
         }
 
@@ -430,11 +439,14 @@ public sealed class FakeSensorSource : ISensorSource
     /// </remarks>
     public void Dispose()
     {
-        Interlocked.Increment(ref _disposeCount);
-        Volatile.Write(ref _disposeThreadId, Environment.CurrentManagedThreadId);
         lock (_gate)
         {
             _disposed = true;
+            Volatile.Write(ref _disposeThreadId, Environment.CurrentManagedThreadId);
+
+            // Counted last, so a caller that observes the count also observes the disposed state and
+            // the thread id.
+            Interlocked.Increment(ref _disposeCount);
             Monitor.PulseAll(_gate);
         }
     }

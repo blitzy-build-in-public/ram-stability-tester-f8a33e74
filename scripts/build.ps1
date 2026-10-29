@@ -1556,4 +1556,3 @@ finally {
     $env:VCPKG_ROOT = $originalVcpkgRoot
 }
 exit $script:ExitCode
-

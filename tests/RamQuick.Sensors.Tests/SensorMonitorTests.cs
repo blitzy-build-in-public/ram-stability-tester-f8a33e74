@@ -342,6 +342,116 @@ public sealed class SensorMonitorTests
         }
     }
 
+    // One reading too old and its peer fresh at its limit, in both directions: only the old reading
+    // turns Stale, so the fresh one keeps its own thermal limit active.
+    [Theory]
+    [InlineData(ThermalSensor.Cpu, 3001)]
+    [InlineData(ThermalSensor.Cpu, 4000)]
+    [InlineData(ThermalSensor.Ram, 3001)]
+    [InlineData(ThermalSensor.Ram, 4000)]
+    public void Current_OneReadingOlderThanStaleAfter_OnlyItIsStaleAndItsFreshPeerTrips(ThermalSensor old, int ageMilliseconds)
+    {
+        var age = TimeSpan.FromMilliseconds(ageMilliseconds);
+        ThermalSensor fresh = PeerOf(old);
+        double limit = LimitFor(fresh);
+        using Harness h = old == ThermalSensor.Cpu
+            ? CreateHarnessAtLimits(cpuAge: age, ramAge: TimeSpan.Zero)
+            : CreateHarnessAtLimits(cpuAge: TimeSpan.Zero, ramAge: age);
+        h.Start();
+        h.Tick();
+
+        SensorReadings current = h.Monitor.Current;
+        AssertUnavailable(ValueOf(current, old), SensorStatus.Stale);
+        Assert.Equal(h.Time.GetUtcNow() - age, ValueOf(current, old).CapturedAt);
+        AssertAvailable(ValueOf(current, fresh), limit);
+        Assert.Equal(h.Time.GetUtcNow(), ValueOf(current, fresh).CapturedAt);
+        Assert.Equal(new ThermalVerdict(fresh, limit, limit), ThermalLimits.Evaluate(current));
+        Assert.Same(current, h.LastReadings);
+        Assert.False(h.Monitor.IsHung);
+    }
+
+    // Readings at both limits captured a second apart, with no fresh read arriving: each turns Stale at
+    // its own deadline, on both paths that apply one, and the younger trips until its own deadline.
+    // The ages put both deadlines between poll ticks, and each move crosses a tick only while nothing
+    // is due, so only the deadline timer, or Current itself, can apply a deadline.
+    [Theory]
+    [InlineData(ThermalSensor.Cpu, true)]
+    [InlineData(ThermalSensor.Cpu, false)]
+    [InlineData(ThermalSensor.Ram, true)]
+    [InlineData(ThermalSensor.Ram, false)]
+    public void Current_ReadingsCapturedASecondApart_EachTurnsStaleAtItsOwnDeadline(ThermalSensor older, bool timersRun)
+    {
+        var olderAge = TimeSpan.FromMilliseconds(1500);
+        var youngerAge = TimeSpan.FromMilliseconds(500);
+        ThermalSensor younger = PeerOf(older);
+        double youngerLimit = LimitFor(younger);
+        var youngerVerdict = new ThermalVerdict(younger, youngerLimit, youngerLimit);
+        using Harness h = older == ThermalSensor.Cpu
+            ? CreateHarnessAtLimits(cpuAge: olderAge, ramAge: youngerAge)
+            : CreateHarnessAtLimits(cpuAge: youngerAge, ramAge: olderAge);
+        h.Start();
+        DateTimeOffset olderCapturedAt = ValueOf(h.Monitor.Current, older).CapturedAt;
+        DateTimeOffset youngerCapturedAt = ValueOf(h.Monitor.Current, younger).CapturedAt;
+        Assert.Equal(olderAge - youngerAge, youngerCapturedAt - olderCapturedAt);
+
+        // The next read stays blocked; the last move below ends about 1.5 s after it started, short of HungAfter.
+        h.BlockNextRead();
+        h.Context.RunPending();
+        int eventsWhileBlocked = h.EventCount;
+
+        MoveClockTo(h.Time, olderCapturedAt + SensorMonitor.StaleAfter, timersRun);
+        AssertAvailable(ValueOf(h.Monitor.Current, older), LimitFor(older));
+
+        MoveClockTo(h.Time, olderCapturedAt + SensorMonitor.StaleAfter + TimeSpan.FromTicks(1), timersRun);
+        SensorReadings current = h.Monitor.Current;
+        AssertUnavailable(ValueOf(current, older), SensorStatus.Stale);
+        Assert.Equal(olderCapturedAt, ValueOf(current, older).CapturedAt);
+        AssertAvailable(ValueOf(current, younger), youngerLimit);
+        Assert.Equal(youngerVerdict, ThermalLimits.Evaluate(current));
+
+        if (timersRun)
+        {
+            // Within the deadline timer's whole-millisecond resolution, the older reading's deadline
+            // raises a snapshot that re-marks that reading alone.
+            h.Time.Advance(TimeSpan.FromMilliseconds(1));
+            h.PumpUntil(
+                () => h.LastReadings is { } readings && ValueOf(readings, older).Status == SensorStatus.Stale,
+                $"Expected the snapshot re-marking the {older} reading Stale to be raised within 1 ms of its deadline");
+            SensorReadings raised = Assert.IsType<SensorReadings>(h.LastReadings);
+            AssertAvailable(ValueOf(raised, younger), youngerLimit);
+            Assert.Equal(youngerVerdict, ThermalLimits.Evaluate(raised));
+        }
+
+        // Exactly StaleAfter old, the younger reading is still fresh, a second after its peer turned Stale.
+        MoveClockTo(h.Time, youngerCapturedAt + SensorMonitor.StaleAfter, timersRun);
+        AssertAvailable(ValueOf(h.Monitor.Current, younger), youngerLimit);
+
+        MoveClockTo(h.Time, youngerCapturedAt + SensorMonitor.StaleAfter + TimeSpan.FromTicks(1), timersRun);
+        current = h.Monitor.Current;
+        AssertBothUnavailable(current, SensorStatus.Stale);
+        Assert.Equal(olderCapturedAt, ValueOf(current, older).CapturedAt);
+        Assert.Equal(youngerCapturedAt, ValueOf(current, younger).CapturedAt);
+        Assert.Null(ThermalLimits.Evaluate(current));
+
+        if (timersRun)
+        {
+            // The younger reading's own deadline timer, armed once its peer turned Stale, raises the last re-marking.
+            h.Time.Advance(TimeSpan.FromMilliseconds(1));
+            h.PumpUntil(
+                () => h.LastReadings is { Cpu.Status: SensorStatus.Stale, Ram.Status: SensorStatus.Stale },
+                $"Expected the snapshot re-marking the {younger} reading Stale to be raised within 1 ms of its own deadline");
+            Assert.Null(ThermalLimits.Evaluate(Assert.IsType<SensorReadings>(h.LastReadings)));
+        }
+        else
+        {
+            // No timer ran, so nothing was raised: Current applied each deadline on its own.
+            h.Context.RunPending();
+            Assert.Equal(eventsWhileBlocked, h.EventCount);
+        }
+
+        Assert.False(h.Monitor.IsHung);
+    }
+
     [Fact]
     public void Read_NotReturningWithinHungAfter_MarksSourceHungPermanently()
     {
@@ -870,6 +980,22 @@ public sealed class SensorMonitorTests
         source.CapturedAtOffset = -age;
     }
 
+    // Readings at both limits, each captured its own age before the read returns: the CPU reading
+    // through the fake's offset, the RAM reading through a decorator that re-stamps it by the difference.
+    private static Harness CreateHarnessAtLimits(TimeSpan cpuAge, TimeSpan ramAge)
+    {
+        var h = new Harness(decorate: inner => new RamRestampingSource(inner, cpuAge - ramAge));
+        ScriptReadingsAtLimits(h.Source, cpuAge);
+        return h;
+    }
+
+    private static ThermalSensor PeerOf(ThermalSensor sensor) => sensor switch
+    {
+        ThermalSensor.Cpu => ThermalSensor.Ram,
+        ThermalSensor.Ram => ThermalSensor.Cpu,
+        _ => throw new ArgumentOutOfRangeException(nameof(sensor), sensor, null),
+    };
+
     private static double LimitFor(ThermalSensor sensor) => sensor switch
     {
         ThermalSensor.Cpu => ThermalLimits.CpuLimitCelsius,
@@ -1128,10 +1254,10 @@ public sealed class SensorMonitorTests
                 Context.RunUntil(condition, _safetyTimeout),
                 $"{expectation} within {_safetyTimeout}; last snapshot: {Describe(LastReadings)}.");
 
-        // A read stamps both values with the clock's time plus the source's offset, and a throwing read is
-        // published as Failed stamped with the clock's time, while a re-marking keeps an earlier
-        // reading's stamp. The fake clock stands still meanwhile, so a raised snapshot with this tick's
-        // stamp is the read's own.
+        // A read stamps its CPU value with the clock's time plus the source's offset (a decorator
+        // re-stamps the RAM value only), and a throwing read is published as Failed stamped with the
+        // clock's time, while a re-marking keeps an earlier reading's stamp. The fake clock stands still
+        // meanwhile, so a raised snapshot with this tick's CPU stamp is the read's own.
         private void WaitForReadSnapshot(int completedBefore)
         {
             DateTimeOffset tickedAt = Time.GetUtcNow();
@@ -1257,6 +1383,39 @@ public sealed class SensorMonitorTests
                 throw _disposeException;
             }
         }
+    }
+
+    // Adds only what FakeSensorSource does not offer: a RAM capture time apart from the CPU's, which the
+    // fake stamps with one time per read, so the two readings age and turn Stale independently. It shifts
+    // each read's RAM stamp by a fixed amount and leaves the CPU value, by which the harness recognises
+    // a read's snapshot, untouched. Every call reaches the fake.
+    private sealed class RamRestampingSource : ISensorSource
+    {
+        private readonly ISensorSource _inner;
+        private readonly TimeSpan _ramShift;
+
+        public RamRestampingSource(ISensorSource inner, TimeSpan ramShift)
+        {
+            _inner = inner;
+            _ramShift = ramShift;
+        }
+
+        public void Open() => _inner.Open();
+
+        public SensorReadings Read()
+        {
+            SensorReadings readings = _inner.Read();
+            SensorValue ram = readings.Ram;
+            DateTimeOffset capturedAt = ram.CapturedAt + _ramShift;
+            return readings with
+            {
+                Ram = ram is { Status: SensorStatus.Available, Celsius: double celsius }
+                    ? SensorValue.Available(celsius, capturedAt)
+                    : SensorValue.Unavailable(ram.Status, capturedAt),
+            };
+        }
+
+        public void Dispose() => _inner.Dispose();
     }
 
     // Holds every post until the test runs it, in any order, so a late delivery can be staged.

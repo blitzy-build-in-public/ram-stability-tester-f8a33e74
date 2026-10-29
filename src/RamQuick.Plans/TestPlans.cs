@@ -444,4 +444,3 @@ public static class TestPlans
         _ => throw new ArgumentOutOfRangeException(nameof(type), type, $"Undefined test type {(int)type}."),
     };
 }
-

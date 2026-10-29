@@ -105,7 +105,8 @@ public sealed class ImmediateSynchronizationContext : SynchronizationContext
     /// </summary>
     /// <remarks>
     /// A callback exception propagates to the caller at once and leaves the remaining callbacks
-    /// queued.
+    /// queued. The drain has no time limit, so work that keeps reposting itself never lets it
+    /// return; <see cref="RunUntil"/> and <see cref="RunAsync"/> bound their drains.
     /// </remarks>
     /// <returns>The number of callbacks run; always 0 in inline mode.</returns>
     public int RunPending()
@@ -154,7 +155,10 @@ public sealed class ImmediateSynchronizationContext : SynchronizationContext
     /// <remarks>
     /// The condition is evaluated after each drain, the first time before any wait, so a condition
     /// that already holds returns at once. Between drains the method waits for a post for at most
-    /// 10 ms, so in inline mode it polls the condition at that interval.
+    /// 10 ms, so in inline mode it polls the condition at that interval. Each drain stops between
+    /// callbacks once <paramref name="timeout"/> has elapsed, so work that keeps reposting itself
+    /// cannot hold the method past its limit; the condition is still evaluated after that last
+    /// drain, so a condition that holds at the deadline returns true.
     /// </remarks>
     /// <param name="condition">The condition to reach; evaluated on the calling thread.</param>
     /// <param name="timeout">The real-time limit.</param>
@@ -167,7 +171,7 @@ public sealed class ImmediateSynchronizationContext : SynchronizationContext
 
         while (true)
         {
-            RunPending();
+            RunPendingUntil(start, timeout);
             if (condition())
             {
                 return true;
@@ -213,6 +217,11 @@ public sealed class ImmediateSynchronizationContext : SynchronizationContext
     /// completed task, and awaiting that task rethrows the body's exception.
     /// </para>
     /// <para>
+    /// Every drain, the final one included, stops between callbacks once the limit has elapsed, so
+    /// a body that keeps yielding, or callbacks that keep reposting themselves, cannot hold the
+    /// method past its limit.
+    /// </para>
+    /// <para>
     /// A synchronous exception from <paramref name="body"/>, a callback exception raised while
     /// pumping, and the timeout all propagate to the caller after the previous context is restored.
     /// </para>
@@ -220,7 +229,11 @@ public sealed class ImmediateSynchronizationContext : SynchronizationContext
     /// <param name="body">The asynchronous body to run.</param>
     /// <param name="timeout">The real-time limit; 10 seconds when null.</param>
     /// <returns>The body's task, already completed.</returns>
-    /// <exception cref="TimeoutException">The body's task did not complete within the limit.</exception>
+    /// <exception cref="TimeoutException">
+    /// The body's task did not complete within the limit, or it completed but posted callbacks were
+    /// still arriving when the limit elapsed. In the second case a faulted body's exception is the
+    /// inner exception.
+    /// </exception>
     public Task RunAsync(Func<Task> body, TimeSpan? timeout = null)
     {
         ArgumentNullException.ThrowIfNull(body);
@@ -233,7 +246,7 @@ public sealed class ImmediateSynchronizationContext : SynchronizationContext
 
         while (!task.IsCompleted)
         {
-            RunPending();
+            RunPendingUntil(start, limit);
             if (task.IsCompleted)
             {
                 break;
@@ -249,8 +262,32 @@ public sealed class ImmediateSynchronizationContext : SynchronizationContext
             WaitForPending(remaining < _pumpSlice ? remaining : _pumpSlice);
         }
 
-        RunPending();
+        if (!RunPendingUntil(start, limit))
+        {
+            throw new TimeoutException(
+                $"The asynchronous body completed, but posted callbacks were still arriving when the limit of {limit} elapsed; {PendingCount} posted callback(s) are still pending.",
+                task.Exception);
+        }
+
         return task;
+    }
+
+    // Runs queued callbacks like RunPending, but checks the limit after each one, so work that keeps
+    // reposting itself cannot hold a timeout-bearing pump past its deadline. A callback exception
+    // still propagates at once. Returns true when the queue was found empty, and false when the
+    // limit elapsed with callbacks still queued.
+    private bool RunPendingUntil(long start, TimeSpan limit)
+    {
+        while (TryDequeue(out SendOrPostCallback? callback, out object? state))
+        {
+            Execute(callback, state);
+            if (Stopwatch.GetElapsedTime(start) >= limit)
+            {
+                return PendingCount == 0;
+            }
+        }
+
+        return true;
     }
 
     // Runs a callback as the context's own thread would: with Current set to this instance, and
@@ -323,4 +360,3 @@ public sealed class ImmediateSynchronizationContext : SynchronizationContext
         }
     }
 }
-

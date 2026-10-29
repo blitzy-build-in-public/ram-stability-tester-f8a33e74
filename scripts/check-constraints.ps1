@@ -979,4 +979,3 @@ catch {
     Write-Error -Message ('check-constraints: scan failed: {0}' -f $_.Exception.Message) -ErrorAction Continue
     exit 2
 }
-

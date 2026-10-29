@@ -1926,4 +1926,3 @@ public sealed record RunSummarySource
         init => _appName = string.IsNullOrWhiteSpace(value) ? DefaultAppName : value;
     }
 }
-

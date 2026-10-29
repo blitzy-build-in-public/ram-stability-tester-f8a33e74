@@ -551,4 +551,3 @@ public sealed class RunStateMachineTests
         Assert.Empty(changes);
     }
 }
-

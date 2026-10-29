@@ -1,8 +1,10 @@
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using RamQuick.App.Services;
+using RamQuick.App.Tests.Fakes;
 using Xunit;
 
 namespace RamQuick.App.Tests;
@@ -186,16 +188,16 @@ public sealed class HostServiceTests
     };
 
     [Theory]
-    // No wait, Timeout.InfiniteTimeSpan (-1 ms) and a bounded wait.
+    // No wait, Timeout.InfiniteTimeSpan (-1 ms) and a bounded wait. The real wait runs on a dedicated
+    // background thread joined within a deadline: an infinite wait on the test thread would hang the
+    // suite if a regression ever left the name contended, and the bounded join turns that into a
+    // failure. The probe thread disposes its own guard, so ownership is released where it is held.
     [InlineData(0)]
     [InlineData(-1)]
     [InlineData(100)]
     public void TryAcquire_Uncontended_ReturnsGuard(int timeoutMilliseconds)
     {
-        using SingleInstanceGuard? guard =
-            SingleInstanceGuard.TryAcquire(TimeSpan.FromMilliseconds(timeoutMilliseconds), UniqueMutexName());
-
-        Assert.NotNull(guard);
+        Assert.True(AcquiresOnAnotherThread(UniqueMutexName(), TimeSpan.FromMilliseconds(timeoutMilliseconds)));
     }
 
     [Fact]
@@ -376,3 +378,151 @@ public sealed class HostServiceTests
     }
 }
 
+/// <summary>
+/// Tests that the timeout-bearing pumps of <see cref="ImmediateSynchronizationContext"/> keep their
+/// deadlines while posted work never lets the queue empty. Every App, Sensors and integration test
+/// that pumps the fake relies on those deadlines to fail rather than hang. The fake has no test file
+/// of its own, so, like the host services above, its tests live in this file.
+/// </summary>
+/// <remarks>
+/// Each pump runs on a dedicated background thread joined within a bound, so a pump that ignored its
+/// deadline would fail the test instead of hanging the run. On every path the reposting work is then
+/// stopped and its last callback drained on the test thread, so nothing outlives the test.
+/// </remarks>
+public sealed class ImmediateSynchronizationContextTests
+{
+    private static readonly TimeSpan _pumpLimit = TimeSpan.FromMilliseconds(200);
+    private static readonly TimeSpan _pumpJoinTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan _cleanupJoinTimeout = TimeSpan.FromSeconds(5);
+
+    [Fact]
+    public void RunUntil_CallbackKeepsReposting_ReturnsFalseAtTimeout()
+    {
+        var context = new ImmediateSynchronizationContext(queuePosts: true);
+        using var stop = new CancellationTokenSource();
+        int runs = 0;
+        PostSelfReposting(context, stop.Token, () => Interlocked.Increment(ref runs));
+        bool reached = true;
+        TimeSpan elapsed = TimeSpan.Zero;
+        int runsWhilePumping = 0;
+
+        RunPumpOnBoundedThread(context, stop, () =>
+        {
+            long started = Stopwatch.GetTimestamp();
+            reached = context.RunUntil(() => false, _pumpLimit);
+            elapsed = Stopwatch.GetElapsedTime(started);
+            runsWhilePumping = Volatile.Read(ref runs);
+        });
+
+        Assert.False(reached);
+        Assert.True(elapsed >= _pumpLimit, $"RunUntil returned after {elapsed}, before its {_pumpLimit} limit.");
+        Assert.True(runsWhilePumping > 1, $"The reposting callback ran {runsWhilePumping} time(s) while pumping.");
+        Assert.Equal(0, context.PendingCount);
+    }
+
+    [Fact]
+    public void RunAsync_BodyKeepsYielding_ThrowsTimeoutException()
+    {
+        var context = new ImmediateSynchronizationContext(queuePosts: true);
+        using var stop = new CancellationTokenSource();
+        Task? bodyTask = null;
+
+        // RunAsync installs the context, so every Task.Yield continuation is posted back to it.
+        async Task KeepYieldingAsync()
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                await Task.Yield();
+            }
+        }
+
+        Assert.Throws<TimeoutException>(() => RunPumpOnBoundedThread(
+            context,
+            stop,
+            () => _ = context.RunAsync(() => bodyTask = KeepYieldingAsync(), _pumpLimit)));
+
+        Assert.Equal(0, context.PendingCount);
+        Assert.NotNull(bodyTask);
+        Assert.True(bodyTask.IsCompletedSuccessfully, $"The body's task is {bodyTask.Status} after the drain.");
+    }
+
+    [Fact]
+    public void RunAsync_CallbackKeepsRepostingAfterBodyCompletes_ThrowsTimeoutException()
+    {
+        var context = new ImmediateSynchronizationContext(queuePosts: true);
+        using var stop = new CancellationTokenSource();
+
+        // The body completes at once, so only RunAsync's final drain meets the reposting work.
+        Task PostRepostingWorkAsync()
+        {
+            PostSelfReposting(context, stop.Token, () => { });
+            return Task.CompletedTask;
+        }
+
+        Assert.Throws<TimeoutException>(() => RunPumpOnBoundedThread(
+            context,
+            stop,
+            () => _ = context.RunAsync(PostRepostingWorkAsync, _pumpLimit)));
+
+        Assert.Equal(0, context.PendingCount);
+    }
+
+    // Posts a callback that reports each run and posts itself again until stop is cancelled, so the
+    // context's queue never empties while the work goes on.
+    private static void PostSelfReposting(ImmediateSynchronizationContext context, CancellationToken stop, Action onRun)
+    {
+        void RunAndRepost(object? state)
+        {
+            onRun();
+            if (!stop.IsCancellationRequested)
+            {
+                context.Post(RunAndRepost, state);
+            }
+        }
+
+        context.Post(RunAndRepost, null);
+    }
+
+    // Runs the pump on a dedicated background thread and fails, rather than hangs, when it outlives
+    // the bounded join. Whatever the outcome, the reposting work is stopped, the pump is given a
+    // moment to return, and the remnant is drained here; only then does the pump's exception
+    // surface, with its original stack.
+    private static void RunPumpOnBoundedThread(
+        ImmediateSynchronizationContext context,
+        CancellationTokenSource stop,
+        Action pump)
+    {
+        ExceptionDispatchInfo? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                pump();
+            }
+            catch (Exception exception)
+            {
+                failure = ExceptionDispatchInfo.Capture(exception);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = nameof(ImmediateSynchronizationContextTests),
+        };
+
+        thread.Start();
+        try
+        {
+            Assert.True(
+                thread.Join(_pumpJoinTimeout),
+                $"The pump ignored its {_pumpLimit} limit and was still running after {_pumpJoinTimeout}.");
+        }
+        finally
+        {
+            stop.Cancel();
+            thread.Join(_cleanupJoinTimeout);
+            context.RunPending();
+        }
+
+        failure?.Throw();
+    }
+}

@@ -303,4 +303,3 @@ public sealed class AnalysisInput
         return count;
     }
 }
-

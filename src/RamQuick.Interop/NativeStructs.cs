@@ -726,4 +726,3 @@ internal static unsafe class FixedUtf8
         return Encoding.UTF8.GetByteCount(value);
     }
 }
-
