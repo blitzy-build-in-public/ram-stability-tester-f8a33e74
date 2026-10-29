@@ -139,13 +139,18 @@ internal sealed class SafeSessionHandle : SafeHandleZeroOrMinusOneIsInvalid
     /// <summary>
     /// Destroys the native session, then disposes the stop event and frees the GCHandle to the callback state.
     /// </summary>
-    /// <returns><see langword="true"/> when <c>rq_session_destroy</c> returned <c>RQ_OK</c>.</returns>
+    /// <returns>
+    /// <see langword="true"/> when <c>rq_session_destroy</c> returned <c>RQ_OK</c>; <see langword="false"/> when it
+    /// returned another code or could not be called.
+    /// </returns>
     /// <remarks>
     /// <para>
     /// Runs once, from <see cref="SafeHandle.Dispose()"/> or from the critical finalizer, and must neither throw nor
-    /// touch the <c>EngineSession</c>, which may already have been collected. The destroy call itself raises no
-    /// managed exception: it is a <c>noexcept</c> native function with a blittable argument, bound through the same
-    /// engine library that created the session.
+    /// touch the <c>EngineSession</c>, which may already have been collected. <c>rq_session_destroy</c> is
+    /// <c>noexcept</c>, but binding its import on first use can raise a managed exception, for example when the
+    /// engine library that created the session lacks the export. The call is therefore guarded. When it throws,
+    /// destruction is unconfirmed, so the callback state is retained as for a failed destroy and
+    /// <see langword="false"/> is returned.
     /// </para>
     /// <para>
     /// It never runs inside an engine callback: <c>EngineSession.Dispose</c> throws while
@@ -155,7 +160,18 @@ internal sealed class SafeSessionHandle : SafeHandleZeroOrMinusOneIsInvalid
     /// </remarks>
     protected override bool ReleaseHandle()
     {
-        int result = NativeMethods.RqSessionDestroy(handle);
+        int result;
+        try
+        {
+            result = NativeMethods.RqSessionDestroy(handle);
+        }
+        catch (Exception)
+        {
+            // Nothing can be reported from a finalizer, and an exception escaping here would terminate the process.
+            // Destruction is unconfirmed, so the native session may still be alive and calling back with user_data:
+            // the callback state stays rooted, as after a failed destroy.
+            return false;
+        }
 
         // Any other result may leave a live native session that still calls back with user_data, or a step gate still
         // waiting on the stop event. The callback state then stays rooted, a small leak, rather than freed under them.
