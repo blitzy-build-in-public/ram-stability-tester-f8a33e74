@@ -686,6 +686,7 @@ typedef struct rq_error_record {
 } rq_error_record;
 
 RQ_STATIC_ASSERT(sizeof(rq_error_record) == 112, "rq_error_record must be 112 bytes");
+RQ_STATIC_ASSERT(offsetof(rq_error_record, sequence) == 0, "rq_error_record.sequence offset");
 RQ_STATIC_ASSERT(offsetof(rq_error_record, address) == 8, "rq_error_record.address offset");
 RQ_STATIC_ASSERT(offsetof(rq_error_record, region_offset) == 16,
                  "rq_error_record.region_offset offset");
