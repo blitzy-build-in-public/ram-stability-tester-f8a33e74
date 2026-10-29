@@ -291,6 +291,13 @@ public static class UiText
         "RAMQuick cannot save its progress journal and logs. Move it to a writable folder and try again.";
 
     /// <summary>
+    /// The error filled into <see cref="JournalWriteFailed"/> when a progress journal record was not
+    /// confirmed as durable within its 5-second bound. A timed-out write carries no error message of its
+    /// own, unlike a write that failed.
+    /// </summary>
+    public const string JournalAcknowledgmentTimedOut = "a record was not confirmed as saved within 5 seconds";
+
+    /// <summary>
     /// The result reason of a run the user stopped.
     /// </summary>
     public const string StoppedByUser = "Stopped by user";
