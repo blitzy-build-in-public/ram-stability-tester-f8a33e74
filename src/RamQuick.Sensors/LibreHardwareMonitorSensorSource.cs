@@ -73,6 +73,18 @@ public sealed class LibreHardwareMonitorSensorSource : ISensorSource
     private readonly TimeProvider _timeProvider;
 
     /// <summary>
+    /// The access decision <see cref="Open"/> makes before any library or driver access:
+    /// <see langword="null"/> grants access, any other status is what both readings report instead.
+    /// </summary>
+    private readonly Func<SensorStatus?> _checkAccess;
+
+    /// <summary>
+    /// Creates the configured but unopened library session that <see cref="Open"/> opens once access
+    /// is granted.
+    /// </summary>
+    private readonly Func<Computer> _createComputer;
+
+    /// <summary>
     /// The opened library session; <see langword="null"/> before <see cref="Open"/>, when access was
     /// denied or opening failed, and after <see cref="Dispose"/>.
     /// </summary>
@@ -94,8 +106,35 @@ public sealed class LibreHardwareMonitorSensorSource : ISensorSource
     /// the sensor monitor judges freshness with. Defaults to <see cref="TimeProvider.System"/>.
     /// </param>
     public LibreHardwareMonitorSensorSource(TimeProvider? timeProvider = null)
+        : this(timeProvider, CheckAccess, CreateComputer)
     {
+    }
+
+    /// <summary>
+    /// Creates a source over a substitute access check and library factory, so tests can observe and
+    /// script every initialization attempt <see cref="Open"/> makes without elevation or a driver.
+    /// </summary>
+    /// <param name="timeProvider">
+    /// The clock that stamps every reading's <see cref="SensorValue.CapturedAt"/>. Defaults to
+    /// <see cref="TimeProvider.System"/>.
+    /// </param>
+    /// <param name="checkAccess">
+    /// Returns <see langword="null"/> when the library may be opened, otherwise the status both
+    /// readings report: a defined status other than <see cref="SensorStatus.Available"/>.
+    /// </param>
+    /// <param name="createComputer">
+    /// Returns the configured library session, not yet opened; <see cref="Open"/> opens it.
+    /// </param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="checkAccess"/> or <paramref name="createComputer"/> is <see langword="null"/>.
+    /// </exception>
+    internal LibreHardwareMonitorSensorSource(TimeProvider? timeProvider, Func<SensorStatus?> checkAccess, Func<Computer> createComputer)
+    {
+        ArgumentNullException.ThrowIfNull(checkAccess);
+        ArgumentNullException.ThrowIfNull(createComputer);
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _checkAccess = checkAccess;
+        _createComputer = createComputer;
     }
 
     /// <summary>
@@ -118,7 +157,7 @@ public sealed class LibreHardwareMonitorSensorSource : ISensorSource
 
         _openAttempted = true;
 
-        if (ResolveAccess(IsProcessElevated(), IsPawnIoInstalled()) is { } deniedStatus)
+        if (CheckAccessOrDeny() is { } deniedStatus)
         {
             _unavailableStatus = deniedStatus;
             return;
@@ -127,19 +166,7 @@ public sealed class LibreHardwareMonitorSensorSource : ISensorSource
         Computer? computer = null;
         try
         {
-            computer = new Computer
-            {
-                IsCpuEnabled = true,
-                IsMemoryEnabled = true,
-                IsBatteryEnabled = false,
-                IsControllerEnabled = false,
-                IsGpuEnabled = false,
-                IsMotherboardEnabled = false,
-                IsNetworkEnabled = false,
-                IsPowerMonitorEnabled = false,
-                IsPsuEnabled = false,
-                IsStorageEnabled = false,
-            };
+            computer = _createComputer();
             computer.Open();
         }
         catch (Exception)
@@ -413,6 +440,55 @@ public sealed class LibreHardwareMonitorSensorSource : ISensorSource
         }
     }
 
+    /// <summary>
+    /// Runs the access check without letting it throw.
+    /// </summary>
+    /// <remarks>
+    /// A check that throws, or that answers with a status no unavailable reading can carry, has not
+    /// established access. It is therefore treated as denied, as the production checks treat a failed
+    /// elevation or PawnIO query, so the driver path stays closed and <see cref="Read"/> never throws.
+    /// </remarks>
+    /// <returns>
+    /// <see langword="null"/> when the library may be opened; otherwise the status both readings report.
+    /// </returns>
+    private SensorStatus? CheckAccessOrDeny()
+    {
+        try
+        {
+            SensorStatus? answer = _checkAccess();
+            return answer is SensorStatus status && (status == SensorStatus.Available || !Enum.IsDefined(status))
+                ? SensorStatus.DriverUnavailable
+                : answer;
+        }
+        catch (Exception)
+        {
+            return SensorStatus.DriverUnavailable;
+        }
+    }
+
+    /// <summary>
+    /// The production access check: the process must be elevated and PawnIO installed.
+    /// </summary>
+    private static SensorStatus? CheckAccess() => ResolveAccess(IsProcessElevated(), IsPawnIoInstalled());
+
+    /// <summary>
+    /// The production library session, not yet opened: the CPU and memory groups only, so no other
+    /// hardware is probed.
+    /// </summary>
+    private static Computer CreateComputer() => new()
+    {
+        IsCpuEnabled = true,
+        IsMemoryEnabled = true,
+        IsBatteryEnabled = false,
+        IsControllerEnabled = false,
+        IsGpuEnabled = false,
+        IsMotherboardEnabled = false,
+        IsNetworkEnabled = false,
+        IsPowerMonitorEnabled = false,
+        IsPsuEnabled = false,
+        IsStorageEnabled = false,
+    };
+
     private static bool IsProcessElevated()
     {
         try
@@ -442,4 +518,3 @@ public sealed class LibreHardwareMonitorSensorSource : ISensorSource
         }
     }
 }
-

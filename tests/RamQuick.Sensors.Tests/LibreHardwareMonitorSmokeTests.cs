@@ -12,20 +12,17 @@ namespace RamQuick.Sensors.Tests;
 /// </summary>
 /// <remarks>
 /// It runs wherever its preconditions hold and reports Skipped elsewhere: an elevated process, a PawnIO
-/// driver the user installed, and at least one CPU or DIMM temperature sensor. It never installs, starts
-/// or prompts for a driver or service and never writes the registry; a missing driver is detected only
-/// through the status the source reports. The observed readings go to the test output, so a run on the
-/// validation PC records which sensors read. Select it with the trait filter <c>Requires=Hardware</c>.
+/// driver the user installed, and at least one CPU or DIMM temperature sensor. Only those missing
+/// prerequisites skip it; a Failed, Stale or Hung reading, or a sensor that stops reading on the second
+/// read, fails it, by the verdicts <see cref="LibreHardwareMonitorSmokeCheckTests"/> pins down without
+/// hardware. It never installs, starts or prompts for a driver or service and never writes the registry;
+/// a missing driver is detected only through the status the source reports. The observed readings go to
+/// the test output, so a run on the validation PC records which sensors read. Select it with the trait
+/// filter <c>Requires=Hardware</c>.
 /// </remarks>
 [Trait("Requires", "Hardware")]
 public sealed class LibreHardwareMonitorSmokeTests
 {
-    // Wide windows: they catch a unit or sensor-selection mistake, such as a raw register value or a
-    // zero placeholder, not a hot machine.
-    private const double MinPlausibleCelsius = 5.0;
-    private const double MaxPlausibleCpuCelsius = 110.0;
-    private const double MaxPlausibleRamCelsius = 100.0;
-
     private static readonly TimeSpan _secondReadDelay = TimeSpan.FromSeconds(1);
 
     [Fact]
@@ -39,11 +36,12 @@ public sealed class LibreHardwareMonitorSmokeTests
         SensorReadings first = source.Read();
         Report("First read", first);
 
-        Assert.SkipWhen(
-            first.Cpu.Status == SensorStatus.DriverUnavailable && first.Ram.Status == SensorStatus.DriverUnavailable,
-            "PawnIO driver not installed.");
-        Assert.SkipWhen(!first.Cpu.IsAvailable && !first.Ram.IsAvailable, "No temperature sensor reads on this machine.");
-        AssertPlausible(first);
+        if (SmokeReadingsCheck.SkipReason(first) is { } skipReason)
+        {
+            Assert.Skip(skipReason);
+        }
+
+        AssertNoProblems("First read", SmokeReadingsCheck.FirstReadProblems(first));
 
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
         _ = cancellationToken.WaitHandle.WaitOne(_secondReadDelay);
@@ -52,35 +50,20 @@ public sealed class LibreHardwareMonitorSmokeTests
         SensorReadings second = source.Read();
         Report("Second read", second);
 
-        AssertPlausible(second);
-        Assert.True(
-            second.Cpu.CapturedAt >= first.Cpu.CapturedAt,
-            $"The second CPU reading was captured at {second.Cpu.CapturedAt:O}, before the first at {first.Cpu.CapturedAt:O}.");
-        Assert.True(
-            second.Ram.CapturedAt >= first.Ram.CapturedAt,
-            $"The second RAM reading was captured at {second.Ram.CapturedAt:O}, before the first at {first.Ram.CapturedAt:O}.");
+        AssertNoProblems("Second read", SmokeReadingsCheck.SecondReadProblems(first, second));
     }
 
-    private static void AssertPlausible(SensorReadings readings)
+    private static void AssertNoProblems(string label, IReadOnlyList<string> problems)
     {
-        if (readings.Cpu.Celsius is double cpuCelsius)
+        if (problems.Count > 0)
         {
-            Assert.InRange(cpuCelsius, MinPlausibleCelsius, MaxPlausibleCpuCelsius);
-        }
-
-        if (readings.Ram.Celsius is double ramCelsius)
-        {
-            Assert.InRange(ramCelsius, MinPlausibleCelsius, MaxPlausibleRamCelsius);
+            Assert.Fail($"{label}: {string.Join(" ", problems)}");
         }
     }
 
     private static void Report(string label, SensorReadings readings) =>
-        TestContext.Current.TestOutputHelper?.WriteLine($"{label}: CPU {Describe(readings.Cpu)}; RAM {Describe(readings.Ram)}");
-
-    private static string Describe(SensorValue value) =>
-        value.Celsius is double celsius
-            ? FormattableString.Invariant($"{celsius:F1} °C ({value.Status}, captured {value.CapturedAt:O})")
-            : FormattableString.Invariant($"N/A ({value.Status}, captured {value.CapturedAt:O})");
+        TestContext.Current.TestOutputHelper?.WriteLine(
+            $"{label}: CPU {SmokeReadingsCheck.Describe(readings.Cpu)}; RAM {SmokeReadingsCheck.Describe(readings.Ram)}");
 }
 
 /// <summary>
@@ -240,6 +223,78 @@ public sealed class LibreHardwareMonitorSelectionTests
         Assert.Equal(
             Available(40.0),
             LibreHardwareMonitorSensorSource.SelectRam([ignored, DimmTemperature("DIMM #2", 40.0f)], _now));
+    }
+
+    // A high reading must reach the thermal limits unchanged, so the sample enters through a library
+    // sensor double and UpdateAndCollect: a drop or clamp anywhere between ISensor.Value and the verdict
+    // fails the exact-value assertions. The trip is stated as data rather than recomputed from the
+    // limit, so a threshold mistake cannot hide behind the comparison under test. 94.9f widens to about
+    // 94.9000015 and 94.99999f is the largest float below 95 (one ulp, about 7.6e-6, under it), so the
+    // inclusive limit holds at the sensor's own resolution; float.MaxValue is the hottest finite reading,
+    // the one any plausibility ceiling would cut.
+    [Theory]
+    [InlineData("CPU Package", 94.9f, false)]
+    [InlineData("CPU Package", 94.99999f, false)]
+    [InlineData("CPU Package", 95.0f, true)]
+    [InlineData("CPU Package", 95.5f, true)]
+    [InlineData("CPU Package", 125.0f, true)]
+    [InlineData("CPU Package", float.MaxValue, true)]
+    [InlineData("Core (Tctl/Tdie)", 94.9f, false)]
+    [InlineData("Core (Tctl/Tdie)", 94.99999f, false)]
+    [InlineData("Core (Tctl/Tdie)", 95.0f, true)]
+    [InlineData("Core (Tctl/Tdie)", 95.5f, true)]
+    [InlineData("Core (Tctl/Tdie)", 125.0f, true)]
+    [InlineData("Core (Tctl/Tdie)", float.MaxValue, true)]
+    public void SelectCpu_PreferredSensorNearOrAboveThermalLimit_PassesValueUnchangedToThermalLimits(
+        string sensorName,
+        float celsius,
+        bool expectedTrip)
+    {
+        HardwareDouble cpu = HardwareDouble.Create(
+            HardwareType.Cpu,
+            [SensorDouble.Create(sensorName, SensorType.Temperature, celsius)]);
+
+        SensorValue selected = LibreHardwareMonitorSensorSource.SelectCpu(
+            LibreHardwareMonitorSensorSource.UpdateAndCollect([cpu.Hardware]),
+            _now);
+
+        ThermalVerdict? expectedVerdict = expectedTrip
+            ? new ThermalVerdict(ThermalSensor.Cpu, celsius, ThermalLimits.CpuLimitCelsius)
+            : null;
+        Assert.Equal(Available(celsius), selected);
+        Assert.Equal(expectedVerdict, ThermalLimits.Evaluate(new SensorReadings(selected, Unavailable(SensorStatus.NoSensor))));
+    }
+
+    // The RAM mirror of the CPU boundary cases at 85 °C, with 84.99999f the largest float below 85. The
+    // hot DIMM sits between cooler ones, so the maximum must keep it wherever it falls in update order.
+    [Theory]
+    [InlineData(84.9f, false)]
+    [InlineData(84.99999f, false)]
+    [InlineData(85.0f, true)]
+    [InlineData(85.5f, true)]
+    [InlineData(120.0f, true)]
+    [InlineData(float.MaxValue, true)]
+    public void SelectRam_HottestDimmNearOrAboveThermalLimit_PassesValueUnchangedToThermalLimits(
+        float celsius,
+        bool expectedTrip)
+    {
+        HardwareDouble memory = HardwareDouble.Create(
+            HardwareType.Memory,
+            [
+                SensorDouble.Create("DIMM #1", SensorType.Temperature, 40.0f),
+                SensorDouble.Create("DIMM #2", SensorType.Temperature, celsius),
+                SensorDouble.Create("DIMM #3", SensorType.Temperature, 45.0f),
+            ]);
+
+        SensorValue selected = LibreHardwareMonitorSensorSource.SelectRam(
+            LibreHardwareMonitorSensorSource.UpdateAndCollect([memory.Hardware]),
+            _now);
+
+        ThermalVerdict? expectedVerdict = expectedTrip
+            ? new ThermalVerdict(ThermalSensor.Ram, celsius, ThermalLimits.RamLimitCelsius)
+            : null;
+        Assert.Equal(Available(celsius), selected);
+        Assert.Equal(expectedVerdict, ThermalLimits.Evaluate(new SensorReadings(Unavailable(SensorStatus.NoSensor), selected)));
     }
 
     [Theory]
@@ -406,20 +461,99 @@ public sealed class LibreHardwareMonitorSelectionTests
         Assert.Null(exception);
     }
 
-    // On an elevated machine an effective Open would report DriverUnavailable or real readings, so
-    // Failed shows that Open did nothing; the capture time is the injected clock's at the Read.
+    // The spy proves Open made no initialization attempt: neither the access check nor the library
+    // construction ran. The Failed read alone could not show it, because a construction or library Open
+    // that throws reports Failed too. The capture time is the injected clock's at the Read.
     [Fact]
     public void Open_AfterDispose_HasNoEffectAndReadReportsFailed()
     {
         var time = new FakeTimeProvider(_now);
-        var source = new LibreHardwareMonitorSensorSource(time);
+        var spy = new InitializationSpy(accessAnswer: null, accessCheckThrows: false);
+        LibreHardwareMonitorSensorSource source = spy.CreateSource(time);
         source.Dispose();
         time.Advance(TimeSpan.FromSeconds(2));
 
         source.Open();
         SensorReadings readings = source.Read();
 
+        Assert.Equal(0, spy.AccessCheckCount);
+        Assert.Equal(0, spy.CreateCount);
         Assert.Equal(SensorReadings.Unavailable(SensorStatus.Failed, _now.AddSeconds(2)), readings);
+    }
+
+    // The positive control for the after-Dispose case: the same spy counts the attempts of an Open on a
+    // live source, so its zero counts there are not vacuous. Granted access reaches the factory, whose
+    // failure reads as Failed: the ambiguity the spy resolves. A check that denies, throws or answers
+    // Available never reaches the factory. Only the first Open has an effect.
+    [Theory]
+    [InlineData(null, false, 1, SensorStatus.Failed)]
+    [InlineData(SensorStatus.DriverUnavailable, false, 0, SensorStatus.DriverUnavailable)]
+    [InlineData(null, true, 0, SensorStatus.DriverUnavailable)]
+    [InlineData(SensorStatus.Available, false, 0, SensorStatus.DriverUnavailable)]
+    public void Open_AccessCheckOutcome_ChecksOnceAndCreatesComputerOnlyWhenGranted(
+        SensorStatus? accessAnswer,
+        bool accessCheckThrows,
+        int expectedCreateCount,
+        SensorStatus expectedStatus)
+    {
+        var spy = new InitializationSpy(accessAnswer, accessCheckThrows);
+        using LibreHardwareMonitorSensorSource source = spy.CreateSource(new FakeTimeProvider(_now));
+
+        source.Open();
+        Assert.Equal(1, spy.AccessCheckCount);
+        Assert.Equal(expectedCreateCount, spy.CreateCount);
+
+        source.Open();
+        SensorReadings readings = source.Read();
+
+        Assert.Equal(1, spy.AccessCheckCount);
+        Assert.Equal(expectedCreateCount, spy.CreateCount);
+        Assert.Equal(SensorReadings.Unavailable(expectedStatus, _now), readings);
+    }
+
+    [Fact]
+    public void Constructor_NullInitializationDelegate_ThrowsArgumentNullException()
+    {
+        var spy = new InitializationSpy(accessAnswer: null, accessCheckThrows: false);
+
+        Assert.Throws<ArgumentNullException>("checkAccess", () => new LibreHardwareMonitorSensorSource(null, null!, spy.CreateComputer));
+        Assert.Throws<ArgumentNullException>("createComputer", () => new LibreHardwareMonitorSensorSource(null, spy.CheckAccess, null!));
+    }
+
+    /// <summary>
+    /// Counts the initialization attempts of a source's Open: its access checks and its library
+    /// constructions. The construction always throws, so no test creates a real <see cref="Computer"/>
+    /// or reaches the driver.
+    /// </summary>
+    private sealed class InitializationSpy
+    {
+        private readonly SensorStatus? _accessAnswer;
+        private readonly bool _accessCheckThrows;
+
+        public InitializationSpy(SensorStatus? accessAnswer, bool accessCheckThrows)
+        {
+            _accessAnswer = accessAnswer;
+            _accessCheckThrows = accessCheckThrows;
+        }
+
+        public int AccessCheckCount { get; private set; }
+
+        public int CreateCount { get; private set; }
+
+        public LibreHardwareMonitorSensorSource CreateSource(TimeProvider timeProvider) =>
+            new(timeProvider, CheckAccess, CreateComputer);
+
+        public SensorStatus? CheckAccess()
+        {
+            AccessCheckCount++;
+            return _accessCheckThrows ? throw new InvalidOperationException("Scripted access-check failure.") : _accessAnswer;
+        }
+
+        public Computer CreateComputer()
+        {
+            CreateCount++;
+            throw new InvalidOperationException("Scripted library construction failure.");
+        }
     }
 
     private static SensorSample CpuTemperature(string sensorName, float? celsius) =>
@@ -434,6 +568,278 @@ public sealed class LibreHardwareMonitorSelectionTests
 
     private static SensorValue Expected(SensorStatus status, double? celsius) =>
         celsius is double value ? Available(value) : Unavailable(status);
+}
+
+/// <summary>
+/// The smoke test's verdicts on the real source's readings: which first read shows a missing
+/// prerequisite and skips, and which readings break the source's contract and fail the test.
+/// </summary>
+/// <remarks>
+/// Pure, so <see cref="LibreHardwareMonitorSmokeCheckTests"/> proves on any machine, without a driver,
+/// that a failing library can neither pass for missing hardware nor pass a read.
+/// </remarks>
+file static class SmokeReadingsCheck
+{
+    // Wide windows: they catch a unit or sensor-selection mistake, such as a raw register value or a
+    // zero placeholder, not a hot machine.
+    public const double MinPlausibleCelsius = 5.0;
+    public const double MaxPlausibleCpuCelsius = 110.0;
+    public const double MaxPlausibleRamCelsius = 100.0;
+
+    /// <summary>
+    /// The reason to skip when both readings of the first read show the same missing prerequisite;
+    /// otherwise <see langword="null"/>.
+    /// </summary>
+    /// <remarks>
+    /// The source reports DriverUnavailable for both readings when PawnIO is absent, and NoSensor where
+    /// access works but the machine has no matching sensor. Failed, Stale and Hung come from a failing
+    /// library or adapter, and a lone DriverUnavailable contradicts the source's all-or-nothing access
+    /// check, so none of them may pass for missing hardware.
+    /// </remarks>
+    public static string? SkipReason(SensorReadings first) =>
+        (first.Cpu.Status, first.Ram.Status) switch
+        {
+            (SensorStatus.DriverUnavailable, SensorStatus.DriverUnavailable) => "PawnIO driver not installed.",
+            (SensorStatus.NoSensor, SensorStatus.NoSensor) => "No temperature sensor reads on this machine.",
+            _ => null,
+        };
+
+    /// <summary>
+    /// The problems of a first read that <see cref="SkipReason"/> did not skip: each reading must be
+    /// Available with a plausible temperature, or NoSensor.
+    /// </summary>
+    public static IReadOnlyList<string> FirstReadProblems(SensorReadings first)
+    {
+        var problems = new List<string>();
+        AddReadingProblems(problems, "CPU", first.Cpu, MaxPlausibleCpuCelsius);
+        AddReadingProblems(problems, "RAM", first.Ram, MaxPlausibleRamCelsius);
+        return problems;
+    }
+
+    /// <summary>
+    /// The problems of the second read: a reading Available in the first read must still be Available
+    /// and plausible, any other must be Available and plausible or NoSensor, and no reading may be
+    /// captured before the first read's.
+    /// </summary>
+    public static IReadOnlyList<string> SecondReadProblems(SensorReadings first, SensorReadings second)
+    {
+        var problems = new List<string>();
+        AddSecondReadProblems(problems, "CPU", first.Cpu, second.Cpu, MaxPlausibleCpuCelsius);
+        AddSecondReadProblems(problems, "RAM", first.Ram, second.Ram, MaxPlausibleRamCelsius);
+        return problems;
+    }
+
+    /// <summary>
+    /// The temperature or N/A, the status and the capture time of a reading, for the test output and
+    /// for problem messages.
+    /// </summary>
+    public static string Describe(SensorValue value) =>
+        value.Celsius is double celsius
+            ? FormattableString.Invariant($"{celsius:F1} °C ({value.Status}, captured {value.CapturedAt:O})")
+            : FormattableString.Invariant($"N/A ({value.Status}, captured {value.CapturedAt:O})");
+
+    private static void AddReadingProblems(List<string> problems, string sensor, SensorValue value, double maxPlausibleCelsius)
+    {
+        // Only an Available value carries a temperature.
+        if (value.Celsius is double celsius)
+        {
+            if (celsius < MinPlausibleCelsius || celsius > maxPlausibleCelsius)
+            {
+                problems.Add(FormattableString.Invariant(
+                    $"{sensor} reading {Describe(value)} is outside the plausible range {MinPlausibleCelsius:F1} to {maxPlausibleCelsius:F1} °C."));
+            }
+        }
+        else if (value.Status != SensorStatus.NoSensor)
+        {
+            problems.Add($"{sensor} reading {Describe(value)} is neither Available nor NoSensor.");
+        }
+    }
+
+    private static void AddSecondReadProblems(
+        List<string> problems,
+        string sensor,
+        SensorValue first,
+        SensorValue second,
+        double maxPlausibleCelsius)
+    {
+        // A sensor that read once and then stops is a library or adapter failure, NoSensor included:
+        // the hardware has not gone anywhere between two reads a second apart.
+        if (first.IsAvailable && !second.IsAvailable)
+        {
+            problems.Add($"{sensor} reading {Describe(second)} is no longer Available after the first read's {Describe(first)}.");
+        }
+        else
+        {
+            AddReadingProblems(problems, sensor, second, maxPlausibleCelsius);
+        }
+
+        if (second.CapturedAt < first.CapturedAt)
+        {
+            problems.Add(FormattableString.Invariant(
+                $"{sensor} reading {Describe(second)} was captured before the first read's {first.CapturedAt:O}."));
+        }
+    }
+}
+
+/// <summary>
+/// Hardware-free tests of the smoke test's verdicts on controlled readings: only a missing prerequisite
+/// skips, and a failing library fails the smoke test rather than skipping or passing it.
+/// </summary>
+/// <remarks>
+/// Untagged, unlike <see cref="LibreHardwareMonitorSmokeTests"/>, so these run on every machine,
+/// including those without elevation or PawnIO where the smoke test itself skips.
+/// </remarks>
+public sealed class LibreHardwareMonitorSmokeCheckTests
+{
+    private static readonly DateTimeOffset _firstReadAt = new(2026, 10, 28, 14, 0, 0, TimeSpan.Zero);
+    private static readonly DateTimeOffset _secondReadAt = _firstReadAt.AddSeconds(1);
+
+    [Theory]
+    [InlineData(SensorStatus.DriverUnavailable, "PawnIO driver not installed.")]
+    [InlineData(SensorStatus.NoSensor, "No temperature sensor reads on this machine.")]
+    public void SkipReason_BothReadingsShowMissingPrerequisite_ReturnsThatPrerequisite(SensorStatus status, string expectedReason)
+    {
+        Assert.Equal(expectedReason, SmokeReadingsCheck.SkipReason(SensorReadings.Unavailable(status, _firstReadAt)));
+    }
+
+    // Failed on both sensors is what a library that fails to open or update returns; it must fail the
+    // smoke test, not skip it as missing hardware.
+    [Theory]
+    [InlineData(SensorStatus.Failed, null, SensorStatus.Failed, null, true, true)]
+    [InlineData(SensorStatus.Stale, null, SensorStatus.Stale, null, true, true)]
+    [InlineData(SensorStatus.Hung, null, SensorStatus.Hung, null, true, true)]
+    [InlineData(SensorStatus.DriverUnavailable, null, SensorStatus.Failed, null, true, true)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.Failed, null, false, true)]
+    [InlineData(SensorStatus.Failed, null, SensorStatus.Available, 40.0, true, false)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.Stale, null, false, true)]
+    [InlineData(SensorStatus.Hung, null, SensorStatus.Available, 40.0, true, false)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.DriverUnavailable, null, false, true)]
+    [InlineData(SensorStatus.DriverUnavailable, null, SensorStatus.NoSensor, null, true, false)]
+    [InlineData(SensorStatus.NoSensor, null, SensorStatus.Failed, null, false, true)]
+    [InlineData(SensorStatus.Available, 4.9, SensorStatus.NoSensor, null, true, false)]
+    [InlineData(SensorStatus.Available, 110.1, SensorStatus.Available, 40.0, true, false)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.Available, 4.9, false, true)]
+    [InlineData(SensorStatus.NoSensor, null, SensorStatus.Available, 100.1, false, true)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.NoSensor, null, false, false)]
+    [InlineData(SensorStatus.NoSensor, null, SensorStatus.Available, 40.0, false, false)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.Available, 40.0, false, false)]
+    [InlineData(SensorStatus.Available, 5.0, SensorStatus.Available, 100.0, false, false)]
+    [InlineData(SensorStatus.Available, 110.0, SensorStatus.Available, 5.0, false, false)]
+    public void FirstRead_NoMissingPrerequisite_IsNotSkippedAndFlagsEachUnexpectedReading(
+        SensorStatus cpuStatus,
+        double? cpuCelsius,
+        SensorStatus ramStatus,
+        double? ramCelsius,
+        bool cpuProblemExpected,
+        bool ramProblemExpected)
+    {
+        var first = new SensorReadings(Reading(cpuStatus, cpuCelsius, _firstReadAt), Reading(ramStatus, ramCelsius, _firstReadAt));
+
+        Assert.Null(SmokeReadingsCheck.SkipReason(first));
+        AssertProblems(SmokeReadingsCheck.FirstReadProblems(first), first, cpuProblemExpected, ramProblemExpected);
+    }
+
+    // The first case is the one that used to pass: both sensors stop reading after a good first read.
+    [Theory]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.Available, 40.0, SensorStatus.Failed, null, SensorStatus.Failed, null, true, true)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.Available, 40.0, SensorStatus.Failed, null, SensorStatus.Available, 41.0, true, false)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.Available, 40.0, SensorStatus.Available, 51.0, SensorStatus.Failed, null, false, true)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.Available, 40.0, SensorStatus.Stale, null, SensorStatus.Hung, null, true, true)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.Available, 40.0, SensorStatus.NoSensor, null, SensorStatus.Available, 41.0, true, false)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.Available, 40.0, SensorStatus.Available, 51.0, SensorStatus.DriverUnavailable, null, false, true)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.Available, 40.0, SensorStatus.Available, 110.1, SensorStatus.Available, 41.0, true, false)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.Available, 40.0, SensorStatus.Available, 51.0, SensorStatus.Available, 4.9, false, true)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.NoSensor, null, SensorStatus.Available, 51.0, SensorStatus.Failed, null, false, true)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.Available, 40.0, SensorStatus.Available, 51.0, SensorStatus.Available, 41.0, false, false)]
+    [InlineData(SensorStatus.Available, 50.0, SensorStatus.NoSensor, null, SensorStatus.Available, 51.0, SensorStatus.NoSensor, null, false, false)]
+    [InlineData(SensorStatus.NoSensor, null, SensorStatus.Available, 40.0, SensorStatus.NoSensor, null, SensorStatus.Available, 41.0, false, false)]
+    [InlineData(SensorStatus.NoSensor, null, SensorStatus.Available, 40.0, SensorStatus.Available, 52.0, SensorStatus.Available, 41.0, false, false)]
+    public void SecondRead_AfterAcceptedFirstRead_FlagsEachReadingThatStoppedOrIsImplausible(
+        SensorStatus firstCpuStatus,
+        double? firstCpuCelsius,
+        SensorStatus firstRamStatus,
+        double? firstRamCelsius,
+        SensorStatus secondCpuStatus,
+        double? secondCpuCelsius,
+        SensorStatus secondRamStatus,
+        double? secondRamCelsius,
+        bool cpuProblemExpected,
+        bool ramProblemExpected)
+    {
+        var first = new SensorReadings(
+            Reading(firstCpuStatus, firstCpuCelsius, _firstReadAt),
+            Reading(firstRamStatus, firstRamCelsius, _firstReadAt));
+        var second = new SensorReadings(
+            Reading(secondCpuStatus, secondCpuCelsius, _secondReadAt),
+            Reading(secondRamStatus, secondRamCelsius, _secondReadAt));
+
+        AssertProblems(SmokeReadingsCheck.SecondReadProblems(first, second), second, cpuProblemExpected, ramProblemExpected);
+    }
+
+    // An equal capture time is accepted: a coarse clock can stamp two reads a second apart alike.
+    [Theory]
+    [InlineData(-1, 1000, true, false)]
+    [InlineData(1000, -1, false, true)]
+    [InlineData(-1000, -1000, true, true)]
+    [InlineData(0, 0, false, false)]
+    public void SecondRead_CaptureTimeRelativeToFirstRead_FlagsEachEarlierReading(
+        int cpuOffsetMilliseconds,
+        int ramOffsetMilliseconds,
+        bool cpuProblemExpected,
+        bool ramProblemExpected)
+    {
+        var first = new SensorReadings(SensorValue.Available(50.0, _firstReadAt), SensorValue.Available(40.0, _firstReadAt));
+        var second = new SensorReadings(
+            SensorValue.Available(51.0, _firstReadAt.AddMilliseconds(cpuOffsetMilliseconds)),
+            SensorValue.Available(41.0, _firstReadAt.AddMilliseconds(ramOffsetMilliseconds)));
+
+        IReadOnlyList<string> problems = SmokeReadingsCheck.SecondReadProblems(first, second);
+
+        AssertProblems(problems, second, cpuProblemExpected, ramProblemExpected);
+        Assert.All(problems, problem => Assert.Contains(FormattableString.Invariant($"{_firstReadAt:O}"), problem, StringComparison.Ordinal));
+    }
+
+    private static SensorValue Reading(SensorStatus status, double? celsius, DateTimeOffset capturedAt)
+    {
+        // A temperature exactly when Available, as SensorValue holds; a case scripting otherwise is malformed.
+        if (status != SensorStatus.Available)
+        {
+            Assert.Null(celsius);
+            return SensorValue.Unavailable(status, capturedAt);
+        }
+
+        return SensorValue.Available(Assert.NotNull(celsius), capturedAt);
+    }
+
+    private static void AssertProblems(
+        IReadOnlyList<string> problems,
+        SensorReadings flagged,
+        bool cpuProblemExpected,
+        bool ramProblemExpected)
+    {
+        AssertSensorProblem(problems, "CPU", flagged.Cpu, cpuProblemExpected);
+        AssertSensorProblem(problems, "RAM", flagged.Ram, ramProblemExpected);
+        Assert.Equal((cpuProblemExpected ? 1 : 0) + (ramProblemExpected ? 1 : 0), problems.Count);
+    }
+
+    // A problem names its sensor, status and value, so a failed smoke run is diagnosable from its
+    // message alone.
+    private static void AssertSensorProblem(IReadOnlyList<string> problems, string sensor, SensorValue value, bool problemExpected)
+    {
+        List<string> sensorProblems = problems.Where(problem => problem.StartsWith(sensor + " ", StringComparison.Ordinal)).ToList();
+        if (!problemExpected)
+        {
+            Assert.Empty(sensorProblems);
+            return;
+        }
+
+        string problem = Assert.Single(sensorProblems);
+        Assert.Contains($"({value.Status}, captured", problem, StringComparison.Ordinal);
+        Assert.Contains(
+            value.Celsius is double celsius ? FormattableString.Invariant($"{celsius:F1} °C") : "N/A",
+            problem,
+            StringComparison.Ordinal);
+    }
 }
 
 /// <summary>
@@ -546,4 +952,3 @@ file class SensorDouble : DispatchProxy
             _ => throw new NotSupportedException($"The sensor source is not expected to use ISensor.{targetMethod?.Name}."),
         };
 }
-

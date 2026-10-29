@@ -479,4 +479,3 @@ internal sealed record SmbiosMemoryDevice(
     ulong? SizeBytes,
     byte MemoryTypeCode,
     int? ConfiguredSpeedMTs);
-
