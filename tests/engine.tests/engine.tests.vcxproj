@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    engine.tests: the GoogleTest executable for the native engine. It links engine_core.lib
+    directly and compiles the production api\api.cpp, so tests drive the real rq_* functions as
+    well as the engine internals, substituting IMemoryAccess, IClock and the worker pool's
+    affinity seam through the layers under fakes\. test_dll\test_exports.cpp is not compiled
+    here: it belongs only to ramquick_engine_test.dll. gtest_main supplies main().
+    GoogleTest comes from the root vcpkg.json in manifest mode, built for x64-windows-static so
+    that it uses the static CRT (/MT, /MTd) like engine.props; the default x64-windows triplet
+    links the dynamic CRT and fails with LNK2038.
+    Toolset, SDK, compiler, CRT and output settings all come from engine.props.
+  -->
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{DB60D547-C709-40B5-97B0-C71DECF688B0}</ProjectGuid>
+    <RootNamespace>enginetests</RootNamespace>
+  </PropertyGroup>
+  <!--
+    Set before Microsoft.Cpp.Default.props so that vcpkg's props and targets see them. The
+    install root is the repository's git-ignored vcpkg_installed\, shared with
+    test_dll\ramquick_engine_test.vcxproj; with it set, the triplet's tree is
+    $(VcpkgInstalledDir)$(VcpkgTriplet)\. vcpkg finds the root vcpkg.json by searching upward.
+    The path is built from MSBuildThisFileDirectory because Directory.Build.props, which defines
+    RamQuickRepoRoot, is imported later, inside Microsoft.Cpp.Default.props.
+    A static triplet installs no DLLs, so vcpkg's app-local DLL deployment step after each link
+    has nothing to copy and is turned off.
+  -->
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgTriplet>x64-windows-static</VcpkgTriplet>
+    <VcpkgInstalledDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..\..\vcpkg_installed'))</VcpkgInstalledDir>
+    <VcpkgApplocalDeps>false</VcpkgApplocalDeps>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="..\..\src\engine\engine.props" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <!-- Every value appends to the engine.props definitions rather than replacing them. -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- Test code includes "fakes/..." and "test_dll/..." from this folder. -->
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!--
+        /external:anglebrackets /external:W0: <gtest/gtest.h> and the Windows headers cannot trip
+        /W4 /WX, which stay in force for every quoted include.
+      -->
+      <TreatAngleIncludeAsExternal>true</TreatAngleIncludeAsExternal>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <PreprocessorDefinitions>_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- Parameterised GoogleTest matrices can exceed the default COFF section count (C1128). -->
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+    </Link>
+  </ItemDefinitionGroup>
+  <!--
+    gtest_main sits in vcpkg's manual-link folder, which VcpkgAutoLink does not link (it adds
+    only lib\*.lib: gtest and gmock). The vcpkg gtest 1.18.0 port builds its debug libraries
+    without a "d" suffix, so both configurations link gtest_main.lib, each from its own tree.
+  -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Link>
+      <AdditionalLibraryDirectories>$(VcpkgInstalledDir)$(VcpkgTriplet)\debug\lib\manual-link;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>gtest_main.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Link>
+      <AdditionalLibraryDirectories>$(VcpkgInstalledDir)$(VcpkgTriplet)\lib\manual-link;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>gtest_main.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="fakes\fake_clock.h" />
+    <ClInclude Include="fakes\fault_spec.h" />
+    <ClInclude Include="fakes\fault_injecting_memory_access.h" />
+    <ClInclude Include="fakes\counting_memory_access.h" />
+    <ClInclude Include="test_dll\ramquick_engine_test.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="test_kernels.cpp" />
+    <ClCompile Include="test_patterns.cpp" />
+    <ClCompile Include="test_access_orders.cpp" />
+    <ClCompile Include="test_step_runner.cpp" />
+    <ClCompile Include="test_coverage.cpp" />
+    <ClCompile Include="test_fault_injection.cpp" />
+    <ClCompile Include="test_reread.cpp" />
+    <ClCompile Include="test_error_collector.cpp" />
+    <ClCompile Include="test_stop.cpp" />
+    <ClCompile Include="test_worker_pool.cpp" />
+    <ClCompile Include="test_memory_region.cpp" />
+    <ClCompile Include="test_api_boundary.cpp" />
+    <ClCompile Include="fakes\fault_injecting_memory_access.cpp" />
+    <ClCompile Include="fakes\counting_memory_access.cpp" />
+    <!-- The production C API; its exports in an .exe also produce an unused engine.tests.lib. -->
+    <ClCompile Include="..\..\src\engine\api\api.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\engine\engine_core.vcxproj">
+      <Project>{6CD894C1-5893-41D4-AE2C-C04C2DC31951}</Project>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>
