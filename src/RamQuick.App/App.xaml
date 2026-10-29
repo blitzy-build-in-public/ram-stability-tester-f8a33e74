@@ -1,0 +1,61 @@
+<!--
+    Application definition for RamQuick.exe and the resources shared by MainWindow.xaml.
+
+    StartupUri is deliberately absent: App.xaml.cs OnStartup runs the platform check and the
+    single-instance guard, composes the object graph by hand and creates the one MainWindow with its
+    DataContext. A StartupUri would open a second, unbound window.
+
+    ShutdownMode is OnExplicitShutdown because message boxes can appear before the main window exists
+    (unsupported platform, already running, damaged installation), and closing the window is deferred
+    until RunController.ShutdownAsync has finished. Neither may end the process implicitly; App.xaml.cs
+    calls Shutdown(exitCode) itself. Startup, Exit and DispatcherUnhandledException are wired in
+    App.xaml.cs, not here, so all wiring sits in one place.
+
+    The resource keys are a contract with MainWindow.xaml and MainWindowLayoutTests, which loads them
+    through App.InitializeComponent() without running the application. Styles use system brushes and
+    the system font so high-contrast themes apply; layout belongs to MainWindow.xaml.
+-->
+<Application x:Class="RamQuick.App.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:converters="clr-namespace:RamQuick.App.Converters"
+             ShutdownMode="OnExplicitShutdown">
+    <Application.Resources>
+        <ResourceDictionary>
+            <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+
+            <!-- Verdict badge background: green PASS, red FAIL, amber ABORTED, transparent otherwise. -->
+            <converters:RunStateToBrushConverter x:Key="RunStateToBrush" />
+
+            <!-- Label of a label/value pair, in the secondary (system gray text) colour. -->
+            <Style x:Key="FieldLabelStyle" TargetType="TextBlock">
+                <Setter Property="Foreground" Value="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" />
+                <Setter Property="Margin" Value="0,0,8,0" />
+            </Style>
+
+            <!-- Value of a label/value pair; long values end in an ellipsis instead of widening the row. -->
+            <Style x:Key="FieldValueStyle" TargetType="TextBlock">
+                <Setter Property="FontWeight" Value="SemiBold" />
+                <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+            </Style>
+
+            <Style x:Key="SectionHeaderStyle" TargetType="TextBlock">
+                <Setter Property="FontWeight" Value="SemiBold" />
+                <Setter Property="Margin" Value="0,8,0,4" />
+            </Style>
+
+            <!--
+                PASS/FAIL/ABORTED badge. The background comes from RunStateToBrush; each of its verdict
+                brushes gives this white bold text a contrast ratio of at least 4.5:1, and the badge
+                always spells out the verdict, so colour is never the only indicator.
+            -->
+            <Style x:Key="VerdictBadgeStyle" TargetType="Border">
+                <Setter Property="CornerRadius" Value="4" />
+                <Setter Property="Padding" Value="12,4" />
+                <Setter Property="TextElement.Foreground" Value="White" />
+                <Setter Property="TextElement.FontWeight" Value="Bold" />
+                <Setter Property="TextElement.FontSize" Value="20" />
+            </Style>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>
