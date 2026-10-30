@@ -895,8 +895,9 @@ public sealed record JournalReadings
 /// </summary>
 public sealed record JournalResult : JournalRecord
 {
-    // See JournalBegin: the init accessor keeps the verdict non-null when a line omits it.
+    // See JournalBegin: the init accessors keep the verdict and the detail non-null when a line omits them.
     private readonly string _verdict = string.Empty;
+    private readonly string _endDetail = string.Empty;
 
     /// <summary>
     /// Gets the terminal state the run reached: <see cref="RunState.Passed"/>, <see cref="RunState.Failed"/>
@@ -920,9 +921,15 @@ public sealed record JournalResult : JournalRecord
     public RunEndReason EndReason { get; init; }
 
     /// <summary>
-    /// Gets the diagnostic detail of the end reason, or <see langword="null"/> when there is none.
+    /// Gets the diagnostic detail of the end reason, which becomes the summary's <c>run.endDetail</c>: empty
+    /// when the end reason has no diagnostic, as for <see cref="RunEndReason.Completed"/>, and never
+    /// <see langword="null"/>.
     /// </summary>
-    public string? EndDetail { get; init; }
+    public string EndDetail
+    {
+        get => _endDetail;
+        init => _endDetail = value ?? string.Empty;
+    }
 
     /// <summary>
     /// Gets the true error total from the engine's counters, never derived from stored records.
@@ -969,7 +976,12 @@ public sealed record JournalResult : JournalRecord
     /// The state the run machine just reached, passed in by the caller rather than cached by the journal.
     /// </param>
     /// <param name="endReason">Why the run reached that state.</param>
-    /// <param name="endDetail">The end reason's diagnostic detail, or <see langword="null"/>.</param>
+    /// <param name="endDetail">
+    /// The end reason's diagnostic detail; <see langword="null"/> or empty when there is none, which
+    /// <see cref="EndDetail"/> holds as empty. It is recorded through
+    /// <see cref="SummaryFormat.RedactPersonalPaths"/>, because it can quote an exception message naming a
+    /// path in the user's profile, and the record feeds the shareable summaries.
+    /// </param>
     /// <param name="totalErrors">The true error total from the engine's counters.</param>
     /// <param name="verifiedBytes">The bytes verified over the whole run.</param>
     /// <param name="elapsed">The engine's elapsed run time.</param>
@@ -1011,7 +1023,7 @@ public sealed record JournalResult : JournalRecord
             TerminalState = terminalState,
             Verdict = verdict,
             EndReason = endReason,
-            EndDetail = endDetail,
+            EndDetail = endDetail is null ? string.Empty : SummaryFormat.RedactPersonalPaths(endDetail),
             TotalErrors = totalErrors,
             VerifiedBytes = verifiedBytes,
             ElapsedMs = JournalValues.WholeMilliseconds(elapsed),

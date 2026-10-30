@@ -5,11 +5,14 @@
  *
  * The Windows rules behind the design:
  * - VirtualLock can lock only up to the process's minimum working-set size. allocate()
- *   therefore raises the minimum with SetProcessWorkingSetSizeEx before locking, to the
- *   attempt's region plus k_working_set_headroom_bytes. Raising it needs
+ *   therefore raises the minimum with SetProcessWorkingSetSizeEx before locking, by the
+ *   attempt's region. The minimum is one limit for the whole process, so the raises of regions
+ *   alive at once, such as those of concurrent sessions, add up under a process-wide lock: the
+ *   minimum is the sum of every live region's raise plus one k_working_set_headroom_bytes, which
+ *   for a lone region is its bytes plus the headroom. Raising it needs
  *   SeIncreaseWorkingSetPrivilege, which the default policy grants to Users, so a 1 GiB region
- *   locks without elevation. The limits in force before the first raise are restored by
- *   release().
+ *   locks without elevation. release() withdraws the region's raise, and the limits in force
+ *   before the first raise return once no region holds one.
  * - Large pages (VirtualAlloc with MEM_LARGE_PAGES) need SeLockMemoryPrivilege enabled in the
  *   token. "Lock pages in memory" is assigned to nobody by default, Administrators included, so
  *   large pages are attempted only when the token already holds the privilege. allocate() then
@@ -21,7 +24,9 @@
  *   page_mode() reports the mix.
  * - Every chunk is allocated, committed and locked by its own calls, with a stop check before
  *   each, so a stop during preparation waits for at most one chunk of k_chunk_bytes. Release is
- *   chunk by chunk as well.
+ *   chunk by chunk as well. A chunk VirtualFree refuses to free stays owned by the region for
+ *   a later release() to retry, and by a process-wide owner once the region is destroyed (see
+ *   orphaned_bytes()), so no allocation is ever lost while reported as released.
  * - No documented user-mode API yields physical addresses, so every address here is virtual.
  *
  * Deliberately free of <windows.h>: Win32 handles and values are held as fixed-width integers,
@@ -65,8 +70,9 @@ inline constexpr std::uint64_t k_slice_granularity_bytes = 2 * k_mib;
 inline constexpr std::uint64_t k_chunk_bytes = 256 * k_mib;
 
 /**
- * Working-set headroom, 256 MiB: the minimum working set is raised to the attempt's region plus
- * this, so the process's own code, stacks and heaps still fit beside the locked pages.
+ * Working-set headroom, 256 MiB: the minimum working set is raised to the live regions' bytes
+ * plus this, once, so the process's own code, stacks and heaps still fit beside the locked
+ * pages.
  */
 inline constexpr std::uint64_t k_working_set_headroom_bytes = 256 * k_mib;
 
@@ -218,6 +224,26 @@ struct slice_view {
 using lock_function = std::function<bool(void* address, std::size_t bytes)>;
 
 /**
+ * Frees one chunk in place of VirtualFree(address, 0, MEM_RELEASE).
+ *
+ * Called with the chunk's base, on the thread that calls allocate() or release(), after the
+ * chunk was unlocked. Returns true once the chunk is freed. On failure it returns false with the
+ * Windows last-error set, exactly as VirtualFree does, and leaves the chunk allocated, so the
+ * region keeps owning it. It must not throw. An empty function means VirtualFree.
+ *
+ * Once the region is destroyed holding a chunk the function refused, the process-wide owner
+ * keeps the function with that chunk and calls it from every later release() of any region,
+ * and from retry_orphaned_chunks(), on that caller's thread and never concurrently with itself.
+ * Whatever it refers to must therefore stay valid until it has freed the chunk, and it must not
+ * release a region itself, since that retry runs under the owner's lock.
+ *
+ * The seam exists only so that test_memory_region.cpp can make a release fail
+ * deterministically; production always passes it empty. session_dependencies::free_override
+ * carries the same signature into a session's region.
+ */
+using free_function = std::function<bool(void* address)>;
+
+/**
  * What allocate() builds.
  *
  * The session's stop_signal is passed as allocate()'s second parameter rather than held here,
@@ -241,18 +267,31 @@ struct region_options {
     bool lock_privilege_held = false;
     /** Replaces VirtualLock when non-empty; a test seam, empty in production. */
     lock_function lock_override;
+    /**
+     * Replaces VirtualFree when non-empty; a test seam, empty in production. allocate() keeps
+     * it for every release of the chunks it allocates, until release() has freed them all.
+     */
+    free_function free_override;
 };
 
 /** How allocate() ended. */
 enum class allocation_status : std::uint32_t {
     /** The region is allocated and locked, and the views are valid. */
     ok,
-    /** The stop signal was raised before a chunk; everything allocated was released. */
+    /**
+     * The stop signal was raised before a chunk. The chunks locked before the stop stay owned
+     * by the region but unexposed (allocated() is false and every view is empty) until
+     * release(), which the coordinator calls after Completed, so the stop never waits for
+     * their release.
+     */
     stopped,
     /**
-     * No attempt down to the minimum could be allocated and locked, or the first size's plan
-     * has no slice or tests fewer than min_region_bytes and was refused before any allocation.
-     * Everything was released.
+     * No attempt down to the minimum could be allocated and locked, or the first size was
+     * refused before any allocation: it needs more than the machine's physical memory, or its
+     * plan has no slice or tests fewer than min_region_bytes. Everything was released, except a
+     * chunk Windows refused to free, which the region keeps (held_bytes()) for release() to
+     * retry: one of a failed attempt ends the retries, and one left by an earlier region
+     * refuses the call before any attempt.
      */
     insufficient_memory,
 };
@@ -271,20 +310,27 @@ struct allocation_outcome {
     /** How the call ended. */
     allocation_status status = allocation_status::ok;
     /**
-     * GetLastError() of the call that failed last: SetProcessWorkingSetSizeEx, VirtualAlloc or
-     * VirtualLock (or the lock override). Filled for insufficient_memory only, and 0 otherwise,
-     * including for a refused request, where no OS call failed.
+     * GetLastError() of the call that failed last: GlobalMemoryStatusEx,
+     * GetProcessWorkingSetSizeEx, SetProcessWorkingSetSizeEx, VirtualAlloc, VirtualLock (or
+     * the lock override) or VirtualFree (or the free override). Filled for insufficient_memory
+     * only, and 0 otherwise, including for a refused request, where no OS call failed.
+     * end_detail never repeats it.
      */
     std::uint32_t os_error = 0;
-    /** Sizes attempted: 1 for the first attempt, plus one per retry. */
+    /**
+     * Sizes attempted: 1 for the first attempt, plus one per retry; 0 when a chunk an earlier
+     * region left held refused the call before any attempt.
+     */
     std::uint32_t attempts = 0;
     /** Large-page chunks of the last attempt that fell back to 4 KiB pages. */
     std::uint32_t large_page_fallbacks = 0;
     /**
-     * English diagnostic for insufficient_memory, naming the failing call and the last size
-     * attempted; for a refused request it names the requested size and worker count, and the
-     * planned and minimum sizes when a slice could be planned. UTF-8, NUL-terminated. Empty for
-     * ok and stopped.
+     * English diagnostic for insufficient_memory. After a failed OS call it names the call and
+     * the size concerned, plus the minimum when the last attempt failed, but never the Windows
+     * error: that is os_error, which the host prefixes ("Windows error n: "). A request larger
+     * than physical memory names the requested and physical sizes; any other refused request
+     * names the requested size and worker count, and the planned and minimum sizes when a slice
+     * could be planned. UTF-8, NUL-terminated. Empty for ok and stopped.
      */
     char end_detail[RQ_END_DETAIL_SIZE] = {};
 };
@@ -304,23 +350,35 @@ struct allocation_outcome {
  * the bases first.
  *
  * @par Exceptions
- * allocate() throws nothing once the first OS allocation has been made. The one operation that
- * can throw is the reservation of the chunk list (std::bad_alloc), which runs before any
- * VirtualAlloc and is sized for the first attempt, the largest, so no retry grows it. Any
- * exception therefore leaves no chunk allocated, and the coordinator converts it into
- * RQ_END_INTERNAL_FAULT.
+ * allocate() throws nothing once the first OS allocation has been made. The operations that can
+ * throw (std::bad_alloc) are the copy of options.free_override and the reservation of the chunk
+ * list, which run before any VirtualAlloc; the reservation is sized for the first attempt, the
+ * largest, so no retry grows it. Any exception therefore leaves no chunk allocated, and the
+ * coordinator converts it into RQ_END_INTERNAL_FAULT.
  *
  * @par Release on every exit path
- * The coordinator calls release() after Completed for every end reason. rq_session_destroy
- * releases the region when the coordinator never ran, and the destructor is the RAII backstop.
- * If the process is terminated, Windows reclaims the locked pages with it.
+ * The coordinator calls release() after Completed for every end reason, a stop during
+ * preparation included, so Released reports the chunks locked before that stop.
+ * rq_session_destroy releases the region when the coordinator never ran, and the destructor is
+ * the RAII backstop. If the process is terminated, Windows reclaims the locked pages with it.
+ * A chunk whose VirtualFree fails is never dropped: the region keeps owning it (held_bytes()),
+ * the coordinator then withholds Released, and the next release() retries it, as
+ * rq_session_destroy and the destructor do. A chunk Windows still refuses to free when the
+ * region is destroyed passes, with the free override that frees it and the working-set raise
+ * that covers it, to a process-wide owner (orphaned_bytes()). Every later release() of any
+ * region in the process retries it, as retry_orphaned_chunks() does, and Windows reclaims it at
+ * process exit at the latest.
  */
 class memory_region {
 public:
     /** An unallocated region; makes no OS call. */
     memory_region() noexcept;
 
-    /** Calls release(), so no exit path leaves memory allocated or locked. */
+    /**
+     * Calls release(), so no exit path leaves memory allocated or locked. A chunk Windows still
+     * refuses to free is logged and handed, with the free override and the working-set raise,
+     * to the process-wide owner that every later release() retries (see orphaned_bytes()).
+     */
     ~memory_region();
 
     memory_region(const memory_region&) = delete;
@@ -332,45 +390,84 @@ public:
      * Plans, allocates and locks the region, shrinking and retrying until an attempt succeeds
      * or the sequence of next_retry_bytes() is exhausted.
      *
-     * The first size is options.region_bytes. When its plan has no slice, or its tested_bytes
-     * is below options.min_region_bytes, no size up to it can reach the minimum, so the call
-     * returns insufficient_memory before any allocation, with attempts 1 and os_error 0. Every
-     * retry size plans tested_bytes equal to it and at least the minimum, so no attempt ever
-     * tests fewer bytes than options.min_region_bytes.
+     * The first size is options.region_bytes. When its plan tests more bytes than the
+     * machine's physical memory (GlobalMemoryStatusEx ullTotalPhys), or the size is too large
+     * to plan and itself exceeds that, it can never be locked, because locked pages are
+     * resident. The call then returns insufficient_memory before reserving the chunk list or
+     * allocating anything, with attempts 1 and os_error 0, so the reservation stays within one
+     * entry per 256 MiB of physical memory plus one per worker. A failure of
+     * GlobalMemoryStatusEx itself returns insufficient_memory in the same way, with its error in
+     * os_error. When the plan has no slice, or its tested_bytes is below
+     * options.min_region_bytes, no size up to it can reach the minimum, so the call returns
+     * insufficient_memory before any allocation, with attempts 1 and os_error 0. Every retry
+     * size plans tested_bytes equal to it and at least the minimum, so no attempt ever tests
+     * fewer bytes than options.min_region_bytes.
      *
-     * Each attempt plans its size with plan_region(), raises the minimum working set to
-     * tested_bytes + k_working_set_headroom_bytes, and then, slice by slice and chunk by chunk,
-     * checks the stop signal, allocates the chunk and locks it. With
+     * Each attempt plans its size with plan_region(), raises the process's minimum working set
+     * by tested_bytes, on top of the raises of the other live regions (so a lone region's
+     * minimum is tested_bytes + k_working_set_headroom_bytes), and then, slice by slice and
+     * chunk by chunk, checks the stop signal, allocates the chunk and locks it. With
      * options.lock_privilege_held, each chunk is first tried as a large-page allocation, and a
      * chunk that fails falls back to 4 KiB pages. 4 KiB-page chunks are locked with VirtualLock,
      * or with options.lock_override when it is set. A failure to raise the working set, to
      * allocate a chunk or to lock it releases that attempt's chunks and retries at
      * next_retry_bytes() of the attempt's size; when that is 0, the call returns
-     * insufficient_memory. A raised stop releases everything and returns stopped.
+     * insufficient_memory. When Windows refuses to free a chunk of the failed attempt
+     * (VirtualFree, or options.free_override), no retry is planned over it: the call returns
+     * insufficient_memory naming VirtualFree with its error, and the chunk stays held, with
+     * the working-set raise covering it, for release(). A raised stop returns stopped at once
+     * and leaves what the region holds, the chunks locked so far included, to release() (see
+     * allocation_status::stopped).
      *
-     * A region that is still allocated is released first, so a repeated call never leaks.
+     * Whatever the region still holds, a stopped call's chunks included, is released first, so
+     * a repeated call never leaks. When that release leaves a chunk held, because Windows
+     * refused to free it, the call returns insufficient_memory with attempts 0 and the
+     * VirtualFree error in os_error, and allocates nothing.
      *
      * @param options What to build; options.worker_count must be non-zero.
      * @param stop The session's stop signal, checked before every chunk. It is a parameter
      *        rather than a member of region_options, which keeps that an aggregate.
      * @return The outcome. On ok, plan(), slice() and chunks() describe the region.
-     * @throws std::bad_alloc only from reserving the chunk list, before any OS allocation.
+     * @throws std::bad_alloc only from copying options.free_override or reserving the chunk
+     *         list, before any OS allocation.
      */
     allocation_outcome allocate(const region_options& options, const stop_signal& stop);
 
     /**
      * Releases the region chunk by chunk, VirtualUnlock (for 4 KiB-page chunks) and then
-     * VirtualFree(MEM_RELEASE) for each. Then restores the working-set limits saved before the
-     * first raise and, when allocate() enabled SeLockMemoryPrivilege, disables it again.
+     * VirtualFree(MEM_RELEASE), or the free override allocate() kept, for each. Then withdraws
+     * the region's working-set raise: the minimum drops to cover the other live regions' raises
+     * or, when none is left, the limits saved before the first raise return. Last, when
+     * allocate() enabled SeLockMemoryPrivilege, it disables it again.
      *
      * Idempotent and noexcept, so it is safe from the destructor and from every exit path. A
-     * failed unlock does not stop the chunk from being freed. Clears the chunk list and resets
-     * the plan, so the accessors report an unallocated region afterwards.
+     * failed unlock does not stop the chunk from being freed. Resets the plan, so the accessors
+     * report an unallocated region afterwards, and clears the chunk list of every chunk it
+     * freed.
      *
-     * @return Bytes released (the Released callback's released_bytes); 0 when nothing was
-     *         allocated.
+     * A chunk whose VirtualFree fails is still allocated, so it stays in the list and
+     * held_bytes() reports it; the call logs the failure and frees the other chunks. The
+     * region's working-set raise stays while any chunk is held, so the minimum never drops
+     * beneath pages that may still be locked; the privilege is disabled regardless, since
+     * freeing a chunk does not need it. The next call retries every held chunk, and once none
+     * is left it withdraws the raise.
+     *
+     * Every call also runs retry_orphaned_chunks(), so the chunks destroyed regions left behind
+     * are retried by any later region in the process.
+     *
+     * @return Bytes of this region this call freed (the Released callback's released_bytes),
+     *         never counting orphaned chunks; 0 when nothing was held.
      */
     std::uint64_t release() noexcept;
+
+    /**
+     * Bytes of every chunk the region holds, allocated or not: the region's after allocate()
+     * returned ok, the chunks a stopped allocate() locked, and after release() the chunks
+     * Windows refused to free. 0 once release() has freed every chunk. The coordinator raises
+     * Released only when this is 0 after release(). Orphaned chunks, which no region holds any
+     * more, are not counted (see orphaned_bytes()).
+     */
+    std::uint64_t held_bytes() const noexcept;
 
     /** True after allocate() returned ok, until release(). */
     bool allocated() const noexcept;
@@ -411,22 +508,48 @@ public:
     std::span<const chunk_view> chunks() const noexcept;
 
 private:
-    // Every chunk of every slice, in ascending logical order.
+    // Every chunk of every slice, in ascending logical order; after release(), only the chunks
+    // Windows refused to free.
     std::vector<chunk_view> chunks_;
     // Plan of the allocated attempt; all zero when not allocated.
     region_plan plan_{};
-    // Working-set limits and QUOTA_LIMITS_* flags read by GetProcessWorkingSetSizeEx before the
-    // first raise (SIZE_T and DWORD held as fixed-width integers); release() restores them.
-    std::uint64_t saved_ws_min_ = 0;
-    std::uint64_t saved_ws_max_ = 0;
-    std::uint32_t saved_ws_flags_ = 0;
-    // True once allocate() has changed the working-set limits, so release() restores them.
-    bool ws_raised_ = false;
-    // Minimum working-set size this object last set.
-    std::uint64_t ws_min_current_ = 0;
+    // options.free_override of the last allocate(), kept until every chunk it must free is
+    // freed; empty means VirtualFree.
+    free_function free_override_;
+    // GetLastError() of the VirtualFree that failed last while a chunk is held (a DWORD held as
+    // a fixed-width integer); 0 when nothing is held.
+    std::uint32_t free_error_ = 0;
+    // Bytes this region added to the process's minimum working set, which every live region
+    // shares (the ledger in memory_region.cpp, which also saves the limits to restore); 0 while
+    // it holds no raise. release() withdraws it once no chunk is held.
+    std::uint64_t ws_contribution_ = 0;
     // True when allocate() enabled SeLockMemoryPrivilege, held but disabled until then, so
     // release() disables it again. The token handle itself is never stored.
     bool privilege_enabled_by_us_ = false;
 };
+
+/**
+ * Bytes of the orphaned chunks: those a memory_region still held when it was destroyed, because
+ * Windows refused to free them, and that a retry has not freed since. 0 unless VirtualFree (or a
+ * free override) refused a chunk through its region's last release().
+ *
+ * The process-wide owner keeps each orphaned chunk with its region's free override and
+ * working-set raise, so the minimum working set keeps covering it until it is freed. Callable
+ * from any thread.
+ */
+std::uint64_t orphaned_bytes() noexcept;
+
+/**
+ * Retries every orphaned chunk with its own region's free override (VirtualFree when empty).
+ * Once every chunk of a destroyed region is freed, that region's working-set raise is withdrawn,
+ * and the limits saved before the first raise return when no region holds one. A chunk Windows
+ * still refuses stays orphaned for the next retry, and Windows reclaims it at process exit at
+ * the latest.
+ *
+ * Every memory_region::release() calls it, so any later region in the process retries the
+ * orphaned chunks; it is exposed for an explicit retry. Noexcept; callable from any thread,
+ * with retries serialised under the owner's lock.
+ */
+void retry_orphaned_chunks() noexcept;
 
 }  // namespace rq::engine

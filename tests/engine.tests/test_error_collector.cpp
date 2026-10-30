@@ -19,7 +19,9 @@
  * - ErrorCollectorRecord: every field of a stored rq_error_record.
  * - ErrorCollectorSession: a real 2-worker, 256 MiB session over the fault-injecting ->
  *   counting -> real stack, whose on_errors batches arrive at most every 100 ms, on the
- *   coordinator only, with an exact, non-decreasing total and at most the capped detail.
+ *   coordinator only, with an exact, non-decreasing total and at most the capped detail. A host
+ *   stop mid-step may bring in early only the run's final batch, which still precedes
+ *   Completed with every stored record and the true total, within 2 s of the stop.
  *
  * The collector tests drive worker_error_sink directly from plain std::threads over one
  * committed, unlocked 64 MiB VirtualAlloc region, so each re-read loads real memory through
@@ -56,6 +58,7 @@
 #include "core/memory/real_memory_access.h"
 #include "core/errors/error_collector.h"
 #include "core/session.h"
+#include "core/runner/step_runner.h"
 #include "fakes/fake_clock.h"
 #include "fakes/counting_memory_access.h"
 #include "fakes/fault_injecting_memory_access.h"
@@ -920,6 +923,36 @@ static_assert(k_session_max_injections > k_detail_cap &&
                   k_session_max_injections > k_session_per_pass,
               "the session test must exceed the detail cap over several passes");
 
+/**
+ * Budget of the stop test's step: far longer than the test lets it run, so the host's stop
+ * always lands mid-step.
+ */
+constexpr std::uint32_t k_stop_step_ms = 60'000U;
+
+/** The bit the stop test's single-bit flips corrupt, as in the fault-class tests. */
+constexpr std::uint32_t k_stop_flip_bit = 17U;
+
+/**
+ * Corruptions the stop test may inject in its whole run, spread over the whole region, so
+ * errors keep arriving through every verification until the stop lands.
+ */
+constexpr std::uint64_t k_stop_max_injections = 200'000U;
+
+/** Batches the stop test lets arrive before it may stop the run, so errors are flowing. */
+constexpr std::size_t k_batches_before_stop = 3U;
+
+/**
+ * The stop test stops at a progress tick that finds undelivered errors while the last batch is
+ * younger than this, so the stop's records fall due inside the 100 ms spacing.
+ */
+constexpr std::uint64_t k_stop_window_ns = k_error_batch_interval_ns / 2U;
+
+/** The stop bound: Completed within 2 s of the request. */
+constexpr std::uint64_t k_stop_bound_ns = 2'000U * k_ns_per_ms;
+
+static_assert(k_stop_max_injections > k_detail_cap,
+              "the stop test's errors must be able to pass the detail cap");
+
 /** One on_errors call as the session raised it. */
 struct error_call {
     /** Session-clock (QPC) time at which the call arrived. */
@@ -927,6 +960,8 @@ struct error_call {
     std::uint32_t count;
     bool has_records;
     std::uint64_t total_errors;
+    /** on_completed had already been raised when the call arrived. */
+    bool after_completed;
 };
 
 /**
@@ -951,6 +986,14 @@ struct session_log {
     bool completed = false;
     bool released = false;
     std::atomic<bool> callback_failed{false};
+
+    // Stop test only: the session log_progress_and_stop stops, and what that stop saw.
+    rq_session_handle stop_handle = nullptr;
+    /** Session-clock time of the stop request; 0 until it is made. */
+    std::uint64_t stop_ns = 0;
+    rq_result stop_result = RQ_OK;
+    /** on_errors calls that had arrived when the stop was requested. */
+    std::size_t batches_at_stop = 0;
 };
 
 /** Runs body on the log under its mutex, noting the calling thread, then wakes the test. */
@@ -984,12 +1027,34 @@ void RQ_CALL log_progress(void* user_data, const rq_progress* /*progress*/) noex
     with_log(user_data, [](session_log&) {});
 }
 
+/**
+ * on_progress of the stop test. Requests the host stop once, at the first tick whose true total
+ * exceeds what the last batch carried while that batch is younger than k_stop_window_ns: the
+ * stop lands mid-step with errors still undelivered, so the run's final batch is due before
+ * the spacing has elapsed. rq_session_stop may be called from inside a callback.
+ */
+void RQ_CALL log_progress_and_stop(void* user_data, const rq_progress* progress) noexcept {
+    const std::uint64_t at_ns = static_cast<session_log*>(user_data)->clock.now_ns();
+    with_log(user_data, [&](session_log& log) {
+        if (log.stop_ns != 0 || log.error_calls.size() < k_batches_before_stop) {
+            return;
+        }
+        const error_call& last = log.error_calls.back();
+        if (progress->total_errors > last.total_errors && at_ns - last.at_ns < k_stop_window_ns) {
+            log.stop_ns = at_ns;
+            log.batches_at_stop = log.error_calls.size();
+            log.stop_result = session_stop(log.stop_handle, RQ_STOP_USER);
+        }
+    });
+}
+
 void RQ_CALL log_errors(void* user_data, const rq_error_record* records, std::uint32_t count,
                         std::uint64_t total_errors) noexcept {
     // Read before the lock, so the spacing measured is the calls' arrival.
     const std::uint64_t at_ns = static_cast<session_log*>(user_data)->clock.now_ns();
     with_log(user_data, [&](session_log& log) {
-        log.error_calls.push_back(error_call{at_ns, count, records != nullptr, total_errors});
+        log.error_calls.push_back(
+            error_call{at_ns, count, records != nullptr, total_errors, log.completed});
         if (records != nullptr) {
             log.records.insert(log.records.end(), records, records + count);
         }
@@ -1258,6 +1323,164 @@ TEST(ErrorCollectorSession, BatchesAtMostTenTimesASecondOnTheCoordinatorWithExac
         EXPECT_EQ(log.callback_threads.count(worker_thread), 0U)
             << "a callback ran on worker " << w << "'s thread";
     }
+}
+
+// Stop latency takes priority over batch spacing, so a host stop may bring the run's final
+// batch in early; it must be the only early one, and it must still carry every stored record
+// and the true total ahead of Completed.
+TEST(ErrorCollectorSession, HostStopMidStepLeavesOnlyTheFinalBatchEarlyAndAheadOfCompleted) {
+    const auto clock = std::make_shared<qpc_clock>();
+    session_log log(*clock);
+    fault_injecting_memory_access* faults = nullptr;
+
+    // Flips spread over the whole region, so both workers confirm errors through every
+    // verification and the stop finds some still undelivered.
+    rq_fault_spec spec = make_fault_spec(RQ_FAULT_SINGLE_BIT_FLIP);
+    spec.bit = k_stop_flip_bit;
+    spec.per_pass_count = k_session_per_pass;
+    spec.max_injections = k_stop_max_injections;
+    spec.seed = 0x13579BDF2468ACE0ULL;
+    const char* invalid = nullptr;
+    ASSERT_TRUE(validate_fault_spec(spec, k_session_region_bytes, &invalid)) << invalid;
+
+    // fault-injecting -> counting -> real, the test DLL's stack, with the session's own clock.
+    session_dependencies dependencies;
+    dependencies.clock = clock;
+    dependencies.wrap_memory_access =
+        [&](std::unique_ptr<IMemoryAccess> real) -> std::unique_ptr<IMemoryAccess> {
+        auto faulted = std::make_unique<fault_injecting_memory_access>(
+            std::make_unique<counting_memory_access>(std::move(real)),
+            normalized(spec, k_session_region_bytes), *clock);
+        faults = faulted.get();
+        return faulted;
+    };
+
+    rq_step_def step{};
+    copy_utf8_truncated(step.name, sizeof(step.name), "Random sequential sweep");
+    step.pattern = RQ_PATTERN_RANDOM;
+    step.access_order = RQ_ORDER_SEQUENTIAL_ASCENDING;
+    step.thread_mode = RQ_THREADS_ALL;
+    step.hold_ms = 0U;
+    step.time_budget_ms = k_stop_step_ms;
+    step.coverage_budget_bp = 2'500U;
+
+    rq_session_config config{};
+    config.struct_size = sizeof(rq_session_config);
+    config.step_def_size = sizeof(rq_step_def);
+    config.region_bytes = k_session_region_bytes;
+    config.min_region_bytes = k_session_min_region_bytes;
+    config.seed = 0x2D4B6F8091A3C5E7ULL;
+    config.worker_count = k_session_workers;
+    config.stop_on_error = 0U;
+    config.error_detail_cap = k_detail_cap;
+    // Every observer tick raises progress, so the stop finds its window promptly.
+    config.progress_interval_ms = k_observer_tick_ms;
+    config.isa_override = RQ_ISA_AUTO;
+    config.step_count = 1U;
+    config.steps = &step;
+
+    rq_callbacks callbacks{};
+    callbacks.struct_size = sizeof(rq_callbacks);
+    callbacks.user_data = &log;
+    callbacks.on_prepared = &log_prepared;
+    callbacks.on_step_starting = &log_step_starting;
+    callbacks.on_step_finished = &log_step_finished;
+    callbacks.on_progress = &log_progress_and_stop;
+    callbacks.on_errors = &log_errors;
+    callbacks.on_completed = &log_completed;
+    callbacks.on_released = &log_released;
+
+    session_handle_guard handle;
+    ASSERT_EQ(session_create(&config, &callbacks, std::move(dependencies), handle.out()), RQ_OK);
+    ASSERT_NE(faults, nullptr);
+    {
+        std::lock_guard<std::mutex> lock(log.mutex);
+        log.stop_handle = handle.get();
+    }
+    ASSERT_EQ(session_start(handle.get()), RQ_OK);
+
+    bool stopped_mid_step = false;
+    {
+        std::unique_lock<std::mutex> lock(log.mutex);
+        log.changed.wait_for(lock, k_run_timeout,
+                             [&log] { return log.stop_ns != 0 || log.completed; });
+        stopped_mid_step = log.stop_ns != 0;
+    }
+    if (!stopped_mid_step) {
+        // The window never came: stop anyway so the run releases, then fail.
+        EXPECT_EQ(session_stop(handle.get(), RQ_STOP_USER), RQ_OK);
+    }
+    ASSERT_TRUE(wait_for_release(log, k_stop_timeout)) << "the session never raised on_released";
+    ASSERT_TRUE(stopped_mid_step) << "no progress tick found undelivered errors after a batch";
+
+    rq_run_result result{};
+    result.struct_size = sizeof(rq_run_result);
+    ASSERT_EQ(session_get_result(handle.get(), &result), RQ_OK);
+    ASSERT_EQ(result.step_result_count, 1U);
+    const rq_step_result step_result = result.step_results[0];
+    const std::uint64_t verified_opportunities = faults->verified_opportunity_count();
+    ASSERT_EQ(handle.reset(), RQ_OK);
+
+    // No callback runs after destroy, so the log is stable from here.
+    std::lock_guard<std::mutex> lock(log.mutex);
+    EXPECT_FALSE(log.callback_failed.load(std::memory_order_relaxed));
+    ASSERT_TRUE(log.completed);
+    EXPECT_EQ(log.stop_result, RQ_OK);
+    EXPECT_EQ(result.end_reason, RQ_END_USER_STOP) << result.end_detail;
+    EXPECT_EQ(step_result.completed, 0U) << "the stop must land mid-step";
+    EXPECT_GE(log.completed_ns, log.stop_ns) << "Completed preceded the stop request";
+    const std::uint64_t latency_ns = log.completed_ns - log.stop_ns;
+    EXPECT_LE(latency_ns, k_stop_bound_ns)
+        << "Completed arrived "
+        << static_cast<double>(latency_ns) / static_cast<double>(k_ns_per_ms)
+        << " ms after the stop; the bound is 2 s";
+
+    // Ground truth: each verified corruption is exactly one error, and the step holds them all.
+    EXPECT_EQ(result.total_errors, verified_opportunities)
+        << "run total " << result.total_errors << ", verified-opportunity injections "
+        << verified_opportunities;
+    EXPECT_EQ(step_result.errors, result.total_errors);
+
+    const std::vector<error_call>& calls = log.error_calls;
+    // The stop found errors the last batch did not carry, so at least one batch follows it.
+    ASSERT_GT(calls.size(), log.batches_at_stop) << "the stop's errors were never delivered";
+    std::uint64_t delivered = 0;
+    std::uint64_t final_spacing_ns = 0;
+    for (std::size_t i = 0; i < calls.size(); ++i) {
+        const error_call& call = calls[i];
+        EXPECT_FALSE(call.after_completed) << "on_errors call " << i << " followed Completed";
+        if (i > 0U) {
+            const error_call& previous = calls[i - 1U];
+            const std::uint64_t spacing_ns = call.at_ns - previous.at_ns;
+            if (i + 1U < calls.size()) {
+                EXPECT_GE(spacing_ns, k_min_batch_spacing_ns)
+                    << "on_errors calls " << i - 1U << " and " << i << " arrived "
+                    << static_cast<double>(spacing_ns) / static_cast<double>(k_ns_per_ms)
+                    << " ms apart; only the run's final batch may come early";
+            } else {
+                final_spacing_ns = spacing_ns;
+            }
+            EXPECT_GE(call.total_errors, previous.total_errors)
+                << "the total fell from " << previous.total_errors << " to " << call.total_errors
+                << " at call " << i;
+        }
+        delivered += call.count;
+    }
+    EXPECT_EQ(calls.back().total_errors, result.total_errors)
+        << "the last batch before Completed must carry the final true total";
+    const std::uint64_t stored =
+        result.total_errors < k_detail_cap ? result.total_errors : std::uint64_t{k_detail_cap};
+    EXPECT_EQ(delivered, stored) << "stored records delivered over " << calls.size() << " batches";
+    ASSERT_EQ(log.records.size(), delivered);
+    for (std::size_t i = 0; i < log.records.size(); ++i) {
+        ASSERT_EQ(log.records[i].sequence, i) << "records must arrive once each, in order";
+    }
+
+    // Reported in the XML results, so the stop's batch cadence can be read without a failure.
+    RecordProperty("error_batches", std::to_string(calls.size()));
+    RecordProperty("final_batch_spacing_ms", std::to_string(final_spacing_ns / k_ns_per_ms));
+    RecordProperty("stop_latency_ms", std::to_string(latency_ns / k_ns_per_ms));
+    RecordProperty("total_errors", std::to_string(result.total_errors));
 }
 
 }  // namespace

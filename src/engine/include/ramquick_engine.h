@@ -48,14 +48,19 @@
  * configured worker, sequences the steps, schedules passes and raises every callback. Workers
  * never call back, and callbacks never run concurrently with each other. rq_api_version,
  * rq_result_message and rq_query_system may be called from any thread. rq_session_stop may be
- * called from any thread at any time, including from inside a callback.
+ * called from any thread at any time, including from inside a callback. Sessions in one process
+ * may run concurrently, each on its own coordinator, so callbacks of different sessions may
+ * overlap. Each raises the process's minimum working set by its own region while it holds that
+ * region, and the limits in force before the first raise return once the last session has
+ * released its memory.
  *
  * @par Event order
  * create -> start -> prepared -> (step_starting -> step_finished, with progress* and errors*
  * between them)* -> completed -> released -> get_result -> destroy.
  * A preparation failure (RQ_END_INSUFFICIENT_MEMORY, RQ_END_AFFINITY_FAILED or
  * RQ_END_INTERNAL_FAULT) delivers completed and then released, with no prepared. A stop
- * recorded before start likewise delivers completed and then released straight away.
+ * recorded before start likewise delivers completed and then released straight away. released
+ * is withheld only when a chunk cannot be freed (see rq_on_released).
  *
  * @par Error contract
  * Result-returning functions are noexcept and convert any C++ exception to RQ_E_INTERNAL, so no
@@ -373,7 +378,8 @@ typedef int32_t rq_result;
 /**
  * Locking failed even at min_region_bytes; os_error holds the last Windows error. The engine
  * never tests fewer than min_region_bytes: a region whose 2 MiB-rounded slices test fewer ends
- * with this reason before anything is locked, with os_error 0.
+ * with this reason before anything is locked, with os_error 0. Locked pages are resident, so a
+ * region whose rounded slices test more than total_phys_bytes ends the same way.
  */
 #define RQ_END_INSUFFICIENT_MEMORY 6u
 /** SetThreadGroupAffinity failed for a worker; no traffic ran. os_error holds the error. */
@@ -478,7 +484,11 @@ typedef struct rq_session_config {
     uint32_t struct_size;
     /** Set by the caller to sizeof(rq_step_def). */
     uint32_t step_def_size;
-    /** Planned bytes under test. The engine rounds each worker's slice down to 2 MiB. */
+    /**
+     * Planned bytes under test. The engine rounds each worker's slice down to 2 MiB. A region
+     * whose rounded slices test more than rq_system_info.total_phys_bytes ends with
+     * RQ_END_INSUFFICIENT_MEMORY before anything is locked.
+     */
     uint64_t region_bytes;
     /**
      * Floor for shrink-and-retry when locking fails; > 0 and <= region_bytes. The engine never
@@ -821,9 +831,14 @@ typedef void(RQ_CALL* rq_on_errors)(void* user_data, const rq_error_record* reco
 typedef void(RQ_CALL* rq_on_completed)(void* user_data, const rq_run_result* result);
 
 /**
- * Raised exactly once, after on_completed, when every chunk has been unlocked and freed.
- * release_ms grows with the region size; it is reported, not bounded. See the common rules
- * above.
+ * Raised once, after on_completed, when every chunk has been unlocked and freed. release_ms
+ * grows with the region size; it is reported, not bounded. Not raised when Windows refuses to
+ * free a chunk (VirtualFree fails), because the release cannot be confirmed: the session keeps
+ * owning that chunk and retries it in rq_session_destroy, and the host proceeds as for a
+ * Released that never arrives. A chunk still refused when rq_session_destroy returns passes to
+ * a process-wide owner that every later release in the process retries, and Windows reclaims
+ * it at process exit at the latest; on_released stays withheld for that session. See the common
+ * rules above.
  */
 typedef void(RQ_CALL* rq_on_released)(void* user_data, uint64_t released_bytes,
                                       uint64_t release_ms);
@@ -959,8 +974,11 @@ RQ_API rq_result RQ_CALL rq_session_get_result(rq_session_handle session,
 
 /**
  * Destroys a session: stops it if running, waits for in-flight callbacks, joins every thread,
- * releases the locked memory (also when the coordinator never ran) and frees the session. No
- * callback runs after it returns, and the handle is invalid from then on.
+ * releases the locked memory (also when the coordinator never ran, and retrying a chunk whose
+ * release withheld on_released) and frees the session. No callback runs after it returns, and
+ * the handle is invalid from then on. A chunk Windows still refuses to free does not fail the
+ * call: it passes to a process-wide owner that every later release in the process retries, and
+ * Windows reclaims it at process exit at the latest.
  *
  * The caller must not race any other call on the same handle with this one; the managed
  * SafeSessionHandle guarantees that.

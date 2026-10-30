@@ -14,6 +14,14 @@
  * - moving inversion: MOVING_INVERSION_WALKING sweeps;
  * - turnaround: RANDOM, TURNAROUND.
  *
+ * StopLatencyLargeRegion repeats the preparing case on an 8 GiB region, where releasing the
+ * memory already locked takes far longer than one chunk's commit-and-lock. It polls the process
+ * working set and stops once at least half the region is locked, so the stop always meets
+ * preparation with gigabytes held. Completed must still arrive within 2 s, and the chunks locked
+ * before the stop are released only after it: Released reports at least the bytes locked at
+ * the stop, less one chunk and a small slack, and at most the region. It skips when less than
+ * twice the region is available, since the 1 GiB suite already gates the bound itself.
+ *
  * A counting_memory_access observer detects the phases. It only raises an atomic flag and sets
  * an auto-reset event, on a worker thread; the test thread waits on that event, so every stop
  * is requested, and its QueryPerformanceCounter instant taken, on the test thread. For traffic
@@ -24,7 +32,9 @@
  *
  * The gate is the 2 s bound from the stop request to on_completed, which ramquick_engine.h
  * places on the engine. Release time grows with the region size and is reported, not bounded,
- * so release_ms and released_bytes are recorded as XML properties and printed but never gated.
+ * so release_ms is recorded as an XML property and printed but never gated. released_bytes is
+ * recorded too, and checked only as an amount: the tested bytes once Prepared was raised, and
+ * the chunks locked before the stop, at most the region, after a stop during preparation.
  * TearDownTestSuite records the largest stop latency of the run.
  *
  * Random points come from a std::mt19937_64 per case, seeded from a suite seed recorded as an
@@ -42,6 +52,7 @@
  */
 #include <gtest/gtest.h>
 #include <windows.h>
+#include <psapi.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -67,6 +78,7 @@
 #include "core/clock.h"
 #include "core/system_info.h"
 #include "core/memory/memory_access.h"
+#include "core/memory/memory_region.h"
 #include "core/session.h"
 #include "fakes/counting_memory_access.h"
 
@@ -119,6 +131,27 @@ constexpr std::uint64_t k_points_per_kind_u64 = static_cast<std::uint64_t>(k_poi
  * next one at under half its delay and its measured preparation time.
  */
 constexpr std::uint32_t k_prepare_attempts = 8U;
+
+/**
+ * The large-region preparing case: a region of several GiB, so that releasing what was locked
+ * before the stop would take far longer than the chunk a stop may wait for.
+ */
+constexpr std::uint64_t k_large_target_region_bytes = 8 * k_gib;
+
+/**
+ * Attempts of the large-region case. The first stops once half the region is locked; each
+ * attempt that finds on_prepared already raised halves that threshold.
+ */
+constexpr std::uint32_t k_large_attempts = 4U;
+
+/**
+ * Working-set growth since start that the large-region case does not attribute to the region:
+ * error-detail storage, thread stacks and heap pages preparation touches.
+ */
+constexpr std::uint64_t k_large_working_set_slack_bytes = 64 * k_mib;
+
+/** Engine seed of the large-region case; it runs no traffic, so any value serves. */
+constexpr std::uint64_t k_large_engine_seed = 0x51A4CE5E0F8B1D27ULL;
 
 /** Environment variable that replays a recorded suite seed. */
 constexpr char k_seed_variable[] = "RAMQUICK_STOP_TEST_SEED";
@@ -252,7 +285,7 @@ std::uint32_t random_delay_ms(std::mt19937_64& rng, std::uint32_t max_ms) {
 
 /**
  * Bytes of the region under test for the given worker count: whole 2 MiB slices reaching at
- * least 1 GiB.
+ * least target, 1 GiB unless the large-region case asks for more.
  *
  * The engine rounds each slice down to k_min_slice_bytes and ends a run whose rounded slices
  * test fewer than min_region_bytes with RQ_END_INSUFFICIENT_MEMORY before locking anything. A
@@ -260,8 +293,9 @@ std::uint32_t random_delay_ms(std::mt19937_64& rng, std::uint32_t max_ms) {
  * divide 512; rounding the slice up keeps one worker per logical processor and at least 1 GiB
  * locked, and equals 1 GiB exactly on power-of-two counts.
  */
-constexpr std::uint64_t region_bytes_for(std::uint32_t workers) noexcept {
-    const std::uint64_t per_worker = (k_target_region_bytes + workers - 1U) / workers;
+constexpr std::uint64_t region_bytes_for(std::uint32_t workers,
+                                         std::uint64_t target = k_target_region_bytes) noexcept {
+    const std::uint64_t per_worker = (target + workers - 1U) / workers;
     const std::uint64_t slice =
         (per_worker + k_min_slice_bytes - 1U) / k_min_slice_bytes * k_min_slice_bytes;
     return slice * workers;
@@ -270,6 +304,24 @@ static_assert(region_bytes_for(128U) == k_gib, "power-of-two worker counts test 
 static_assert(region_bytes_for(12U) >= k_gib &&
                   region_bytes_for(12U) % (12U * k_min_slice_bytes) == 0,
               "other counts round each slice up to whole 2 MiB");
+static_assert(region_bytes_for(128U, k_large_target_region_bytes) == 8 * k_gib,
+              "the large region is exactly 8 GiB on power-of-two counts");
+
+/**
+ * The process working set (PROCESS_MEMORY_COUNTERS.WorkingSetSize). During preparation it grows
+ * by the pages VirtualLock has faulted in, which is how the large-region case tells how much of
+ * the region is locked. False, with the Windows error in error, when the query fails.
+ */
+bool query_working_set(std::uint64_t& bytes, DWORD& error) noexcept {
+    PROCESS_MEMORY_COUNTERS counters{};
+    counters.cb = sizeof(counters);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+        error = GetLastError();
+        return false;
+    }
+    bytes = counters.WorkingSetSize;
+    return true;
+}
 
 std::string end_reason_name(std::uint32_t reason) {
     switch (reason) {
@@ -558,6 +610,11 @@ private:
 class stop_session {
 public:
     stop_session(const case_spec& spec, std::uint32_t workers, std::uint64_t engine_seed)
+        : stop_session(spec, workers, engine_seed, region_bytes_for(workers)) {}
+
+    /** As above over region_bytes, which is also the minimum, so no retry shrinks it. */
+    stop_session(const case_spec& spec, std::uint32_t workers, std::uint64_t engine_seed,
+                 std::uint64_t region_bytes)
         : trigger_(spec.target, spec.target == phase_kind::pre_hold_flush ? 2U * workers : 0U) {
         copy_utf8_truncated(step_.name, sizeof(step_.name), spec.step_name);
         step_.pattern = spec.pattern;
@@ -569,7 +626,7 @@ public:
 
         config_.struct_size = sizeof(rq_session_config);
         config_.step_def_size = sizeof(rq_step_def);
-        config_.region_bytes = region_bytes_for(workers);
+        config_.region_bytes = region_bytes;
         config_.min_region_bytes = config_.region_bytes;
         config_.seed = engine_seed;
         config_.worker_count = workers;
@@ -791,8 +848,10 @@ void StopLatency::run_preparing_case(const case_spec& spec, const std::string& l
         expect_stopped_within_bound(record, stop_ns, attempt_label);
         report(attempt_label, delay_ms, stop_ns, record);
         if (!record.prepared()) {
-            // The stop met preparation: no step gate, no step result and no memory traffic,
-            // and whatever was locked before the stop is released.
+            // The stop met preparation: no step gate, no step result and no memory traffic.
+            // The chunks locked before the stop are held through Completed and released after
+            // it, so released_bytes counts them: anything from 0, for a stop before the first
+            // chunk, up to the region.
             EXPECT_EQ(record.gates, 0U) << attempt_label;
             EXPECT_EQ(record.result.step_result_count, 0U) << attempt_label;
             EXPECT_EQ(primitives, 0U) << attempt_label << ": a stop during preparation ran traffic";
@@ -903,6 +962,149 @@ const auto k_all_cases =
 INSTANTIATE_TEST_SUITE_P(StopAtRandomPoints, StopLatency,
                          ::testing::Combine(k_all_cases, ::testing::Range(0, k_points_per_kind)),
                          case_name);
+
+/**
+ * A stop during preparation of a multi-GiB region. Its own suite, because gtest does not let
+ * TEST_F share the parameterised StopLatency fixture.
+ */
+class StopLatencyLargeRegion : public ::testing::Test {
+protected:
+    /**
+     * Skips, rather than fails, when the large region would not leave the machine as much
+     * memory again: StopLatency already gates the bound on its 1 GiB region, and this case only
+     * adds the size at which releasing the locked chunks before Completed would show.
+     */
+    void SetUp() override {
+        rq_system_info info{};
+        info.struct_size = sizeof(rq_system_info);
+        ASSERT_EQ(query_system(&info), RQ_OK);
+        const std::size_t processors = enumerate_logical_processors().size();
+        workers_ = static_cast<std::uint32_t>(std::min<std::size_t>(processors, k_max_workers));
+        ASSERT_GT(workers_, 0U);
+        region_bytes_ = region_bytes_for(workers_, k_large_target_region_bytes);
+        if (info.avail_phys_bytes / 2U < region_bytes_) {
+            GTEST_SKIP() << "the large-region stop locks " << region_bytes_ / k_mib
+                         << " MiB and needs twice that available, but only "
+                         << info.avail_phys_bytes / k_mib << " MiB is available";
+        }
+    }
+
+    std::uint32_t workers_ = 0;
+    std::uint64_t region_bytes_ = 0;
+};
+
+TEST_F(StopLatencyLargeRegion, CompletedWithinTwoSecondsOfAStopMidPreparation) {
+    const case_spec& spec = spec_for(stop_case::preparing);
+    RecordProperty("large_region_mib", region_bytes_ / k_mib);
+    RecordProperty("large_region_workers", workers_);
+    std::uint64_t threshold_bytes = region_bytes_ / 2U;
+    for (std::uint32_t attempt = 0; attempt < k_large_attempts; ++attempt) {
+        const std::string label = "large_preparing_attempt" + std::to_string(attempt);
+        stop_session run(spec, workers_, k_large_engine_seed + attempt, region_bytes_);
+        ASSERT_EQ(run.create(), RQ_OK) << label;
+
+        std::uint64_t baseline_bytes = 0;
+        DWORD query_error = ERROR_SUCCESS;
+        ASSERT_TRUE(query_working_set(baseline_bytes, query_error))
+            << label << ": GetProcessMemoryInfo failed (Windows error " << query_error << ")";
+        const std::uint64_t start_ns = qpc_now_ns();
+        ASSERT_EQ(run.start(), RQ_OK) << label;
+
+        // Stops as soon as the threshold is locked, unless preparation ends first.
+        std::uint64_t locked_at_stop = 0;
+        bool threshold_reached = false;
+        for (;;) {
+            std::uint64_t working_set_bytes = 0;
+            ASSERT_TRUE(query_working_set(working_set_bytes, query_error))
+                << label << ": GetProcessMemoryInfo failed (Windows error " << query_error << ")";
+            locked_at_stop =
+                working_set_bytes > baseline_bytes ? working_set_bytes - baseline_bytes : 0U;
+            if (locked_at_stop >= threshold_bytes) {
+                threshold_reached = true;
+                break;
+            }
+            const run_record seen = run.recorder().snapshot();
+            ASSERT_FALSE(seen.completed())
+                << label << ": the run ended before " << threshold_bytes / k_mib
+                << " MiB was locked; " << seen.describe();
+            if (seen.prepared()) {
+                break;
+            }
+            ASSERT_LE(since(qpc_now_ns(), start_ns), k_phase_timeout_ms * k_ns_per_ms)
+                << label << ": " << locked_at_stop / k_mib << " MiB locked after 30 s; "
+                << seen.describe();
+            Sleep(1);
+        }
+        std::uint64_t stop_ns = 0;
+        ASSERT_EQ(run.stop_now(stop_ns), RQ_OK) << label;
+
+        ASSERT_TRUE(run.recorder().wait_completed(k_completed_timeout))
+            << label << ": no Completed within 10 s of the stop; "
+            << run.recorder().snapshot().describe();
+        ASSERT_TRUE(run.recorder().wait_released(k_released_timeout))
+            << label << ": no Released; " << run.recorder().snapshot().describe();
+        const run_record record = run.recorder().snapshot();
+        const std::uint64_t primitives = run.primitive_count();
+        ASSERT_EQ(run.destroy(), RQ_OK) << label;
+
+        if (!threshold_reached || record.prepared()) {
+            // Preparation finished before the stop; aim the next attempt at an earlier point.
+            std::printf("[ stop     ] %s: Prepared arrived first at %llu MiB locked (preparation "
+                        "took %llu ms); next threshold %llu MiB\n",
+                        label.c_str(), static_cast<unsigned long long>(locked_at_stop / k_mib),
+                        static_cast<unsigned long long>(record.prepared_info.prepare_ms),
+                        static_cast<unsigned long long>(threshold_bytes / 2U / k_mib));
+            std::fflush(stdout);
+            threshold_bytes /= 2U;
+            continue;
+        }
+
+        // The stop met preparation with gigabytes locked: no traffic, and Completed within the
+        // bound however much was locked.
+        const std::uint64_t latency_ns = since(record.completed_ns, stop_ns);
+        EXPECT_EQ(record.result.end_reason, RQ_END_USER_STOP) << label << ": " << record.describe();
+        EXPECT_EQ(record.prepared_calls, 0U) << label;
+        EXPECT_EQ(record.gates, 0U) << label;
+        EXPECT_EQ(record.result.step_result_count, 0U) << label;
+        EXPECT_EQ(primitives, 0U) << label << ": a stop during preparation ran traffic";
+        EXPECT_EQ(record.completed_calls, 1U) << label;
+        EXPECT_GE(record.completed_ns, stop_ns) << label << ": Completed preceded the stop request";
+        EXPECT_LE(latency_ns, k_stop_bound_ns)
+            << label << ": Completed arrived " << format_ms(latency_ns) << " ms after a stop with "
+            << locked_at_stop / k_mib << " MiB locked; the bound is 2 s";
+
+        // The locked chunks are released after Completed and reported by Released. At most
+        // one chunk was still being locked when the stop was seen, and the working set also
+        // holds a little preparation memory outside the region.
+        EXPECT_EQ(record.released_calls, 1U) << label;
+        EXPECT_GE(record.released_ns, record.completed_ns)
+            << label << ": Released preceded Completed";
+        EXPECT_GT(record.released_bytes, 0U)
+            << label << ": the chunks locked before the stop were not reported by Released";
+        EXPECT_GE(record.released_bytes + k_chunk_bytes + k_large_working_set_slack_bytes,
+                  locked_at_stop)
+            << label << ": Released reported " << record.released_bytes / k_mib << " MiB but "
+            << locked_at_stop / k_mib << " MiB was locked at the stop";
+        EXPECT_LE(record.released_bytes, region_bytes_) << label;
+
+        // Release time is reported, never gated.
+        RecordProperty("large_attempts", attempt + 1U);
+        RecordProperty("large_locked_at_stop_mib", locked_at_stop / k_mib);
+        RecordProperty("large_stop_latency_ms", format_ms(latency_ns));
+        RecordProperty("large_released_bytes", record.released_bytes);
+        RecordProperty("large_release_ms", record.release_ms);
+        std::printf("[ stop     ] %s: %llu MiB locked at the stop, stop -> Completed %s ms, "
+                    "release %llu ms (%llu MiB) after Completed\n",
+                    label.c_str(), static_cast<unsigned long long>(locked_at_stop / k_mib),
+                    format_ms(latency_ns).c_str(),
+                    static_cast<unsigned long long>(record.release_ms),
+                    static_cast<unsigned long long>(record.released_bytes / k_mib));
+        std::fflush(stdout);
+        return;
+    }
+    FAIL() << "preparation finished before the stop in all " << k_large_attempts
+           << " attempts, so no stop met the Preparing state of the large region";
+}
 
 /* ---------------------------------------------------------------------------------------------
  * Checked handle close

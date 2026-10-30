@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using RamQuick.Core;
 
 namespace RamQuick.Logging;
@@ -299,6 +300,9 @@ public sealed record RunSummary
             StopOnError = begin.StopOnError,
             Verdict = result is null ? FailVerdict : VerdictOf(result),
             EndReason = result is null ? nameof(RunEndReason.PreviousRunUnfinished) : result.EndReason.ToString(),
+
+            // A result's detail is redacted here as well as by JournalResult.Create: recovery reads results back
+            // from journals, which an earlier build may have written unredacted, and the summary is shared.
             EndDetail = result is null
                 ? UnfinishedDetail(
                     lastStepNumber,
@@ -306,7 +310,7 @@ public sealed record RunSummary
                     lastStepName,
                     lastBeat is not null,
                     lastBeatUtc is not null)
-                : result.EndDetail,
+                : SummaryFormat.RedactPersonalPaths(result.EndDetail),
             StartRequestedUtc = startRequestedUtc,
             StartedUtc = startedUtc,
             EndedUtc = endedUtc,
@@ -696,6 +700,7 @@ public sealed record SummaryRun
     private readonly string _testType = string.Empty;
     private readonly string _verdict = string.Empty;
     private readonly string _endReason = string.Empty;
+    private readonly string _endDetail = string.Empty;
 
     /// <summary>
     /// Gets the run id: the run GUID in its 32-hex-digit <c>N</c> form, which also ends the results file
@@ -740,10 +745,15 @@ public sealed record SummaryRun
     }
 
     /// <summary>
-    /// Gets the end reason's diagnostic detail, or <see langword="null"/> when there is none. For an
-    /// unfinished run it states where the run stopped and which times are approximate or unknown.
+    /// Gets the end reason's diagnostic detail: empty when the end reason has no diagnostic, as for
+    /// <see cref="RunEndReason.Completed"/>, and never <see langword="null"/>. For an unfinished run it states
+    /// where the run stopped and which times are approximate or unknown.
     /// </summary>
-    public string? EndDetail { get; init; }
+    public string EndDetail
+    {
+        get => _endDetail;
+        init => _endDetail = value ?? string.Empty;
+    }
 
     /// <summary>
     /// Gets the UTC time Start was accepted, the origin of <see cref="TimeToVerdictSeconds"/>, or
@@ -1747,6 +1757,27 @@ public static class SummaryFormat
 {
     private const string HexPrefix = "0x";
 
+    // The placeholders RedactPersonalPaths leaves where a personal part of a path stood.
+    private const string UserProfileToken = "%USERPROFILE%";
+    private const string LocalAppDataToken = "%LOCALAPPDATA%";
+    private const string RoamingAppDataToken = "%APPDATA%";
+    private const string TempToken = "%TEMP%";
+    private const string AppFolderToken = "<app folder>";
+    private const string UserToken = "<user>";
+    private const string MachineToken = "<machine>";
+
+    // Windows keeps every account's profile folder here, named after the account.
+    private const string ProfilesFolderName = "Users";
+
+    // No Windows user name may hold these, so besides white space, separators and quotes they end a name in a path.
+    private const string NameTerminators = "\"'[]:;|=,+*?<>";
+
+    // No Windows file name may hold these, so a profile folder name, which may hold anything else, ends before one.
+    private const string InvalidFileNameCharacters = "\"<>|:*?";
+
+    // An apostrophe closing a quoted path is followed by one of these, white space or the end of the name's text.
+    private const string ClosingQuoteFollowers = ".,;:)]!?";
+
     /// <summary>
     /// Formats a 64-bit value as <c>"0x"</c> plus 16 uppercase hex digits, for example
     /// <c>"0x0000023A4F7C1D48"</c>.
@@ -1799,6 +1830,374 @@ public static class SummaryFormat
     /// <param name="id">The run id.</param>
     /// <returns>The 32 lowercase hex digits.</returns>
     public static string RunId(Guid id) => id.ToString("N", CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Returns <paramref name="text"/> with the personal parts of the Windows paths it holds replaced by
+    /// placeholders. The journal's <c>result</c> record and both summaries persist an end detail through it,
+    /// because an end detail can carry an exception message, and an exception message can name a path in the
+    /// user's profile, while the summaries are made to be shared and no log may record personal data.
+    /// </summary>
+    /// <param name="text">The text, typically an end detail or an exception message.</param>
+    /// <returns>
+    /// The redacted text; <paramref name="text"/> itself when it holds nothing to redact.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// The rules apply in this order, ignoring letter case and treating <c>\</c> and <c>/</c> alike:
+    /// </para>
+    /// <list type="number">
+    /// <item><description>
+    /// The current user's profile folder, local and roaming application data folders, temporary folder and the
+    /// application's own folder become <c>%USERPROFILE%</c>, <c>%LOCALAPPDATA%</c>, <c>%APPDATA%</c>,
+    /// <c>%TEMP%</c> and <c>&lt;app folder&gt;</c>, the longest folder first, wherever one ends where a name
+    /// ends. A folder the environment cannot name, a relative one and a bare drive or share root are skipped.
+    /// </description></item>
+    /// <item><description>
+    /// The folder after any remaining <c>&lt;drive&gt;:\Users\</c> becomes <c>&lt;user&gt;</c>, whichever
+    /// account's profile it is. The whole profile folder name is redacted, spaces and apostrophes included, and
+    /// it never runs past a character no file name may hold, such as a line break or a colon. It runs to the
+    /// separator after it; where none follows, to the quote that closes a quoted path, or else to the end of the
+    /// line, less the spaces and dots Windows drops from the end of a name and a drive letter starting another
+    /// path.
+    /// </description></item>
+    /// <item><description>
+    /// A path segment equal to the current user name, following a separator, becomes <c>&lt;user&gt;</c>.
+    /// </description></item>
+    /// <item><description>
+    /// The computer name, as a whole word, becomes <c>&lt;machine&gt;</c>.
+    /// </description></item>
+    /// </list>
+    /// <para>
+    /// In rules 1 and 3, a name ends at the end of the text, a separator, white space, a quote, a character no
+    /// Windows user name may hold, or a dot that ends a sentence. Everything else is kept verbatim. The result is
+    /// stable: redacting it again returns it unchanged. An environment lookup that fails skips its rule, so no
+    /// text makes this method throw.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException"><paramref name="text"/> is <see langword="null"/>.</exception>
+    public static string RedactPersonalPaths(string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        if (text.Length == 0)
+        {
+            return text;
+        }
+
+        string redacted = text;
+        foreach ((string folder, string token) in PersonalFolders())
+        {
+            redacted = ReplaceFolder(redacted, folder, token);
+        }
+
+        redacted = RedactProfileFolderNames(redacted);
+        if (EnvironmentValue(static () => Environment.UserName) is { } userName)
+        {
+            redacted = ReplaceUserSegments(redacted, userName);
+        }
+
+        if (EnvironmentValue(static () => Environment.MachineName) is { } machineName)
+        {
+            redacted = ReplaceMachineWords(redacted, machineName);
+        }
+
+        return redacted;
+    }
+
+    // Longest first, so a folder inside another (the temporary folder inside local application data inside the
+    // profile) is replaced by its own, more specific placeholder.
+    private static IEnumerable<(string Folder, string Token)> PersonalFolders()
+    {
+        var folders = new List<(string Folder, string Token)>(5);
+        AddPersonalFolder(folders, static () => SpecialFolder(Environment.SpecialFolder.UserProfile), UserProfileToken);
+        AddPersonalFolder(folders, static () => SpecialFolder(Environment.SpecialFolder.LocalApplicationData), LocalAppDataToken);
+        AddPersonalFolder(folders, static () => SpecialFolder(Environment.SpecialFolder.ApplicationData), RoamingAppDataToken);
+        AddPersonalFolder(folders, static () => Path.GetTempPath(), TempToken);
+        AddPersonalFolder(folders, static () => AppContext.BaseDirectory, AppFolderToken);
+        return folders.OrderByDescending(static entry => entry.Folder.Length);
+    }
+
+    private static string SpecialFolder(Environment.SpecialFolder folder) =>
+        Environment.GetFolderPath(folder, Environment.SpecialFolderOption.DoNotVerify);
+
+    private static void AddPersonalFolder(List<(string Folder, string Token)> folders, Func<string?> lookup, string token)
+    {
+        string? folder = EnvironmentValue(lookup)?.TrimEnd('\\', '/');
+        if (string.IsNullOrEmpty(folder))
+        {
+            return;
+        }
+
+        try
+        {
+            // A drive or share root would match the start of every path on that volume, and a relative folder
+            // the start of unrelated names, so neither identifies anything personal.
+            string? root = Path.GetPathRoot(folder)?.TrimEnd('\\', '/');
+            if (Path.IsPathFullyQualified(folder) && !string.Equals(root, folder, StringComparison.OrdinalIgnoreCase))
+            {
+                folders.Add((folder, token));
+            }
+        }
+        catch (Exception)
+        {
+            // Deliberately swallowed: a folder that cannot be examined is skipped like one the environment cannot name.
+        }
+    }
+
+    // The redaction runs while a failure is being recorded, so an environment that cannot answer, such as a
+    // profile that is not loaded, only skips its rule rather than raising a failure of its own.
+    private static string? EnvironmentValue(Func<string?> lookup)
+    {
+        try
+        {
+            string? value = lookup();
+            return string.IsNullOrWhiteSpace(value) ? null : value;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private static string ReplaceFolder(string text, string folder, string token)
+    {
+        StringBuilder? result = null;
+        int copied = 0;
+        int index = 0;
+        while (index <= text.Length - folder.Length)
+        {
+            if (StartsWord(text, index)
+                && PathTextEquals(text.AsSpan(index, folder.Length), folder)
+                && EndsName(text, index + folder.Length))
+            {
+                result ??= new StringBuilder(text.Length);
+                result.Append(text, copied, index - copied).Append(token);
+                index += folder.Length;
+                copied = index;
+            }
+            else
+            {
+                index++;
+            }
+        }
+
+        return Finish(result, text, copied);
+    }
+
+    // <drive>:\Users\<name>: whoever's profile a path names, its folder name is the account's name.
+    private static string RedactProfileFolderNames(string text)
+    {
+        StringBuilder? result = null;
+        int copied = 0;
+        int prefixLength = 3 + ProfilesFolderName.Length + 1;
+        int index = 0;
+        while (index <= text.Length - prefixLength)
+        {
+            if (char.IsAsciiLetter(text[index])
+                && StartsWord(text, index)
+                && text[index + 1] == ':'
+                && IsSeparator(text[index + 2])
+                && text.AsSpan(index + 3, ProfilesFolderName.Length).Equals(ProfilesFolderName, StringComparison.OrdinalIgnoreCase)
+                && IsSeparator(text[index + prefixLength - 1]))
+            {
+                // The placeholder starts with a character that ends a name, so a redacted folder reads as empty
+                // and is left as it is.
+                int nameStart = index + prefixLength;
+                int nameEnd = ProfileFolderNameEnd(text, index, nameStart);
+                if (nameEnd > nameStart)
+                {
+                    result ??= new StringBuilder(text.Length);
+                    result.Append(text, copied, nameStart - copied).Append(UserToken);
+                    copied = nameEnd;
+                }
+
+                index = Math.Max(nameEnd, index + 1);
+            }
+            else
+            {
+                index++;
+            }
+        }
+
+        return Finish(result, text, copied);
+    }
+
+    private static string ReplaceUserSegments(string text, string userName)
+    {
+        StringBuilder? result = null;
+        int copied = 0;
+        int index = 1;
+        while (index <= text.Length - userName.Length)
+        {
+            if (IsSeparator(text[index - 1])
+                && text.AsSpan(index, userName.Length).Equals(userName, StringComparison.OrdinalIgnoreCase)
+                && EndsName(text, index + userName.Length))
+            {
+                result ??= new StringBuilder(text.Length);
+                result.Append(text, copied, index - copied).Append(UserToken);
+                index += userName.Length;
+                copied = index;
+            }
+            else
+            {
+                index++;
+            }
+        }
+
+        return Finish(result, text, copied);
+    }
+
+    private static string ReplaceMachineWords(string text, string machineName)
+    {
+        StringBuilder? result = null;
+        int copied = 0;
+        int index = 0;
+        while (index <= text.Length - machineName.Length)
+        {
+            int end = index + machineName.Length;
+            if ((index == 0 || !IsMachineNameCharacter(text[index - 1]))
+                && (end == text.Length || !IsMachineNameCharacter(text[end]))
+                && text.AsSpan(index, machineName.Length).Equals(machineName, StringComparison.OrdinalIgnoreCase)
+                && !IsPlaceholderAt(text, index - 1))
+            {
+                result ??= new StringBuilder(text.Length);
+                result.Append(text, copied, index - copied).Append(MachineToken);
+                index = end;
+                copied = index;
+            }
+            else
+            {
+                index++;
+            }
+        }
+
+        return Finish(result, text, copied);
+    }
+
+    // A computer named like a placeholder's word must not turn the placeholder into another one, which keeps the
+    // redaction stable.
+    private static bool IsPlaceholderAt(string text, int start) =>
+        start >= 0 && (StartsWithAt(text, start, MachineToken) || StartsWithAt(text, start, UserToken));
+
+    private static bool StartsWithAt(string text, int start, string value) =>
+        text.Length - start >= value.Length && text.AsSpan(start, value.Length).Equals(value, StringComparison.OrdinalIgnoreCase);
+
+    private static string Finish(StringBuilder? result, string text, int copied) =>
+        result is null ? text : result.Append(text, copied, text.Length - copied).ToString();
+
+    private static bool StartsWord(string text, int index) => index == 0 || !char.IsLetterOrDigit(text[index - 1]);
+
+    private static bool IsSeparator(char character) => character is '\\' or '/';
+
+    private static bool IsQuote(char character) => character is '"' or '\'';
+
+    private static bool IsMachineNameCharacter(char character) => char.IsLetterOrDigit(character) || character is '-' or '_';
+
+    private static bool PathTextEquals(ReadOnlySpan<char> text, string path)
+    {
+        for (int i = 0; i < path.Length; i++)
+        {
+            char actual = text[i];
+            char expected = path[i];
+            bool same = IsSeparator(actual)
+                ? IsSeparator(expected)
+                : char.ToUpperInvariant(actual) == char.ToUpperInvariant(expected);
+            if (!same)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool EndsName(string text, int index)
+    {
+        if (index >= text.Length)
+        {
+            return true;
+        }
+
+        char next = text[index];
+
+        // Names hold dots, so a dot ends one only where it ends a sentence.
+        if (next == '.')
+        {
+            return index + 1 == text.Length || char.IsWhiteSpace(text[index + 1]) || IsQuote(text[index + 1]);
+        }
+
+        return IsSeparator(next) || char.IsWhiteSpace(next) || NameTerminators.Contains(next);
+    }
+
+    // A profile folder is named after its account, and Windows lets that name hold spaces, apostrophes, dots and
+    // brackets, so the whole component up to the next separator is the name. Only a character no file name may
+    // hold ends the scan sooner. Without a separator, the quote that opened the path closes the name; failing that
+    // the name runs to where the scan stopped, because any part of it left in place still names the account.
+    private static int ProfileFolderNameEnd(string text, int pathStart, int nameStart)
+    {
+        int limit = nameStart;
+        while (limit < text.Length && !IsSeparator(text[limit]) && MayBeInFileName(text[limit]))
+        {
+            limit++;
+        }
+
+        if (limit < text.Length && IsSeparator(text[limit]))
+        {
+            return limit;
+        }
+
+        // A colon stops the scan; when it follows a drive letter, that letter starts the next path, not this name,
+        // and so does an apostrophe quoting that path. Redacted with this name, the apostrophe would leave the next
+        // path unquoted on a second redaction and change how much of it is redacted.
+        if (limit > nameStart
+            && limit + 1 < text.Length
+            && text[limit] == ':'
+            && IsSeparator(text[limit + 1])
+            && char.IsAsciiLetter(text[limit - 1])
+            && StartsWord(text, limit - 1))
+        {
+            limit--;
+            if (limit > nameStart && text[limit - 1] == '\'')
+            {
+                limit--;
+            }
+        }
+
+        char opening = pathStart > 0 ? text[pathStart - 1] : '\0';
+        if (opening == '"' && limit < text.Length && text[limit] == '"')
+        {
+            return limit;
+        }
+
+        if (opening == '\'')
+        {
+            // An apostrophe inside the name, as in O'Connor, is followed by more of the name.
+            for (int quote = nameStart; quote < limit; quote++)
+            {
+                if (text[quote] == '\''
+                    && (quote + 1 == limit
+                        || char.IsWhiteSpace(text[quote + 1])
+                        || ClosingQuoteFollowers.Contains(text[quote + 1])))
+                {
+                    return quote;
+                }
+            }
+        }
+
+        // Windows drops the spaces and dots a file name ends with, so trailing ones belong to the sentence.
+        int end = limit;
+        while (end > nameStart && (char.IsWhiteSpace(text[end - 1]) || text[end - 1] == '.'))
+        {
+            end--;
+        }
+
+        return end;
+    }
+
+    // Line and paragraph separators end a line, which no name in a message spans.
+    private static bool MayBeInFileName(char character) =>
+        !char.IsControl(character)
+        && character is not ('\u2028' or '\u2029')
+        && !InvalidFileNameCharacters.Contains(character);
 }
 
 /// <summary>

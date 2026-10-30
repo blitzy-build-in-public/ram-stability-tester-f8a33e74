@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Runtime.ExceptionServices;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Automation.Peers;
@@ -99,6 +100,12 @@ public partial class App : Application
     // Covers an elevated restart: the instance that launched it holds the mutex until its window has closed.
     private static readonly TimeSpan _singleInstanceWait = TimeSpan.FromSeconds(5);
 
+    // A crash or startup-failure report waits at most this long for its app-errors.log write, the bound the results
+    // log gives its own drain at close. The wait never holds the dispatcher: it runs on the thread pool, or in the
+    // AppDomain handler, after which the process ends at once, so an unawaited write would be lost with it. The bound
+    // keeps a stalled disk from holding the exit.
+    private static readonly TimeSpan _appErrorWriteBound = TimeSpan.FromSeconds(2);
+
     private static readonly TimeSpan _liveRegionRetryInterval = TimeSpan.FromMilliseconds(250);
 
     // Per-window live-region state lives on the window itself, as WorkAreaSizing keeps its sizing state, so two
@@ -123,6 +130,10 @@ public partial class App : Application
     // An exception the dispatcher leaves unhandled reaches AppDomain.UnhandledException as the same object; it is
     // reported once.
     private Exception? _reportedFatalException;
+
+    // Set by the first dispatcher exception, which a pool thread reports and then rethrows. Any other dispatcher
+    // exception finds it set and is left unhandled, and closing is refused until the rethrow ends the process.
+    private int _dispatcherExceptionClaimed;
 
     // Registered once per process, before any window exists: Main constructs the application before anything else,
     // and the test fixture that loads App.xaml constructs it too. One class handler adds nothing to the text elements
@@ -197,6 +208,11 @@ public partial class App : Application
     /// (with any session left after its shutdown deadline), the sensor monitor, and finally the single-instance
     /// mutex, which lets a waiting elevated instance start.
     /// </summary>
+    /// <remarks>
+    /// This runs on the UI thread, so nothing here waits. The sensor monitor, whose disposal joins its thread, has
+    /// already been disposed on the thread pool before the window closed or a startup failure shut the application
+    /// down, so its source is still closed before the mutex is released.
+    /// </remarks>
     /// <param name="e">The exit arguments, carrying the exit code passed to <see cref="Application.Shutdown(int)"/>.</param>
     protected override void OnExit(ExitEventArgs e)
     {
@@ -311,7 +327,8 @@ public partial class App : Application
 
     private async Task ReportStartupFailureAsync(IUserPrompt prompt, Exception exception)
     {
-        // Both loggers write synchronously and never throw; the thread pool keeps that write off the UI thread.
+        // Both reporters wait a bounded time for their write and never throw; the thread pool keeps even that wait off
+        // the UI thread.
         await Task.Run(() => ReportFatalException(exception, StartupErrorSource));
 
         try
@@ -322,9 +339,10 @@ public partial class App : Application
         {
             // The dialog itself failed, for example because the dispatcher is already shutting down. The application
             // ends regardless; the failure is kept for diagnosis.
-            ReportFatalException(promptFailure, StartupErrorSource);
+            await Task.Run(() => ReportFatalException(promptFailure, StartupErrorSource));
         }
 
+        await DisposeSensorMonitorOffUiThreadAsync();
         Shutdown(ExitCodeFailure);
     }
 
@@ -332,6 +350,14 @@ public partial class App : Application
     // on them), and published the summaries; the window stays responsive meanwhile and shows that progress.
     private async void OnMainWindowClosingAsync(object? sender, CancelEventArgs e)
     {
+        // A dispatcher exception is being reported and its rethrow ends the process. The disabled window still takes
+        // a close from its title bar, and a normal exit now would end the process before the report and the crash.
+        if (Volatile.Read(ref _dispatcherExceptionClaimed) != 0)
+        {
+            e.Cancel = true;
+            return;
+        }
+
         if (_closeConfirmed)
         {
             return;
@@ -356,6 +382,7 @@ public partial class App : Application
             await Task.Run(() => ReportFatalException(exception, ClosingErrorSource));
         }
 
+        await DisposeSensorMonitorOffUiThreadAsync();
         _closeConfirmed = true;
         RequestWindowClose();
     }
@@ -383,12 +410,39 @@ public partial class App : Application
         }
     }
 
-    // The dispatcher exception is left unhandled, so the process ends once the session is disposed and the locked
-    // memory released; the journal, which has no result record, makes the next launch report the run.
-    private void OnDispatcherUnhandledException(object? sender, DispatcherUnhandledExceptionEventArgs e) =>
-        ReportFatalException(e.Exception, FatalErrorSource);
+    // The report disposes the session and writes the error, which can take up to its bound, so it runs on the thread
+    // pool and the UI thread does not wait: the first exception is handled, the window is disabled, and the pool thread
+    // rethrows the exception once the report has finished. Any other exception raised meanwhile finds the claim taken
+    // and is left unhandled. Either way the process ends as an unhandled crash; Windows reclaims any locked pages left,
+    // and the journal, which has no result record, makes the next launch report the run.
+    private void OnDispatcherUnhandledException(object? sender, DispatcherUnhandledExceptionEventArgs e)
+    {
+        if (Interlocked.Exchange(ref _dispatcherExceptionClaimed, 1) != 0)
+        {
+            return;
+        }
 
-    // May run on any thread; RunController.HandleFatalException is thread-safe.
+        e.Handled = true;
+        Exception exception = e.Exception;
+        _ = ThreadPool.QueueUserWorkItem(_ => ReportFatalThenRethrow(exception));
+        if (_window is { } window)
+        {
+            window.IsEnabled = false;
+        }
+    }
+
+    // The rethrow is unhandled on this pool thread, which always ends the process, and AppDomain.UnhandledException
+    // finds the exception already reported. It is not rethrown on the dispatcher: there, an exception that unwinds
+    // through a message box's modal loop can be swallowed, which would leave the disabled window running.
+    private void ReportFatalThenRethrow(Exception exception)
+    {
+        ReportFatalException(exception, FatalErrorSource);
+        ExceptionDispatchInfo.Capture(exception).Throw();
+    }
+
+    // May run on any thread; RunController.HandleFatalException is thread-safe. The process ends as soon as this
+    // returns, so the report's bounded wait runs here. It reaches the UI thread only with an exception that has
+    // escaped the dispatcher, which no longer pumps.
     private void OnDomainUnhandledException(object? sender, UnhandledExceptionEventArgs e)
     {
         if (e.ExceptionObject is Exception exception)
@@ -398,7 +452,9 @@ public partial class App : Application
     }
 
     // Logs the exception and, once the controller exists, disposes its engine session so the locked memory is
-    // released before the process ends. Never throws; safe on any thread.
+    // released before the process ends. Each waits only a bounded time, so a hung engine or a stalled disk never
+    // holds the exit; the wait blocks the calling thread, so the UI thread hands this to the thread pool. Never
+    // throws; safe on any thread.
     private void ReportFatalException(Exception exception, string source)
     {
         if (ReferenceEquals(Interlocked.Exchange(ref _reportedFatalException, exception), exception))
@@ -420,12 +476,13 @@ public partial class App : Application
     {
         if (dataDirectory is not null)
         {
-            ResultsLog.AppendAppError(dataDirectory, source, exception, TimeProvider.System.GetUtcNow());
+            _ = ResultsLog.TryAppendAppError(dataDirectory, source, exception, TimeProvider.System.GetUtcNow(), _appErrorWriteBound);
         }
     }
 
     // Each disposal is isolated, so one failure never leaves a later resource, above all the mutex, unreleased. The
-    // dispatcher is stopping, so the failure is logged synchronously; a queued write could be lost with the process.
+    // failure's write is queued to the thread pool because the UI thread never blocks; at exit it can be lost if the
+    // process ends before it lands.
     private void DisposeOnExit(IDisposable? disposable)
     {
         if (disposable is null)
@@ -439,7 +496,20 @@ public partial class App : Application
         }
         catch (Exception exception)
         {
-            LogAppError(_dataDirectory, ExitErrorSource, exception);
+            if (_dataDirectory is { } dataDirectory)
+            {
+                ResultsLog.QueueAppError(dataDirectory, ExitErrorSource, exception, TimeProvider.System.GetUtcNow());
+            }
+        }
+    }
+
+    // SensorMonitor.Dispose joins the sensor thread for up to a second, so it runs on the thread pool before the
+    // application shuts down; the call in OnExit, on the UI thread, then finds the monitor disposed.
+    private async Task DisposeSensorMonitorOffUiThreadAsync()
+    {
+        if (_sensorMonitor is { } sensorMonitor)
+        {
+            await Task.Run(() => DisposeOnExit(sensorMonitor));
         }
     }
 

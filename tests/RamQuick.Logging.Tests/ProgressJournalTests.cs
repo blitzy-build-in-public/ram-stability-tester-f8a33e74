@@ -1483,6 +1483,25 @@ public sealed partial class ProgressJournalTests
         Assert.Equal(new[] { begin, step }, records);
     }
 
+    // A completed run's result carries an empty detail, which the summary's run.endDetail string takes. A line an
+    // earlier build wrote with a null detail, or one that lost the field, reads back the same way.
+    [Theory]
+    [InlineData("\"endDetail\":null,")]
+    [InlineData("")]
+    public void Serializer_ResultWithoutEndDetail_ReadsBackEmptyDetail(string endDetailField)
+    {
+        JournalResult passed = PassedResult();
+        string written = JournalLineSerializer.Serialize(passed);
+        string line = written.Replace("\"endDetail\":\"\",", endDetailField, StringComparison.Ordinal);
+        Assert.NotEqual(written, line);
+
+        Assert.True(JournalLineSerializer.TryParse(line, out JournalRecord? parsed), $"The line '{line}' did not parse.");
+
+        Assert.Equal(string.Empty, passed.EndDetail);
+        Assert.Equal(string.Empty, Assert.IsType<JournalResult>(parsed).EndDetail);
+        Assert.Equal(passed, parsed);
+    }
+
     [Fact]
     public void JournalBegin_Create_CapturesPlanAndMachineAndComparesByValue()
     {

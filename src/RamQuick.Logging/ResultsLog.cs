@@ -80,8 +80,11 @@ public sealed record SummaryPublishResult(bool Succeeded, string? JsonPath, stri
 /// the drain to render, so a large batch costs the caller only a reference copy. One drain loop on the thread
 /// pool appends the events in order and flushes them to the device after every drained batch, so a crashed
 /// run's <c>.log</c> keeps every event that reached the drain. A write failure is recorded once in
-/// <see cref="WriteFailure"/> and otherwise swallowed: the run continues without its event log. Events logged
-/// after <see cref="Dispose"/> are discarded.
+/// <see cref="WriteFailure"/> and the run continues without its event log. The run controller reads
+/// <see cref="WriteFailure"/>, which performs no I/O, on every progress event, after <see cref="FlushAsync"/> at
+/// publication and after <see cref="Dispose"/>; it reports the failure once to <c>app-errors.log</c> and on the
+/// notice line, which then tells results saved without a complete event log from results not saved. Events
+/// logged after <see cref="Dispose"/> are discarded.
 /// </para>
 /// <para>
 /// The run state is never cached here: <see cref="LogVerdict"/> receives the terminal state as a parameter.
@@ -959,11 +962,13 @@ public sealed class ResultsLog : IDisposable
     /// <see cref="Guid.Empty"/>, when there is none, and then the header has no <c>run_id</c>.
     /// </param>
     /// <remarks>
-    /// Synchronous, for the application's unhandled-exception handlers. It runs inside crash handlers, so it
-    /// never throws for a failure to format or write the block: such a failure is swallowed. Only the
-    /// exception's own text is written, with the data folder and the user's folders and name written as
-    /// <c>&lt;data&gt;</c>, <c>%LOCALAPPDATA%</c>, <c>%APPDATA%</c>, <c>%USERPROFILE%</c> and <c>%USERNAME%</c>, as in
-    /// the <c>.log</c>; no user or machine name is added.
+    /// Synchronous, for a thread that may block on I/O; the UI thread queues the write with
+    /// <see cref="QueueAppError"/> instead, and crash and exit handlers running off the UI thread bound their wait with
+    /// <see cref="TryAppendAppError"/>. It runs inside crash handlers, so it never throws for a failure to
+    /// format or write the block: such a failure is swallowed. Only the exception's own text is written, with the
+    /// data folder and the user's folders and name written as <c>&lt;data&gt;</c>, <c>%LOCALAPPDATA%</c>,
+    /// <c>%APPDATA%</c>, <c>%USERPROFILE%</c> and <c>%USERNAME%</c>, as in the <c>.log</c>; no user or machine name
+    /// is added.
     /// </remarks>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="dataDirectory"/> or <paramref name="exception"/> is <see langword="null"/>.
@@ -980,7 +985,68 @@ public sealed class ResultsLog : IDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(source);
         ArgumentNullException.ThrowIfNull(exception);
 
-        WriteAppError(dataDirectory.AppErrorsLogPath, dataDirectory.RootPath, source, exception, utc, runId);
+        _ = WriteAppError(dataDirectory.AppErrorsLogPath, dataDirectory.RootPath, source, exception, utc, runId);
+    }
+
+    /// <summary>
+    /// Performs <see cref="AppendAppError"/> on the thread pool and waits at most <paramref name="timeout"/> for the
+    /// block to be written and flushed to the device.
+    /// </summary>
+    /// <param name="dataDirectory">The data folder.</param>
+    /// <param name="source">Where the exception was caught, for example <c>"App.OnExit"</c>.</param>
+    /// <param name="exception">The exception.</param>
+    /// <param name="utc">The time it was caught.</param>
+    /// <param name="timeout">
+    /// How long to wait for the write: non-negative, or <see cref="Timeout.InfiniteTimeSpan"/> to wait until it ends.
+    /// </param>
+    /// <param name="runId">
+    /// The run in progress or still publishing when it was caught, or <see langword="null"/> when there is none; see
+    /// <see cref="AppendAppError"/>.
+    /// </param>
+    /// <returns>
+    /// <see langword="true"/> when the block was written and flushed within <paramref name="timeout"/>;
+    /// <see langword="false"/> when the write failed or was still running when the wait ended.
+    /// </returns>
+    /// <remarks>
+    /// For crash and exit handlers running off the UI thread, which queues its writes with
+    /// <see cref="QueueAppError"/> because it never blocks: the process may end as soon as these handlers return, so
+    /// they wait for the write, but a stalled disk must not hold them beyond the bound. A write still running when the
+    /// wait ends finishes alone. Like <see cref="AppendAppError"/>, it never throws for a failure to format or write
+    /// the block, nor for a timeout.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="dataDirectory"/> or <paramref name="exception"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException"><paramref name="source"/> is <see langword="null"/>, empty or white space.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="timeout"/> is negative and not <see cref="Timeout.InfiniteTimeSpan"/>, or longer than
+    /// <see cref="int.MaxValue"/> milliseconds.
+    /// </exception>
+    public static bool TryAppendAppError(
+        DataDirectory dataDirectory,
+        string source,
+        Exception exception,
+        DateTimeOffset utc,
+        TimeSpan timeout,
+        Guid? runId = null)
+    {
+        ArgumentNullException.ThrowIfNull(dataDirectory);
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
+        ArgumentNullException.ThrowIfNull(exception);
+        if ((timeout < TimeSpan.Zero && timeout != Timeout.InfiniteTimeSpan) || timeout.TotalMilliseconds > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(timeout),
+                timeout,
+                "The bound must be non-negative and at most Int32.MaxValue milliseconds, or infinite.");
+        }
+
+        string path = dataDirectory.AppErrorsLogPath;
+        string dataRoot = dataDirectory.RootPath;
+
+        // WriteAppError swallows every failure, so the task never faults and reading its result cannot throw.
+        Task<bool> write = Task.Run(() => WriteAppError(path, dataRoot, source, exception, utc, runId));
+        return write.Wait(timeout) && write.Result;
     }
 
     /// <summary>
@@ -1086,7 +1152,8 @@ public sealed class ResultsLog : IDisposable
         }
     }
 
-    private static void WriteAppError(
+    // True once the block is flushed to the device, so a bounded caller can tell a written block from a lost one.
+    private static bool WriteAppError(
         string path,
         string dataRoot,
         string source,
@@ -1137,10 +1204,13 @@ public sealed class ResultsLog : IDisposable
                 stream.Write(bytes);
                 stream.Flush(flushToDisk: true);
             }
+
+            return true;
         }
         catch (Exception)
         {
             // Deliberately swallowed: logging a fault must never raise another one inside a crash handler.
+            return false;
         }
     }
 

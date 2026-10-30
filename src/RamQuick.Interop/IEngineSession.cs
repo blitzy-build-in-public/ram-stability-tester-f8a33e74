@@ -57,8 +57,9 @@ public enum StopReason : uint
 /// and <see cref="ErrorsDetected"/> between them)* → <see cref="Completed"/> → <see cref="Released"/>. A preparation
 /// failure, such as a locking shortfall or an affinity failure, raises <see cref="Completed"/> and then
 /// <see cref="Released"/> with no <see cref="Prepared"/>, and so does a session stopped before it started.
-/// <see cref="Completed"/> and <see cref="Released"/> are each raised exactly once per started session. Every handler
-/// receives the session as <c>sender</c>.
+/// <see cref="Completed"/> is raised exactly once per started session and <see cref="Released"/> at most once: the
+/// engine withholds <see cref="Released"/> when Windows refuses to free a chunk, because the release cannot be
+/// confirmed. Every handler receives the session as <c>sender</c>.
 /// </para>
 /// <para>
 /// <b>Disposal.</b> <see cref="IDisposable.Dispose"/> releases the native session: it stops a run still in progress,
@@ -112,8 +113,9 @@ public interface IEngineSession : IDisposable
     event EventHandler<EngineCompleted>? Completed;
 
     /// <summary>
-    /// Raised exactly once per started session, after <see cref="Completed"/>, when the locked memory has been
-    /// released. It is the last event of the session, and the run's summaries are published only after it.
+    /// Raised at most once per started session, after <see cref="Completed"/>, when the locked memory has been
+    /// released; not raised when the engine cannot free every chunk. It is the last event of the session, and the run's
+    /// summaries are published only after it, or without a release time once the host stops waiting for it.
     /// </summary>
     event EventHandler<EngineReleased>? Released;
 

@@ -27,6 +27,8 @@
 #include <cwchar>
 #include <cstdarg>
 #include <algorithm>
+#include <utility>
+#include <vector>
 
 namespace rq::engine {
 
@@ -82,20 +84,25 @@ void debug_log(_Printf_format_string_ const wchar_t* format, ...) noexcept {
     OutputDebugStringW(buffer);
 }
 
-/** Fills os_error and end_detail of an insufficient_memory outcome for a failed OS call. */
+/**
+ * Fills os_error and end_detail of an insufficient_memory outcome for a failed OS call.
+ *
+ * The Windows error travels in os_error alone: the host prefixes it to the detail ("Windows
+ * error n: "), so a code in the text would be shown twice.
+ */
 void set_detail(allocation_outcome& outcome, const char* call, DWORD error,
                 std::uint64_t attempted_mib, std::uint64_t min_mib) noexcept {
     char buffer[256];
-    std::snprintf(buffer, sizeof(buffer),
-                  "%s failed (Windows error %lu) at %llu MiB; %llu MiB minimum not lockable", call,
-                  error, attempted_mib, min_mib);
+    std::snprintf(buffer, sizeof(buffer), "%s failed at %llu MiB; %llu MiB minimum not lockable",
+                  call, attempted_mib, min_mib);
     outcome.os_error = error;
     copy_utf8_truncated(outcome.end_detail, sizeof(outcome.end_detail), buffer);
 }
 
 /**
- * Owns a 4 KiB-page allocation from VirtualAlloc until it is locked and handed to the chunk
- * list, so a failed lock frees it at once (it is not yet in the list that release() walks).
+ * Owns a 4 KiB-page allocation from VirtualAlloc until it is handed to the chunk list, locked,
+ * or unlocked after a failed lock for the attempt's cleanup to free. Only an exception from the
+ * lock override leaves it here, and the destructor then frees it.
  */
 class pending_allocation {
 public:
@@ -167,42 +174,53 @@ bool adjust_lock_memory_privilege(bool enable, bool& was_enabled, DWORD& error) 
     return true;
 }
 
+/** What free_chunks() did. */
+struct chunks_freed {
+    /** Bytes whose VirtualFree succeeded. */
+    std::uint64_t bytes = 0;
+    /** GetLastError() of the last VirtualFree that failed; ERROR_SUCCESS when none failed. */
+    DWORD free_error = ERROR_SUCCESS;
+};
+
 /**
- * Unlocks (4 KiB-page chunks only; large pages are never locked) and frees every chunk, then
- * clears the list. A failed unlock does not keep the chunk from being freed.
+ * Unlocks (4 KiB-page chunks only; large pages are never locked) and frees every chunk. A
+ * failed unlock does not keep the chunk from being freed.
  *
- * @return Bytes whose VirtualFree succeeded.
+ * A chunk whose VirtualFree fails is still allocated, so it stays in the list, which keeps
+ * ownership of it for a later call to retry: dropping it would lose the allocation while the
+ * caller reports the region released. The kept chunks are moved to the front of the same
+ * vector, in order, so this noexcept path never allocates.
+ *
+ * @param free_override Replaces VirtualFree(base, 0, MEM_RELEASE) when non-empty.
  */
-std::uint64_t free_chunks(std::vector<chunk_view>& chunks) noexcept {
-    std::uint64_t freed = 0;
+chunks_freed free_chunks(std::vector<chunk_view>& chunks,
+                         const free_function& free_override) noexcept {
+    chunks_freed freed{};
+    std::size_t kept = 0;
     for (const chunk_view& chunk : chunks) {
         if (!chunk.large_pages && !VirtualUnlock(chunk.base, chunk.bytes)) {
             const DWORD error = GetLastError();
-            // A chunk locked by a test's lock override may never have been locked for real.
+            // A chunk locked by a test's lock override may never have been locked for real, and
+            // a chunk kept by an earlier call was already unlocked by it.
             if (error != ERROR_NOT_LOCKED) {
                 debug_log(L"VirtualUnlock of the chunk at %llu MiB failed (Windows error %lu)",
                           chunk.logical_offset / k_mib, error);
             }
         }
-        if (VirtualFree(chunk.base, 0, MEM_RELEASE)) {
-            freed += chunk.bytes;
+        const bool released = free_override ? free_override(chunk.base)
+                                            : VirtualFree(chunk.base, 0, MEM_RELEASE) != FALSE;
+        if (released) {
+            freed.bytes += chunk.bytes;
         } else {
-            const DWORD error = GetLastError();
-            debug_log(L"VirtualFree of the chunk at %llu MiB failed (Windows error %lu)",
-                      chunk.logical_offset / k_mib, error);
+            freed.free_error = GetLastError();
+            debug_log(L"VirtualFree of the chunk at %llu MiB failed (Windows error %lu); the "
+                      L"chunk is kept for a later release",
+                      chunk.logical_offset / k_mib, freed.free_error);
+            chunks[kept++] = chunk;
         }
     }
-    chunks.clear();
+    chunks.erase(chunks.begin() + static_cast<std::ptrdiff_t>(kept), chunks.end());
     return freed;
-}
-
-/** Restores working-set limits read by GetProcessWorkingSetSizeEx; logs a failure. */
-void restore_working_set(std::uint64_t minimum, std::uint64_t maximum,
-                         std::uint32_t flags) noexcept {
-    if (!SetProcessWorkingSetSizeEx(GetCurrentProcess(), static_cast<SIZE_T>(minimum),
-                                    static_cast<SIZE_T>(maximum), flags)) {
-        debug_log(L"Restoring the working-set limits failed (Windows error %lu)", GetLastError());
-    }
 }
 
 /** The failing OS call of an attempt and its GetLastError(), captured right after the call. */
@@ -210,6 +228,239 @@ struct attempt_failure {
     const char* call = "";
     DWORD error = ERROR_SUCCESS;
 };
+
+/** Holds an SRW lock exclusively for its lifetime; acquiring one cannot fail or throw. */
+class exclusive_lock {
+public:
+    explicit exclusive_lock(SRWLOCK& lock) noexcept : lock_(lock) {
+        AcquireSRWLockExclusive(&lock_);
+    }
+    ~exclusive_lock() { ReleaseSRWLockExclusive(&lock_); }
+    exclusive_lock(const exclusive_lock&) = delete;
+    exclusive_lock& operator=(const exclusive_lock&) = delete;
+
+private:
+    SRWLOCK& lock_;
+};
+
+constexpr std::uint64_t saturating_add(std::uint64_t a, std::uint64_t b) noexcept {
+    return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+
+/**
+ * The process's working-set limits, shared by every region that raises them.
+ *
+ * VirtualLock is bounded by a single minimum working set per process, so the regions of
+ * sessions running at once in one process must share it. Each region adds its contribution,
+ * the bytes it is about to lock, and the minimum is the sum of every live contribution plus
+ * one k_working_set_headroom_bytes, which for a lone region is its own bytes plus the
+ * headroom. Without the sum, each raise would replace the minimum another live region relies
+ * on, and the next VirtualLock of either would fail with ERROR_WORKING_SET_QUOTA. The limits in
+ * force before the first contribution are restored once the last one is withdrawn; they are
+ * kept until a restore succeeds, so a failed restore never makes raised limits the baseline.
+ *
+ * Both limits are soft (QUOTA_LIMITS_HARDWS_*_DISABLE): the minimum never forces other
+ * processes to be trimmed and the maximum never caps this one. Every change runs under one SRW
+ * lock, which the noexcept release path can take because acquiring it cannot fail. Constant
+ * initialized and trivially destructible, so it is usable from any region, static ones
+ * included.
+ */
+class working_set_ledger {
+public:
+    constexpr working_set_ledger() noexcept = default;
+
+    /**
+     * Adds contribution and sets the limits to cover it. On failure the ledger and the limits
+     * are unchanged, and failure names the call that failed.
+     */
+    bool add(std::uint64_t contribution, attempt_failure& failure) noexcept {
+        const exclusive_lock guard(lock_);
+        if (!baseline_saved_) {
+            SIZE_T minimum = 0;
+            SIZE_T maximum = 0;
+            DWORD flags = 0;
+            if (!GetProcessWorkingSetSizeEx(GetCurrentProcess(), &minimum, &maximum, &flags)) {
+                failure = attempt_failure{"GetProcessWorkingSetSizeEx", GetLastError()};
+                return false;
+            }
+            baseline_minimum_ = minimum;
+            baseline_maximum_ = maximum;
+            baseline_flags_ = flags;
+            baseline_saved_ = true;
+        }
+        // Saturated, so an absurd total fails in SetProcessWorkingSetSizeEx with its own error
+        // instead of wrapping to a small minimum.
+        const std::uint64_t total = saturating_add(total_, contribution);
+        if (!set_limits(total)) {
+            failure = attempt_failure{"SetProcessWorkingSetSizeEx", GetLastError()};
+            return false;
+        }
+        total_ = total;
+        ++holders_;
+        return true;
+    }
+
+    /**
+     * Withdraws a contribution add() accepted: lowers the minimum to the remaining ones, or
+     * restores the saved limits when it was the last. A failure is logged; a minimum left too
+     * high only costs headroom, and the next change sets the limits afresh.
+     */
+    void remove(std::uint64_t contribution) noexcept {
+        const exclusive_lock guard(lock_);
+        // Every withdrawal pairs with an accepted add(), so an empty ledger has nothing to undo.
+        if (holders_ == 0) {
+            return;
+        }
+        total_ -= std::min(total_, contribution);
+        --holders_;
+        if (holders_ != 0) {
+            if (!set_limits(total_)) {
+                debug_log(L"Lowering the minimum working set to %llu MiB failed (Windows error "
+                          L"%lu)",
+                          saturating_add(total_, k_working_set_headroom_bytes) / k_mib,
+                          GetLastError());
+            }
+            return;
+        }
+        total_ = 0;
+        if (SetProcessWorkingSetSizeEx(GetCurrentProcess(), baseline_minimum_, baseline_maximum_,
+                                       baseline_flags_)) {
+            baseline_saved_ = false;
+        } else {
+            debug_log(L"Restoring the working-set limits failed (Windows error %lu)",
+                      GetLastError());
+        }
+    }
+
+private:
+    /** Minimum = total + headroom; maximum = at least the saved maximum, and headroom above it. */
+    bool set_limits(std::uint64_t total) const noexcept {
+        const std::uint64_t minimum = saturating_add(total, k_working_set_headroom_bytes);
+        const std::uint64_t maximum = std::max<std::uint64_t>(
+            baseline_maximum_, saturating_add(minimum, k_working_set_headroom_bytes));
+        return SetProcessWorkingSetSizeEx(
+                   GetCurrentProcess(), static_cast<SIZE_T>(minimum), static_cast<SIZE_T>(maximum),
+                   QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) != FALSE;
+    }
+
+    SRWLOCK lock_ = SRWLOCK_INIT;
+    // Sum of the live contributions, and how many there are. Plain fields guarded by lock_
+    // rather than atomics: each change must stay paired with the SetProcessWorkingSetSizeEx
+    // call that applies it, which no atomic counter could order.
+    std::uint64_t total_ = 0;
+    std::uint32_t holders_ = 0;
+    // The limits read before the first contribution, kept until a restore to them succeeds.
+    bool baseline_saved_ = false;
+    SIZE_T baseline_minimum_ = 0;
+    SIZE_T baseline_maximum_ = 0;
+    DWORD baseline_flags_ = 0;
+};
+
+/** The ledger of this process. */
+working_set_ledger& process_working_set() noexcept {
+    static working_set_ledger ledger;
+    return ledger;
+}
+
+/** Withdraws a region's working-set raise, if it holds one, and zeroes it. */
+void restore_working_set(std::uint64_t& contribution) noexcept {
+    if (contribution != 0) {
+        process_working_set().remove(contribution);
+        contribution = 0;
+    }
+}
+
+/**
+ * The owner of the chunks that regions still held when they were destroyed, because Windows
+ * refused to free them.
+ *
+ * A destroyed region cannot keep owning a chunk, and dropping the chunk would leave a committed,
+ * possibly locked, allocation with no owner and no retry, under a working-set raise nobody
+ * withdraws. Each entry therefore keeps what its region held: the chunks, the free override
+ * that frees them and the working-set contribution that covers them, which stays in the ledger
+ * until every chunk of the entry is freed, so the minimum never drops beneath pages that may
+ * still be locked. Every release() in the process retries the entries, so any later region
+ * frees them once Windows allows it; Windows reclaims what is still refused at process exit.
+ *
+ * Every change runs under one SRW lock, which the noexcept release path can take because
+ * acquiring it cannot fail. Lock order: this lock, then the ledger's; the ledger never takes
+ * this one. The constructor is constexpr and noexcept, and memory_region's constructor makes
+ * the first use, so the owner outlives every region, static ones included.
+ */
+class orphan_owner {
+public:
+    constexpr orphan_owner() noexcept = default;
+
+    /**
+     * Takes over the chunks, free override and working-set contribution of a region being
+     * destroyed, leaving them empty and zero there, so nothing withdraws the contribution twice.
+     */
+    void adopt(std::vector<chunk_view>& chunks, free_function& free_override,
+               std::uint64_t& contribution) noexcept {
+        const exclusive_lock guard(lock_);
+        try {
+            entries_.emplace_back();
+        } catch (...) {
+            // Growing the list can fail only for want of memory, and then ownership of the
+            // chunks can be kept nowhere. Ending the process is the one way left to have the
+            // pages freed: Windows reclaims them, locked ones included, with the process, and
+            // the host reports the unfinished run at its next launch.
+            debug_log(L"The orphaned-chunk list could not grow; ending the process so Windows "
+                      L"reclaims the chunks");
+            __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+        }
+        orphan_entry& entry = entries_.back();
+        // Swaps move without copying an element or allocating, and cannot throw.
+        entry.chunks.swap(chunks);
+        entry.free_override.swap(free_override);
+        entry.ws_contribution = std::exchange(contribution, 0);
+    }
+
+    /**
+     * Frees every adopted chunk Windows now allows, each with its own region's free override.
+     * An entry whose chunks are all freed withdraws its working-set contribution and is erased,
+     * which moves the later entries down and allocates nothing.
+     */
+    void retry() noexcept {
+        const exclusive_lock guard(lock_);
+        for (orphan_entry& entry : entries_) {
+            free_chunks(entry.chunks, entry.free_override);
+            if (entry.chunks.empty()) {
+                restore_working_set(entry.ws_contribution);
+            }
+        }
+        std::erase_if(entries_, [](const orphan_entry& entry) { return entry.chunks.empty(); });
+    }
+
+    /** Bytes of every adopted chunk still allocated. */
+    std::uint64_t bytes() noexcept {
+        const exclusive_lock guard(lock_);
+        std::uint64_t total = 0;
+        for (const orphan_entry& entry : entries_) {
+            for (const chunk_view& chunk : entry.chunks) {
+                total += chunk.bytes;
+            }
+        }
+        return total;
+    }
+
+private:
+    /** What one destroyed region still held. */
+    struct orphan_entry {
+        std::vector<chunk_view> chunks;
+        free_function free_override;
+        std::uint64_t ws_contribution = 0;
+    };
+
+    SRWLOCK lock_ = SRWLOCK_INIT;
+    std::vector<orphan_entry> entries_;
+};
+
+/** The orphan owner of this process. */
+orphan_owner& process_orphans() noexcept {
+    static orphan_owner orphans;
+    return orphans;
+}
 
 enum class attempt_status { ok, stopped, failed };
 
@@ -272,10 +523,22 @@ std::uint64_t next_retry_bytes(std::uint64_t attempted_bytes, std::uint64_t min_
     return floor_bytes < attempted_bytes ? floor_bytes : 0;
 }
 
-memory_region::memory_region() noexcept = default;
+memory_region::memory_region() noexcept {
+    // Constructed before any region is complete, so the owner is destroyed after every region,
+    // static ones included, whose destructor may hand it chunks.
+    process_orphans();
+}
 
 memory_region::~memory_region() {
     release();
+    if (!chunks_.empty()) {
+        // Ownership never ends with the object: a chunk Windows still refuses to free passes,
+        // with the override that frees it and the working-set raise that covers it, to the
+        // process-wide owner that every later release() retries.
+        debug_log(L"%llu MiB could not be freed and pass to the owner of orphaned chunks",
+                  held_bytes() / k_mib);
+        process_orphans().adopt(chunks_, free_override_, ws_contribution_);
+    }
 }
 
 allocation_outcome memory_region::allocate(const region_options& options, const stop_signal& stop) {
@@ -284,13 +547,86 @@ allocation_outcome memory_region::allocate(const region_options& options, const 
     release();
 
     allocation_outcome outcome{};
+    if (!chunks_.empty()) {
+        // Windows refused to free a chunk of the earlier region, so it stays owned for a later
+        // release() to retry. A plan over it would mix it into the new region's chunk list, so
+        // the call is refused before any attempt; the free error is the one that failed last.
+        char buffer[256];
+        std::snprintf(buffer, sizeof(buffer),
+                      "VirtualFree failed; %llu MiB of an earlier region is still held",
+                      held_bytes() / k_mib);
+        outcome.status = allocation_status::insufficient_memory;
+        outcome.os_error = free_error_;
+        copy_utf8_truncated(outcome.end_detail, sizeof(outcome.end_detail), buffer);
+        return outcome;
+    }
+    // Kept for every later release() of the chunks this call allocates. Copied before any OS
+    // state is touched, as the chunk-list reservation below is, since a copy may throw.
+    free_override_ = options.free_override;
+
+    // Ends the call at its first size, before the chunk list is reserved or any OS state is
+    // touched, as the first attempt's refusal of a size that cannot reach the minimum does.
+    auto refuse_first_size = [&outcome](const char* detail, std::uint32_t os_error) {
+        outcome.status = allocation_status::insufficient_memory;
+        outcome.attempts = 1;
+        outcome.os_error = os_error;
+        copy_utf8_truncated(outcome.end_detail, sizeof(outcome.end_detail), detail);
+        return outcome;
+    };
+
+    const region_plan first_plan = plan_region(options.region_bytes, options.worker_count);
+
+    // Locked pages stay resident, so a first size that plans more bytes than the machine has
+    // can never be locked. The host sizes its request from available memory, so such a request
+    // is malformed rather than a shortfall to shrink through, and it is refused before the
+    // reservation below: plan_region() accepts nearly 2^32 chunks per slice, so a single-worker
+    // request near 1 EiB would otherwise reserve over 100 GiB of chunk views. A plan with no
+    // slice is either too small, which the first attempt refuses, or too large to plan, so the
+    // requested size stands in for its tested bytes.
+    MEMORYSTATUSEX memory_status{};
+    memory_status.dwLength = sizeof(memory_status);
+    if (!GlobalMemoryStatusEx(&memory_status)) {
+        const DWORD error = GetLastError();
+        char buffer[256];
+        std::snprintf(buffer, sizeof(buffer),
+                      "GlobalMemoryStatusEx failed, so the %llu MiB region was not checked "
+                      "against physical memory",
+                      options.region_bytes / k_mib);
+        return refuse_first_size(buffer, error);
+    }
+    const std::uint64_t planned_bytes =
+        first_plan.slice_bytes != 0 ? first_plan.tested_bytes : options.region_bytes;
+    if (planned_bytes > memory_status.ullTotalPhys) {
+        // The request is rounded up and physical memory down to whole MiB, so the text never
+        // shows a request equal to the memory it exceeds. No OS call failed, so os_error is 0.
+        const std::uint64_t requested_mib =
+            options.region_bytes / k_mib + (options.region_bytes % k_mib != 0 ? 1u : 0u);
+        char buffer[256];
+        std::snprintf(buffer, sizeof(buffer),
+                      "Region of %llu MiB exceeds the %llu MiB of physical memory", requested_mib,
+                      memory_status.ullTotalPhys / k_mib);
+        return refuse_first_size(buffer, 0);
+    }
+
+    // Both factors are 32-bit, so the product is exact in 64 bits. Within physical memory it is
+    // at most one entry per 256 MiB plus one per worker; the check keeps the reservation within
+    // what the list can hold should that bound ever be loosened.
+    const std::uint64_t chunk_count =
+        static_cast<std::uint64_t>(first_plan.worker_count) * first_plan.chunks_per_slice;
+    if (chunk_count > chunks_.max_size()) {
+        char buffer[256];
+        std::snprintf(buffer, sizeof(buffer),
+                      "Region of %llu MiB over %u workers needs %llu chunks, more than can be "
+                      "tracked",
+                      options.region_bytes / k_mib, options.worker_count, chunk_count);
+        return refuse_first_size(buffer, 0);
+    }
 
     // The first attempt is the largest and no retry needs more chunks, so this one reservation
-    // is the only operation that can throw. It runs before any OS state is touched, so an
-    // exception leaves nothing allocated, locked, raised or enabled.
-    const region_plan first_plan = plan_region(options.region_bytes, options.worker_count);
-    chunks_.reserve(static_cast<std::size_t>(first_plan.worker_count) *
-                    first_plan.chunks_per_slice);
+    // and the copy of the free override above are the only operations that can throw. They run
+    // before any OS state is touched, so an exception leaves nothing allocated, locked, raised or
+    // enabled.
+    chunks_.reserve(static_cast<std::size_t>(chunk_count));
 
     // Large pages only when the token already holds SeLockMemoryPrivilege and the processor
     // supports them; otherwise every chunk uses 4 KiB pages locked with VirtualLock.
@@ -312,42 +648,17 @@ allocation_outcome memory_region::allocate(const region_options& options, const 
     }
     const bool use_large_pages = large_page_minimum != 0;
 
-    // Whether the limits in force before this call's first raise have been saved. They are
-    // read once per call, so every restore returns to them even after a failed restore.
-    bool limits_saved = false;
-
-    // VirtualLock locks only up to the minimum working set, so the minimum is raised to the
-    // bytes still to be locked plus headroom for the process's own pages. Both limits are soft
-    // (QUOTA_LIMITS_HARDWS_*_DISABLE): the minimum never forces other processes to be trimmed
-    // and the maximum never caps this one. The raise needs SeIncreaseWorkingSetPrivilege, which
-    // the default policy grants to Users. Holding it suffices; it need not be enabled, and a
-    // standard user's token holds it disabled, so a 1 GiB region locks without elevation.
+    // VirtualLock locks only up to the minimum working set, so the minimum is raised by the
+    // bytes still to be locked, on top of the raise of every other live region; the ledger adds
+    // the headroom for the process's own pages once. The raise needs
+    // SeIncreaseWorkingSetPrivilege, which the default policy grants to Users. Holding it
+    // suffices; it need not be enabled, and a standard user's token holds it disabled, so a
+    // 1 GiB region locks without elevation.
     auto raise_working_set = [&](std::uint64_t locked_bytes, attempt_failure& failure) -> bool {
-        if (!limits_saved) {
-            SIZE_T saved_min = 0;
-            SIZE_T saved_max = 0;
-            DWORD saved_flags = 0;
-            if (!GetProcessWorkingSetSizeEx(GetCurrentProcess(), &saved_min, &saved_max,
-                                            &saved_flags)) {
-                failure = attempt_failure{"GetProcessWorkingSetSizeEx", GetLastError()};
-                return false;
-            }
-            saved_ws_min_ = saved_min;
-            saved_ws_max_ = saved_max;
-            saved_ws_flags_ = saved_flags;
-            limits_saved = true;
-        }
-        const std::uint64_t minimum = locked_bytes + k_working_set_headroom_bytes;
-        const std::uint64_t maximum =
-            std::max(saved_ws_max_, minimum + k_working_set_headroom_bytes);
-        if (!SetProcessWorkingSetSizeEx(
-                GetCurrentProcess(), static_cast<SIZE_T>(minimum), static_cast<SIZE_T>(maximum),
-                QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
-            failure = attempt_failure{"SetProcessWorkingSetSizeEx", GetLastError()};
+        if (!process_working_set().add(locked_bytes, failure)) {
             return false;
         }
-        ws_raised_ = true;
-        ws_min_current_ = minimum;
+        ws_contribution_ = locked_bytes;
         return true;
     };
 
@@ -394,7 +705,8 @@ allocation_outcome memory_region::allocate(const region_options& options, const 
                     // memory twice and could itself make the large-page allocations fail. Later
                     // chunks are included because they may fall back too, and an attempt whose
                     // chunks are all large never raises the working set.
-                    if (!ws_raised_ && !raise_working_set(plan.tested_bytes - offset, failure)) {
+                    if (ws_contribution_ == 0 &&
+                        !raise_working_set(plan.tested_bytes - offset, failure)) {
                         return attempt_status::failed;
                     }
                     void* const allocation =
@@ -411,6 +723,11 @@ allocation_outcome memory_region::allocate(const region_options& options, const 
                         // The lock override reports its failure through the last error too, and
                         // stands in for VirtualLock, so the failure is named after it.
                         failure = attempt_failure{"VirtualLock", GetLastError()};
+                        // The unlocked chunk joins the list, within the capacity reserved for
+                        // this attempt, so the attempt's cleanup frees it with the others and
+                        // keeps owning it should Windows refuse to free it.
+                        chunks_.push_back(chunk_view{
+                            static_cast<std::uint64_t*>(pending.hand_over()), size, offset, false});
                         return attempt_status::failed;
                     }
                     base = pending.hand_over();
@@ -426,8 +743,11 @@ allocation_outcome memory_region::allocate(const region_options& options, const 
 
     std::uint64_t bytes = options.region_bytes;
     for (;;) {
+        // A stop returns at once and leaves whatever the region holds (chunks locked before
+        // it, a working-set raise, an enabled privilege) to release(). The coordinator calls
+        // that after Completed, so the stop bound never includes a teardown that grows with the
+        // bytes already locked. plan_ stays unset, so nothing held is exposed as a region.
         if (stop.stop_requested()) {
-            release();
             outcome.status = allocation_status::stopped;
             return outcome;
         }
@@ -472,19 +792,26 @@ allocation_outcome memory_region::allocate(const region_options& options, const 
             return outcome;
         }
         if (status == attempt_status::stopped) {
-            release();
+            // The attempt's chunks stay held for release(), as for a stop before an attempt.
             outcome.status = allocation_status::stopped;
             return outcome;
         }
 
         // The attempt failed: drop its chunks and working-set raise, but keep the privilege
         // state for the retry.
-        free_chunks(chunks_);
-        if (ws_raised_) {
-            restore_working_set(saved_ws_min_, saved_ws_max_, saved_ws_flags_);
-            ws_raised_ = false;
-            ws_min_current_ = 0;
+        const chunks_freed freed = free_chunks(chunks_, free_override_);
+        if (!chunks_.empty()) {
+            // Windows refused to free a chunk of the attempt. It stays owned, with the
+            // working-set raise that covers it and the privilege state, until release() frees
+            // it. No retry is planned over it: slice() indexes chunks_ by position, and the
+            // list's capacity covers one attempt's chunks only.
+            free_error_ = freed.free_error;
+            set_detail(outcome, "VirtualFree", freed.free_error, bytes / k_mib,
+                       options.min_region_bytes / k_mib);
+            outcome.status = allocation_status::insufficient_memory;
+            return outcome;
         }
+        restore_working_set(ws_contribution_);
 
         const std::uint64_t next =
             next_retry_bytes(bytes, options.min_region_bytes, options.worker_count);
@@ -503,19 +830,29 @@ allocation_outcome memory_region::allocate(const region_options& options, const 
 }
 
 std::uint64_t memory_region::release() noexcept {
-    const std::uint64_t released = free_chunks(chunks_);
+    const chunks_freed freed = free_chunks(chunks_, free_override_);
+    // Unusable from here on, even while a chunk Windows refused to free is still held.
     plan_ = region_plan{};
 
-    // Restored only after every chunk is unlocked and freed, so the lower minimum never has to
-    // hold locked pages.
-    if (ws_raised_) {
-        restore_working_set(saved_ws_min_, saved_ws_max_, saved_ws_flags_);
-        ws_raised_ = false;
-        ws_min_current_ = 0;
+    if (!chunks_.empty()) {
+        // The held chunk keeps the working-set raise that covers it until a later call frees
+        // it, so the minimum is never lowered beneath pages that may still be locked.
+        free_error_ = freed.free_error;
+    } else {
+        free_error_ = ERROR_SUCCESS;
+        // The seam is needed only while a chunk it must free is held.
+        free_override_ = nullptr;
+        // Withdrawn only after every chunk is unlocked and freed, so the lower minimum never has
+        // to hold this region's locked pages.
+        restore_working_set(ws_contribution_);
     }
+    // Every release in the process retries the chunks destroyed regions left behind, so each
+    // keeps an owner that retries it. They are not this region's, so freed.bytes leaves them out.
+    retry_orphaned_chunks();
 
     // Only a privilege this object enabled is disabled again; one that was already enabled is
-    // left as it was found.
+    // left as it was found. A held chunk does not need it: the privilege governs new large-page
+    // allocations only, not freeing one.
     if (privilege_enabled_by_us_) {
         bool was_enabled = false;
         DWORD error = ERROR_SUCCESS;
@@ -525,7 +862,15 @@ std::uint64_t memory_region::release() noexcept {
         }
         privilege_enabled_by_us_ = false;
     }
-    return released;
+    return freed.bytes;
+}
+
+std::uint64_t memory_region::held_bytes() const noexcept {
+    std::uint64_t bytes = 0;
+    for (const chunk_view& chunk : chunks_) {
+        bytes += chunk.bytes;
+    }
+    return bytes;
 }
 
 bool memory_region::allocated() const noexcept {
@@ -593,6 +938,14 @@ std::span<const chunk_view> memory_region::chunks() const noexcept {
         return {};
     }
     return chunks_;
+}
+
+std::uint64_t orphaned_bytes() noexcept {
+    return process_orphans().bytes();
+}
+
+void retry_orphaned_chunks() noexcept {
+    process_orphans().retry();
 }
 
 }  // namespace rq::engine

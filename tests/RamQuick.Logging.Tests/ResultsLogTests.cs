@@ -846,6 +846,47 @@ public sealed partial class ResultsLogTests
         Assert.Null(log.WriteFailure);
     }
 
+    // A byte-range lock held through a second handle makes the drain's writes fail with a lock violation, with no
+    // access-control change. The first failure is kept for the run controller to report, and the log keeps accepting
+    // events and completing flushes, so the run is never held by its event log.
+    [Fact]
+    public async Task LogEvents_WriteFails_RecordsFirstFailureAndKeepsCompletingFlushesAsync()
+    {
+        using var root = new TestDataRoot();
+        using ResultsLog log = Open(root, CreateTime(), new ScriptedRunIds(JournalSamples.RunIdA));
+        log.LogNotice("before the lock");
+        await log.FlushAsync().WaitAsync(_ceiling, Cancellation);
+        Assert.Null(log.WriteFailure);
+
+        using (var blocker = new FileStream(log.LogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            blocker.Lock(0, long.MaxValue);
+            try
+            {
+                log.LogNotice("while locked");
+                await log.FlushAsync().WaitAsync(_ceiling, Cancellation);
+                IOException failure = Assert.IsAssignableFrom<IOException>(log.WriteFailure);
+
+                log.LogNotice("still locked");
+                await log.FlushAsync().WaitAsync(_ceiling, Cancellation);
+                Assert.Same(failure, log.WriteFailure);
+            }
+            finally
+            {
+                blocker.Unlock(0, long.MaxValue);
+            }
+        }
+
+        log.LogNotice("after the lock");
+        await log.FlushAsync().WaitAsync(_ceiling, Cancellation);
+        log.Dispose();
+        await log.FlushAsync().WaitAsync(_ceiling, Cancellation);
+
+        Assert.NotNull(log.WriteFailure);
+        string text = Encoding.UTF8.GetString(await ReadSharedBytesAsync(log.LogPath));
+        Assert.Contains("NOTICE message=\"before the lock\"" + LineEnd, text, StringComparison.Ordinal);
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Publication
     // ---------------------------------------------------------------------------------------------
@@ -1039,7 +1080,7 @@ public sealed partial class ResultsLogTests
                 && reason.ToString() == endReason,
             $"run.endReason '{endReason}' is not a RunEndReason name.");
         Assert.Equal(nameof(RunEndReason.Completed), endReason);
-        Kind(JsonValueKind.Null, json, "run", "endDetail");
+        Assert.Equal(string.Empty, Kind(JsonValueKind.String, json, "run", "endDetail").GetString());
         foreach (string stamp in new[] { "startRequestedUtc", "startedUtc", "endedUtc", "verdictUtc" })
         {
             Assert.Matches(IsoUtcPattern(), Kind(JsonValueKind.String, json, "run", stamp).GetString()!);
@@ -1648,6 +1689,7 @@ public sealed partial class ResultsLogTests
         Assert.Throws<ArgumentNullException>(() => TextSummaryFormatter.Format(null!));
         Assert.Throws<ArgumentNullException>(() => TextSummaryFormatter.TryParseRunId(null!));
         Assert.Throws<ArgumentNullException>(() => RunSummaryJson.Serialize(null!));
+        Assert.Throws<ArgumentNullException>(() => SummaryFormat.RedactPersonalPaths(null!));
     }
 
     [Fact]
@@ -1677,6 +1719,131 @@ public sealed partial class ResultsLogTests
     {
         Assert.Equal(parsed, SummaryFormat.TryParseHex64(text, out ulong value));
         Assert.Equal(expected, value);
+    }
+
+    // Each case pairs a text with its redaction. The environment's folders and names are read at run time, so the
+    // cases hold this host's personal values and prove that none of them survives.
+    public static TheoryData<string, string> PersonalPathCases()
+    {
+        string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string roamingAppData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        string userName = Environment.UserName;
+        string machineName = Environment.MachineName;
+        return new TheoryData<string, string>
+        {
+            { profile + @"\Documents\RamQuick\data\journal\active-run.jsonl", @"%USERPROFILE%\Documents\RamQuick\data\journal\active-run.jsonl" },
+            { "Could not find file '" + profile + @"\x.log'.", @"Could not find file '%USERPROFILE%\x.log'." },
+            { profile.ToUpperInvariant().Replace('\\', '/') + "/notes.txt", "%USERPROFILE%/notes.txt" },
+            { localAppData + @"\RamQuick\logs\app-errors.log", @"%LOCALAPPDATA%\RamQuick\logs\app-errors.log" },
+            { roamingAppData + @"\RamQuick\settings", @"%APPDATA%\RamQuick\settings" },
+            { Path.GetTempPath() + "RamQuick.tmp", @"%TEMP%\RamQuick.tmp" },
+            { AppContext.BaseDirectory + "ramquick_engine.dll", @"<app folder>\ramquick_engine.dll" },
+            { @"Access to the path 'D:\Users\alice\Desktop\notes.txt' is denied.", @"Access to the path 'D:\Users\<user>\Desktop\notes.txt' is denied." },
+            { "Could not find 'e:/USERS/alice.contoso/AppData/x.json'.", "Could not find 'e:/USERS/<user>/AppData/x.json'." },
+            { @"The journal is in C:\Users\alice.", @"The journal is in C:\Users\<user>." },
+            { @"C:\Users\Alice Smith\Downloads\RamQuick\ramquick_engine.dll", @"C:\Users\<user>\Downloads\RamQuick\ramquick_engine.dll" },
+            { @"C:\Users\O'Connor\Downloads\RamQuick\ramquick_engine.dll", @"C:\Users\<user>\Downloads\RamQuick\ramquick_engine.dll" },
+            { @"C:\Users\j.doe [corp]\x", @"C:\Users\<user>\x" },
+            { @"'C:\Users\O'Connor' is denied.", @"'C:\Users\<user>' is denied." },
+            { @"""C:\Users\Alice Smith""", @"""C:\Users\<user>""" },
+            { @"Access to 'C:\Users\Alice Smith'.", @"Access to 'C:\Users\<user>'." },
+            { @"C:\Users\Alice Smith", @"C:\Users\<user>" },
+            { "Missing C:\\Users\\Alice Smith\r\n   at RamQuick.Load()", "Missing C:\\Users\\<user>\r\n   at RamQuick.Load()" },
+            { @"Copy C:\Users\Alice Smith to D:\backup failed.", @"Copy C:\Users\<user> D:\backup failed." },
+            { @"Copy C:\Users\Alice Smith to 'C:\Users\O'Connor'.", @"Copy C:\Users\<user> 'C:\Users\<user>'." },
+            { @"\\fileserver\home\" + userName + @"\RamQuick", @"\\fileserver\home\<user>\RamQuick" },
+            { "Host " + machineName + " refused the request", "Host <machine> refused the request" },
+            { @"\\" + machineName.ToLowerInvariant() + @"\share\x", @"\\<machine>\share\x" },
+            { "Host " + machineName + "X refused the request", "Host " + machineName + "X refused the request" },
+            { @"D:\Data\Users\alice\x", @"D:\Data\Users\alice\x" },
+            { @"C:\Users\", @"C:\Users\" },
+            { "Stop requested by host: host fault", "Stop requested by host: host fault" },
+            { "Windows error 87: SetThreadGroupAffinity failed: group 1, processor 12", "Windows error 87: SetThreadGroupAffinity failed: group 1, processor 12" },
+            { string.Empty, string.Empty },
+        };
+    }
+
+    // Texts no exception message is expected to hold, each repeated the given number of times; the redaction must
+    // survive every one of them.
+    public static TheoryData<string, int> AdversarialTexts() => new()
+    {
+        { "\uD800 unpaired surrogate \uDC00", 1 },
+        { "C:", 1 },
+        { @"C:\Users", 1 },
+        { @"\\", 1 },
+        { "/", 1 },
+        { "<user> <machine> %USERPROFILE% <app folder>", 1 },
+        { "\0\r\n\t" + Environment.UserName + "\u2028" + Environment.MachineName, 1 },
+        { @"C:\Users\" + Environment.UserName + @"\", 10_000 },
+    };
+
+    [Theory]
+    [MemberData(nameof(PersonalPathCases))]
+    public void SummaryFormat_RedactPersonalPaths_ReplacesOnlyPersonalPartsAndIsStable(string text, string expected)
+    {
+        string redacted = SummaryFormat.RedactPersonalPaths(text);
+
+        Assert.Equal(expected, redacted);
+        Assert.Equal(expected, SummaryFormat.RedactPersonalPaths(redacted));
+    }
+
+    [Theory]
+    [MemberData(nameof(AdversarialTexts))]
+    public void SummaryFormat_RedactPersonalPaths_AnyText_NeverThrowsAndIsStable(string fragment, int repetitions)
+    {
+        string text = string.Concat(Enumerable.Repeat(fragment, repetitions));
+
+        string redacted = SummaryFormat.RedactPersonalPaths(text);
+
+        Assert.Equal(redacted, SummaryFormat.RedactPersonalPaths(redacted));
+        Assert.DoesNotContain(@"\" + Environment.UserName + @"\", redacted, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // A result created by the controller is redacted by JournalResult.Create; one read back from a journal an
+    // earlier build wrote unredacted is redacted by RunSummary.Build. Either way neither summary names the account.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task EndDetail_PathInExceptionMessage_PersistedRedactedInResultAndBothSummariesAsync(bool throughCreate)
+    {
+        string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        string detail = "Could not find file '" + profile + @"\Documents\RamQuick\data\journal\active-run.jsonl' or 'C:\Users\alice\x.log'.";
+        string expected = @"Could not find file '%USERPROFILE%\Documents\RamQuick\data\journal\active-run.jsonl' or 'C:\Users\<user>\x.log'.";
+        using var root = new TestDataRoot();
+        using ResultsLog log = Open(root, CreateTime(), new ScriptedRunIds(JournalSamples.RunIdA));
+        RunSummarySource source = JournalSamples.CompletedRunSource(Array.Empty<ErrorRecord>(), SummaryCauseHints.Empty);
+        JournalResult completed = source.Result!;
+        JournalResult created = JournalSamples.Result(
+            RunState.Aborted,
+            RunEndReason.EngineFault,
+            completed.TotalErrors,
+            completed.VerifiedBytes,
+            TimeSpan.FromMilliseconds(completed.ElapsedMs),
+            null,
+            completed.StepsCompleted,
+            completed.CompletedUtc,
+            completed.VerdictUtc,
+            detail);
+        JournalResult result = throughCreate
+            ? created with { Utc = completed.Utc }
+            : created with { Utc = completed.Utc, EndDetail = detail };
+        Assert.Equal(throughCreate ? expected : detail, result.EndDetail);
+
+        RunSummary summary = RunSummary.Build(source with { Result = result });
+        using JsonDocument document = await PublishAndParseAsync(log, summary);
+        string text = await File.ReadAllTextAsync(log.SummaryTextPath, Cancellation);
+
+        Assert.Equal(expected, summary.Run.EndDetail);
+        Assert.Equal(expected, Kind(JsonValueKind.String, document.RootElement, "run", "endDetail").GetString());
+        AssertTextLines(text, "Detail: " + expected);
+        string json = await File.ReadAllTextAsync(log.SummaryJsonPath, Cancellation);
+        foreach (string published in new[] { json, text })
+        {
+            Assert.DoesNotContain(profile, published, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain(JsonEncodedText.Encode(profile).ToString(), published, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("alice", published, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     [Theory]
@@ -1836,6 +2003,80 @@ public sealed partial class ResultsLogTests
         Assert.False(File.Exists(root.Data.AppErrorsLogPath));
     }
 
+    [Theory]
+    [InlineData(false, null, "")]
+    [InlineData(true, null, "")]
+    [InlineData(false, "11111111-1111-4111-8111-111111111111", " run_id=11111111111141118111111111111111")]
+    public async Task TryAppendAppError_HealthyFolder_WritesBlockAndReturnsTrueAsync(bool infinite, string? runId, string expectedField)
+    {
+        using var root = new TestDataRoot();
+        TimeSpan timeout = infinite ? Timeout.InfiniteTimeSpan : _ceiling;
+        Guid? id = runId is null ? null : Guid.Parse(runId, Invariant);
+
+        bool written = ResultsLog.TryAppendAppError(
+            root.Data, "App.OnExit", new InvalidOperationException("Exit failure"), _t0, timeout, id);
+
+        // The wait covers the flush, so the block is already on disk when the call returns.
+        string text = await File.ReadAllTextAsync(root.Data.AppErrorsLogPath, Cancellation);
+        Assert.True(written);
+        Assert.Equal(
+            Utc(_t0) + " APP_ERROR source=\"App.OnExit\"" + expectedField + LineEnd
+                + "  System.InvalidOperationException: Exit failure" + LineEnd + LineEnd,
+            text);
+    }
+
+    [Fact]
+    public void TryAppendAppError_LocationUnwritable_ReturnsFalseWithoutThrowing()
+    {
+        using var root = new TestDataRoot();
+        root.CreateBlockingFile("logs");
+        bool written = true;
+
+        Exception? thrown = Record.Exception(
+            () => written = ResultsLog.TryAppendAppError(root.Data, "App.OnExit", new InvalidOperationException("Lost"), _t0, _ceiling));
+
+        Assert.Null(thrown);
+        Assert.False(written);
+        Assert.False(File.Exists(root.Data.AppErrorsLogPath));
+    }
+
+    [Fact]
+    public async Task TryAppendAppError_WriteOutlastsBound_ReturnsFalseAndWriteFinishesAloneAsync()
+    {
+        using var root = new TestDataRoot();
+        using var release = new ManualResetEventSlim(initialState: false);
+        var stalled = new StallingException(release);
+        TimeSpan bound = TimeSpan.FromMilliseconds(200);
+
+        long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+        bool written = ResultsLog.TryAppendAppError(root.Data, "App.OnExit", stalled, _t0, bound);
+        TimeSpan elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(startedAt);
+        release.Set();
+
+        Assert.False(written);
+        Assert.True(elapsed < _ceiling, $"The bounded write returned after {elapsed.TotalMilliseconds:0} ms.");
+        string text = await WaitForFileContentAsync(root.Data.AppErrorsLogPath, StallingException.Text);
+        Assert.Equal(
+            Utc(_t0) + " APP_ERROR source=\"App.OnExit\"" + LineEnd + "  " + StallingException.Text + LineEnd + LineEnd,
+            text);
+    }
+
+    [Theory]
+    [InlineData(-2L)]
+    [InlineData(-1_000L)]
+    [InlineData((long)int.MaxValue + 1)]
+    public void TryAppendAppError_TimeoutOutOfRange_ThrowsAndWritesNothing(long timeoutMs)
+    {
+        using var root = new TestDataRoot();
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            "timeout",
+            () => ResultsLog.TryAppendAppError(
+                root.Data, "Source", new InvalidOperationException("Unused"), _t0, TimeSpan.FromMilliseconds(timeoutMs)));
+
+        Assert.False(File.Exists(root.Data.AppErrorsLogPath));
+    }
+
     [Fact]
     public void AppErrors_InvalidArguments_ThrowAndWriteNothing()
     {
@@ -1848,6 +2089,9 @@ public sealed partial class ResultsLogTests
         Assert.Throws<ArgumentNullException>(() => ResultsLog.QueueAppError(null!, "Source", exception, _t0));
         Assert.Throws<ArgumentException>(() => ResultsLog.QueueAppError(root.Data, string.Empty, exception, _t0));
         Assert.Throws<ArgumentNullException>(() => ResultsLog.QueueAppError(root.Data, "Source", null!, _t0));
+        Assert.Throws<ArgumentNullException>(() => ResultsLog.TryAppendAppError(null!, "Source", exception, _t0, _ceiling));
+        Assert.Throws<ArgumentException>(() => ResultsLog.TryAppendAppError(root.Data, "\t", exception, _t0, _ceiling));
+        Assert.Throws<ArgumentNullException>(() => ResultsLog.TryAppendAppError(root.Data, "Source", null!, _t0, _ceiling));
 
         Assert.False(File.Exists(root.Data.AppErrorsLogPath));
     }
@@ -2288,6 +2532,25 @@ public sealed partial class ResultsLogTests
     private sealed class UnformattableException : Exception
     {
         public override string ToString() => throw new InvalidOperationException("The exception text is unavailable.");
+    }
+
+    /// <summary>
+    /// An exception whose text is formatted only once the test releases it, holding the write as a stalled disk
+    /// would.
+    /// </summary>
+    private sealed class StallingException : Exception
+    {
+        public const string Text = "StallingException: formatted after the release";
+
+        private readonly ManualResetEventSlim _release;
+
+        public StallingException(ManualResetEventSlim release) => _release = release;
+
+        public override string ToString()
+        {
+            _release.Wait();
+            return Text;
+        }
     }
 }
 

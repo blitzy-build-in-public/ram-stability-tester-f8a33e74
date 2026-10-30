@@ -179,8 +179,8 @@ public sealed record EngineCompleted(
 /// <see cref="SynchronizationContext"/> captured when the session was created.
 /// </summary>
 /// <remarks>
-/// Raised exactly once, after <c>Completed</c>. The run's summaries are published only after it, so that they carry
-/// the release time.
+/// Raised at most once, after <c>Completed</c>, and not when the engine cannot free every chunk. The run's summaries
+/// are published only after it, so that they carry the release time.
 /// </remarks>
 /// <param name="ReleasedBytes">The bytes unlocked and freed, in bytes.</param>
 /// <param name="ReleaseTime">The time the release took, written as the summary's <c>memory.releaseSeconds</c>.</param>

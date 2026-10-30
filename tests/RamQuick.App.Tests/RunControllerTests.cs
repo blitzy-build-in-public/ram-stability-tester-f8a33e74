@@ -183,11 +183,17 @@ internal sealed class ControllerHarness : IDisposable
     /// Makes every run journal into one <see cref="StalledJournalStorage"/>, which the test can block or fail. The
     /// journal takes ownership of the storage, so it serves one run.
     /// </summary>
-    public void UseStalledJournal()
+    /// <param name="journalTime">
+    /// The clock of the journal's acknowledgment and heartbeat bounds; the controller's, <see cref="Time"/>, when
+    /// <see langword="null"/>. A clock the test never advances keeps a blocked acknowledgment pending for good.
+    /// </param>
+    public void UseStalledJournal(TimeProvider? journalTime = null)
     {
         ThrowIfBuilt();
         StalledJournalStorage storage = Storage ??= new StalledJournalStorage();
-        Options = CopyOptions(Options, journalFactory: (_, timeProvider) => new ProgressJournal(storage, timeProvider));
+        Options = CopyOptions(
+            Options,
+            journalFactory: (_, timeProvider) => new ProgressJournal(storage, journalTime ?? timeProvider));
     }
 
     /// <summary>Makes every Start run <paramref name="plan"/>, whatever test type is selected.</summary>
@@ -631,6 +637,11 @@ public sealed class RunControllerTests
 
     // The journal-acknowledgment bound measured with a margin below it for scheduling jitter.
     private static readonly TimeSpan _gateTimeoutFloor = ProgressJournal.AcknowledgmentTimeout - TimeSpan.FromMilliseconds(250);
+
+    // Real-time ceilings of the teardown calls: Dispose never waits, and a fatal error waits at most 3 s, here with a
+    // margin for scheduling jitter.
+    private static readonly TimeSpan _disposeReturnCeiling = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan _fatalReturnCeiling = TimeSpan.FromSeconds(5);
 
     // Long enough for a gate that ignored the events still queued before it to journal its step and return.
     private static readonly TimeSpan _undeliveredEventsWindow = TimeSpan.FromMilliseconds(300);
@@ -1132,6 +1143,7 @@ public sealed class RunControllerTests
         Assert.Empty(harness.SummaryJsonPaths());
         Assert.True(harness.JournalExists);
         Assert.False(session.IsDisposed);
+        Assert.Equal(string.Empty, Assert.Single(harness.ReadJournal().OfType<JournalResult>()).EndDetail);
 
         harness.Release(TimeSpan.FromMilliseconds(1250));
 
@@ -1140,8 +1152,10 @@ public sealed class RunControllerTests
         Assert.Equal(1.25, root.GetProperty("memory").GetProperty("releaseSeconds").GetDouble());
         Assert.Equal("PASS", root.GetProperty("run").GetProperty("verdict").GetString());
         Assert.Equal(nameof(RunEndReason.Completed), root.GetProperty("run").GetProperty("endReason").GetString());
+        Assert.Equal(string.Empty, root.GetProperty("run").GetProperty("endDetail").GetString());
         Assert.Equal(session.Options.Steps.Count, root.GetProperty("steps").GetArrayLength());
         Assert.True(File.Exists(TextSummaryPathOf(harness.SummaryJsonPath())));
+        Assert.DoesNotContain("\r\nDetail:", File.ReadAllText(TextSummaryPathOf(harness.SummaryJsonPath())), StringComparison.Ordinal);
         Assert.False(harness.JournalExists);
         Assert.True(harness.Controller.CanStart);
         Assert.Equal(PostRunActivity.None, harness.Controller.PostRunActivity);
@@ -1274,6 +1288,75 @@ public sealed class RunControllerTests
         Assert.Equal("{}", File.ReadAllText(takenJsonPath));
     }
 
+    // The .log is made to fail mid-run, with no access-control change, by a byte-range lock held through a second
+    // handle: the drain's writes then fail with a lock violation. The run goes on, the failure is reported once, and
+    // the final notice says how much of the results was saved.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void EventLog_WriteFailsMidRun_ReportedOnceAndFinalNoticeTellsWhatWasSaved(bool publicationFails)
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+        string logPath = Assert.Single(harness.RunLogPaths());
+        string baseName = Path.GetFileNameWithoutExtension(logPath);
+        StepAttributes step = session.Options.Steps[0];
+        RunProgress progress = FakeEngineData.Progress(
+            step.Index, session.Options.Steps.Count, step.Name, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(290), GiB, session.Options.RegionBytes, 0);
+        using var blocker = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        blocker.Lock(0, long.MaxValue);
+        try
+        {
+            // Every tenth simulated second logs a PROGRESS line; the drain fails to write it, and the next Progress
+            // event finds the failure.
+            Stopwatch waited = Stopwatch.StartNew();
+            for (int second = 11; harness.Controller.NoticeMessage is null; second++)
+            {
+                Assert.True(waited.Elapsed < ControllerHarness.DefaultWait, "The event log's write failure was never reported.");
+                session.PublishProgress(progress with { Elapsed = TimeSpan.FromSeconds(second) });
+                harness.Pump();
+                Thread.Sleep(10);
+            }
+
+            Assert.StartsWith(UiText.EventLogNotSaved(string.Empty), harness.Controller.NoticeMessage, StringComparison.Ordinal);
+            Assert.Empty(session.StopRequests);
+            harness.RunUntil(() => harness.AppErrorsLogText().Contains("source=\"RunController.ResultsLog\"", StringComparison.Ordinal));
+
+            if (publicationFails)
+            {
+                File.WriteAllText(ResultsLog.GetSummaryJsonPath(harness.Data!, baseName), "{}");
+            }
+
+            harness.Complete(RunEndReason.Completed);
+            harness.Release(TimeSpan.FromMilliseconds(100));
+
+            Assert.Equal(RunState.Passed, harness.StateMachine.State);
+            Assert.Equal(UiText.PassedReason, harness.Controller.ResultMessage);
+            Assert.True(File.Exists(ResultsLog.GetSummaryTextPath(harness.Data!, baseName)));
+            string notice = harness.Controller.NoticeMessage!;
+            if (publicationFails)
+            {
+                Assert.StartsWith(UiText.ResultsNotSaved(string.Empty), notice, StringComparison.Ordinal);
+                Assert.Contains(UiText.NoticeSeparator + UiText.EventLogNotSaved(string.Empty), notice, StringComparison.Ordinal);
+                Assert.True(harness.JournalExists);
+            }
+            else
+            {
+                Assert.True(File.Exists(ResultsLog.GetSummaryJsonPath(harness.Data!, baseName)));
+                Assert.StartsWith(UiText.ResultsSavedWithoutEventLog(string.Empty), notice, StringComparison.Ordinal);
+                Assert.False(harness.JournalExists);
+            }
+
+            Assert.Equal(1, CountOf(harness.AppErrorsLogText(), "source=\"RunController.ResultsLog\""));
+        }
+        finally
+        {
+            blocker.Unlock(0, long.MaxValue);
+        }
+    }
+
 
     [Theory]
     [InlineData(false)]
@@ -1325,6 +1408,73 @@ public sealed class RunControllerTests
         Assert.False(harness.JournalExists);
         Assert.True(harness.Controller.CanStart);
         harness.RunUntil(() => harness.AppErrorsLogText().Contains(failure.Message, StringComparison.Ordinal));
+    }
+
+    // A managed exception from the engine seam can name a path in the user's profile. The display keeps it, and so
+    // does app-errors.log, the local diagnostic log; the journal's result record, both shareable summaries and the
+    // .log's COMPLETED and VERDICT lines do not.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SessionStartup_PathBearingException_PersistsRedactedDetailAndLogsFullMessage(bool failCreation)
+    {
+        using var harness = new ControllerHarness();
+        harness.UseStalledJournal();
+        string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var failure = new IOException(
+            "Could not load '" + profile + @"\Downloads\RamQuick\ramquick_engine.dll', "
+            + @"'C:\Users\Alice Smith\Downloads\RamQuick\ramquick_engine.dll', "
+            + @"'C:\Users\O'Connor\Downloads\RamQuick\ramquick_engine.dll' or 'C:\Users\alice\AppData\Local\Temp\rq.tmp'.");
+        const string Redacted =
+            @"Could not load '%USERPROFILE%\Downloads\RamQuick\ramquick_engine.dll', "
+            + @"'C:\Users\<user>\Downloads\RamQuick\ramquick_engine.dll', "
+            + @"'C:\Users\<user>\Downloads\RamQuick\ramquick_engine.dll' or 'C:\Users\<user>\AppData\Local\Temp\rq.tmp'.";
+        if (failCreation)
+        {
+            harness.Engine.CreateSessionException = failure;
+        }
+        else
+        {
+            harness.Engine.StartException = failure;
+        }
+
+        harness.Initialize();
+
+        Assert.Equal(StartResult.Accepted, harness.TryStart());
+        harness.WaitForPublication();
+
+        Assert.Equal(RunState.Aborted, harness.StateMachine.State);
+        Assert.Equal(RunEndReason.EngineFault, harness.StateMachine.EndReason);
+        Assert.Equal(UiText.EngineError(failure.Message), harness.Controller.ResultMessage);
+        Assert.Equal(Redacted, harness.StateMachine.EndDetail);
+        AssertPublishedEndDetail(harness, Redacted);
+        string json = File.ReadAllText(harness.SummaryJsonPath());
+        string text = File.ReadAllText(TextSummaryPathOf(harness.SummaryJsonPath()));
+        string journal = string.Join("\n", harness.Storage!.Lines);
+
+        // The .log's own path lines name the data folder, so only the lines carrying the end detail are checked.
+        string[] detailLines = harness.LogText()
+            .Split("\r\n")
+            .Where(line => line.Contains(" COMPLETED ", StringComparison.Ordinal) || line.Contains(" VERDICT ", StringComparison.Ordinal))
+            .ToArray();
+        Assert.Equal(2, detailLines.Length);
+        foreach (string persisted in new[] { json, text, journal }.Concat(detailLines))
+        {
+            Assert.DoesNotContain(profile, persisted, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain(JsonEncodedText.Encode(profile).ToString(), persisted, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain(profile.Replace(@"\", @"\\", StringComparison.Ordinal), persisted, StringComparison.OrdinalIgnoreCase);
+            foreach (string name in new[] { "Alice", "Smith", "O'Connor", "Connor" })
+            {
+                Assert.DoesNotContain(name, persisted, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        Assert.All(detailLines, line => Assert.Contains("%USERPROFILE%", line, StringComparison.Ordinal));
+
+        // app-errors.log keeps the exception's full text; as a local log it writes the account's own folders as
+        // placeholders too.
+        string logged = typeof(IOException).FullName + ": Could not load '%USERPROFILE%" + @"\Downloads\RamQuick\ramquick_engine.dll'";
+        harness.RunUntil(() => harness.AppErrorsLogText().Contains(logged, StringComparison.Ordinal));
     }
 
     [Fact]
@@ -2212,11 +2362,16 @@ public sealed class RunControllerTests
         Assert.Equal(UiText.JournalWriteFailed(failure.Message), harness.Controller.ResultMessage);
 
         harness.Release(TimeSpan.FromMilliseconds(100));
+        AssertPublishedEndDetail(harness, UiText.JournalWriteFailed(failure.Message));
         AssertGateFailureLogged(RunLogLines(harness), failure.Message, failedAt);
     }
 
-    [Fact]
-    public void JournalFailure_SeenOnNextProgress_RequestsHostFaultOnceAndAbortsWithJournalMessage()
+    // The failed write names the journal in the user's profile: the display keeps the path, and the persisted cause
+    // is redacted like every persisted end detail.
+    [Theory]
+    [InlineData("stepEnd")]
+    [InlineData("beat")]
+    public void JournalFailure_SeenOnNextProgress_RequestsHostFaultOnceAndAbortsWithJournalMessage(string recordType)
     {
         using var harness = new ControllerHarness();
         harness.UseStalledJournal();
@@ -2224,15 +2379,31 @@ public sealed class RunControllerTests
         FakeEngineSession session = harness.StartAccepted();
         harness.Prepare();
         ProgressJournal journal = Assert.Single(harness.Journals);
-        harness.Storage!.FailNext("stepEnd");
-
-        session.RaiseStepFinished(0);
-        harness.RunUntil(() => journal.Failure is not null);
-        Assert.Empty(session.StopRequests);
-
+        string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        harness.Storage!.FailNext(
+            recordType,
+            new IOException("The process cannot access the file '" + profile + @"\RamQuick\data\journal\active-run.jsonl'."));
         StepAttributes next = session.Options.Steps[1];
         RunProgress progress = FakeEngineData.Progress(
             next.Index, session.Options.Steps.Count, next.Name, TimeSpan.FromSeconds(45), TimeSpan.FromSeconds(255), 2 * GiB, session.Options.RegionBytes, 0);
+
+        if (recordType == "beat")
+        {
+            // The heartbeat writes the snapshot the progress sink stored, once the journal's clock reaches it.
+            session.PublishProgress(progress with { Elapsed = TimeSpan.FromSeconds(44) });
+            harness.Pump();
+            harness.Time.Advance(ProgressJournal.HeartbeatInterval);
+        }
+        else
+        {
+            session.RaiseStepFinished(0);
+        }
+
+        harness.RunUntil(() => journal.Failure is not null);
+        JournalFailure failure = Assert.IsType<JournalFailure>(journal.Failure);
+        Assert.Equal(recordType, failure.RecordType);
+        Assert.Empty(session.StopRequests);
+
         session.PublishProgress(progress);
         harness.RunUntil(() => session.StopRequests.Count > 0);
         Assert.Equal(new[] { StopReason.HostFault }, session.StopRequests);
@@ -2245,13 +2416,19 @@ public sealed class RunControllerTests
         harness.AwaitVerdict();
         Assert.Equal(RunState.Aborted, harness.StateMachine.State);
         Assert.Equal(RunEndReason.HostFault, harness.StateMachine.EndReason);
-        Assert.Equal(UiText.JournalWriteFailed(journal.Failure!.Message), harness.Controller.ResultMessage);
+        Assert.Equal(UiText.JournalWriteFailed(failure.Message), harness.Controller.ResultMessage);
+
+        harness.Release(TimeSpan.FromMilliseconds(100));
+        AssertPublishedEndDetail(
+            harness,
+            UiText.JournalWriteFailed(@"The process cannot access the file '%USERPROFILE%\RamQuick\data\journal\active-run.jsonl'."));
     }
 
     [Fact]
     public void CallbackFault_RequestsHostFaultAndWritesAppErrorLog()
     {
         using var harness = new ControllerHarness();
+        harness.UseStalledJournal();
         harness.Initialize();
         FakeEngineSession session = harness.StartAccepted();
         harness.Prepare();
@@ -2268,12 +2445,32 @@ public sealed class RunControllerTests
         harness.AwaitVerdict();
         Assert.Equal(RunState.Aborted, harness.StateMachine.State);
         Assert.Equal(RunEndReason.HostFault, harness.StateMachine.EndReason);
-        Assert.Equal(UiText.EngineError(fault.Message), harness.Controller.ResultMessage);
+        Assert.Equal(UiText.HostFault(fault.Message), harness.Controller.ResultMessage);
+        Assert.Equal(UiText.HostFault(fault.Message), harness.StateMachine.EndDetail);
 
-        // The sink's stop and the wrapper's own are one stop decision, logged after its cause; the app-errors.log
-        // entry names the run.
         harness.Release(TimeSpan.FromMilliseconds(100));
+        AssertPublishedEndDetail(harness, UiText.HostFault(fault.Message));
         AssertFaultLogged(harness, "EngineCallback:on_progress", fault);
+    }
+
+    // A host-fault stop with no cause recorded by the controller, such as a step gate whose session was already
+    // collected, keeps the engine's own detail, under the application's wording rather than the engine-fault one.
+    [Fact]
+    public void HostFault_WithoutRecordedCause_ShowsApplicationWordingAndPersistsEngineDetail()
+    {
+        const string EngineDetail = "Stop requested by host: host fault";
+        using var harness = new ControllerHarness();
+        harness.UseStalledJournal();
+        harness.Initialize();
+        harness.StartAccepted();
+        harness.Prepare();
+
+        harness.Complete(RunEndReason.HostFault, endDetail: EngineDetail);
+
+        Assert.Equal(RunState.Aborted, harness.StateMachine.State);
+        Assert.Equal(UiText.HostFault(EngineDetail), harness.Controller.ResultMessage);
+        harness.Release(TimeSpan.FromMilliseconds(100));
+        AssertPublishedEndDetail(harness, EngineDetail);
     }
 
     [Fact]
@@ -2309,7 +2506,7 @@ public sealed class RunControllerTests
         session.CompleteWithFirstRecordedReason();
         harness.AwaitVerdict();
         Assert.Equal(RunEndReason.HostFault, harness.StateMachine.EndReason);
-        Assert.Equal(UiText.EngineError(fault.Message), harness.Controller.ResultMessage);
+        Assert.Equal(UiText.HostFault(fault.Message), harness.Controller.ResultMessage);
 
         harness.Release(TimeSpan.FromMilliseconds(100));
         AssertFaultLogged(harness, "RunController.OnSessionProgressChanged", fault);
@@ -2464,8 +2661,74 @@ public sealed class RunControllerTests
             Assert.Equal(JsonValueKind.Null, root.GetProperty("memory").GetProperty("releaseSeconds").ValueKind);
         }
 
+        // The clock stands at the deadline, so the shutdown has not waited for the disposal running on the thread pool.
+        harness.RunUntil(() => session.IsDisposed);
         Assert.Equal(1, session.DisposeCount);
         Assert.False(harness.JournalExists);
+    }
+
+    [Theory]
+    [InlineData(1, false)]
+    [InlineData(2, false)]
+    [InlineData(1, true)]
+    public void ShutdownAsync_EngineSilentAfterStepsStarted_ListsEveryStartedStepOnce(int startedSteps, bool lastFinished)
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+        for (int index = 0; index < startedSteps; index++)
+        {
+            // The gate runs on a coordinator thread while the UI context is pumped, because it waits for that context
+            // to deliver the events raised before it; the engine raises StepStarted only once the gate continues.
+            (StepGateDecision decision, _) = harness.RunGate(index);
+            Assert.Equal(StepGateDecision.Continue, decision);
+            session.RaiseStepStarted(index);
+            if (index < startedSteps - 1 || lastFinished)
+            {
+                session.RaiseStepFinished(index);
+            }
+        }
+
+        StepAttributes last = session.Options.Steps[startedSteps - 1];
+        RunProgress progress = FakeEngineData.Progress(
+            startedSteps - 1, session.Options.Steps.Count, last.Name, TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(280), 3 * GiB, session.Options.RegionBytes, 0);
+        session.PublishProgress(progress);
+        harness.RunUntil(() => ReferenceEquals(harness.Controller.CurrentProgress, progress));
+
+        // Neither Completed nor Released ever arrives: the controller concludes and publishes the run from its own totals.
+        Task shutdown = harness.Shutdown();
+        harness.Time.Advance(harness.Options.ShutdownCompletedTimeout);
+        harness.RunUntil(() => harness.StateMachine.IsTerminal
+            && harness.Controller.PostRunActivity == PostRunActivity.ReleasingMemory);
+        harness.Time.Advance(harness.Options.ShutdownReleasedTimeout);
+        harness.AwaitTask(shutdown);
+
+        string jsonPath = harness.SummaryJsonPath();
+        using (JsonDocument summary = harness.ReadSummary())
+        {
+            JsonElement root = summary.RootElement;
+            Assert.Equal("ABORTED", root.GetProperty("run").GetProperty("verdict").GetString());
+            Assert.Equal(nameof(RunEndReason.UserStop), root.GetProperty("run").GetProperty("endReason").GetString());
+            Assert.Equal(JsonValueKind.Null, root.GetProperty("memory").GetProperty("releaseSeconds").ValueKind);
+            JsonElement[] steps = root.GetProperty("steps").EnumerateArray().ToArray();
+            Assert.Equal(startedSteps, steps.Length);
+            for (int index = 0; index < startedSteps; index++)
+            {
+                bool finished = index < startedSteps - 1 || lastFinished;
+                JsonElement step = steps[index];
+                Assert.Equal(index + 1, step.GetProperty("index").GetInt32());
+                Assert.Equal(session.Options.Steps[index].Name, step.GetProperty("name").GetString());
+                Assert.Equal(finished, step.GetProperty("completed").GetBoolean());
+                Assert.Equal(finished ? JsonValueKind.Number : JsonValueKind.Null, step.GetProperty("actualSeconds").ValueKind);
+            }
+        }
+
+        // The text summary's steps table ends each row with its Completed column.
+        string row = Assert.Single(
+            File.ReadAllLines(TextSummaryPathOf(jsonPath)),
+            line => line.Contains(last.Name, StringComparison.Ordinal));
+        Assert.EndsWith(lastFinished ? "Yes" : "No", row.TrimEnd(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -2510,9 +2773,82 @@ public sealed class RunControllerTests
         harness.Controller.Dispose();
         harness.Controller.Dispose();
 
+        // The session is disposed on the thread pool.
+        harness.RunUntil(() => session.IsDisposed);
         Assert.Equal(1, session.DisposeCount);
         Assert.True(harness.JournalExists);
         Assert.Equal(StartResult.Busy, harness.TryStart());
+    }
+
+    [Fact]
+    public void Dispose_SessionDisposalBlocks_ReturnsAtOnceAndDisposesOnAnotherThread()
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+        session.BlockDispose();
+        try
+        {
+            long startedAt = Stopwatch.GetTimestamp();
+            harness.Controller.Dispose();
+            TimeSpan elapsed = Stopwatch.GetElapsedTime(startedAt);
+
+            Assert.True(elapsed < _disposeReturnCeiling, $"Dispose returned after {elapsed.TotalMilliseconds:0} ms.");
+            harness.RunUntil(() => session.DisposeCount == 1);
+            Assert.NotEqual(Environment.CurrentManagedThreadId, session.DisposeThreadId);
+            Assert.False(session.IsDisposed);
+            Assert.True(harness.JournalExists);
+        }
+        finally
+        {
+            session.ReleaseDispose();
+        }
+
+        harness.RunUntil(() => session.IsDisposed);
+    }
+
+    [Fact]
+    public void ShutdownAsync_PublicationStalledPastDeadline_StartsSessionDisposalWithoutAwaitingIt()
+    {
+        using var harness = new ControllerHarness();
+
+        // The journal's own bounds run on a clock that never moves, so the blocked end record holds the publication.
+        harness.UseStalledJournal(journalTime: new FakeTimeProvider(ControllerHarness.StartTime));
+        StalledJournalStorage storage = harness.Storage!;
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+        session.BlockDispose();
+        storage.BlockNext("end");
+        try
+        {
+            Task shutdown = harness.Shutdown();
+            harness.Time.Advance(harness.Options.ShutdownCompletedTimeout);
+            harness.RunUntil(() => harness.StateMachine.IsTerminal
+                && harness.Controller.PostRunActivity == PostRunActivity.ReleasingMemory);
+            harness.Time.Advance(harness.Options.ShutdownReleasedTimeout);
+            harness.RunUntil(() => storage.BlockedCount == 1);
+            Assert.Equal(0, session.DisposeCount);
+            Assert.False(shutdown.IsCompleted);
+
+            // The publication misses the deadline: the release is started, and the shutdown ends without waiting for it.
+            harness.Time.Advance(harness.Options.ShutdownReleasedTimeout);
+            harness.AwaitTask(shutdown);
+            harness.RunUntil(() => session.DisposeCount == 1);
+
+            Assert.NotEqual(Environment.CurrentManagedThreadId, session.DisposeThreadId);
+            Assert.False(session.IsDisposed);
+            Assert.Equal(RunState.Aborted, harness.StateMachine.State);
+            Assert.Single(harness.SummaryJsonPaths());
+            Assert.True(harness.JournalExists);
+        }
+        finally
+        {
+            session.ReleaseDispose();
+        }
+
+        harness.RunUntil(() => session.IsDisposed);
     }
 
     [Fact]
@@ -2535,6 +2871,37 @@ public sealed class RunControllerTests
         Assert.Contains(crash.Message, appErrors, StringComparison.Ordinal);
         Assert.Equal(1, session.DisposeCount);
         Assert.True(harness.JournalExists);
+    }
+
+    [Fact]
+    public void HandleFatalException_SessionDisposalBlocks_ReturnsWithinBoundAndStillLogs()
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+        session.BlockDispose();
+        var crash = new InvalidOperationException("crash while the engine hangs");
+        try
+        {
+            long startedAt = Stopwatch.GetTimestamp();
+            Exception? thrown = Record.Exception(() => harness.Controller.HandleFatalException(crash));
+            TimeSpan elapsed = Stopwatch.GetElapsedTime(startedAt);
+
+            Assert.Null(thrown);
+            Assert.True(elapsed < _fatalReturnCeiling, $"HandleFatalException returned after {elapsed.TotalSeconds:0.0} s.");
+            Assert.Contains(crash.Message, harness.AppErrorsLogText(), StringComparison.Ordinal);
+            Assert.Equal(1, session.DisposeCount);
+            Assert.NotEqual(Environment.CurrentManagedThreadId, session.DisposeThreadId);
+            Assert.False(session.IsDisposed);
+            Assert.True(harness.JournalExists);
+        }
+        finally
+        {
+            session.ReleaseDispose();
+        }
+
+        harness.RunUntil(() => session.IsDisposed);
     }
 
     [Fact]
@@ -2633,6 +3000,37 @@ public sealed class RunControllerTests
     }
 
     private static string TextSummaryPathOf(string jsonSummaryPath) => jsonSummaryPath[..^".json".Length] + ".txt";
+
+    // Reads what a published run persisted as its end detail: the journal's result record, from the stalled storage's
+    // append history, which outlives the journal's deletion; run.endDetail of the JSON summary; and the text summary's
+    // "Detail:" line.
+    private static void AssertPublishedEndDetail(ControllerHarness harness, string expected)
+    {
+        StalledJournalStorage storage = harness.Storage
+            ?? throw new InvalidOperationException("Only a stalled journal keeps its result record after publication.");
+        JournalResult result = Assert.Single(JournalLineSerializer.ParseAll(storage.Lines).OfType<JournalResult>());
+        Assert.Equal(expected, result.EndDetail);
+        using (JsonDocument summary = harness.ReadSummary())
+        {
+            Assert.Equal(expected, summary.RootElement.GetProperty("run").GetProperty("endDetail").GetString());
+        }
+
+        string text = File.ReadAllText(TextSummaryPathOf(harness.SummaryJsonPath()));
+        Assert.Contains("\r\nDetail: " + expected + "\r\n", text, StringComparison.Ordinal);
+    }
+
+    private static int CountOf(string text, string value)
+    {
+        int count = 0;
+        for (int index = text.IndexOf(value, StringComparison.Ordinal);
+            index >= 0;
+            index = text.IndexOf(value, index + value.Length, StringComparison.Ordinal))
+        {
+            count++;
+        }
+
+        return count;
+    }
 
     private static JournalBegin BeginRecord(Guid runId, string baseName, int stepCount) =>
         JournalBegin.Create(

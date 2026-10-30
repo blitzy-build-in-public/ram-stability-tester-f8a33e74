@@ -35,9 +35,11 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <vector>
 
 #include "ramquick_engine.h"
 #include "core/clock.h"
+#include "core/system_info.h"
 #include "core/memory/memory_access.h"
 #include "core/runner/worker_pool.h"
 
@@ -89,6 +91,20 @@ struct session_dependencies {
      * Shared ownership keeps it alive for the session's lifetime.
      */
     std::shared_ptr<IThreadAffinity> affinity;
+
+    /**
+     * Frees each chunk of the session's region in place of VirtualFree(MEM_RELEASE); empty, as
+     * in production, means VirtualFree. The same signature and contract as memory_region.h's
+     * free_function, spelled out so this header pulls in no region type: return false with the
+     * Windows last-error set to refuse, leaving the chunk allocated, and never throw. The
+     * coordinator's preparation hands it to the region, which calls it from the coordinator's
+     * release after on_completed and from shutdown()'s retry, never concurrently. If it still
+     * refuses a chunk when the session is destroyed, the process-wide owner of orphaned chunks
+     * keeps it with that chunk and calls it from every later release in the process, so what
+     * it refers to must stay valid until it has freed the chunk. A test seam that makes a
+     * release fail deterministically.
+     */
+    std::function<bool(void* address)> free_override;
 };
 
 /* ---------------------------------------------------------------------------------------------
@@ -193,9 +209,10 @@ rq_result validate_config(const rq_session_config* config, const rq_callbacks* c
  * Validates a session configuration and its callback set against this machine.
  *
  * Obtains the limits from enumerate_logical_processors().size() and from the available-set mask
- * of select_isa(read_cpu_features(), RQ_ISA_AUTO), then applies the pure overload. session_create
- * calls it; test_exports.cpp calls it before reading any field of an rq_session_config it has
- * not yet checked.
+ * of select_isa(read_cpu_features(), RQ_ISA_AUTO), then applies the pure overload.
+ * test_exports.cpp calls it before reading any field of an rq_session_config it has not yet
+ * checked. session_create derives the same limits from the topology snapshot it keeps for the
+ * session's worker placements, and applies the pure overload itself.
  *
  * @param config Configuration to check; may be null.
  * @param callbacks Callback set to check; may be null.
@@ -273,7 +290,11 @@ std::int64_t compute_remaining_ms(const remaining_inputs& in) noexcept;
  * concurrently. The end reason is first-writer-wins through the session's stop_signal (host
  * stops, RQ_END_FIRST_ERROR from a worker, faults, and RQ_END_COMPLETED recorded once every step
  * has run) and alone decides the terminal state. on_completed is raised after every worker has
- * joined; the locked region is then released for every end reason, and on_released follows.
+ * joined; the locked region is then released for every end reason, and on_released follows
+ * once every chunk is freed. A chunk Windows refuses to free withholds on_released and stays
+ * held for shutdown() to retry; one still refused when the session is destroyed passes to the
+ * process-wide owner of orphaned chunks (core/memory/memory_region.h), which every later
+ * release in the process retries.
  *
  * @par Ownership and threading
  * Created only by session_create and owned through std::shared_ptr: by the registry's handle
@@ -291,10 +312,14 @@ class session {
 public:
     /**
      * Internal: constructs an idle session. Only session_create calls it, after validate_config
-     * has returned RQ_OK for the same config and callbacks; other callers use session_create.
+     * has returned RQ_OK for the same config and callbacks against limits taken from the same
+     * processors snapshot; other callers use session_create.
      *
      * Deep-copies the configuration scalars, the step array with its inline names and the
-     * callback struct, so the caller may free its copies once construction returns. Runs ISA
+     * callback struct, so the caller may free its copies once construction returns. Keeps the
+     * first config.worker_count entries of processors as the worker placements: worker i is
+     * pinned to entry i, and preparation never queries the topology again, so a processor gone
+     * inactive since creation fails its worker's pin with RQ_END_AFFINITY_FAILED. Runs ISA
      * dispatch once (read_cpu_features, select_isa with config.isa_override, tables_for) and
      * keeps that kernel table for the session's lifetime. Builds real_memory_access over it and
      * passes it through dependencies.wrap_memory_access when that is set. Fills a null clock
@@ -305,13 +330,17 @@ public:
      * @param config A validated configuration; read only during the call.
      * @param callbacks A validated callback set; read only during the call.
      * @param dependencies Seams to adopt; see session_dependencies.
-     * @throws std::invalid_argument when dependencies.wrap_memory_access returns null, or when
-     *         the wrapper itself throws it; session_create maps it to RQ_E_INVALID_ARGUMENT.
+     * @param processors enumerate_logical_processors() as taken for validation, in its
+     *        group-major order; adopted.
+     * @throws std::invalid_argument when processors has fewer than config.worker_count entries
+     *         or config.isa_override names a set this CPU lacks, which validation rules out;
+     *         when dependencies.wrap_memory_access returns null; or when the wrapper itself
+     *         throws it. session_create maps it to RQ_E_INVALID_ARGUMENT.
      * @throws std::system_error when the stop event cannot be created, std::bad_alloc, and
      *         anything else the wrapper throws.
      */
     session(const rq_session_config& config, const rq_callbacks& callbacks,
-            session_dependencies dependencies);
+            session_dependencies dependencies, std::vector<logical_processor> processors);
 
     /**
      * Calls shutdown(), so a session released without session_destroy still records a stop,
@@ -385,8 +414,9 @@ public:
      * Records RQ_END_USER_STOP (first writer wins, so an earlier reason is kept), suppresses
      * every callback not yet raised, and joins the coordinator, which first lets a callback in
      * flight return. The coordinator still releases the locked region with its callbacks
-     * suppressed, and when the coordinator never ran the region is released here, so no exit
-     * path leaves memory locked. No callback runs after it returns.
+     * suppressed, and the region is released again here, which covers a coordinator that never
+     * ran and retries a chunk Windows refused to free, so no exit path leaves memory locked. No
+     * callback runs after it returns.
      *
      * Idempotent: session_destroy calls it, and the destructor calls it again. Host thread only;
      * never on the coordinator thread, which would join itself (session_destroy checks
@@ -440,12 +470,15 @@ private:
  * Validates a configuration and creates an idle, registered session.
  *
  * Steps: out null gives RQ_E_INVALID_ARGUMENT and writes nothing; otherwise *out is set to null
- * first. validate_config(config, callbacks) must return RQ_OK, else its code is returned. The
- * session is then constructed: ISA dispatch runs once, the configuration, the steps, their
- * names and the callbacks are deep-copied, and the memory-access stack is built through
- * dependencies.wrap_memory_access; a null wrapper result gives RQ_E_INVALID_ARGUMENT. Finally
- * the session is registered and its handle stored in *out. Allocates nothing large and starts
- * no thread.
+ * first. The active logical processors are enumerated once (enumerate_logical_processors), and
+ * the pure validate_config must return RQ_OK against the limits of that snapshot and of this
+ * CPU's instruction sets, exactly those the two-argument overload applies, else its code is
+ * returned. The session is then constructed: it keeps the snapshot's first worker_count entries
+ * as its worker placements, so start never enumerates again, ISA dispatch runs once, the
+ * configuration, the steps, their names and the callbacks are deep-copied, and the
+ * memory-access stack is built through dependencies.wrap_memory_access; a null wrapper result
+ * gives RQ_E_INVALID_ARGUMENT. Finally the session is registered and its handle stored in *out.
+ * Allocates nothing large and starts no thread.
  *
  * Any failure, an exception included, registers nothing, leaves *out null and leaves
  * live_session_count() unchanged.

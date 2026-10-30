@@ -661,6 +661,10 @@ public sealed class FakeEngineSession : IEngineSession
     // the session, and a disposed handle would throw ObjectDisposedException into that wait.
     private readonly ManualResetEvent _stopEvent = new(initialState: false);
 
+    // Set unless a test holds Dispose with BlockDispose. Never disposed, for the reason _stopEvent is
+    // not: the thread held in Dispose may still be waking from it when the test ends.
+    private readonly ManualResetEventSlim _disposeGate = new(initialState: true);
+
     // Guarded by _gate.
     private readonly List<StopReason> _stopRequests = new();
     private readonly List<StepOutcome> _finishedSteps = new();
@@ -675,6 +679,7 @@ public sealed class FakeEngineSession : IEngineSession
     private int _started;
     private int _completedRaised;
     private int _disposeCount;
+    private int _disposeThreadId;
     private int _disposed;
     private int _droppedEventCount;
 
@@ -839,8 +844,11 @@ public sealed class FakeEngineSession : IEngineSession
         }
     }
 
-    /// <summary>Gets the number of <see cref="Dispose"/> calls.</summary>
+    /// <summary>Gets the number of <see cref="Dispose"/> calls, a call still held by <see cref="BlockDispose"/> included.</summary>
     public int DisposeCount => Volatile.Read(ref _disposeCount);
+
+    /// <summary>Gets the managed thread id of the first <see cref="Dispose"/> call, or 0 before it.</summary>
+    public int DisposeThreadId => Volatile.Read(ref _disposeThreadId);
 
     /// <summary>Gets a value indicating whether <see cref="Dispose"/> has been called.</summary>
     public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
@@ -931,14 +939,26 @@ public sealed class FakeEngineSession : IEngineSession
     /// Marks the session disposed; idempotent apart from <see cref="DisposeCount"/>, and never throws.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Like the wrapper, disposing before <see cref="Completed"/> has been raised stops the run: it records
     /// <see cref="RunEndReason.HostFault"/> as the engine's reason, first writer winning, and then sets
     /// <see cref="StopEvent"/> so a waiting gate wakes. That stop is the engine's, so
     /// <see cref="StopRequests"/> is unchanged.
+    /// </para>
+    /// <para>
+    /// After <see cref="BlockDispose"/>, the first call is counted and its thread recorded, then it blocks
+    /// until <see cref="ReleaseDispose"/>, with the session not yet disposed, as <c>rq_session_destroy</c>
+    /// blocks while it joins engine threads that never end.
+    /// </para>
     /// </remarks>
     public void Dispose()
     {
-        Interlocked.Increment(ref _disposeCount);
+        if (Interlocked.Increment(ref _disposeCount) == 1)
+        {
+            Volatile.Write(ref _disposeThreadId, Environment.CurrentManagedThreadId);
+            _disposeGate.Wait();
+        }
+
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             return;
@@ -950,6 +970,16 @@ public sealed class FakeEngineSession : IEngineSession
             _stopEvent.Set();
         }
     }
+
+    /// <summary>
+    /// Makes the first <see cref="Dispose"/> call block, once counted, until <see cref="ReleaseDispose"/>:
+    /// the stand-in for an engine whose threads never join. A test that calls it releases the session in
+    /// a <c>finally</c>, so no thread stays held past the test.
+    /// </summary>
+    public void BlockDispose() => _disposeGate.Reset();
+
+    /// <summary>Lets a <see cref="Dispose"/> call held by <see cref="BlockDispose"/> finish; later calls return at once.</summary>
+    public void ReleaseDispose() => _disposeGate.Set();
 
 
     /// <summary>Raises <see cref="Prepared"/>.</summary>

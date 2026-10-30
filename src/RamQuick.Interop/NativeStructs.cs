@@ -363,7 +363,10 @@ internal unsafe struct RqCallbacks
     /// <summary><c>on_completed</c>: raised exactly once, after every worker has joined; memory is released afterwards.</summary>
     public delegate* unmanaged[Cdecl]<void*, RqRunResult*, void> OnCompleted;
 
-    /// <summary><c>on_released</c>: raised exactly once, after <c>on_completed</c>, with the released bytes and release time in milliseconds.</summary>
+    /// <summary>
+    /// <c>on_released</c>: raised at most once, after <c>on_completed</c>, with the released bytes and release time in
+    /// milliseconds; withheld when a chunk cannot be freed.
+    /// </summary>
     public delegate* unmanaged[Cdecl]<void*, ulong, ulong, void> OnReleased;
 }
 

@@ -40,6 +40,9 @@ public static class UiText
     private const string JournalWriteFailedFormat = "Progress journal could not be written: {0}";
     private const string ResultsNotSavedFormat = "Results could not be saved: {0}";
     private const string EngineErrorFormat = "Engine error: {0}";
+    private const string HostFaultFormat = "Stopped because of an internal error in RAMQuick: {0}";
+    private const string EventLogNotSavedFormat = "Event log could not be written: {0}";
+    private const string ResultsSavedWithoutEventLogFormat = "Results were saved, but the event log is incomplete: {0}";
     private const string PreviousRunUnfinishedFormat =
         "The previous test did not finish at step {0} of {1} ({2}), which likely indicates severe instability.";
 
@@ -601,6 +604,46 @@ public static class UiText
     {
         ArgumentNullException.ThrowIfNull(message);
         return string.Format(CultureInfo.InvariantCulture, EngineErrorFormat, message);
+    }
+
+    /// <summary>
+    /// Returns the result reason of a run stopped as a host fault for a cause inside the application rather
+    /// than the engine, such as an exception in one of its callbacks or event handlers.
+    /// <see cref="EngineError"/> stays reserved for engine faults, and <see cref="JournalWriteFailed"/> names
+    /// a journal write failure.
+    /// </summary>
+    /// <param name="message">The description of the fault, shown verbatim.</param>
+    /// <returns>"Stopped because of an internal error in RAMQuick: " followed by <paramref name="message"/>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="message"/> is <see langword="null"/>.</exception>
+    public static string HostFault(string message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        return string.Format(CultureInfo.InvariantCulture, HostFaultFormat, message);
+    }
+
+    /// <summary>
+    /// Returns the notice shown while a run continues after its <c>.log</c> event log could not be written.
+    /// </summary>
+    /// <param name="error">The description of the write failure, shown verbatim.</param>
+    /// <returns>"Event log could not be written: " followed by <paramref name="error"/>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="error"/> is <see langword="null"/>.</exception>
+    public static string EventLogNotSaved(string error)
+    {
+        ArgumentNullException.ThrowIfNull(error);
+        return string.Format(CultureInfo.InvariantCulture, EventLogNotSavedFormat, error);
+    }
+
+    /// <summary>
+    /// Returns the notice shown when a run's summaries were published but its <c>.log</c> event log lost
+    /// events, so its results are saved only in part.
+    /// </summary>
+    /// <param name="error">The description of the event log's write failure, shown verbatim.</param>
+    /// <returns>"Results were saved, but the event log is incomplete: " followed by <paramref name="error"/>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="error"/> is <see langword="null"/>.</exception>
+    public static string ResultsSavedWithoutEventLog(string error)
+    {
+        ArgumentNullException.ThrowIfNull(error);
+        return string.Format(CultureInfo.InvariantCulture, ResultsSavedWithoutEventLogFormat, error);
     }
 
     /// <summary>

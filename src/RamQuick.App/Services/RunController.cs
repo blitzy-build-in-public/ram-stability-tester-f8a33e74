@@ -222,6 +222,15 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
     private static readonly string _appVersion = ResolveAppVersion();
 
+    // How long a fatal error waits for its app-errors.log write and the session's release: the bound Completed has
+    // when the window closes. A hung engine, a slow release or a stalled disk is left to the process's termination,
+    // with which Windows reclaims the locked pages, and the journal stays for the next launch.
+    private static readonly TimeSpan _fatalTeardownBound = TimeSpan.FromSeconds(3);
+
+    // Publication waits at most this long for the event log to drain, as long as the log's own close waits, so a
+    // stalled disk never holds the results back.
+    private static readonly TimeSpan _logFlushTimeout = TimeSpan.FromSeconds(2);
+
     private readonly IEngine _engine;
     private readonly SensorMonitor _sensorMonitor;
     private readonly IMemoryInventorySource _memoryInventory;
@@ -710,9 +719,10 @@ public sealed partial class RunController : ObservableObject, IDisposable
     /// published with <c>memory.releaseSeconds: null</c> if it has not arrived.
     /// </para>
     /// <para>
-    /// The session's disposal, which releases the locked memory, is awaited only until that deadline: once it has
-    /// passed the method returns and the process may exit, and Windows reclaims the pages. Every bound is measured on
-    /// the controller's <see cref="TimeProvider"/>. Start is refused from the moment this method is called.
+    /// The session's disposal, which releases the locked memory, is awaited only until that deadline. Once it has
+    /// passed, a disposal not yet begun is started on the thread pool, the method returns without waiting for it,
+    /// and the process may exit; Windows then reclaims the pages. Every bound is measured on the controller's
+    /// <see cref="TimeProvider"/>. Start is refused from the moment this method is called.
     /// </para>
     /// </remarks>
     /// <returns>A task that completes when the controller's work is finished or its deadline has passed.</returns>
@@ -723,49 +733,74 @@ public sealed partial class RunController : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Records an exception that is about to end the process and releases the run's locked memory. Called from the
-    /// application's unhandled-exception handlers on any thread; never throws.
+    /// Records an exception that is about to end the process and releases the run's locked memory. Thread-safe and
+    /// never throws, but it blocks the calling thread for at most 3 s, so it must not be called on the UI thread: the
+    /// application's unhandled-exception handlers hand it to the thread pool.
     /// </summary>
     /// <remarks>
-    /// The exception is appended synchronously to <c>&lt;data&gt;\logs\app-errors.log</c> when a data folder exists,
-    /// with the id of the run in progress, if any.
-    /// The session is then disposed, which stops the engine, joins its threads and releases the memory; its journal
-    /// is left in place, so the next launch reports the run.
+    /// <para>
+    /// The exception is appended to <c>&lt;data&gt;\logs\app-errors.log</c> when a data folder exists, with the id of
+    /// the run in progress, if any, and the session is disposed, which stops the engine, joins its threads and
+    /// releases the memory. Both run on the thread pool, and the calling thread waits for them for at most 3 s: a hung
+    /// engine, a slow release or a stalled disk is left to the process's termination, with which Windows reclaims the
+    /// locked pages.
+    /// </para>
+    /// <para>
+    /// The journal is left in place either way, so the next launch reports the run.
+    /// </para>
     /// </remarks>
     /// <param name="exception">The unhandled exception; nothing is logged when it is <see langword="null"/>.</param>
     public void HandleFatalException(Exception exception)
     {
         DataDirectory? dataDirectory = _dataDirectory;
         Guid? runId = Volatile.Read(ref _run)?.Log.RunId;
+        var pending = new List<Task>(2);
         if (dataDirectory is not null && exception is not null)
         {
-            ResultsLog.AppendAppError(dataDirectory, FatalErrorSource, exception, _timeProvider.GetUtcNow(), runId);
+            DateTimeOffset caughtUtc = _timeProvider.GetUtcNow();
+            pending.Add(Task.Run(
+                () => ResultsLog.AppendAppError(dataDirectory, FatalErrorSource, exception, caughtUtc, runId)));
         }
 
-        try
+        if (Volatile.Read(ref _run)?.TakeSession() is { } session)
         {
-            Volatile.Read(ref _run)?.TakeSession()?.Dispose();
-        }
-        catch (Exception disposeFailure)
-        {
-            // The session refuses disposal from inside an engine callback, which is where a coordinator-thread crash
-            // lands; the process is ending, and Windows reclaims the locked pages with it.
-            if (dataDirectory is not null)
+            Unsubscribe(session);
+
+            // The failure is written on the pool thread too, inside the bounded wait below, because the process ends
+            // soon after this method returns and a queued write would be lost with it.
+            pending.Add(DisposeOnThreadPoolAsync(session.Dispose, disposeFailure =>
             {
-                ResultsLog.AppendAppError(
-                    dataDirectory, FatalErrorSource, disposeFailure, _timeProvider.GetUtcNow(), runId);
-            }
+                if (dataDirectory is not null)
+                {
+                    ResultsLog.AppendAppError(
+                        dataDirectory, FatalErrorSource, disposeFailure, _timeProvider.GetUtcNow(), runId);
+                }
+            }));
         }
+
+        // The process ends soon after this method returns, so the release and the write get this bounded wait to finish
+        // first. It blocks the calling thread for at most 3 s, which is why this must never run on the UI thread; the
+        // application calls it from the thread pool. Neither task can fault, so the wait never throws; whatever is
+        // still running when the bound passes ends with the process.
+        _ = Task.WaitAll(pending.ToArray(), _fatalTeardownBound);
     }
 
     /// <summary>
     /// Releases everything the controller still holds: unsubscribes from the sensor monitor, withdraws a pending
-    /// Start, and disposes the current session (releasing its memory), journal and results log. Idempotent.
+    /// Start, and starts the disposal of the current session (releasing its memory), journal and results log.
+    /// Idempotent, and never blocks.
     /// </summary>
     /// <remarks>
-    /// Normally called at exit after <see cref="ShutdownAsync"/>, when nothing is left. Disposing a session can block
-    /// until the engine has released the region. A journal disposed before its <c>end</c> record is kept on disk, so
-    /// the next launch recovers the run.
+    /// <para>
+    /// Normally called at exit after <see cref="ShutdownAsync"/>, when nothing is left. Otherwise the session's
+    /// disposal, which joins the engine's threads and releases the region, and the journal's and log's disposal run
+    /// on the thread pool as independent work, so a hung engine never keeps the journal or the log open; a failure is
+    /// written to the application error log.
+    /// </para>
+    /// <para>
+    /// At exit past the shutdown deadline the process may end before that work finishes: Windows then reclaims the
+    /// locked pages, and a journal without its <c>end</c> record stays on disk, so the next launch recovers the run.
+    /// </para>
     /// </remarks>
     public void Dispose()
     {
@@ -784,11 +819,16 @@ public sealed partial class RunController : ObservableObject, IDisposable
             if (run.TakeSession() is { } session)
             {
                 Unsubscribe(session);
-                session.Dispose();
+                _ = DisposeOnThreadPoolAsync(session.Dispose, failure => ReportAppError(nameof(Dispose), failure));
             }
 
-            run.Journal.Dispose();
-            run.Log.Dispose();
+            _ = DisposeOnThreadPoolAsync(
+                () =>
+                {
+                    run.Journal.Dispose();
+                    run.Log.Dispose();
+                },
+                failure => ReportAppError(nameof(Dispose), failure));
         }
     }
 
@@ -865,8 +905,15 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
         _ = await CompletesWithinAsync(run.PublicationDone.Task, _options.ShutdownReleasedTimeout);
 
-        // Past the deadline the process may exit with the session still releasing; Windows reclaims the pages.
-        _ = await CompletesWithinAsync(run.Pipeline, RemainingUntil(run.ConcludedUtc, _options.ShutdownReleasedTimeout));
+        // Past the deadline the process may exit with the session still releasing; Windows reclaims the pages. A
+        // pipeline still short of its teardown has not started the release, so it is started here, on the thread
+        // pool and unawaited, and the pipeline's own teardown then finds no session left.
+        if (!await CompletesWithinAsync(run.Pipeline, RemainingUntil(run.ConcludedUtc, _options.ShutdownReleasedTimeout))
+            && run.TakeSession() is { } session)
+        {
+            Unsubscribe(session);
+            _ = DisposeOnThreadPoolAsync(session.Dispose, failure => ReportAppError(nameof(ShutdownAsync), failure));
+        }
     }
 
     private (SystemSnapshot? Snapshot, MemoryInventory Inventory) ProbeMachine()
@@ -1237,10 +1284,16 @@ public sealed partial class RunController : ObservableObject, IDisposable
             JournalAck ack = run.Journal.RecordStepStarting(step.Index, step.Count, step.Name);
             TimeSpan remaining = ProgressJournal.AcknowledgmentTimeout - Stopwatch.GetElapsedTime(startedAt);
             JournalAckStatus status = ack.Wait(stopEvent, remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero);
+            if (status == JournalAckStatus.Acknowledged)
+            {
+                // The step's traffic starts once Continue is returned, so a run the controller has to conclude itself
+                // still lists this step when its StepFinished never arrives.
+                run.RecordStepStarted(step);
+                return StepGateDecision.Continue;
+            }
+
             return status switch
             {
-                JournalAckStatus.Acknowledged => StepGateDecision.Continue,
-
                 // The stop event is set only after the stop reason is recorded, so the engine ends with that reason.
                 JournalAckStatus.Stopped => StepGateDecision.Abort,
                 JournalAckStatus.TimedOut => FailStep(run, UiText.JournalAcknowledgmentTimedOut),
@@ -1426,6 +1479,10 @@ public sealed partial class RunController : ObservableObject, IDisposable
             UpdateTruncation(run);
             run.Log.LogProgress(e);
             AnswerJournalFailure(run);
+            if (!run.LogFailureReported)
+            {
+                ReportLogFailure(run);
+            }
         }
         catch (Exception exception)
         {
@@ -1535,6 +1592,33 @@ public sealed partial class RunController : ObservableObject, IDisposable
         run.TryRecordJournalFailure(failure.Message);
         LogJournalFailureOnce(run);
         RequestEngineStop(run, StopReason.HostFault);
+    }
+
+    // The event log's drain records its first write failure and carries on, so the run continues without the log, as
+    // designed. Reading that record performs no I/O on the UI thread. The exception goes to app-errors.log once, with
+    // its full text, and the notice says what the failure leaves of the results: before publication, that the event
+    // log is not being written; after it, whether the results were saved without a complete event log or not at all.
+    private void ReportLogFailure(RunContext run)
+    {
+        if (run.Log.WriteFailure is not { } failure)
+        {
+            return;
+        }
+
+        if (!run.LogFailureReported)
+        {
+            run.LogFailureReported = true;
+            ReportAppError(nameof(ResultsLog), failure);
+        }
+
+        NoticeMessage = run.PublicationOutcome switch
+        {
+            null => UiText.EventLogNotSaved(failure.Message),
+            { Succeeded: true } => UiText.ResultsSavedWithoutEventLog(failure.Message),
+            { Error: var error } => UiText.ResultsNotSaved(error ?? string.Empty)
+                + UiText.NoticeSeparator
+                + UiText.EventLogNotSaved(failure.Message),
+        };
     }
 
     // Called from the coordinator (a failed step gate) and the UI thread (a failure seen on Progress); the first
@@ -1702,11 +1786,16 @@ public sealed partial class RunController : ObservableObject, IDisposable
         _timeProvider.GetUtcNow());
 
     // Used only when the engine stays silent past the shutdown bound: the run ends ABORTED as a user stop with what
-    // the controller itself observed.
+    // the controller itself observed. No step result arrives with that end, so the step the gate let start without a
+    // StepFinished is carried as unfinished, keeping one summary entry per started step.
     private Conclusion ConclusionFromOwnTotals(RunContext run)
     {
         RunProgress? progress = CurrentProgress;
         IReadOnlyList<StepOutcome> outcomes = run.OutcomesSnapshot();
+        JournalStepStart? unfinishedStep = run.LastStartedStep is { } started
+            && !outcomes.Any(outcome => outcome.Attributes.Index == started.Index)
+                ? new JournalStepStart { Index = started.Index + 1, Count = started.Count, Name = started.Name }
+                : null;
         return new Conclusion(
             RunEndReason.UserStop,
             TotalErrors,
@@ -1717,7 +1806,8 @@ public sealed partial class RunController : ObservableObject, IDisposable
             outcomes,
             0,
             null,
-            _timeProvider.GetUtcNow());
+            _timeProvider.GetUtcNow(),
+            unfinishedStep);
     }
 
     private void BeginConclusion(RunContext run, Conclusion conclusion, bool releaseExpected)
@@ -1755,7 +1845,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
         catch (Exception exception)
         {
             ReportAppError(nameof(PublishAsync), exception);
+            run.PublicationOutcome = new SummaryPublishResult(false, null, null, exception.Message);
             NoticeMessage = UiText.ResultsNotSaved(exception.Message);
+            ReportLogFailure(run);
         }
         finally
         {
@@ -1789,6 +1881,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         IReadOnlyList<StepOutcome> outcomes = DistinctSteps(
             conclusion.StepResults.Count > 0 ? conclusion.StepResults : run.OutcomesSnapshot());
         run.FinalOutcomes = outcomes;
+        run.FinalUnfinishedStep = conclusion.UnfinishedStep;
 
         // The engine's end reason is authoritative. A first-error stop not logged yet, because its error report never
         // arrived or a request logged after the engine had stopped came first, is logged now, stamped as COMPLETED so
@@ -1799,17 +1892,19 @@ public sealed partial class RunController : ObservableObject, IDisposable
                 conclusion.CompletedUtc, nameof(RunEndReason.FirstError), conclusion.FirstErrorTime);
         }
 
+        // The engine's own detail, redacted: a start fault carries a managed exception's message, which can name a
+        // path in the user's profile, and no log may record personal data. app-errors.log keeps the full exception.
         run.Log.LogCompleted(
             conclusion.CompletedUtc,
             conclusion.EndReason,
-            conclusion.EndDetail,
+            conclusion.EndDetail is { } engineDetail ? SummaryFormat.RedactPersonalPaths(engineDetail) : null,
             TotalErrors,
             conclusion.VerifiedBytes,
             conclusion.Elapsed,
             conclusion.FirstErrorTime);
 
         string reason;
-        if (StateMachine.TryFinish(conclusion.EndReason, TotalErrors, conclusion.EndDetail))
+        if (StateMachine.TryFinish(conclusion.EndReason, TotalErrors, PersistedEndDetail(run, conclusion)))
         {
             reason = ResultReason(run, conclusion);
         }
@@ -1818,7 +1913,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
             // An end the current state cannot take, such as Completed before Prepared, breaks the engine's event
             // contract; the run still ends, as an engine fault, so the state machine never stays in progress.
             string detail = conclusion.EndDetail ?? conclusion.EndReason.ToString();
-            if (!StateMachine.TryFinish(RunEndReason.EngineFault, TotalErrors, detail))
+            if (!StateMachine.TryFinish(RunEndReason.EngineFault, TotalErrors, SummaryFormat.RedactPersonalPaths(detail)))
             {
                 throw new InvalidOperationException($"A run cannot end from {StateMachine.State}.");
             }
@@ -1885,9 +1980,23 @@ public sealed partial class RunController : ObservableObject, IDisposable
         RunEndReason.AffinityFailed => UiText.AffinityFailed(conclusion.OsError),
         RunEndReason.HostFault => run.JournalFailureText is { } journalFailure
             ? UiText.JournalWriteFailed(journalFailure)
-            : UiText.EngineError(run.CallbackFaultText ?? conclusion.EndDetail ?? conclusion.EndReason.ToString()),
+            : UiText.HostFault(run.CallbackFaultText ?? conclusion.EndDetail ?? conclusion.EndReason.ToString()),
         _ => UiText.EngineError(conclusion.EndDetail ?? conclusion.EndReason.ToString()),
     };
+
+    // The engine reports a host-fault stop only as the host's request; the cause this controller recorded is what the
+    // state machine, the VERDICT line, the result record and both summaries state. The detail is persisted, so it goes
+    // through the redaction the shareable summaries need, while the displayed reason keeps the full text.
+    private static string? PersistedEndDetail(RunContext run, Conclusion conclusion)
+    {
+        string? detail = conclusion.EndReason switch
+        {
+            RunEndReason.HostFault when run.JournalFailureText is { } journalFailure => UiText.JournalWriteFailed(journalFailure),
+            RunEndReason.HostFault when run.CallbackFaultText is { } callbackFault => UiText.HostFault(callbackFault),
+            _ => conclusion.EndDetail,
+        };
+        return detail is null ? null : SummaryFormat.RedactPersonalPaths(detail);
+    }
 
     private async Task<CauseHints> AnalyseAsync(RunContext run, IReadOnlyList<StepOutcome> outcomes)
     {
@@ -1946,6 +2055,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
             Begin = run.Begin,
             Prepared = run.Prepared,
             FinishedSteps = run.FinalOutcomes.Select(JournalStepEnd.FromOutcome).ToArray(),
+            UnfinishedStep = run.FinalUnfinishedStep,
             Result = run.Result,
             Released = released,
             StoredErrors = run.Stored.ToArray(),
@@ -1966,21 +2076,30 @@ public sealed partial class RunController : ObservableObject, IDisposable
             published = new SummaryPublishResult(false, null, null, exception.Message);
         }
 
+        // Publication logged its outcome last, so once the drain has flushed it every event of the run has reached the
+        // disk or met a write failure, and the notice can tell fully saved results from partially saved ones.
+        _ = await CompletesWithinAsync(run.Log.FlushAsync(), _logFlushTimeout);
+        run.PublicationOutcome = published;
+
         if (published.Succeeded)
         {
+            // The summaries hold every result, so the journal is retired even when the event log is incomplete:
+            // keeping it would only make the next Start report a recovery that recovers nothing.
             JournalAckStatus ended = await run.Journal.EndAsync();
             if (ended != JournalAckStatus.Acknowledged)
             {
                 run.Log.LogJournalFailure(run.Journal.Failure?.Message ?? ended.ToString());
             }
-
-            return;
+        }
+        else
+        {
+            // The verdict stays displayed, and the journal is kept so the next launch retries the publication.
+            string failure = UiText.ResultsNotSaved(published.Error ?? string.Empty);
+            NoticeMessage = failure;
+            run.Log.LogNotice(failure);
         }
 
-        // The verdict stays displayed, and the journal is kept so the next launch retries the publication.
-        string failure = UiText.ResultsNotSaved(published.Error ?? string.Empty);
-        NoticeMessage = failure;
-        run.Log.LogNotice(failure);
+        ReportLogFailure(run);
     }
 
     // Disposal joins the engine's threads and releases the locked region, which can take long on a large region,
@@ -2017,6 +2136,12 @@ public sealed partial class RunController : ObservableObject, IDisposable
             ReportAppError(nameof(TeardownAsync), exception);
         }
 
+        // Closing the log writes what it still buffered, so the close can meet the log's first write failure.
+        if (!run.LogFailureReported)
+        {
+            ReportLogFailure(run);
+        }
+
         if (ReferenceEquals(_run, run))
         {
             Volatile.Write(ref _run, null);
@@ -2025,6 +2150,22 @@ public sealed partial class RunController : ObservableObject, IDisposable
         PostRunActivity = PostRunActivity.None;
         CanStart = !_disposed;
     }
+
+    // Disposal joins the engine's threads, or waits for the journal writer and the log's drain, so a caller that must
+    // not block hands it to the thread pool. The task never faults, provided reportFailure, which receives any
+    // failure on the pool thread, does not throw.
+    private static Task DisposeOnThreadPoolAsync(Action dispose, Action<Exception> reportFailure) =>
+        Task.Run(() =>
+        {
+            try
+            {
+                dispose();
+            }
+            catch (Exception failure)
+            {
+                reportFailure(failure);
+            }
+        });
 
     private async Task<bool> CompletesWithinAsync(Task task, TimeSpan timeout)
     {
@@ -2101,7 +2242,8 @@ public sealed partial class RunController : ObservableObject, IDisposable
         IReadOnlyList<StepOutcome> StepResults,
         uint OsError,
         string? EndDetail,
-        DateTimeOffset CompletedUtc);
+        DateTimeOffset CompletedUtc,
+        JournalStepStart? UnfinishedStep = null);
 
     private sealed record ReleaseNotice(EngineReleased Released, DateTimeOffset ReceivedUtc);
 
@@ -2114,9 +2256,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// The state of one accepted run, from Preparing until its session is disposed. The session, journal-failure
-    /// and callback-fault fields are published atomically, and the stop decision is taken under a lock, because the
-    /// coordinator thread reads or writes them; everything else belongs to the UI thread.
+    /// The state of one accepted run, from Preparing until its session is disposed. The session, journal-failure,
+    /// callback-fault and last-started-step fields are published atomically, and the stop decision is taken under a
+    /// lock, because the coordinator thread reads or writes them; everything else belongs to the UI thread.
     /// </summary>
     private sealed class RunContext
     {
@@ -2127,6 +2269,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         private IEngineSession? _session;
         private string? _journalFailureText;
         private string? _callbackFaultText;
+        private EngineStepStarted? _lastStartedStep;
         private int _journalFailureLogged;
         private bool _stopDecisionLogged;
         private bool _firstErrorStopLogged;
@@ -2162,6 +2305,8 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
         public string? CallbackFaultText => Volatile.Read(ref _callbackFaultText);
 
+        public EngineStepStarted? LastStartedStep => Volatile.Read(ref _lastStartedStep);
+
         public bool SessionStarted { get; set; }
 
         public bool Concluded { get; set; }
@@ -2181,6 +2326,8 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
         public IReadOnlyList<StepOutcome> FinalOutcomes { get; set; } = Array.Empty<StepOutcome>();
 
+        public JournalStepStart? FinalUnfinishedStep { get; set; }
+
         public JournalResult? Result { get; set; }
 
         public SummaryTemperatures Temperatures { get; set; } = SummaryTemperatures.Initial;
@@ -2192,6 +2339,10 @@ public sealed partial class RunController : ObservableObject, IDisposable
         public SensorStatus? LastRamStatus { get; set; }
 
         public bool JournalFailureAnswered { get; set; }
+
+        public bool LogFailureReported { get; set; }
+
+        public SummaryPublishResult? PublicationOutcome { get; set; }
 
         public TaskCompletionSource ConclusionStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -2262,6 +2413,8 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
         public void TryRecordCallbackFault(string failure) =>
             Interlocked.CompareExchange(ref _callbackFaultText, failure, null);
+
+        public void RecordStepStarted(EngineStepStarted step) => Volatile.Write(ref _lastStartedStep, step);
 
         // True for the first caller only: the coordinator and the UI thread can both log the journal failure.
         public bool TryClaimJournalFailureLog() => Interlocked.Exchange(ref _journalFailureLogged, 1) == 0;

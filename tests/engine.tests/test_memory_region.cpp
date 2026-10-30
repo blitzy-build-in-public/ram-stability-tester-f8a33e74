@@ -9,9 +9,10 @@
  * - MemoryRegionAllocate and MemoryRegionRefusal: memory_region over real memory without
  *   elevation. Every chunk is committed, every page is resident and locked (QueryWorkingSetEx),
  *   slices follow worker order in logical offsets, a scripted lock override drives
- *   shrink-and-retry and exhaustion deterministically, a stop before or during preparation frees
- *   everything, and release() and the destructor leave every former chunk base MEM_FREE with the
- *   working-set limits restored.
+ *   shrink-and-retry and exhaustion deterministically, a stop before preparation allocates
+ *   nothing, a stop during preparation keeps the chunks it locked, unexposed, until release()
+ *   frees exactly them, and release() and the destructor leave every former chunk base MEM_FREE
+ *   with the working-set limits restored.
  * - MemoryRegionLargePages: large-page chunks, skipped when the token lacks
  *   SeLockMemoryPrivilege, which nobody holds by default.
  * - MemoryRegionRelease: whole sessions ending in each of completed, user stop, first error,
@@ -20,7 +21,10 @@
  *   That check runs inside on_released itself, before anything else in the process can reuse
  *   the freed address range. The two end reasons that fail before any traffic touch no chunk, so
  *   their release is shown by the commit charge instead: it is sampled inside the failing pin,
- *   after the region was committed, and again inside on_released.
+ *   after the region was committed, and again inside on_released. A scripted free override
+ *   refuses chunks: a refused chunk stays owned and committed, Released is withheld, and a chunk
+ *   still refused when its region or session is destroyed passes to the process-wide owner
+ *   until a later retry frees it and restores the working-set limits.
  *
  * Regions stay at or below 512 MiB and sessions use at most two workers. Locking up to that size
  * needs no elevation once the working set is raised, which memory_region does itself.
@@ -77,7 +81,7 @@ constexpr std::uint32_t k_error_invalid_parameter = 87;
 static_assert(k_error_working_set_quota == ERROR_WORKING_SET_QUOTA, "Windows error 1453");
 static_assert(k_error_invalid_parameter == ERROR_INVALID_PARAMETER, "Windows error 87");
 
-/** The lock override's "always fail" setting. */
+/** The "always fail" setting of the lock and free scripts. */
 constexpr std::uint32_t k_always = UINT32_MAX;
 
 /** Session regions: 64 MiB for runs with traffic, 32 MiB minimum. */
@@ -469,12 +473,28 @@ public:
     /** Makes the gate of step_index return RQ_ACTION_ABORT. Call before the session starts. */
     void abort_gate_at(std::uint32_t step_index) noexcept { abort_at_ = step_index; }
 
+    /**
+     * Makes every step gate wait, for at most k_event_timeout, until partner has seen Prepared
+     * or Completed, so two sessions hold their regions at once before either runs a step. Call
+     * before the session starts.
+     */
+    void hold_gate_for(run_recorder& partner) noexcept { partner_ = &partner; }
+
     bool wait_for_progress() {
         return wait_until([this] { return run_.progress_calls > 0 || run_.completed; });
     }
 
     bool wait_for_released() {
         return wait_until([this] { return run_.released; });
+    }
+
+    bool wait_for_completed() {
+        return wait_until([this] { return run_.completed; });
+    }
+
+    /** Waits at most timeout for Released; false when it has not been raised by then. */
+    bool released_within(std::chrono::milliseconds timeout) {
+        return wait_until([this] { return run_.released; }, timeout);
     }
 
     recorded_run snapshot() const {
@@ -488,9 +508,9 @@ private:
     }
 
     template <class Predicate>
-    bool wait_until(Predicate done) {
+    bool wait_until(Predicate done, std::chrono::milliseconds timeout = k_event_timeout) {
         std::unique_lock<std::mutex> lock(mutex_);
-        return changed_.wait_for(lock, k_event_timeout, done);
+        return changed_.wait_for(lock, timeout, done);
     }
 
     template <class Update>
@@ -513,6 +533,11 @@ private:
                                                   const rq_step_start* info) noexcept {
         run_recorder& recorder = self(user_data);
         recorder.update([](recorded_run& run) { ++run.gate_calls; });
+        if (recorder.partner_ != nullptr) {
+            run_recorder& partner = *recorder.partner_;
+            partner.wait_until(
+                [&partner] { return partner.run_.prepared || partner.run_.completed; });
+        }
         return info->index == recorder.abort_at_ ? RQ_ACTION_ABORT : RQ_ACTION_CONTINUE;
     }
 
@@ -565,6 +590,7 @@ private:
 
     const address_capture& capture_;
     std::uint32_t abort_at_ = k_no_step;
+    run_recorder* partner_ = nullptr;
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     recorded_run run_;
@@ -1056,9 +1082,11 @@ TEST(MemoryRegionShrink, ReportsInsufficientMemoryWhenNoSizeLocks) {
     const std::string detail = outcome.end_detail;
     EXPECT_FALSE(detail.empty());
     EXPECT_NE(detail.find("VirtualLock"), std::string::npos) << detail;
-    EXPECT_NE(detail.find("1453"), std::string::npos) << detail;
     EXPECT_NE(detail.find("at 32 MiB"), std::string::npos) << "names the last size: " << detail;
     EXPECT_NE(detail.find("32 MiB minimum"), std::string::npos) << detail;
+    // The error is os_error's alone: the host prefixes "Windows error n: " to the detail.
+    EXPECT_EQ(detail.find("Windows error"), std::string::npos) << detail;
+    EXPECT_EQ(detail.find("1453"), std::string::npos) << detail;
 
     ASSERT_EQ(script.bases().size(), script.calls());
     for (const void* base : script.bases()) {
@@ -1114,6 +1142,102 @@ INSTANTIATE_TEST_SUITE_P(
         return std::string(info.param.name);
     });
 
+/**
+ * A first size above physical memory, as a function of the machine's total physical bytes, so
+ * the bound is exercised whatever the machine holds.
+ */
+struct physical_bound_case {
+    const char* name;
+    std::uint32_t worker_count;
+    std::uint64_t (*region_bytes)(std::uint64_t total_phys_bytes);
+};
+
+void PrintTo(const physical_bound_case& value, std::ostream* os) {
+    *os << value.name;
+}
+
+class MemoryRegionRefusalAbovePhysicalMemory
+    : public ::testing::TestWithParam<physical_bound_case> {};
+
+TEST_P(MemoryRegionRefusalAbovePhysicalMemory, RefusesBeforeReservingTheChunkList) {
+    // The refusal makes one query and allocates nothing, so this limit is generous.
+    constexpr long long k_refusal_limit_ms = 1000;
+    const physical_bound_case& request = GetParam();
+
+    MEMORYSTATUSEX memory_status{};
+    memory_status.dwLength = sizeof(memory_status);
+    ASSERT_TRUE(GlobalMemoryStatusEx(&memory_status))
+        << "GlobalMemoryStatusEx failed (Windows error " << GetLastError() << ")";
+    const std::uint64_t total_phys = memory_status.ullTotalPhys;
+    const std::uint64_t region_bytes = request.region_bytes(total_phys);
+    ASSERT_GT(region_bytes, total_phys);
+    const region_plan plan = plan_region(region_bytes, request.worker_count);
+    if (plan.slice_bytes != 0) {
+        ASSERT_GT(plan.tested_bytes, total_phys) << "the plan itself must exceed physical memory";
+    }
+
+    // The request is rounded up and physical memory down to whole MiB, as the engine does.
+    char expected_detail[RQ_END_DETAIL_SIZE];
+    std::snprintf(expected_detail, sizeof(expected_detail),
+                  "Region of %llu MiB exceeds the %llu MiB of physical memory",
+                  region_bytes / k_mib + (region_bytes % k_mib != 0 ? 1u : 0u), total_phys / k_mib);
+
+    const working_set_limits limits_before = current_working_set_limits();
+    stop_signal stop;
+    // Every lock fails, so even an engine that went on to shrink and retry would lock nothing.
+    lock_script script(k_always);
+    memory_region region;
+    const std::uint64_t private_before = current_private_usage();
+    ASSERT_NE(private_before, 0u) << "GetProcessMemoryInfo failed";
+    const auto started = std::chrono::steady_clock::now();
+    const allocation_outcome outcome = region.allocate(
+        make_options(region_bytes, k_session_min_region_bytes, request.worker_count, script.bind()),
+        stop);
+    const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - started)
+                                     .count();
+    // Read while the region still exists, so a reserved chunk list would still be committed.
+    const std::uint64_t private_after = current_private_usage();
+    const std::uint64_t private_growth =
+        private_after > private_before ? private_after - private_before : 0;
+
+    ASSERT_EQ(outcome.status, allocation_status::insufficient_memory)
+        << status_name(outcome.status) << ": " << outcome.end_detail;
+    EXPECT_EQ(outcome.attempts, 1u);
+    EXPECT_EQ(outcome.os_error, 0u) << "no OS call failed";
+    EXPECT_EQ(outcome.large_page_fallbacks, 0u);
+    EXPECT_STREQ(outcome.end_detail, expected_detail);
+    EXPECT_EQ(script.calls(), 0u) << "nothing was allocated or locked";
+    EXPECT_LT(elapsed_ms, k_refusal_limit_ms);
+    EXPECT_LE(private_growth, k_private_usage_slack_bytes)
+        << "the commit charge grew by " << private_growth / k_mib << " MiB";
+    expect_unallocated(region, "after a request above physical memory");
+    expect_limits_restored(limits_before, "after a request above physical memory");
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    MemoryRegionRefusalAbovePhysicalMemoryCases, MemoryRegionRefusalAbovePhysicalMemory,
+    ::testing::Values(
+        // The largest plannable slice, 2^32 - 2 chunks of 256 MiB: nearly 1 EiB, whose chunk list
+        // alone would need over 100 GiB.
+        physical_bound_case{"NearOneEibOnOneWorker", 1,
+                            [](std::uint64_t) -> std::uint64_t {
+                                return (std::uint64_t{UINT32_MAX} - 1) * k_chunk_bytes;
+                            }},
+        // The first multiple of the 6 MiB unit of 3 workers above physical memory, so the plan
+        // tests all of it.
+        physical_bound_case{"JustAbovePhysicalMemory", 3,
+                            [](std::uint64_t total_phys_bytes) -> std::uint64_t {
+                                constexpr std::uint64_t k_unit = 3 * k_slice_granularity_bytes;
+                                return (total_phys_bytes / k_unit + 1) * k_unit;
+                            }},
+        // A slice of 2^60 bytes or more has no plan, so the request itself is compared.
+        physical_bound_case{"TooLargeToPlan", 1,
+                            [](std::uint64_t) -> std::uint64_t { return UINT64_MAX; }}),
+    [](const ::testing::TestParamInfo<physical_bound_case>& info) {
+        return std::string(info.param.name);
+    });
+
 TEST(MemoryRegionStop, StopBeforeAllocateAllocatesNothing) {
     stop_signal stop;
     stop.request(RQ_END_USER_STOP, 0, "Stopped before allocate");
@@ -1127,13 +1251,17 @@ TEST(MemoryRegionStop, StopBeforeAllocateAllocatesNothing) {
     EXPECT_EQ(outcome.end_detail[0], '\0');
     EXPECT_EQ(script.calls(), 0u);
     expect_unallocated(region, "after a stop before allocate");
+    EXPECT_EQ(region.release(), 0u) << "nothing was allocated";
 }
 
-TEST(MemoryRegionStop, StopDuringPreparationFreesEveryEarlierChunk) {
+TEST(MemoryRegionStop, StopDuringPreparationKeepsLockedChunksUntilRelease) {
     // Four 16 MiB slices of one chunk each; the stop arrives while chunk 2 is locked, so the
-    // check before chunk 3 sees it.
+    // check before chunk 3 sees it. allocate() returns at once, holding chunks 1 and 2, so
+    // that the coordinator can raise Completed before it releases them.
     constexpr std::uint32_t k_workers = 4;
     constexpr std::uint32_t k_stop_on_call = 2;
+    constexpr std::uint64_t k_slice_bytes = 16 * k_mib;
+    constexpr std::uint64_t k_locked_bytes = k_stop_on_call * k_slice_bytes;
     const working_set_limits limits_before = current_working_set_limits();
 
     stop_signal stop;
@@ -1147,11 +1275,31 @@ TEST(MemoryRegionStop, StopDuringPreparationFreesEveryEarlierChunk) {
     EXPECT_EQ(outcome.end_detail[0], '\0');
     EXPECT_EQ(script.calls(), k_stop_on_call) << "no chunk after the stop was allocated";
     ASSERT_EQ(script.bases().size(), k_stop_on_call);
-    for (const void* base : script.bases()) {
-        expect_freed(base, "after a stop during preparation");
-    }
+    const std::vector<const void*> bases = script.bases();
+
+    // Held but never exposed as a usable region.
     expect_unallocated(region, "after a stop during preparation");
-    expect_limits_restored(limits_before, "after a stop during preparation");
+    for (const void* base : bases) {
+        MEMORY_BASIC_INFORMATION info{};
+        ASSERT_EQ(VirtualQuery(base, &info, sizeof(info)), sizeof(info));
+        EXPECT_EQ(info.AllocationBase, base) << "one allocation per chunk";
+        EXPECT_EQ(info.State, static_cast<DWORD>(MEM_COMMIT))
+            << "a chunk locked before the stop was freed before release(): "
+            << memory_state_name(info.State);
+        EXPECT_TRUE(pages_locked(chunk_view{static_cast<std::uint64_t*>(const_cast<void*>(base)),
+                                            k_slice_bytes, 0, false}))
+            << "a chunk locked before the stop was unlocked before release()";
+    }
+    EXPECT_GE(static_cast<std::uint64_t>(current_working_set_limits().minimum), k_locked_bytes)
+        << "the working-set raise covering the held chunks was undone before release()";
+
+    EXPECT_EQ(region.release(), k_locked_bytes) << "release() frees exactly the held chunks";
+    EXPECT_EQ(region.release(), 0u) << "release() is idempotent";
+    for (const void* base : bases) {
+        expect_freed(base, "after release() of a stopped region");
+    }
+    expect_unallocated(region, "after release() of a stopped region");
+    expect_limits_restored(limits_before, "after release() of a stopped region");
 }
 
 TEST(MemoryRegionRelease, DestructorReleasesEveryChunk) {
@@ -1171,6 +1319,514 @@ TEST(MemoryRegionRelease, DestructorReleasesEveryChunk) {
         expect_freed(base, "after the destructor");
     }
     expect_limits_restored(limits_before, "after the destructor");
+}
+
+/** The Windows error the scripted free refusals report. */
+constexpr std::uint32_t k_error_invalid_address = 487;
+static_assert(k_error_invalid_address == ERROR_INVALID_ADDRESS, "Windows error 487");
+
+/** How long a session test watches for a Released that must be withheld. */
+constexpr std::chrono::milliseconds k_released_withheld_wait{1000};
+
+/**
+ * Stands in for VirtualFree through region_options::free_override and
+ * session_dependencies::free_override.
+ *
+ * The first chunk it is asked to free is refused up to refusals times (every time for k_always,
+ * until stop_refusing()): the call leaves the chunk allocated and returns false with
+ * ERROR_INVALID_ADDRESS as the last error, exactly as a failed VirtualFree reports it. Every
+ * other call frees for real. A session calls it from its coordinator and later from the
+ * destroying thread, and the owner of orphaned chunks from whichever thread retries them, so
+ * the record is guarded.
+ */
+class free_script {
+public:
+    explicit free_script(std::uint32_t refusals) : refusals_(refusals) {}
+
+    /**
+     * Stops refusing and retries the orphaned chunks, so no chunk a destroyed region handed to
+     * the process-wide owner keeps calling this script once it is gone, even after a failed
+     * assertion ended the test early, and later tests start with nothing orphaned.
+     */
+    ~free_script() {
+        stop_refusing();
+        retry_orphaned_chunks();
+    }
+
+    free_script(const free_script&) = delete;
+    free_script& operator=(const free_script&) = delete;
+
+    /** Makes every later call free for real. */
+    void stop_refusing() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        refusals_ = refused_;
+    }
+
+    free_function bind() {
+        return [this](void* address) { return release_chunk(address); };
+    }
+
+    std::uint32_t calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return calls_;
+    }
+
+    std::uint32_t refusals_made() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return refused_;
+    }
+
+    /** The chunk whose free is refused: the first one asked for; null before any call. */
+    const void* refused_base() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return refused_base_;
+    }
+
+    /** Waits, for at most k_event_timeout, until count calls have been made. */
+    bool wait_for_calls(std::uint32_t count) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return called_.wait_for(lock, k_event_timeout, [&] { return calls_ >= count; });
+    }
+
+private:
+    bool release_chunk(void* address) noexcept {
+        bool refuse = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++calls_;
+            if (refused_base_ == nullptr) {
+                refused_base_ = address;
+            }
+            if (address == refused_base_ && refused_ < refusals_) {
+                ++refused_;
+                refuse = true;
+            }
+        }
+        called_.notify_all();
+        if (refuse) {
+            // Set after the lock is dropped, so nothing can overwrite it before the region reads
+            // it.
+            SetLastError(k_error_invalid_address);
+            return false;
+        }
+        return VirtualFree(address, 0, MEM_RELEASE) != FALSE;
+    }
+
+    std::uint32_t refusals_;
+    mutable std::mutex mutex_;
+    std::condition_variable called_;
+    std::uint32_t calls_ = 0;
+    std::uint32_t refused_ = 0;
+    const void* refused_base_ = nullptr;
+};
+
+/** Success when VirtualQuery reports base as the start of a committed allocation. */
+::testing::AssertionResult is_committed_allocation(const void* base) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(base, &info, sizeof(info)) != sizeof(info)) {
+        return ::testing::AssertionFailure() << "VirtualQuery(" << hex_address(address_of(base))
+                                             << ") failed (Windows error " << GetLastError() << ")";
+    }
+    if (info.AllocationBase != base || info.State != MEM_COMMIT) {
+        return ::testing::AssertionFailure()
+               << "address " << hex_address(address_of(base))
+               << " is not a committed allocation: " << memory_state_name(info.State)
+               << ", allocation base " << hex_address(address_of(info.AllocationBase));
+    }
+    return ::testing::AssertionSuccess();
+}
+
+TEST(MemoryRegionRelease, KeepsAChunkWindowsRefusesToFreeUntilALaterReleaseFreesIt) {
+    // Two 32 MiB slices of one chunk each. The first chunk's free is refused twice: by the first
+    // release() and by the release() a repeated allocate() runs first.
+    constexpr std::uint64_t k_region = 64 * k_mib;
+    constexpr std::uint64_t k_chunk = 32 * k_mib;
+    const working_set_limits limits_before = current_working_set_limits();
+
+    free_script frees(2);
+    stop_signal stop;
+    memory_region region;
+    region_options options = make_options(k_region, k_chunk, 2);
+    options.free_override = frees.bind();
+    const allocation_outcome outcome = region.allocate(options, stop);
+    ASSERT_EQ(outcome.status, allocation_status::ok)
+        << status_name(outcome.status) << ": " << outcome.end_detail;
+    const std::vector<const void*> bases = chunk_bases(region);
+    ASSERT_EQ(bases.size(), 2u);
+    EXPECT_EQ(region.held_bytes(), k_region);
+
+    // The refused chunk stays committed and owned, with the raise that covers it; only the other
+    // chunk's bytes count as released.
+    EXPECT_EQ(region.release(), k_chunk) << "release() reports only the bytes it freed";
+    ASSERT_EQ(frees.refused_base(), bases[0]) << "chunks are freed in logical order";
+    EXPECT_EQ(region.held_bytes(), k_chunk);
+    expect_unallocated(region, "with a refused chunk held");
+    EXPECT_TRUE(is_committed_allocation(bases[0])) << "the refused chunk was dropped or freed";
+    expect_freed(bases[1], "the chunk whose free succeeded");
+    EXPECT_EQ(static_cast<std::uint64_t>(current_working_set_limits().minimum),
+              k_region + k_working_set_headroom_bytes)
+        << "the working-set raise was undone while a chunk is held";
+
+    // A repeated allocate() retries the held chunk first and, refused again, plans nothing over
+    // it; the override of the earlier call is kept for that chunk.
+    lock_script locks(0);
+    const allocation_outcome refused =
+        region.allocate(make_options(k_region, k_chunk, 2, locks.bind()), stop);
+    ASSERT_EQ(refused.status, allocation_status::insufficient_memory)
+        << status_name(refused.status);
+    EXPECT_EQ(refused.attempts, 0u);
+    EXPECT_EQ(refused.os_error, k_error_invalid_address);
+    const std::string detail = refused.end_detail;
+    EXPECT_NE(detail.find("VirtualFree"), std::string::npos) << detail;
+    EXPECT_NE(detail.find("32 MiB"), std::string::npos) << "names the held bytes: " << detail;
+    EXPECT_EQ(locks.calls(), 0u) << "a chunk was locked over the held one";
+    EXPECT_EQ(frees.refusals_made(), 2u);
+    EXPECT_EQ(region.held_bytes(), k_chunk);
+    EXPECT_TRUE(is_committed_allocation(bases[0]));
+
+    // The next release() frees it and only then restores the limits.
+    EXPECT_EQ(region.release(), k_chunk);
+    EXPECT_EQ(region.held_bytes(), 0u);
+    EXPECT_EQ(frees.calls(), 4u) << "two chunks, then the held one twice";
+    expect_freed(bases[0], "after the retried release()");
+    expect_unallocated(region, "after the retried release()");
+    expect_limits_restored(limits_before, "after the retried release()");
+    EXPECT_EQ(region.release(), 0u) << "release() is idempotent";
+}
+
+TEST(MemoryRegionRelease, EndsTheRetriesWhenAFailedAttemptsChunkCannotBeFreed) {
+    // The first chunk's lock fails, so the attempt's cleanup frees that unlocked chunk, and the
+    // free is refused once: no retry is planned over the held chunk.
+    constexpr std::uint64_t k_region = 64 * k_mib;
+    constexpr std::uint64_t k_chunk = 32 * k_mib;
+    const working_set_limits limits_before = current_working_set_limits();
+
+    free_script frees(1);
+    lock_script locks(1);
+    stop_signal stop;
+    memory_region region;
+    region_options options = make_options(k_region, k_chunk, 2, locks.bind());
+    options.free_override = frees.bind();
+    const allocation_outcome outcome = region.allocate(options, stop);
+    ASSERT_EQ(outcome.status, allocation_status::insufficient_memory)
+        << status_name(outcome.status);
+    EXPECT_EQ(outcome.attempts, 1u) << "a retry was planned over a held chunk";
+    EXPECT_EQ(outcome.os_error, k_error_invalid_address);
+    const std::string detail = outcome.end_detail;
+    EXPECT_NE(detail.find("VirtualFree"), std::string::npos) << detail;
+    EXPECT_EQ(locks.calls(), 1u);
+    ASSERT_EQ(locks.bases().size(), 1u);
+    const void* const base = locks.bases()[0];
+    EXPECT_EQ(frees.refused_base(), base) << "the chunk whose lock failed is freed by the cleanup";
+    EXPECT_EQ(region.held_bytes(), k_chunk);
+    expect_unallocated(region, "after a failed attempt left a chunk held");
+    EXPECT_TRUE(is_committed_allocation(base)) << "the refused chunk was dropped or freed";
+    EXPECT_EQ(static_cast<std::uint64_t>(current_working_set_limits().minimum),
+              k_region + k_working_set_headroom_bytes)
+        << "the working-set raise was undone while a chunk is held";
+
+    EXPECT_EQ(region.release(), k_chunk);
+    EXPECT_EQ(region.held_bytes(), 0u);
+    expect_freed(base, "after release() of the held chunk");
+    expect_limits_restored(limits_before, "after release() of the held chunk");
+}
+
+TEST(MemoryRegionRelease, DestructorHandsAChunkStillRefusedToTheProcessWideOwner) {
+    // Two 32 MiB slices of one chunk each. The first chunk's free is refused on every call until
+    // the script stops refusing, so the region is destroyed still holding it.
+    constexpr std::uint64_t k_region = 64 * k_mib;
+    constexpr std::uint64_t k_chunk = 32 * k_mib;
+    ASSERT_EQ(orphaned_bytes(), 0u) << "an earlier test left orphaned chunks";
+    const working_set_limits limits_before = current_working_set_limits();
+
+    free_script frees(k_always);
+    std::vector<const void*> bases;
+    {
+        stop_signal stop;
+        memory_region region;
+        region_options options = make_options(k_region, k_chunk, 2);
+        options.free_override = frees.bind();
+        const allocation_outcome outcome = region.allocate(options, stop);
+        ASSERT_EQ(outcome.status, allocation_status::ok)
+            << status_name(outcome.status) << ": " << outcome.end_detail;
+        bases = chunk_bases(region);
+        ASSERT_EQ(bases.size(), 2u);
+    }
+
+    // The destructor's release() freed the second chunk and was refused the first, which
+    // outlives the region under the process-wide owner: still committed, and still covered by
+    // the region's working-set raise.
+    ASSERT_EQ(frees.refused_base(), bases[0]) << "chunks are freed in logical order";
+    EXPECT_EQ(frees.calls(), 2u);
+    EXPECT_EQ(orphaned_bytes(), k_chunk);
+    EXPECT_TRUE(is_committed_allocation(bases[0])) << "the refused chunk was dropped or freed";
+    expect_freed(bases[1], "the chunk whose free succeeded");
+    EXPECT_EQ(static_cast<std::uint64_t>(current_working_set_limits().minimum),
+              k_region + k_working_set_headroom_bytes)
+        << "the working-set raise was undone while an orphaned chunk is held";
+
+    // An explicit retry that Windows still refuses keeps the chunk orphaned.
+    retry_orphaned_chunks();
+    EXPECT_EQ(frees.calls(), 3u);
+    EXPECT_EQ(orphaned_bytes(), k_chunk);
+    EXPECT_TRUE(is_committed_allocation(bases[0])) << "a refused retry dropped or freed the chunk";
+
+    // Once Windows allows it, the release() of any later region frees it, with the override the
+    // destroyed region kept, without counting it as that region's, and restores the limits.
+    frees.stop_refusing();
+    memory_region later;
+    EXPECT_EQ(later.release(), 0u) << "the orphaned bytes were counted as the later region's";
+    EXPECT_EQ(frees.calls(), 4u);
+    EXPECT_EQ(orphaned_bytes(), 0u);
+    expect_freed(bases[0], "after a later region's release()");
+    expect_limits_restored(limits_before, "after a later region's release()");
+}
+
+TEST(MemoryRegionRelease, SessionWithholdsReleasedUntilDestroyFreesARefusedChunk) {
+    const std::uint32_t workers = session_worker_count();
+    const std::uint32_t live_before = live_session_count();
+    const working_set_limits limits_before = current_working_set_limits();
+
+    const std::vector<rq_step_def> steps = make_steps(1, k_short_step_ms);
+    const rq_session_config config = make_config(steps, k_session_region_bytes, workers, 0);
+    const region_plan planned = plan_region(config.region_bytes, workers);
+    const std::uint32_t chunk_count = workers * planned.chunks_per_slice;
+    ASSERT_GT(chunk_count, 0u);
+
+    address_capture capture;
+    run_recorder recorder(capture);
+    const rq_callbacks callbacks = recorder.callbacks();
+    free_script frees(1);
+    layer_handles layers;
+    session_dependencies dependencies =
+        make_dependencies(capture, layers, std::nullopt, std::make_shared<qpc_clock>(), nullptr);
+    dependencies.free_override = frees.bind();
+
+    session_guard session;
+    ASSERT_EQ(session_create(&config, &callbacks, std::move(dependencies), session.out()), RQ_OK);
+    EXPECT_EQ(live_session_count(), live_before + 1);
+    ASSERT_EQ(session_start(session.get()), RQ_OK);
+    ASSERT_TRUE(recorder.wait_for_completed()) << "Completed not raised within 30 s";
+
+    // The coordinator's release after Completed asks for every chunk once and is refused one,
+    // which the session then still holds.
+    ASSERT_TRUE(frees.wait_for_calls(chunk_count)) << "the coordinator released no chunk";
+    const void* const refused = frees.refused_base();
+    ASSERT_NE(refused, nullptr);
+    EXPECT_TRUE(is_committed_allocation(refused)) << "the refused chunk was dropped or freed";
+    // The coordinator raises Released right after that release, if at all, so its absence for
+    // this long shows it withheld rather than not yet reached; destroying the session sooner
+    // would suppress it either way.
+    EXPECT_FALSE(recorder.released_within(k_released_withheld_wait))
+        << "Released confirmed a release that left a chunk allocated";
+
+    // Destroying the session retries the held chunk, and no callback follows it.
+    ASSERT_EQ(session.destroy(), RQ_OK);
+    EXPECT_EQ(live_session_count(), live_before) << "session not destroyed";
+    const recorded_run run = recorder.snapshot();
+    ASSERT_TRUE(run.completed);
+    EXPECT_EQ(run.result.end_reason, RQ_END_COMPLETED)
+        << end_reason_name(run.result.end_reason) << ": " << run.result.end_detail;
+    EXPECT_TRUE(run.prepared);
+    EXPECT_FALSE(run.released) << "Released confirmed a release that left a chunk allocated";
+    EXPECT_EQ(frees.refusals_made(), 1u);
+    EXPECT_EQ(frees.calls(), chunk_count + 1) << "every chunk once, then the held one again";
+    expect_freed(refused, "after session_destroy");
+    for (const std::uintptr_t base : capture.bases()) {
+        EXPECT_TRUE(is_freed(base)) << "after session_destroy";
+    }
+    expect_limits_restored(limits_before, "after session_destroy");
+}
+
+TEST(MemoryRegionRelease, SessionDestroyHandsAChunkStillRefusedToTheProcessWideOwner) {
+    const std::uint32_t workers = session_worker_count();
+    const std::uint32_t live_before = live_session_count();
+    ASSERT_EQ(orphaned_bytes(), 0u) << "an earlier test left orphaned chunks";
+    const working_set_limits limits_before = current_working_set_limits();
+
+    const std::vector<rq_step_def> steps = make_steps(1, k_short_step_ms);
+    const rq_session_config config = make_config(steps, k_session_region_bytes, workers, 0);
+    const region_plan planned = plan_region(config.region_bytes, workers);
+    const std::uint32_t chunk_count = workers * planned.chunks_per_slice;
+    ASSERT_GT(chunk_count, 0u);
+    // The refused chunk is the first one released: slice 0's first chunk.
+    const std::uint64_t refused_bytes =
+        planned.full_chunks_per_slice != 0 ? k_chunk_bytes : planned.final_chunk_bytes;
+
+    address_capture capture;
+    run_recorder recorder(capture);
+    const rq_callbacks callbacks = recorder.callbacks();
+    free_script frees(k_always);
+    layer_handles layers;
+    session_dependencies dependencies =
+        make_dependencies(capture, layers, std::nullopt, std::make_shared<qpc_clock>(), nullptr);
+    dependencies.free_override = frees.bind();
+
+    session_guard session;
+    ASSERT_EQ(session_create(&config, &callbacks, std::move(dependencies), session.out()), RQ_OK);
+    EXPECT_EQ(live_session_count(), live_before + 1);
+    ASSERT_EQ(session_start(session.get()), RQ_OK);
+    ASSERT_TRUE(recorder.wait_for_completed()) << "Completed not raised within 30 s";
+    ASSERT_TRUE(frees.wait_for_calls(chunk_count)) << "the coordinator released no chunk";
+    EXPECT_FALSE(recorder.released_within(k_released_withheld_wait))
+        << "Released confirmed a release that left a chunk allocated";
+
+    // Destroying the session retries the chunk and, refused every time, hands it to the
+    // process-wide owner; the call still succeeds and no callback follows it.
+    ASSERT_EQ(session.destroy(), RQ_OK);
+    EXPECT_EQ(live_session_count(), live_before) << "session not destroyed";
+    const recorded_run run = recorder.snapshot();
+    ASSERT_TRUE(run.completed);
+    EXPECT_EQ(run.result.end_reason, RQ_END_COMPLETED)
+        << end_reason_name(run.result.end_reason) << ": " << run.result.end_detail;
+    EXPECT_FALSE(run.released) << "Released confirmed a release that left a chunk allocated";
+    const void* const refused = frees.refused_base();
+    ASSERT_NE(refused, nullptr);
+    const std::uint32_t calls_at_destroy = frees.calls();
+    EXPECT_GT(calls_at_destroy, chunk_count) << "session_destroy did not retry the held chunk";
+    EXPECT_EQ(frees.refusals_made(), calls_at_destroy - (chunk_count - 1))
+        << "only the refused chunk is asked for again";
+    EXPECT_EQ(orphaned_bytes(), refused_bytes);
+    EXPECT_TRUE(is_committed_allocation(refused)) << "the refused chunk was dropped or freed";
+    EXPECT_EQ(static_cast<std::uint64_t>(current_working_set_limits().minimum),
+              planned.tested_bytes + k_working_set_headroom_bytes)
+        << "the working-set raise was undone while an orphaned chunk is held";
+
+    // Once Windows allows it, a retry frees the chunk with the session's override and restores
+    // the limits.
+    frees.stop_refusing();
+    retry_orphaned_chunks();
+    EXPECT_EQ(frees.calls(), calls_at_destroy + 1);
+    EXPECT_EQ(orphaned_bytes(), 0u);
+    expect_freed(refused, "after retry_orphaned_chunks()");
+    for (const std::uintptr_t base : capture.bases()) {
+        EXPECT_TRUE(is_freed(base)) << "after retry_orphaned_chunks()";
+    }
+    expect_limits_restored(limits_before, "after retry_orphaned_chunks()");
+}
+
+/**
+ * Regions of two sessions at once: each larger than the working-set headroom, so a minimum
+ * that covered only one region could not also hold the other's locked pages, and each with its
+ * minimum equal to its size, so no shrink can hide a shortfall.
+ */
+constexpr std::uint64_t k_concurrent_region_bytes = 512 * k_mib;
+static_assert(k_concurrent_region_bytes > k_working_set_headroom_bytes,
+              "each concurrent region must exceed the shared headroom");
+
+TEST(MemoryRegionRelease, ConcurrentRegionsAddTheirWorkingSetRaises) {
+    constexpr std::uint64_t k_region = k_concurrent_region_bytes;
+    constexpr std::uint32_t k_workers = 2;
+    const working_set_limits limits_before = current_working_set_limits();
+
+    stop_signal stop;
+    memory_region first;
+    memory_region second;
+    const allocation_outcome first_outcome =
+        first.allocate(make_options(k_region, k_region, k_workers), stop);
+    ASSERT_EQ(first_outcome.status, allocation_status::ok)
+        << status_name(first_outcome.status) << ": " << first_outcome.end_detail;
+    const allocation_outcome second_outcome =
+        second.allocate(make_options(k_region, k_region, k_workers), stop);
+    ASSERT_EQ(second_outcome.status, allocation_status::ok)
+        << status_name(second_outcome.status) << ": " << second_outcome.end_detail;
+    EXPECT_EQ(second_outcome.attempts, 1u);
+    EXPECT_EQ(first.tested_bytes(), k_region);
+    EXPECT_EQ(second.tested_bytes(), k_region);
+    EXPECT_EQ(static_cast<std::uint64_t>(current_working_set_limits().minimum),
+              2 * k_region + k_working_set_headroom_bytes)
+        << "the minimum is not the sum of both raises plus one headroom";
+    for (const memory_region* region : {&first, &second}) {
+        for (const chunk_view& chunk : region->chunks()) {
+            EXPECT_TRUE(pages_locked(chunk)) << "with both regions locked";
+        }
+    }
+
+    // Releasing the first lowers the minimum to the second's raise, whose pages stay locked.
+    const std::vector<const void*> first_bases = chunk_bases(first);
+    EXPECT_EQ(first.release(), k_region);
+    for (const void* base : first_bases) {
+        expect_freed(base, "after release() of the first region");
+    }
+    EXPECT_EQ(static_cast<std::uint64_t>(current_working_set_limits().minimum),
+              k_region + k_working_set_headroom_bytes)
+        << "the first region's raise was not withdrawn alone";
+    for (const chunk_view& chunk : second.chunks()) {
+        EXPECT_TRUE(pages_locked(chunk)) << "after release() of the first region";
+    }
+
+    // Releasing the last restores the limits in force before either raise.
+    const std::vector<const void*> second_bases = chunk_bases(second);
+    EXPECT_EQ(second.release(), k_region);
+    for (const void* base : second_bases) {
+        expect_freed(base, "after release() of both regions");
+    }
+    expect_limits_restored(limits_before, "after release() of both regions");
+}
+
+TEST(MemoryRegionRelease, ConcurrentSessionsEachLockTheirWholeRegion) {
+    const std::uint32_t workers = session_worker_count();
+    const std::uint32_t live_before = live_session_count();
+    const working_set_limits limits_before = current_working_set_limits();
+
+    const std::vector<rq_step_def> steps = make_steps(1, k_short_step_ms);
+    rq_session_config config = make_config(steps, k_concurrent_region_bytes, workers, 0);
+    config.min_region_bytes = k_concurrent_region_bytes;
+    ASSERT_EQ(plan_region(config.region_bytes, workers).tested_bytes, k_concurrent_region_bytes);
+
+    // Each gate waits for the other session's Prepared, so both regions are locked at once
+    // before either runs its step.
+    address_capture first_capture;
+    address_capture second_capture;
+    run_recorder first(first_capture);
+    run_recorder second(second_capture);
+    first.hold_gate_for(second);
+    second.hold_gate_for(first);
+    const rq_callbacks first_callbacks = first.callbacks();
+    const rq_callbacks second_callbacks = second.callbacks();
+
+    layer_handles first_layers;
+    layer_handles second_layers;
+    session_guard first_session;
+    session_guard second_session;
+    ASSERT_EQ(session_create(&config, &first_callbacks,
+                             make_dependencies(first_capture, first_layers, std::nullopt,
+                                               std::make_shared<qpc_clock>(), nullptr),
+                             first_session.out()),
+              RQ_OK);
+    ASSERT_EQ(session_create(&config, &second_callbacks,
+                             make_dependencies(second_capture, second_layers, std::nullopt,
+                                               std::make_shared<qpc_clock>(), nullptr),
+                             second_session.out()),
+              RQ_OK);
+    EXPECT_EQ(live_session_count(), live_before + 2);
+
+    // Started back to back, so the two preparations overlap as well.
+    ASSERT_EQ(session_start(first_session.get()), RQ_OK);
+    ASSERT_EQ(session_start(second_session.get()), RQ_OK);
+    ASSERT_TRUE(first.wait_for_released()) << "first session: Released not raised within 30 s";
+    ASSERT_TRUE(second.wait_for_released()) << "second session: Released not raised within 30 s";
+    ASSERT_EQ(first_session.destroy(), RQ_OK);
+    ASSERT_EQ(second_session.destroy(), RQ_OK);
+    EXPECT_EQ(live_session_count(), live_before);
+
+    const run_recorder* const recorders[] = {&first, &second};
+    for (const run_recorder* recorder : recorders) {
+        const recorded_run run = recorder->snapshot();
+        SCOPED_TRACE(recorder == &first ? "first session" : "second session");
+        ASSERT_TRUE(run.completed);
+        EXPECT_EQ(run.result.end_reason, RQ_END_COMPLETED)
+            << end_reason_name(run.result.end_reason) << " (Windows error " << run.result.os_error
+            << "): " << run.result.end_detail;
+        EXPECT_TRUE(run.prepared);
+        EXPECT_EQ(run.prepared_info.tested_bytes, k_concurrent_region_bytes);
+        EXPECT_EQ(run.result.steps_completed, 1u);
+        EXPECT_EQ(run.released_bytes, k_concurrent_region_bytes);
+        for (const std::string& unfreed : run.unfreed) {
+            ADD_FAILURE() << unfreed;
+        }
+    }
+    expect_limits_restored(limits_before, "after both sessions");
 }
 
 TEST(MemoryRegionLargePages, AllocatesLargePageChunksWhenThePrivilegeIsHeld) {

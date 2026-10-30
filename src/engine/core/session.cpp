@@ -11,10 +11,14 @@
  * @par Coordinator
  * One thread per session sequences everything and raises every callback; workers never call
  * back, so callbacks never run concurrently. Its order is: stop-before-start check, preparation
- * (worker placements, error storage, the locked region, the pinned pool, the step runner),
- * on_prepared, then each step as gate, run_step and on_step_finished, then the frozen end
- * reason. The tail always runs, for every end reason: join the workers, deliver the last error
- * records, store the result, on_completed, release the region chunk by chunk, on_released.
+ * (error storage, the locked region, the pool pinned to the placements taken at creation, the
+ * step runner), on_prepared, then each step as gate, run_step, its closing error batch and
+ * on_step_finished, then the frozen end reason; a stop leaves the step it ends in to the tail.
+ * The tail always runs, for every end reason: join the workers, deliver the run's final error
+ * batch, close the step the run ended in, store the result, on_completed, release the region
+ * chunk by chunk, on_released. A chunk Windows refuses to free withholds on_released and is
+ * retried when the session is destroyed, and after that by every later release in the process
+ * through the owner of orphaned chunks in memory_region.cpp.
  *
  * @par Exceptions
  * A C++ exception anywhere in preparation or the steps becomes RQ_END_INTERNAL_FAULT with its
@@ -305,6 +309,10 @@ struct run_resources {
     std::uint32_t open_step = 0;
     std::uint64_t open_step_start_ns = 0;
     std::uint32_t open_step_passes = 0;
+    // Set when run_step returned for the open step with a stop pending: the run ends in that
+    // step, so the tail closes it with this outcome after the run's final error batch.
+    bool open_step_returned = false;
+    step_outcome open_step_outcome{};
 };
 
 /**
@@ -387,13 +395,21 @@ rq_result validate_config(const rq_session_config* config, const rq_callbacks* c
     return RQ_OK;
 }
 
-rq_result validate_config(const rq_session_config* config, const rq_callbacks* callbacks) {
-    const std::vector<logical_processor> processors = enumerate_logical_processors();
+namespace {
+
+/** This machine's validation limits, with the worker bound taken from one topology snapshot. */
+validation_limits machine_limits(std::span<const logical_processor> processors) {
     validation_limits limits{};
     limits.logical_processors =
         processors.size() > UINT32_MAX ? UINT32_MAX : static_cast<std::uint32_t>(processors.size());
     limits.isa_available_mask = select_isa(read_cpu_features(), RQ_ISA_AUTO).available_mask;
-    return validate_config(config, callbacks, limits);
+    return limits;
+}
+
+}  // namespace
+
+rq_result validate_config(const rq_session_config* config, const rq_callbacks* callbacks) {
+    return validate_config(config, callbacks, machine_limits(enumerate_logical_processors()));
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -434,7 +450,7 @@ std::int64_t compute_remaining_ms(const remaining_inputs& in) noexcept {
  */
 struct session::state {
     state(const rq_session_config& config, const rq_callbacks& callbacks,
-          session_dependencies dependencies);
+          session_dependencies dependencies, std::vector<logical_processor> processors);
 
     state(const state&) = delete;
     state& operator=(const state&) = delete;
@@ -460,7 +476,13 @@ struct session::state {
                         std::uint64_t now_ns) const noexcept;
     void deliver_errors(run_resources& run, std::uint64_t now_ns) const noexcept;
     bool has_undelivered_errors(const run_resources& run) const noexcept;
-    void deliver_closing_batch(run_resources& run);
+    /**
+     * The closing batch of a step that ended with no stop pending, kept 100 ms after the
+     * previous drain. Returns false, having posted nothing, when a stop is pending on entry or
+     * ends the spacing wait: the run then ends in this step, and finish() posts its records in
+     * the run's final batch before closing it.
+     */
+    bool deliver_closing_batch(run_resources& run);
     void close_step(run_resources& run, bool completed, std::uint64_t actual_ns,
                     std::uint64_t verified_bytes) noexcept;
     std::uint32_t raise_step_gate(const rq_step_start& info) const noexcept;
@@ -481,10 +503,14 @@ struct session::state {
     rq_session_config config_;
     std::vector<rq_step_def> steps_;
     rq_callbacks callbacks_;
+    // Processor of each worker, group-major: the first worker_count entries of the topology
+    // snapshot session_create validated worker_count against, so start never queries it again.
+    std::vector<logical_processor> placements_;
 
     // Seams, kept for the session's lifetime.
     std::shared_ptr<IClock> clock_;
     std::shared_ptr<IThreadAffinity> affinity_;
+    free_function free_override_;
 
     // ISA dispatch, run once at creation and fixed for the session.
     isa_selection isa_;
@@ -549,16 +575,24 @@ private:
 };
 
 session::state::state(const rq_session_config& config, const rq_callbacks& callbacks,
-                      session_dependencies dependencies)
+                      session_dependencies dependencies, std::vector<logical_processor> processors)
     : config_(config), steps_(config.steps, config.steps + config.step_count),
-      callbacks_(callbacks), clock_(clock_or_default(std::move(dependencies.clock))),
+      callbacks_(callbacks), placements_(std::move(processors)),
+      clock_(clock_or_default(std::move(dependencies.clock))),
       affinity_(affinity_or_default(std::move(dependencies.affinity))),
+      free_override_(std::move(dependencies.free_override)),
       isa_(select_isa(read_cpu_features(), config.isa_override)), kernels_(tables_for(isa_)) {
     // validate_config has already checked the override against this machine; a rejection here
     // means the configuration was never validated.
     if (isa_.override_rejected) {
         throw std::invalid_argument("isa_override names an instruction set this CPU lacks");
     }
+    // Likewise for worker_count, validated against this same snapshot. Group-major order: worker
+    // i is pinned to the i-th active logical processor.
+    if (placements_.size() < config.worker_count) {
+        throw std::invalid_argument("worker_count exceeds the active logical processors");
+    }
+    placements_.resize(config.worker_count);
     // The copy never refers to the caller's array, which may be freed once creation returns.
     config_.steps = steps_.data();
 
@@ -646,7 +680,7 @@ void session::state::shutdown() {
         coordinator.join();
     }
     // The coordinator releases the region in its tail; this covers a coordinator that never
-    // ran. Idempotent.
+    // ran, and retries any chunk Windows refused to free in that tail. Idempotent.
     region_.release();
 }
 
@@ -698,17 +732,9 @@ void session::state::run_session(run_resources& run) {
 }
 
 bool session::state::prepare(run_resources& run) {
-    std::vector<logical_processor> placements = enumerate_logical_processors();
-    if (placements.size() < config_.worker_count) {
-        char detail[RQ_END_DETAIL_SIZE];
-        std::snprintf(detail, sizeof(detail),
-                      "Only %zu logical processors are active; the session needs %u workers",
-                      placements.size(), config_.worker_count);
-        stop_.request(RQ_END_INTERNAL_FAULT, 0, detail);
-        return false;
-    }
-    // Group-major order: worker i is pinned to the i-th active logical processor.
-    placements.resize(config_.worker_count);
+    // The snapshot taken at creation, not a fresh query. A processor that has gone inactive
+    // since then fails its worker's pin, which ends preparation with RQ_END_AFFINITY_FAILED.
+    const std::vector<logical_processor>& placements = placements_;
 
     // Error-detail storage is preallocated here, at start, never at create.
     error_collector_options options;
@@ -724,12 +750,15 @@ bool session::state::prepare(run_resources& run) {
     request.min_region_bytes = config_.min_region_bytes;
     request.worker_count = config_.worker_count;
     request.lock_privilege_held = lock_memory_privilege_held();
+    request.free_override = free_override_;
     const allocation_outcome allocated = region_.allocate(request, stop_);
     switch (allocated.status) {
     case allocation_status::ok:
         break;
     case allocation_status::stopped:
-        // The host's stop reason is already recorded.
+        // The host's stop reason is already recorded. The chunks locked before the stop are
+        // still held by region_: finish() frees them after on_completed and reports them in
+        // on_released, so Completed never waits for a release that grows with the bytes locked.
         return false;
     case allocation_status::insufficient_memory:
         stop_.request(RQ_END_INSUFFICIENT_MEMORY, allocated.os_error, allocated.end_detail);
@@ -823,8 +852,15 @@ void session::state::run_plan(run_resources& run) {
         run.open_step_passes = 0;
         const step_outcome outcome = run.runner->run_step(step, index, ticker);
         run.open_step_passes = outcome.passes;
-        // Every record the step produced reaches the host before its on_step_finished.
-        deliver_closing_batch(run);
+        // Every record the step produced reaches the host before its on_step_finished. With a
+        // stop pending the run ends in this step: finish() closes it after the run's final
+        // error batch, so the stop's records go out in one post, the run's only early one.
+        if (!deliver_closing_batch(run)) {
+            run.open_step_returned = true;
+            run.open_step_outcome = outcome;
+            every_step_ran = false;
+            break;
+        }
         close_step(run, outcome.completed, outcome.actual_ns, outcome.verified_bytes);
 
         if (!outcome.completed) {
@@ -889,21 +925,28 @@ bool session::state::has_undelivered_errors(const run_resources& run) const noex
                                      run.errors->stored_count() > run.delivered_records);
 }
 
-void session::state::deliver_closing_batch(run_resources& run) {
+bool session::state::deliver_closing_batch(run_resources& run) {
+    // A pending stop ends the run in this step. Posting here would put a closing batch ahead of
+    // finish()'s, so the step's records wait for the run's final batch instead.
+    if (stop_.stop_requested()) {
+        return false;
+    }
     if (!has_undelivered_errors(run)) {
-        return;
+        return true;
     }
     if (run.drained_once) {
         const std::uint64_t since = elapsed_since(clock_->now_ns(), run.last_drain_ns);
         if (since < k_error_batch_interval_ns) {
-            // Keeps batches 100 ms apart. The wait returns at once when a stop is pending, so
-            // stop latency wins over spacing, which costs at most one early batch per run: the
-            // loop ends after a stop.
+            // Keeps batches 100 ms apart. The wait returns at once on a stop, because stop
+            // latency takes priority over spacing; the records then go out in the final batch.
             const std::uint64_t wait_ns = k_error_batch_interval_ns - since;
-            clock_->wait_for_stop(stop_, (wait_ns + k_ns_per_ms - 1) / k_ns_per_ms);
+            if (clock_->wait_for_stop(stop_, (wait_ns + k_ns_per_ms - 1) / k_ns_per_ms)) {
+                return false;
+            }
         }
     }
     deliver_errors(run, clock_->now_ns());
+    return true;
 }
 
 void session::state::close_step(run_resources& run, bool completed, std::uint64_t actual_ns,
@@ -941,17 +984,26 @@ void session::state::finish(run_resources& run) noexcept {
     if (run.pool) {
         run.pool->shutdown();
     }
-    // Every stored record and the final total precede Completed. A reason is always recorded
-    // by now, so no spacing wait applies.
+    // The run's final error batch: every stored record and the final total, in one post ahead
+    // of the open step's on_step_finished and of Completed. It is the only batch that can come
+    // less than 100 ms after the previous one. A reason is always recorded by now, and stop
+    // latency takes priority over spacing, so it never waits; every earlier batch keeps the
+    // spacing, and a closing batch a stop interrupts is left to this one, so a run has at
+    // most one early batch.
     if (has_undelivered_errors(run)) {
         deliver_errors(run, clock_->now_ns());
     }
-    // A step an exception interrupted still gets its result, cut short, so every step whose
-    // gate continued has exactly one on_step_finished before on_completed. With the workers
-    // joined, the step's coverage and error counts are exact.
+    // Every step whose gate continued has exactly one on_step_finished before on_completed.
+    // The step the run ended in keeps what run_step reported; one an exception interrupted is
+    // cut short. With the workers joined, its coverage and error counts are exact.
     if (run.step_open) {
-        close_step(run, false, elapsed_since(clock_->now_ns(), run.open_step_start_ns),
-                   run.coverage->step_total());
+        if (run.open_step_returned) {
+            close_step(run, run.open_step_outcome.completed, run.open_step_outcome.actual_ns,
+                       run.open_step_outcome.verified_bytes);
+        } else {
+            close_step(run, false, elapsed_since(clock_->now_ns(), run.open_step_start_ns),
+                       run.coverage->step_total());
+        }
     }
     const std::uint64_t end_ns = clock_->now_ns();
 
@@ -1014,6 +1066,17 @@ void session::state::finish(run_resources& run) noexcept {
     const std::uint64_t released_bytes = region_.release();
     const std::uint64_t release_ms =
         released_bytes == 0 ? 0 : elapsed_since(clock_->now_ns(), release_start_ns) / k_ns_per_ms;
+    // Released confirms that every chunk is freed, so it is withheld while Windows refuses to
+    // free one. The region keeps owning that chunk, and shutdown() retries it at
+    // rq_session_destroy; the host treats the missing Released as a release it could not
+    // confirm.
+    const std::uint64_t held_bytes = region_.held_bytes();
+    if (held_bytes != 0) {
+        debug_log(L"%llu MiB could not be freed after the run (VirtualFree failed); Released is "
+                  L"not raised, and the release is retried when the session is destroyed",
+                  held_bytes / k_mib);
+        return;
+    }
     raise(callbacks_.on_released, released_bytes, release_ms);
 }
 
@@ -1022,8 +1085,9 @@ void session::state::finish(run_resources& run) noexcept {
  * ------------------------------------------------------------------------------------------- */
 
 session::session(const rq_session_config& config, const rq_callbacks& callbacks,
-                 session_dependencies dependencies)
-    : state_(std::make_unique<state>(config, callbacks, std::move(dependencies))) {}
+                 session_dependencies dependencies, std::vector<logical_processor> processors)
+    : state_(std::make_unique<state>(config, callbacks, std::move(dependencies),
+                                     std::move(processors))) {}
 
 session::~session() {
     shutdown();
@@ -1067,14 +1131,18 @@ rq_result session_create(const rq_session_config* config, const rq_callbacks* ca
         return RQ_E_INVALID_ARGUMENT;
     }
     *out = nullptr;
-    const rq_result validation = validate_config(config, callbacks);
+    // One topology snapshot serves validation and the session's worker placements, so start
+    // pins the workers to the processors worker_count was checked against.
+    std::vector<logical_processor> processors = enumerate_logical_processors();
+    const rq_result validation = validate_config(config, callbacks, machine_limits(processors));
     if (validation != RQ_OK) {
         return validation;
     }
 
     std::shared_ptr<session> created;
     try {
-        created = std::make_shared<session>(*config, *callbacks, std::move(dependencies));
+        created = std::make_shared<session>(*config, *callbacks, std::move(dependencies),
+                                            std::move(processors));
     } catch (const std::invalid_argument&) {
         return RQ_E_INVALID_ARGUMENT;
     }
