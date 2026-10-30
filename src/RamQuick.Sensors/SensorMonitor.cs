@@ -56,6 +56,9 @@ public sealed class SensorMonitor : IDisposable
 
     private readonly ISensorSource _source;
     private readonly TimeProvider _timeProvider;
+
+    // The bounded wait Dispose performs for the sensor thread: Thread.Join outside tests.
+    private readonly Func<Thread, TimeSpan, bool> _waitForSensorThread;
     private readonly object _gate = new();
     private readonly ManualResetEvent _disposeEvent = new(false);
 
@@ -88,12 +91,38 @@ public sealed class SensorMonitor : IDisposable
     /// <param name="timeProvider">The clock that drives polling and measures reading and read ages.</param>
     /// <exception cref="ArgumentNullException"><paramref name="source"/> or <paramref name="timeProvider"/> is <see langword="null"/>.</exception>
     public SensorMonitor(ISensorSource source, TimeProvider timeProvider)
+        : this(source, timeProvider, static (thread, timeout) => thread.Join(timeout))
+    {
+    }
+
+    /// <summary>
+    /// Creates a monitor over a sensor source with a substitute for the bounded wait
+    /// <see cref="Dispose"/> performs for the sensor thread, so tests can check the budget that wait is
+    /// given without spending it in real time.
+    /// </summary>
+    /// <param name="source">
+    /// The sensor source. The monitor takes ownership of it: only the monitor's sensor thread opens,
+    /// reads and disposes it.
+    /// </param>
+    /// <param name="timeProvider">The clock that drives polling and measures reading and read ages.</param>
+    /// <param name="waitForSensorThread">
+    /// Waits for the given sensor thread to finish, for at most the given time, and returns
+    /// <see langword="true"/> when the thread finished. <see cref="Dispose"/> calls it at most once, with
+    /// <see cref="DisposeTimeout"/>, and never for a hung thread or from the sensor thread itself. The
+    /// public constructor passes <see cref="Thread.Join(TimeSpan)"/>.
+    /// </param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="source"/>, <paramref name="timeProvider"/> or <paramref name="waitForSensorThread"/> is <see langword="null"/>.
+    /// </exception>
+    internal SensorMonitor(ISensorSource source, TimeProvider timeProvider, Func<Thread, TimeSpan, bool> waitForSensorThread)
     {
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(timeProvider);
+        ArgumentNullException.ThrowIfNull(waitForSensorThread);
 
         _source = source;
         _timeProvider = timeProvider;
+        _waitForSensorThread = waitForSensorThread;
         _waitHandles = [_disposeEvent, _tickEvent];
         _current = SensorReadings.Unavailable(SensorStatus.Stale, timeProvider.GetUtcNow());
     }
@@ -216,7 +245,7 @@ public sealed class SensorMonitor : IDisposable
         // wait from the sensor thread itself either, which is where a handler runs when the context
         // executes posts inline.
         bool threadFinished = thread is null
-            || (!_hung && thread != Thread.CurrentThread && thread.Join(DisposeTimeout));
+            || (!_hung && thread != Thread.CurrentThread && _waitForSensorThread(thread, DisposeTimeout));
 
         // A thread still running may yet wait on these handles, so they are left to their finalizers.
         if (threadFinished)

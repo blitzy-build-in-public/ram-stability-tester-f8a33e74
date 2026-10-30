@@ -18,14 +18,16 @@ namespace RamQuick.Sensors.Tests;
 /// timer callback on the test thread. Snapshots are posted to a queued
 /// <see cref="ImmediateSynchronizationContext"/> that the test thread drains, so it plays the UI thread.
 /// Real time is spent only waiting for work already due on the sensor thread, each wait bounded by a
-/// safety timeout rather than a sleep.
+/// safety timeout rather than a sleep. Where the sensor thread is still busy, the single bounded wait
+/// <see cref="SensorMonitor.Dispose"/> performs for it is checked through the monitor's wait seam: its
+/// budget and the caller's time are each held to 1 s.
 /// </remarks>
 public sealed class SensorMonitorTests
 {
     private static readonly TimeSpan _safetyTimeout = TimeSpan.FromSeconds(5);
 
-    // Margin over DisposeTimeout so a heavily loaded host does not fail a correct monitor.
-    private static readonly TimeSpan _disposeBound = SensorMonitor.DisposeTimeout + TimeSpan.FromSeconds(1);
+    // The AAP's disposal bound, stated here rather than taken from DisposeTimeout; it carries no margin.
+    private static readonly TimeSpan _disposeBound = TimeSpan.FromSeconds(1);
 
     // The timer callback runs inside Advance on the UI-like thread, so it must never wait on a read.
     private static readonly TimeSpan _advanceBound = TimeSpan.FromMilliseconds(500);
@@ -48,6 +50,7 @@ public sealed class SensorMonitorTests
 
         Assert.Throws<ArgumentNullException>("source", () => new SensorMonitor(null!, TimeProvider.System));
         Assert.Throws<ArgumentNullException>("timeProvider", () => new SensorMonitor(source, null!));
+        Assert.Throws<ArgumentNullException>("waitForSensorThread", () => new SensorMonitor(source, TimeProvider.System, null!));
     }
 
     [Fact]
@@ -656,7 +659,8 @@ public sealed class SensorMonitorTests
     [Fact]
     public void Dispose_WhileReadBlockedButNotHung_ReturnsWithinDisposeTimeout()
     {
-        using var h = new Harness();
+        var waits = new DisposeWaitRecorder();
+        using var h = new Harness(waitForSensorThread: waits.Wait);
         h.Start();
         h.BlockNextRead();
         h.Tick(expectRead: false);
@@ -666,7 +670,7 @@ public sealed class SensorMonitorTests
 
         TimeSpan took = Measure(h.Monitor.Dispose);
 
-        Assert.True(took < _disposeBound, $"Dispose took {took.TotalMilliseconds:F0} ms with a read blocked.");
+        AssertOneBoundedWaitForBusySensorThread(waits, Assert.NotNull(h.Source.OpenThreadId), took, "with a read blocked");
         Assert.Equal(0, h.Source.DisposeCount);
 
         // The read completes in the background, then the sensor thread closes the source.
@@ -756,7 +760,7 @@ public sealed class SensorMonitorTests
 
         TimeSpan took = TimeSpan.FromTicks(Interlocked.Read(ref disposeTicks));
         Assert.True(took >= TimeSpan.Zero, "The handler did not record its Dispose call.");
-        Assert.True(took < SensorMonitor.DisposeTimeout, $"Dispose from the sensor thread took {took.TotalMilliseconds:F0} ms; it must not wait on itself.");
+        Assert.True(took < _disposeBound, $"Dispose from the sensor thread took {took.TotalMilliseconds:F0} ms; it must not wait on itself.");
         Assert.Equal(h.Source.OpenThreadId, Volatile.Read(ref handlerThreadId));
         Assert.Equal(h.Source.OpenThreadId, h.Source.DisposeThreadId);
 
@@ -771,7 +775,8 @@ public sealed class SensorMonitorTests
     [InlineData(true)]
     public void Dispose_WhileOpenInProgress_ReturnsWithinDisposeTimeoutAndClosesSourceWithoutReading(bool openThrows)
     {
-        using var h = new Harness(decorate: inner => new InstrumentedSource(inner, holdOpen: true));
+        var waits = new DisposeWaitRecorder();
+        using var h = new Harness(decorate: inner => new InstrumentedSource(inner, holdOpen: true), waitForSensorThread: waits.Wait);
         var instrumented = Assert.IsType<InstrumentedSource>(h.MonitoredSource);
         if (openThrows)
         {
@@ -782,12 +787,14 @@ public sealed class SensorMonitorTests
         Assert.True(instrumented.WaitForOpenEntered(_safetyTimeout), $"The sensor thread did not begin opening the source within {_safetyTimeout}.");
 
         TimeSpan took = Measure(h.Monitor.Dispose);
-        Assert.True(took < _disposeBound, $"Dispose took {took.TotalMilliseconds:F0} ms with Open in progress.");
 
         instrumented.ReleaseOpen();
         Assert.True(
             SpinWait.SpinUntil(() => h.Source.DisposeCount == 1, _safetyTimeout),
             $"The sensor thread did not close the source within {_safetyTimeout} of Open returning; DisposeCount: {h.Source.DisposeCount}.");
+
+        // The fake records the sensor thread only once the held Open reaches it.
+        AssertOneBoundedWaitForBusySensorThread(waits, Assert.NotNull(h.Source.OpenThreadId), took, "with Open in progress");
         Assert.Equal(1, h.Source.OpenCount);
         Assert.Equal(0, h.Source.ReadCount);
         Assert.Equal(h.Source.OpenThreadId, h.Source.DisposeThreadId);
@@ -1073,6 +1080,24 @@ public sealed class SensorMonitorTests
         Assert.True(took < _disposeBound, $"Dispose took {took.TotalMilliseconds:F0} ms {situation}.");
     }
 
+    // Dispose found the sensor thread busy: it must have asked for exactly one wait, for that thread,
+    // with a budget inside the bound, and returned inside the bound itself. The budget and the caller's
+    // time outside the wait are reported, never added to a gate.
+    private static void AssertOneBoundedWaitForBusySensorThread(DisposeWaitRecorder waits, int sensorThreadId, TimeSpan took, string situation)
+    {
+        DisposeWait wait = Assert.Single(waits.Waits);
+        Assert.Equal(sensorThreadId, wait.ThreadId);
+        Assert.True(wait.Budget > TimeSpan.Zero, $"Dispose gave the sensor thread no time to finish {situation}: {wait.Budget.TotalMilliseconds:F0} ms.");
+        Assert.True(
+            wait.Budget <= _disposeBound,
+            $"Dispose would wait {wait.Budget.TotalMilliseconds:F0} ms for the sensor thread {situation}; the bound is {_disposeBound.TotalMilliseconds:F0} ms.");
+        Assert.False(wait.ThreadFinished, $"The sensor thread had already finished {situation}, so the wait was never at stake.");
+        Assert.True(took < _disposeBound, $"Dispose took {took.TotalMilliseconds:F0} ms {situation}.");
+        TestContext.Current.TestOutputHelper?.WriteLine(
+            $"Dispose {situation}: wait budget {wait.Budget.TotalMilliseconds:F0} ms; caller time {took.TotalMilliseconds:F3} ms, " +
+            $"of which {(took - wait.Took).TotalMilliseconds:F3} ms outside the wait.");
+    }
+
     private static TimeSpan Max(TimeSpan first, TimeSpan second) => first > second ? first : second;
 
     // Advance runs every timer that falls due on the way; AdjustTime moves the clock and every timer
@@ -1098,6 +1123,10 @@ public sealed class SensorMonitorTests
     // One ReadingsChanged invocation as the handler saw it.
     private readonly record struct ReceivedEvent(object? Sender, SensorReadings Readings, SynchronizationContext? Context, int ThreadId);
 
+    // One wait Dispose asked for: the thread, the budget, whether the probe found the thread finished,
+    // and the real time the probe took.
+    private readonly record struct DisposeWait(int ThreadId, TimeSpan Budget, bool ThreadFinished, TimeSpan Took);
+
     // A monitor over a FakeSensorSource on a fake clock, posting to a context the test thread drains.
     private sealed class Harness : IDisposable
     {
@@ -1105,16 +1134,20 @@ public sealed class SensorMonitorTests
         private readonly List<ReceivedEvent> _events = [];
         private bool _disposed;
 
+        // waitForSensorThread, when given, replaces the bounded wait Dispose performs for the sensor thread.
         public Harness(
             Func<TimeProvider, FakeSensorSource>? createSource = null,
             Func<ISensorSource, ISensorSource>? decorate = null,
-            bool queuePosts = true)
+            bool queuePosts = true,
+            Func<Thread, TimeSpan, bool>? waitForSensorThread = null)
         {
             Time = new FakeTimeProvider();
             Source = createSource?.Invoke(Time) ?? new FakeSensorSource(Time);
             MonitoredSource = decorate?.Invoke(Source) ?? Source;
             Context = new ImmediateSynchronizationContext(queuePosts);
-            Monitor = new SensorMonitor(MonitoredSource, Time);
+            Monitor = waitForSensorThread is null
+                ? new SensorMonitor(MonitoredSource, Time)
+                : new SensorMonitor(MonitoredSource, Time, waitForSensorThread);
         }
 
         public FakeTimeProvider Time { get; }
@@ -1382,6 +1415,40 @@ public sealed class SensorMonitorTests
             {
                 throw _disposeException;
             }
+        }
+    }
+
+    // Stands in for the bounded wait Dispose performs for the sensor thread. Each call probes that thread
+    // without blocking and records the thread, the budget and the probe's answer, which it returns, so
+    // Dispose gets a truthful answer at once and the test checks the budget without spending it.
+    private sealed class DisposeWaitRecorder
+    {
+        private readonly object _gate = new();
+        private readonly List<DisposeWait> _waits = [];
+
+        public IReadOnlyList<DisposeWait> Waits
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _waits.ToArray();
+                }
+            }
+        }
+
+        public bool Wait(Thread thread, TimeSpan budget)
+        {
+            int threadId = thread.ManagedThreadId;
+            long startedAt = Stopwatch.GetTimestamp();
+            bool finished = thread.Join(TimeSpan.Zero);
+            var wait = new DisposeWait(threadId, budget, finished, Stopwatch.GetElapsedTime(startedAt));
+            lock (_gate)
+            {
+                _waits.Add(wait);
+            }
+
+            return finished;
         }
     }
 

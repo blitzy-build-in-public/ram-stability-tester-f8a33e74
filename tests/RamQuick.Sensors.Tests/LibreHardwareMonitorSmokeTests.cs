@@ -431,18 +431,29 @@ public sealed class LibreHardwareMonitorSelectionTests
         Assert.Equal(1, cpu.UpdateCount);
     }
 
-    // Open checks elevation before any driver access, so this path touches no hardware.
+    // The access check answers with the production decision for a non-elevated process on a machine
+    // with PawnIO, so elevation alone denies access, and the test host's own elevation does not decide
+    // whether this runs. Open checks access before any driver access, so the library is never created.
     [Fact]
     public void OpenAndRead_NotElevated_ReportsDriverUnavailableWithoutThrowing()
     {
-        Assert.SkipWhen(ProcessElevation.IsElevated(), "Covers the non-elevated path only.");
+        var spy = new InitializationSpy(
+            LibreHardwareMonitorSensorSource.ResolveAccess(isElevated: false, driverInstalled: true),
+            accessCheckThrows: false);
+        using LibreHardwareMonitorSensorSource source = spy.CreateSource(new FakeTimeProvider(_now));
+        SensorReadings? readings = null;
 
-        using var source = new LibreHardwareMonitorSensorSource(new FakeTimeProvider(_now));
-        source.Open();
-        SensorReadings readings = source.Read();
+        Exception? exception = Record.Exception(() =>
+        {
+            source.Open();
+            readings = source.Read();
+        });
 
+        Assert.Null(exception);
+        Assert.Equal(1, spy.AccessCheckCount);
+        Assert.Equal(0, spy.CreateCount);
         Assert.Equal(SensorReadings.Unavailable(SensorStatus.DriverUnavailable, _now), readings);
-        Assert.Null(readings.Cpu.Celsius);
+        Assert.Null(readings!.Cpu.Celsius);
         Assert.Null(readings.Ram.Celsius);
     }
 
@@ -843,8 +854,7 @@ public sealed class LibreHardwareMonitorSmokeCheckTests
 }
 
 /// <summary>
-/// Whether the test process runs elevated: the precondition the smoke test and the non-elevated case
-/// branch on.
+/// Whether the test process runs elevated: the precondition the hardware smoke test skips without.
 /// </summary>
 file static class ProcessElevation
 {

@@ -2138,8 +2138,10 @@ public sealed partial class ResultsLogTests
         }
     }
 
-    // A path naming the account, built from the folders Windows reports for it, and the text the logs write in its
-    // place. Only the text is used: nothing is ever written under the profile.
+    // A path naming the account, built from the folders and name Windows reports for it, and the text the logs write
+    // in its place. A folder Windows does not report, or reports as a bare volume root, and a name that cannot be one
+    // path segment, name no account, so the logs write the path as it stands: every host checks either the
+    // placeholder or that fallback, and none skips. Only the text is used: nothing is ever written under the profile.
     private static (string Path, string Expected) AccountLocationText(AccountLocation location, TestDataRoot root)
     {
         switch (location)
@@ -2149,37 +2151,39 @@ public sealed partial class ResultsLogTests
                     Path.Combine(root.Data.RootPath, "journal", DataDirectory.JournalFileName),
                     @"<data>\journal\" + DataDirectory.JournalFileName);
             case AccountLocation.LocalAppData:
-                return (
-                    Path.Combine(
-                        KnownFolder(Environment.SpecialFolder.LocalApplicationData), "RamQuick", "journal", "active-run.jsonl"),
-                    @"%LOCALAPPDATA%\RamQuick\journal\active-run.jsonl");
+                (string localAppData, bool localAppDataRedacted) = KnownFolder(Environment.SpecialFolder.LocalApplicationData);
+                string journal = Path.Combine(localAppData, "RamQuick", "journal", "active-run.jsonl");
+                return (journal, localAppDataRedacted ? @"%LOCALAPPDATA%\RamQuick\journal\active-run.jsonl" : journal);
             case AccountLocation.RoamingAppData:
-                return (
-                    Path.Combine(KnownFolder(Environment.SpecialFolder.ApplicationData), "RamQuick", "notes.txt"),
-                    @"%APPDATA%\RamQuick\notes.txt");
+                (string roamingAppData, bool roamingAppDataRedacted) = KnownFolder(Environment.SpecialFolder.ApplicationData);
+                string notes = Path.Combine(roamingAppData, "RamQuick", "notes.txt");
+                return (notes, roamingAppDataRedacted ? @"%APPDATA%\RamQuick\notes.txt" : notes);
             case AccountLocation.UserProfile:
                 // Case and separator style do not matter, and a trailing separator stays.
-                return (
-                    KnownFolder(Environment.SpecialFolder.UserProfile).ToUpperInvariant().Replace('\\', '/') + "/Desktop/",
-                    "%USERPROFILE%/Desktop/");
+                (string profile, bool profileRedacted) = KnownFolder(Environment.SpecialFolder.UserProfile);
+                string desktop = profile.ToUpperInvariant().Replace('\\', '/') + "/Desktop/";
+                return (desktop, profileRedacted ? "%USERPROFILE%/Desktop/" : desktop);
             case AccountLocation.UserNameSegment:
                 string userName = Environment.UserName;
-                Assert.SkipWhen(string.IsNullOrWhiteSpace(userName), "Windows reports no user name for this account.");
-                return (@"\\fileserver\home\" + userName + @"\RamQuick", @"\\fileserver\home\%USERNAME%\RamQuick");
+                string share = @"\\fileserver\home\" + userName + @"\RamQuick";
+                bool userNameRedacted = !string.IsNullOrWhiteSpace(userName) && userName.AsSpan().IndexOfAny('\\', '/') < 0;
+                return (share, userNameRedacted ? @"\\fileserver\home\%USERNAME%\RamQuick" : share);
             case AccountLocation.ProfileSibling:
                 // A folder whose name merely starts with the profile's is another folder, written as it is.
-                string sibling = KnownFolder(Environment.SpecialFolder.UserProfile) + "-archive-7f3c";
+                string sibling = KnownFolder(Environment.SpecialFolder.UserProfile).Folder + "-archive-7f3c";
                 return (sibling, sibling);
             default:
                 throw new ArgumentOutOfRangeException(nameof(location), location, "Not an account location of these tests.");
         }
     }
 
-    private static string KnownFolder(Environment.SpecialFolder folder)
+    // The folder without its trailing separator, and whether the logs redact it: not when Windows reports it empty,
+    // white space or a bare volume root, which would otherwise rewrite every path on that volume.
+    private static (string Folder, bool Redacted) KnownFolder(Environment.SpecialFolder folder)
     {
-        string path = Environment.GetFolderPath(folder, Environment.SpecialFolderOption.DoNotVerify);
-        Assert.SkipWhen(string.IsNullOrEmpty(path), $"Windows reports no {folder} folder for this account.");
-        return Path.TrimEndingDirectorySeparator(path);
+        string path = Path.TrimEndingDirectorySeparator(
+            Environment.GetFolderPath(folder, Environment.SpecialFolderOption.DoNotVerify).Trim());
+        return (path, path.Length > 0 && Path.GetPathRoot(path) is { } volume && volume.Length < path.Length);
     }
 
     private static RunSummary CompletedSummary(

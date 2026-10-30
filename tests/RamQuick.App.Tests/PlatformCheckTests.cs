@@ -107,17 +107,22 @@ public sealed class PlatformCheckTests
     }
 
     [Fact]
-    public void EvaluateCurrent_SupportedTestHost_IsSupported()
+    public void EvaluateCurrent_TestHost_ReturnsVerdictForObservedOperatingSystem()
     {
-        // The automated suites run on Windows 10/11 x64, so the real architecture and build pass.
-        if (RuntimeInformation.OSArchitecture != Architecture.X64)
+        // Every host checks the verdict its real operating system requires, so none skips: the
+        // Windows 10/11 x64 hosts the suites run on get Supported. Windows on Arm runs this x64 test
+        // process under emulation and reports Arm64, so a refusal there also shows that the operating
+        // system's architecture, not the process's, is checked.
+        PlatformCheckResult expected = (RuntimeInformation.OSArchitecture, Environment.OSVersion.Version.Build) switch
         {
-            Assert.Skip($"The test host's operating system is {RuntimeInformation.OSArchitecture}, not X64.");
-        }
+            (not Architecture.X64, _) => new PlatformCheckResult(false, PlatformRejection.NotX64),
+            (_, < 14393) => new PlatformCheckResult(false, PlatformRejection.BuildTooOld),
+            _ => PlatformCheckResult.Supported,
+        };
 
         PlatformCheckResult result = PlatformCheck.EvaluateCurrent();
 
-        Assert.Equal(PlatformCheckResult.Supported, result);
+        Assert.Equal(expected, result);
     }
 
     [Theory]
