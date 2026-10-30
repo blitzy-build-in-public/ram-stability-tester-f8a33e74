@@ -114,6 +114,7 @@ The current test catalogue (v10.0 onward), and how each test relates to RAMQuick
 Sources:
 
 - MemTest86 individual test descriptions: https://www.memtest86.com/tech_individual-test-descr.html
+- Archived copy of the same page (Internet Archive): https://web.archive.org/web/20261002110228/https://www.memtest86.com/tech_individual-test-descr.html
 
 ### HCI MemTest
 
@@ -160,7 +161,7 @@ No reviewed source ranks settings by how often they fail across platforms. The I
 - **Refresh.** Too low a tRFC gives fast errors or lockups. Too high a tREFI is temperature-sensitive. Sources: integralfx DDR4 OC Guide (https://github.com/integralfx/MemTestHelper/blob/oc-guide/DDR4%20OC%20Guide.md) and goraxyz DDR5 OC Guide (https://github.com/goraxyz/DDR5-OC/blob/main/OC%20Guide.md).
 - **Primary and secondary timings.** tRCD is a commonly difficult DDR5 primary timing. The floors for tRP, tWR, tWTR and tRTP vary by IC. Source: goraxyz DDR5 OC Guide.
 - **Voltages and IMC/PHY margin.** Low VDD/VDDQ and limited IMC/PHY margin cap frequency and timings: VDDIO and SoC/VDDP on AM5 (AMD Ryzen Master user guide, https://docs.amd.com/r/en-US/68886-ryzen-master-user-guide/RAM), and VDD2 on Intel (Intel Core Ultra 200S datasheet). Poor ODT, RTT or drive strength shows up as reduced margin, training failure or no-POST.
-- **Warm-up failures** are common. One ASUS DDR5-8400 setup erred after about 40 minutes at 67–68 °C and passed near 38 °C with added airflow (https://rog-forum.asus.com/t5/push-the-limits/dram-temperatures-and-stability/bc-p/1150839). In Igor's Lab measurements the SPD-hub reading ran about 12 °C below the module surface (https://www.igorslab.de/en/how-hot-is-ddr5-memory-really-reading-value-from-spd-stroke-vs-real-measurement-at-module-investigative/2/).
+- **Warm-up failures** are common. One ASUS DDR5-8400 setup erred after about 40 minutes at 67–68 °C and passed near 38 °C with added airflow (https://rog-forum.asus.com/t5/push-the-limits/dram-temperatures-and-stability/bc-p/1150839). In Igor's Lab measurements the SPD-hub reading ran about 12 °C below the module surface (https://www.igorslab.de/en/how-hot-is-ddr5-memory-really-reading-value-from-spd-stroke-vs-real-measurement-at-module-investigative/2/ and its archived copy https://web.archive.org/web/20261011044454/https://www.igorslab.de/en/how-hot-is-ddr5-memory-really-reading-value-from-spd-stroke-vs-real-measurement-at-module-investigative/2/).
 
 ### DDR5 refresh
 
@@ -774,7 +775,7 @@ Known thermal-threshold risks:
 2. Microsoft Defender antimalware definition release notes 1.423.270.0 (WinRing0 detection): https://www.microsoft.com/en-us/wdsi/definitions/antimalware-definition-release-notes?requestVersion=1.423.270.0
 3. TestMem5 `extreme@anta777` configuration, integralfx MemTestHelper: https://github.com/integralfx/MemTestHelper/blob/oc-guide/TM5-Configs/extreme%40anta777.cfg
 4. HCI MemTest manual: https://hcidesign.com/memtest/manual.html
-5. MemTest86 individual test descriptions: https://www.memtest86.com/tech_individual-test-descr.html
+5. MemTest86 individual test descriptions: https://www.memtest86.com/tech_individual-test-descr.html (archived copy: https://web.archive.org/web/20261002110228/https://www.memtest86.com/tech_individual-test-descr.html)
 6. Karhu RAM Test, Karhu Software: https://www.karhusoftware.com/
 7. .NET and .NET Core support policy: https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core
 8. LibreHardwareMonitor discussion 1904, PawnIO in place of WinRing0: https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/discussions/1904
@@ -783,7 +784,7 @@ Known thermal-threshold risks:
 11. goraxyz DDR5 OC Guide: https://github.com/goraxyz/DDR5-OC/blob/main/OC%20Guide.md
 12. AMD Ryzen Master user guide, RAM: https://docs.amd.com/r/en-US/68886-ryzen-master-user-guide/RAM
 13. ASUS ROG forum, DRAM temperatures and stability: https://rog-forum.asus.com/t5/push-the-limits/dram-temperatures-and-stability/bc-p/1150839
-14. Igor's Lab, how hot DDR5 memory really is (SPD reading against module measurement): https://www.igorslab.de/en/how-hot-is-ddr5-memory-really-reading-value-from-spd-stroke-vs-real-measurement-at-module-investigative/2/
+14. Igor's Lab, how hot DDR5 memory really is (SPD reading against module measurement): https://www.igorslab.de/en/how-hot-is-ddr5-memory-really-reading-value-from-spd-stroke-vs-real-measurement-at-module-investigative/2/ (archived copy: https://web.archive.org/web/20261011044454/https://www.igorslab.de/en/how-hot-is-ddr5-memory-really-reading-value-from-spd-stroke-vs-real-measurement-at-module-investigative/2/)
 15. JESD79-5 DDR5 SDRAM specification: https://faculty-web.msoe.edu/johnsontimoj/ELE4142/files4142/DDR5_Spec.pdf
 16. SetProcessWorkingSetSizeEx, Microsoft Learn: https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-setprocessworkingsetsizeex
 17. Large-page support, Microsoft Learn: https://learn.microsoft.com/en-us/windows/win32/memory/large-page-support
@@ -792,8 +793,9 @@ Known thermal-threshold risks:
 20. Intel 64 and IA-32 Architectures Software Developer's Manual, combined volumes: https://cdrdv2-public.intel.com/874240/325462-090-sdm-vol-1-2abcd-3abcd-4.pdf
 21. 12th Generation Intel Core processors datasheet, volume 1 of 2, data scrambling: https://edc.intel.com/content/www/ca/fr/design/ipla/software-development-platforms/client/platforms/alder-lake-desktop/12th-generation-intel-core-processors-datasheet-volume-1-of-2/009/009/data-scrambling/
 
+Sources 5 and 14 refuse automated retrieval: on 30 October 2026 both returned HTTP 403 to HEAD and GET requests from a command-line client. MemTest86 returned the page when the request carried a full browser user agent, while Igor's Lab still answered HTTP 403 with a Cloudflare challenge. A browser may still open them. Their Internet Archive copies, listed with them, returned HTTP 200 on the same date and carry the content cited here: MemTest86's descriptions of tests 0–14, and Igor's Lab's 12-degree difference between the SPD-hub reading and the module hotspot.
+
 Cited by name, without a URL:
 
 - Intel Core Ultra 200S series processors datasheet, cited for VDD2 on Intel platforms.
 - TestMem5 `1usmus_v3` configuration.
-
