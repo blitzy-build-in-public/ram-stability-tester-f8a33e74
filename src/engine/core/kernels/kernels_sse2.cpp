@@ -269,6 +269,89 @@ std::uint64_t verify_and_stream_sse2(std::uint64_t* p, std::size_t words,
 }
 
 /* ---------------------------------------------------------------------------------------------
+ * Strided kernels (contracts in kernels.h): the BankStride visits of one work group per call
+ * ------------------------------------------------------------------------------------------- */
+
+/** Words per visited line: four XMM vectors. */
+constexpr std::size_t k_line_words = k_cache_line_bytes / sizeof(std::uint64_t);
+
+static_assert(k_line_words % k_lanes == 0, "a cache line must hold whole SSE2 vectors");
+
+/**
+ * Calls block(w, expected) for each aligned vector of the lines a strided call's visits name: the
+ * lines in visit order, the four vectors of a line ascending. w is the word offset of the vector's
+ * lane 0 from the span start, and expected holds the pattern values of its two words.
+ *
+ * The first visit costs one division; every later one advances the line and sweep counters,
+ * because a division per visit would cost more than the line's own stores. One cursor serves the
+ * whole call and is repositioned per line, so no line pays a pattern-key computation or a cursor
+ * construction.
+ *
+ * The cursor and the counters are locals here and block receives only values: MSVC keeps in
+ * memory a cursor that a kernel's lambda captures by reference, storing its counter and word
+ * index every vector and, in the fill, reloading them. XMM6 to XMM15 keep their values across a
+ * call under the x64 convention, so the verification's out-of-line report needs no re-derivation
+ * of the cursor. The v143 Release listing shows the cursor's counter, word index and mode in
+ * registers throughout the vector loop of both kernels.
+ */
+template <class Block>
+__forceinline void for_each_visited_block(const strided_visits& visits, const pattern_spec& spec,
+                                          std::uint64_t span_first_word_index,
+                                          Block&& block) noexcept {
+    // Copied, so that the kernel's stores through the span need not be assumed to change them and
+    // no line reloads them.
+    const std::uint64_t visit_count = visits.visit_count;
+    if (visit_count == 0) {
+        return;
+    }
+    const std::uint64_t lines_per_sweep = visits.lines_per_sweep;
+    const std::uint64_t stride_words = visits.stride_bytes / sizeof(std::uint64_t);
+    std::uint64_t line = visits.first_visit % lines_per_sweep;
+    std::uint64_t sweep_start = visits.first_visit / lines_per_sweep * k_line_words;
+    std::uint64_t offset = sweep_start + line * stride_words;
+    sse2_cursor cursor(spec, span_first_word_index, 1);
+    for (std::uint64_t n = 0; n != visit_count; ++n) {
+        cursor.seek(span_first_word_index + offset);
+        for (std::size_t i = 0; i != k_line_words; i += k_lanes) {
+            block(static_cast<std::size_t>(offset) + i, cursor.current());
+            cursor.advance();
+        }
+        if (++line == lines_per_sweep) {
+            // The next sweep starts one line further on.
+            line = 0;
+            sweep_start += k_line_words;
+            offset = sweep_start;
+        } else {
+            offset += stride_words;
+        }
+    }
+}
+
+/** fill_stream_strided_fn: four MOVNTDQ per visited line, ascending. */
+void fill_stream_strided_sse2(std::uint64_t* span, const strided_visits& visits,
+                              const pattern_spec& spec,
+                              std::uint64_t span_first_word_index) noexcept {
+    for_each_visited_block(
+        visits, spec, span_first_word_index,
+        [span](std::size_t w, __m128i value) { stream_vector(span + w, value); });
+}
+
+/** verify_strided_fn: ordinary aligned loads of every visited line, ascending. */
+std::uint64_t verify_strided_sse2(const std::uint64_t* span, const strided_visits& visits,
+                                  const pattern_spec& spec, std::uint64_t span_first_word_index,
+                                  mismatch_sink& sink) noexcept {
+    std::uint64_t mismatches = 0;
+    for_each_visited_block(visits, spec, span_first_word_index,
+                           [&](std::size_t w, __m128i expected) {
+                               const __m128i actual = load_vector(span + w);
+                               if (!all_lanes_equal(actual, expected)) [[unlikely]] {
+                                   mismatches += report_lanes(span + w, actual, expected, 1, sink);
+                               }
+                           });
+    return mismatches;
+}
+
+/* ---------------------------------------------------------------------------------------------
  * Line flush shared by both flush_range helpers
  * ------------------------------------------------------------------------------------------- */
 
@@ -363,6 +446,8 @@ constinit const kernel_table k_kernels_sse2 = {
     .verify = &verify_sse2,
     .verify_and_stream = &verify_and_stream_sse2,
     .reread = &reread_clflushopt,
+    .fill_stream_strided = &fill_stream_strided_sse2,
+    .verify_strided = &verify_strided_sse2,
 };
 
 }  // namespace rq::engine

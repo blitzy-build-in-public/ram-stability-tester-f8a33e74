@@ -105,8 +105,9 @@ struct access_context {
      * RQ_ACCESS_* value of the verifications the issuing phase performs: VERIFY_AFTER_WRITE or
      * VERIFY_AFTER_HOLD for verify, READ_MODIFY_WRITE for sweep, TURNAROUND_READ for turnaround
      * and, for reread, the value of the verification that found the mismatch. 0 in write and
-     * pre_hold_flush, which verify nothing. Consumers read it only on verify, verify_and_stream
-     * and reread_word, where it is never 0; it becomes rq_error_record.access_type.
+     * pre_hold_flush, which verify nothing. Consumers read it only on verify, verify_strided,
+     * verify_and_stream and reread_word, where it is never 0; it becomes
+     * rq_error_record.access_type.
      */
     std::uint32_t access_type;
     /**
@@ -147,7 +148,7 @@ struct access_context {
      * fetched (see rq_error_record.time_since_write_us). The fault-injecting layer applies a
      * delay-dependent fault only where now - write_time_ns reaches the fault's threshold,
      * 2000 ms by default, which only hold verifications reach. Consumers read it only on verify,
-     * verify_and_stream and reread_word.
+     * verify_strided, verify_and_stream and reread_word.
      */
     std::uint64_t write_time_ns;
 };
@@ -163,9 +164,12 @@ static_assert(std::is_aggregate_v<access_context>,
  * Each primitive takes the issuing access_context first, followed by the matching kernel's
  * parameters in the kernel's order and with the meanings core/kernels/kernels.h gives them
  * (see "Common semantics of the range entries" there, for first_word_index and direction in
- * particular). Ranges are a pointer to 8-byte-aligned 64-bit words plus a word count. The real
- * layer therefore forwards every call without reordering or converting anything except
- * flush's word count, which kernel_table::flush_range takes in bytes.
+ * particular). Ranges are a pointer to 8-byte-aligned 64-bit words plus a word count. The
+ * strided primitives take a 64-byte-aligned span, its word count and the strided_visits of the
+ * call instead (see "Strided entries" there). The real layer therefore forwards every call
+ * without reordering or converting anything except flush's word count, which
+ * kernel_table::flush_range takes in bytes, and it drops the strided primitives' span word
+ * count, which only substitute layers use to bound their bookkeeping.
  *
  * @par Layers
  * The test DLL composes fault-injecting -> counting -> real, each layer owning the next
@@ -186,23 +190,29 @@ static_assert(std::is_aggregate_v<access_context>,
  * between a line's most recent store or load and its next verification load, it issues fence,
  * a flush covering the line, and fence, in that order. Hold steps add the same sequence before
  * the hold (phase_kind::pre_hold_flush). counting_memory_access records every call with its
- * context and address range in order, so test_step_runner.cpp asserts that sequence for every
- * verified line, on later passes as on the first. verify, verify_and_stream and reread_word
- * never assume anything about a line's earlier cache residency, and no implementation loads
- * with MOVNTDQA, which has no non-temporal effect on write-back memory.
+ * context and address range, and a strided call with its span and visits, in order, so
+ * test_step_runner.cpp asserts that sequence for every verified line, on later passes as on the
+ * first. A strided verification needs it for each line it visits, and the runner's one fence,
+ * flush of the window and fence before the window's verifications cover them all. verify,
+ * verify_strided, verify_and_stream and reread_word never assume anything about a line's
+ * earlier cache residency, and no implementation loads with MOVNTDQA, which has no
+ * non-temporal effect on write-back memory.
  *
  * @par Coverage
- * A verify or verify_and_stream call verifies word_count x 8 bytes. Moving inversion verifies
- * in both sweeps of a pass, so it counts twice per pass. reread_word, stream_fill, flush and
+ * A verify or verify_and_stream call verifies word_count x 8 bytes, and a verify_strided call
+ * visit_count x 64 bytes, the lines it visits. Moving inversion verifies in both sweeps of a
+ * pass, so it counts twice per pass. reread_word, stream_fill, stream_fill_strided, flush and
  * fence never count. counting_memory_access sums exactly these bytes, which gives the
  * independent count rq_test_get_independent_verified_bytes returns and test_coverage.cpp holds
  * coverage_counter's total against.
  *
  * @par Fault injection
  * A substitute layer may modify words in [words, words + word_count) immediately before it
- * forwards verify or verify_and_stream. That point follows the last write to those words
- * before their verification, so a corruption made there always survives to be checked. The
- * layer logs its ground truth from ctx.step_index, ctx.pass_index, the logical offset
+ * forwards verify or verify_and_stream, and words of the lines a verify_strided call visits
+ * immediately before it forwards that call; never a word of the span the call does not visit,
+ * which a later call verifies. That point follows the last write to those words before their
+ * verification, so a corruption made there always survives to be checked. The layer logs its
+ * ground truth from ctx.step_index, ctx.pass_index, the logical offset
  * (address - ctx.region_base) and expected_value(expected, word index) from
  * core/patterns/patterns.h.
  *
@@ -296,6 +306,47 @@ public:
                                             const pattern_spec& next,
                                             std::uint64_t first_word_index, int direction,
                                             mismatch_sink& sink) = 0;
+
+    /**
+     * Streams `spec` over the lines `visits` names, as kernel_table::fill_stream_strided: the
+     * BankStride write of one work group in one call, so the seam and the kernel table are
+     * crossed once per 16,384 lines rather than once per line. No fence, as for stream_fill.
+     *
+     * @param ctx Issuing context; phase write.
+     * @param span First word of the span the visits are relative to, 64-byte aligned: the
+     *        window.
+     * @param span_word_count Words in the span; every visited line lies inside it. The real
+     *        layer ignores it; substitute layers bound their bookkeeping with it.
+     * @param visits The call's visits (core/kernels/kernels.h); visit_count 0 does nothing.
+     * @param spec Pattern instance whose values the visited lines receive.
+     * @param span_first_word_index Logical word index of span[0]: span[j] receives the value of
+     *        index span_first_word_index + j.
+     */
+    virtual void stream_fill_strided(const access_context& ctx, std::uint64_t* span,
+                                     std::size_t span_word_count, const strided_visits& visits,
+                                     const pattern_spec& spec,
+                                     std::uint64_t span_first_word_index) = 0;
+
+    /**
+     * Loads every word of the lines `visits` names and compares it with its `expected` value,
+     * as kernel_table::verify_strided, reporting each mismatching word to `sink` in visit order
+     * and ascending within a line. Verifies visit_count x 64 bytes. Relies on the runner's
+     * fence, flush and fence covering every visited line since its last store or load.
+     *
+     * @param ctx Issuing context; phase verify.
+     * @param span First word of the span, 64-byte aligned, as for stream_fill_strided.
+     * @param span_word_count Words in the span, as for stream_fill_strided.
+     * @param visits The call's visits; visit_count 0 does nothing and returns 0.
+     * @param expected Pattern instance the visited lines should hold.
+     * @param span_first_word_index Logical word index of span[0], as for stream_fill_strided.
+     * @param sink Receives each mismatch, as for verify.
+     * @return Number of mismatching words.
+     */
+    virtual std::uint64_t verify_strided(const access_context& ctx, const std::uint64_t* span,
+                                         std::size_t span_word_count, const strided_visits& visits,
+                                         const pattern_spec& expected,
+                                         std::uint64_t span_first_word_index,
+                                         mismatch_sink& sink) = 0;
 
     /**
      * Re-reads one word under the re-read rule, as kernel_table::reread: fence, a flush of the

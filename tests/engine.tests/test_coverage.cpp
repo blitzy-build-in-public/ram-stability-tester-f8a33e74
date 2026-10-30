@@ -559,6 +559,8 @@ void step_harness::on_primitive(const primitive_record& record) noexcept {
     begin_pass_once(record.ctx);
     switch (record.kind) {
     case primitive_kind::verify:
+    case primitive_kind::verify_strided:
+        // A strided record's bytes are the lines it visits, the bytes it verifies.
         tally_verified(record);
         break;
     case primitive_kind::verify_and_stream:
@@ -567,6 +569,7 @@ void step_harness::on_primitive(const primitive_record& record) noexcept {
         tally_streamed(record);
         break;
     case primitive_kind::stream_fill:
+    case primitive_kind::stream_fill_strided:
         tally_streamed(record);
         break;
     case primitive_kind::flush:

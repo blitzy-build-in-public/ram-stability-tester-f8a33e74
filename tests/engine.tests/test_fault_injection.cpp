@@ -11,6 +11,12 @@
  * - FaultInjection/FaultInjectionTest runs the four classes: single-bit flips (bit 17) spread
  *   over the region, a stuck bit (bit 5) in one word, an address-region fault inside a contiguous
  *   1/32 of the region, and a delay-dependent fault that only hold verifications can reach.
+ * - FaultInjectionLayer drives the fault-injecting layer directly over an unlocked 1 MiB buffer
+ *   through 1,000 (step, pass) keys, in milliseconds: once max_injections is spent it builds no
+ *   more target sets, its table never holds more than the newest pass's set, and a reclaimed
+ *   set asked for again injects the same words and bits. FaultInjectionLayerStrided checks that
+ *   a BankStride verify_strided call injects exactly the single-bit-flip targets, or the stuck
+ *   word, on the lines it visits and none elsewhere.
  *
  * The session is built through session_create with the stack the test DLL uses, fault-injecting
  * over counting over real, so the engine runs its production coordinator, worker pool, step
@@ -30,6 +36,8 @@
  * skipped detection test would read as a pass.
  */
 #include <gtest/gtest.h>
+#include <windows.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -39,6 +47,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -53,9 +62,13 @@
 #include "core/clock.h"
 #include "core/session.h"
 #include "core/system_info.h"
+#include "core/kernels/isa_dispatch.h"
+#include "core/kernels/kernels.h"
+#include "core/patterns/patterns.h"
 #include "core/memory/memory_access.h"
 #include "core/memory/real_memory_access.h"
 #include "test_dll/ramquick_engine_test.h"
+#include "fakes/fake_clock.h"
 #include "fakes/fault_spec.h"
 #include "fakes/counting_memory_access.h"
 #include "fakes/fault_injecting_memory_access.h"
@@ -329,6 +342,22 @@ public:
                                     int direction, mismatch_sink& sink) override {
         return layer_for(ctx).verify_and_stream(ctx, words, word_count, expected, next,
                                                 first_word_index, direction, sink);
+    }
+
+    void stream_fill_strided(const access_context& ctx, std::uint64_t* span,
+                             std::size_t span_word_count, const strided_visits& visits,
+                             const pattern_spec& spec,
+                             std::uint64_t span_first_word_index) override {
+        fault_->stream_fill_strided(ctx, span, span_word_count, visits, spec,
+                                    span_first_word_index);
+    }
+
+    std::uint64_t verify_strided(const access_context& ctx, const std::uint64_t* span,
+                                 std::size_t span_word_count, const strided_visits& visits,
+                                 const pattern_spec& expected, std::uint64_t span_first_word_index,
+                                 mismatch_sink& sink) override {
+        return layer_for(ctx).verify_strided(ctx, span, span_word_count, visits, expected,
+                                             span_first_word_index, sink);
     }
 
     std::uint64_t reread_word(const access_context& ctx,
@@ -951,6 +980,247 @@ const std::array<fault_case, 4> k_fault_cases{{
 }};
 
 /* ---------------------------------------------------------------------------------------------
+ * The layer driven directly
+ * ------------------------------------------------------------------------------------------- */
+
+/** Bytes of the buffer the layer tests stream and verify. */
+constexpr std::size_t k_layer_region_bytes = std::size_t{1} << 20U;
+constexpr std::size_t k_layer_region_words = k_layer_region_bytes / sizeof(std::uint64_t);
+
+/**
+ * Ranges each pass verifies the buffer in, so that every (step, pass) is looked up several
+ * times: through the table by a worker's first range of the pass, through its slot afterwards.
+ */
+constexpr std::size_t k_layer_ranges = 16U;
+constexpr std::size_t k_layer_range_words = k_layer_region_words / k_layer_ranges;
+
+static_assert(k_layer_range_words * k_layer_ranges == k_layer_region_words,
+              "the ranges must cover the buffer exactly");
+
+/**
+ * Worker indices the ranges rotate through: three that each cache the current pass's set in
+ * their own slot, and one far beyond the layer's per-worker slots, which looks every call up in
+ * the table.
+ */
+constexpr std::array<std::uint32_t, 4> k_layer_workers{0U, 1U, 2U, 1U << 20U};
+
+/** The capped test's 1,000 (step, pass) keys, in the ascending order the engine issues them. */
+constexpr std::uint32_t k_layer_steps = 4U;
+constexpr std::uint32_t k_layer_passes_per_step = 250U;
+
+/** Targets per (step, pass) and the run-wide cap of the capped test: spent within a few passes. */
+constexpr std::uint32_t k_layer_flips_per_pass = 4U;
+constexpr std::uint64_t k_layer_max_injections = 10U;
+
+/** Targets per (step, pass) of the rebuild test, whose cap never limits it. */
+constexpr std::uint32_t k_rebuild_flips_per_pass = 16U;
+
+/** Releases a VirtualAlloc buffer. */
+struct virtual_free_deleter {
+    void operator()(std::uint64_t* words) const noexcept { VirtualFree(words, 0, MEM_RELEASE); }
+};
+
+/** Counts the reported mismatches, and those that no single-bit flip can cause. */
+class mismatch_tally final : public mismatch_sink {
+public:
+    void on_mismatch(const std::uint64_t*, std::uint64_t expected,
+                     std::uint64_t actual) noexcept override {
+        ++mismatches;
+        if (std::popcount(expected ^ actual) != 1) {
+            ++multi_bit_mismatches;
+        }
+    }
+
+    std::uint64_t mismatches = 0;
+    std::uint64_t multi_bit_mismatches = 0;
+};
+
+/**
+ * The test DLL's stack, fault-injecting -> counting -> real over the host's kernels, driven
+ * directly over a committed, unlocked k_layer_region_bytes buffer. The buffer's base serves as
+ * access_context::region_base, so a word's logical offset is its distance from the base. The
+ * fake clock never moves, which no single-bit flip depends on.
+ */
+class layer_harness {
+public:
+    /** @param spec A valid spec that has passed through normalized() for the buffer. */
+    explicit layer_harness(const rq_fault_spec& spec)
+        : buffer_(static_cast<std::uint64_t*>(VirtualAlloc(
+              nullptr, k_layer_region_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))),
+          layer_(std::make_unique<counting_memory_access>(std::make_unique<real_memory_access>(
+                     tables_for(select_isa(read_cpu_features(), RQ_ISA_AUTO)))),
+                 spec, clock_) {}
+
+    /** False when VirtualAlloc failed. */
+    bool valid() const noexcept { return buffer_ != nullptr; }
+
+    const fault_injecting_memory_access& layer() const noexcept { return layer_; }
+
+    /**
+     * Streams the buffer with the (step, pass)'s random pattern and fences, then verifies it
+     * through the layer in k_layer_ranges ranges rotated over k_layer_workers, as a pass's
+     * verify phase would. Streaming first restores every word an earlier pass corrupted, so
+     * only this pass's injections can mismatch. No flush: these tests check the layer's
+     * bookkeeping, not DRAM, and the fence alone orders the streamed values before the loads.
+     *
+     * @return The mismatches the verifications returned.
+     */
+    std::uint64_t verify_pass(std::uint32_t step, std::uint32_t pass, mismatch_sink& sink) {
+        const pattern_spec expected = stream_pass(step, pass);
+        std::uint64_t mismatches = 0;
+        for (std::size_t r = 0; r < k_layer_ranges; ++r) {
+            const access_context verify_ctx{step,
+                                            pass,
+                                            phase_kind::verify,
+                                            RQ_ACCESS_VERIFY_AFTER_WRITE,
+                                            k_layer_workers[r % k_layer_workers.size()],
+                                            base(),
+                                            clock_.now_ns()};
+            const std::size_t first = r * k_layer_range_words;
+            mismatches += layer_.verify(verify_ctx, buffer_.get() + first, k_layer_range_words,
+                                        expected, first, 1, sink);
+        }
+        return mismatches;
+    }
+
+    /**
+     * The first half of verify_pass: streams the buffer with the (step, pass)'s random pattern
+     * through the layer and fences.
+     *
+     * @return The pattern streamed, which the pass's verifications expect.
+     */
+    pattern_spec stream_pass(std::uint32_t step, std::uint32_t pass) {
+        const pattern_spec expected{RQ_PATTERN_RANDOM, k_session_seed, pass, false};
+        const access_context write_ctx{
+            step, pass, phase_kind::write, 0U, k_layer_workers[0], base(), clock_.now_ns()};
+        layer_.stream_fill(write_ctx, buffer_.get(), k_layer_region_words, expected, 0U, 1);
+        layer_.fence(write_ctx);
+        return expected;
+    }
+
+    /**
+     * One strided verification of the visits over the whole buffer as the span, through the
+     * layer on one worker, against the pattern stream_pass(step, pass) wrote.
+     *
+     * @return The mismatches the verification returned.
+     */
+    std::uint64_t verify_strided(std::uint32_t step, std::uint32_t pass, std::uint32_t worker,
+                                 const strided_visits& visits, mismatch_sink& sink) {
+        const pattern_spec expected{RQ_PATTERN_RANDOM, k_session_seed, pass, false};
+        const access_context verify_ctx{
+            step,   pass,   phase_kind::verify, RQ_ACCESS_VERIFY_AFTER_WRITE,
+            worker, base(), clock_.now_ns()};
+        return layer_.verify_strided(verify_ctx, buffer_.get(), k_layer_region_words, visits,
+                                     expected, 0U, sink);
+    }
+
+private:
+    std::uintptr_t base() const noexcept { return reinterpret_cast<std::uintptr_t>(buffer_.get()); }
+
+    std::unique_ptr<std::uint64_t, virtual_free_deleter> buffer_;
+    // Declared before the layer, which holds a reference to it.
+    fake_clock clock_;
+    fault_injecting_memory_access layer_;
+};
+
+/** A single-bit-flip spec for the layer tests, normalized for the buffer. */
+rq_fault_spec layer_spec(std::uint32_t bit, std::uint32_t per_pass_count,
+                         std::uint64_t max_injections) noexcept {
+    rq_fault_spec spec = make_fault_spec(RQ_FAULT_SINGLE_BIT_FLIP);
+    spec.bit = bit;
+    spec.per_pass_count = per_pass_count;
+    spec.max_injections = max_injections;
+    spec.seed = k_fault_seed;
+    return normalized(spec, k_layer_region_bytes);
+}
+
+/** (word offset, bit) of every logged injection of one (step, pass), in logging order. */
+std::vector<std::pair<std::uint64_t, std::uint32_t>>
+logged_targets(const std::vector<rq_injected_fault>& log, std::uint32_t step, std::uint32_t pass) {
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> targets;
+    for (const rq_injected_fault& injection : log) {
+        if (injection.step_index == step && injection.pass_index == pass) {
+            targets.emplace_back(injection.word_offset, injection.bit);
+        }
+    }
+    return targets;
+}
+
+/**
+ * The strided layer test's visits: the 8 KiB BankStride stride over the 1 MiB buffer, 128 lines
+ * per sweep. The layer's visited-line test does not depend on the stride; test_kernels.cpp
+ * covers all three.
+ */
+constexpr std::uint64_t k_strided_layer_stride = std::uint64_t{8} << 10U;
+constexpr std::uint64_t k_strided_layer_lines_per_sweep =
+    k_layer_region_bytes / k_strided_layer_stride;
+constexpr std::uint64_t k_strided_layer_visits = k_layer_region_bytes / 64U;
+
+/** First visit of the test's second strided call: half the phase plus half a sweep, mid-sweep. */
+constexpr std::uint64_t k_strided_layer_split =
+    k_strided_layer_visits / 2U + k_strided_layer_lines_per_sweep / 2U;
+
+/**
+ * The stuck word of the strided test: 4 KiB plus one word past mid-buffer, on the line of visit
+ * (4096 / 64) * 128 + 64, the second call's first visit.
+ */
+constexpr std::uint64_t k_strided_stuck_offset = k_layer_region_bytes / 2U + 4096U + 8U;
+
+static_assert((k_strided_stuck_offset % k_strided_layer_stride) / 64U *
+                      k_strided_layer_lines_per_sweep +
+                  k_strided_stuck_offset / k_strided_layer_stride ==
+              k_strided_layer_split);
+
+/** Targets of the strided test's single-bit flips: enough to land on both calls' lines. */
+constexpr std::uint32_t k_strided_flips_per_pass = 64U;
+
+rq_fault_spec strided_flip_spec() noexcept {
+    return layer_spec(k_random_bit, k_strided_flips_per_pass, k_max_expected_reports);
+}
+
+/**
+ * A stuck bit in the strided test's stuck word, stuck at the complement of the bit pass 0
+ * writes there, so that its verification mismatches.
+ */
+rq_fault_spec strided_stuck_bit_spec() noexcept {
+    rq_fault_spec spec = make_fault_spec(RQ_FAULT_STUCK_BIT);
+    spec.bit = k_stuck_bit;
+    spec.max_injections = k_max_expected_reports;
+    spec.region_offset = k_strided_stuck_offset;
+    const pattern_spec written{RQ_PATTERN_RANDOM, k_session_seed, 0U, false};
+    spec.stuck_value =
+        ~(expected_value(written, k_strided_stuck_offset / sizeof(std::uint64_t)) >> k_stuck_bit) &
+        1U;
+    spec.seed = k_fault_seed;
+    return normalized(spec, k_layer_region_bytes);
+}
+
+/** One fault class of the strided layer test. */
+struct strided_layer_case {
+    const char* name;
+    rq_fault_spec (*make_spec)() noexcept;
+};
+
+void PrintTo(const strided_layer_case& c, std::ostream* os) {
+    *os << c.name;
+}
+
+constexpr std::array<strided_layer_case, 2> k_strided_layer_cases{{
+    {"single_bit_flip", &strided_flip_spec},
+    {"stuck_bit", &strided_stuck_bit_spec},
+}};
+
+/** Whether the byte at offset from the span start lies on a line a strided call visits. */
+constexpr bool on_visited_line(const strided_visits& v, std::uint64_t offset) noexcept {
+    const std::uint64_t visit =
+        offset % v.stride_bytes / 64U * v.lines_per_sweep + offset / v.stride_bytes;
+    return offset < v.lines_per_sweep * v.stride_bytes && visit >= v.first_visit &&
+           visit - v.first_visit < v.visit_count;
+}
+
+class FaultInjectionLayerStrided : public ::testing::TestWithParam<strided_layer_case> {};
+
+/* ---------------------------------------------------------------------------------------------
  * Tests
  * ------------------------------------------------------------------------------------------- */
 
@@ -1065,6 +1335,172 @@ TEST_P(FaultInjectionTest, EveryInjectionIsReportedOnceWithItsWordBitStepAndPass
 
 INSTANTIATE_TEST_SUITE_P(FaultInjection, FaultInjectionTest, ::testing::ValuesIn(k_fault_cases),
                          [](const ::testing::TestParamInfo<fault_case>& info) {
+                             return std::string(info.param.name);
+                         });
+
+TEST(FaultInjectionLayer, SpentCapStopsTargetSetBuildsAndTheTableKeepsOnlyTheNewestPass) {
+    const rq_fault_spec spec =
+        layer_spec(k_flipped_bit, k_layer_flips_per_pass, k_layer_max_injections);
+    const char* reason = nullptr;
+    ASSERT_TRUE(validate_fault_spec(spec, k_layer_region_bytes, &reason))
+        << (reason != nullptr ? reason : "");
+    layer_harness harness(spec);
+    ASSERT_TRUE(harness.valid()) << "VirtualAlloc failed with Windows error " << GetLastError();
+    const fault_injecting_memory_access& layer = harness.layer();
+
+    mismatch_tally sink;
+    std::uint64_t returned_mismatches = 0;
+    bool spent = false;
+    std::uint64_t built_when_spent = 0;
+    for (std::uint32_t step = 0; step < k_layer_steps; ++step) {
+        for (std::uint32_t pass = 0; pass < k_layer_passes_per_step; ++pass) {
+            returned_mismatches += harness.verify_pass(step, pass, sink);
+            ASSERT_LE(layer.retained_target_set_count(), 1U)
+                << "step " << step << ", pass " << pass;
+            if (!spent && layer.injection_count() == k_layer_max_injections) {
+                spent = true;
+                built_when_spent = layer.built_target_set_count();
+            }
+        }
+    }
+    RecordProperty("target_sets_built", std::to_string(layer.built_target_set_count()));
+
+    // The cap holds, every logged injection was verified and reported once, as one bit.
+    ASSERT_TRUE(spent) << "the cap was never reached";
+    EXPECT_EQ(layer.injection_count(), k_layer_max_injections);
+    EXPECT_EQ(layer.verified_opportunity_count(), k_layer_max_injections);
+    EXPECT_EQ(sink.mismatches, k_layer_max_injections);
+    EXPECT_EQ(returned_mismatches, k_layer_max_injections);
+    EXPECT_EQ(sink.multi_bit_mismatches, 0U);
+    const std::vector<rq_injected_fault> log = layer.injection_log();
+    ASSERT_EQ(log.size(), k_layer_max_injections);
+    for (const rq_injected_fault& injection : log) {
+        EXPECT_EQ(injection.verified_opportunity, 1U);
+        EXPECT_EQ(injection.bit, k_flipped_bit);
+        EXPECT_LT(injection.word_offset, k_layer_region_bytes);
+    }
+
+    // Every target lies in the verified buffer, so each set built before the cap was spent
+    // yielded at least one injection; none was built for the hundreds of passes after it.
+    EXPECT_GE(built_when_spent, 1U);
+    EXPECT_LE(built_when_spent, k_layer_max_injections);
+    EXPECT_EQ(layer.built_target_set_count(), built_when_spent);
+    EXPECT_EQ(layer.retained_target_set_count(), 1U);
+}
+
+TEST(FaultInjectionLayer, AReclaimedTargetSetIsRebuiltWithTheSameWordsAndBits) {
+    // A seeded random bit per target, so the rebuild must reproduce bits as well as offsets.
+    const rq_fault_spec spec =
+        layer_spec(k_random_bit, k_rebuild_flips_per_pass, k_max_expected_reports);
+    const char* reason = nullptr;
+    ASSERT_TRUE(validate_fault_spec(spec, k_layer_region_bytes, &reason))
+        << (reason != nullptr ? reason : "");
+    layer_harness harness(spec);
+    ASSERT_TRUE(harness.valid()) << "VirtualAlloc failed with Windows error " << GetLastError();
+    const fault_injecting_memory_access& layer = harness.layer();
+    mismatch_tally sink;
+
+    harness.verify_pass(0U, 0U, sink);
+    const std::vector<std::pair<std::uint64_t, std::uint32_t>> first =
+        logged_targets(layer.injection_log(), 0U, 0U);
+    ASSERT_GE(first.size(), 1U);
+    EXPECT_EQ(layer.built_target_set_count(), 1U);
+    EXPECT_EQ(layer.retained_target_set_count(), 1U);
+
+    // Pass 1 reclaims pass 0's set from the table, and every slotted worker drops it too.
+    harness.verify_pass(0U, 1U, sink);
+    EXPECT_EQ(layer.built_target_set_count(), 2U);
+    EXPECT_EQ(layer.retained_target_set_count(), 1U);
+
+    // Going back to pass 0 rebuilds its set, and the table keeps the newest pass's beside it.
+    harness.verify_pass(0U, 0U, sink);
+    EXPECT_EQ(layer.built_target_set_count(), 3U);
+    EXPECT_EQ(layer.retained_target_set_count(), 2U);
+    const std::vector<std::pair<std::uint64_t, std::uint32_t>> both =
+        logged_targets(layer.injection_log(), 0U, 0U);
+    ASSERT_EQ(both.size(), 2U * first.size());
+    const std::vector<std::pair<std::uint64_t, std::uint32_t>> again(
+        both.begin() + static_cast<std::ptrdiff_t>(first.size()), both.end());
+    EXPECT_EQ(again, first);
+
+    // A newer pass returns the table to one generation.
+    harness.verify_pass(0U, 2U, sink);
+    EXPECT_EQ(layer.built_target_set_count(), 4U);
+    EXPECT_EQ(layer.retained_target_set_count(), 1U);
+
+    EXPECT_EQ(layer.verified_opportunity_count(), layer.injection_count());
+    EXPECT_EQ(sink.mismatches, layer.injection_count());
+    EXPECT_EQ(sink.multi_bit_mismatches, 0U);
+}
+
+// A BankStride verification reads only the lines it visits, so it injects exactly the targets on
+// those lines, each once, and none elsewhere: split over two calls, as the step runner splits a
+// window into work groups, the pass injects exactly what a plain verification of the buffer does.
+TEST_P(FaultInjectionLayerStrided, VerifyStridedInjectsExactlyTheTargetsOnItsVisitedLines) {
+    const rq_fault_spec spec = GetParam().make_spec();
+    const char* reason = nullptr;
+    ASSERT_TRUE(validate_fault_spec(spec, k_layer_region_bytes, &reason))
+        << (reason != nullptr ? reason : "");
+    using target = std::pair<std::uint64_t, std::uint32_t>;
+
+    // The reference: what a plain verification of the whole buffer injects in (step 0, pass 0).
+    layer_harness reference(spec);
+    ASSERT_TRUE(reference.valid()) << "VirtualAlloc failed with Windows error " << GetLastError();
+    mismatch_tally reference_sink;
+    reference.verify_pass(0U, 0U, reference_sink);
+    std::vector<target> all = logged_targets(reference.layer().injection_log(), 0U, 0U);
+    std::sort(all.begin(), all.end());
+    ASSERT_FALSE(all.empty()) << "the reference pass injected nothing";
+
+    layer_harness harness(spec);
+    ASSERT_TRUE(harness.valid()) << "VirtualAlloc failed with Windows error " << GetLastError();
+    const fault_injecting_memory_access& layer = harness.layer();
+    harness.stream_pass(0U, 0U);
+    // A slotted worker first, then one the layer looks up in its table.
+    const std::pair<std::uint32_t, strided_visits> calls[] = {
+        {k_layer_workers[0], strided_visits{k_strided_layer_stride, k_strided_layer_lines_per_sweep,
+                                            0U, k_strided_layer_split}},
+        {k_layer_workers[3],
+         strided_visits{k_strided_layer_stride, k_strided_layer_lines_per_sweep,
+                        k_strided_layer_split, k_strided_layer_visits - k_strided_layer_split}},
+    };
+    mismatch_tally sink;
+    std::uint64_t returned = 0;
+    std::size_t logged = 0;
+    for (const auto& [worker, visits] : calls) {
+        SCOPED_TRACE("visits [" + std::to_string(visits.first_visit) + ", +" +
+                     std::to_string(visits.visit_count) + ")");
+        returned += harness.verify_strided(0U, 0U, worker, visits, sink);
+        const std::vector<target> so_far = logged_targets(layer.injection_log(), 0U, 0U);
+        std::vector<target> injected(so_far.begin() + static_cast<std::ptrdiff_t>(logged),
+                                     so_far.end());
+        logged = so_far.size();
+        std::sort(injected.begin(), injected.end());
+        std::vector<target> expected;
+        std::copy_if(all.begin(), all.end(), std::back_inserter(expected),
+                     [&](const target& t) { return on_visited_line(visits, t.first); });
+        EXPECT_EQ(injected, expected);
+        if (&visits == &calls[0].second) {
+            EXPECT_LT(expected.size(), all.size())
+                << "no target lies off the first call's lines, so none could be wrongly injected";
+        }
+    }
+
+    // Together the calls injected and reported every target once, as one bit.
+    EXPECT_EQ(logged, all.size());
+    EXPECT_EQ(returned, all.size());
+    EXPECT_EQ(sink.mismatches, all.size());
+    EXPECT_EQ(sink.multi_bit_mismatches, 0U);
+    EXPECT_EQ(layer.injection_count(), all.size());
+    EXPECT_EQ(layer.verified_opportunity_count(), all.size());
+    for (const rq_injected_fault& injection : layer.injection_log()) {
+        EXPECT_EQ(injection.verified_opportunity, 1U);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(FaultInjectionLayerStridedClasses, FaultInjectionLayerStrided,
+                         ::testing::ValuesIn(k_strided_layer_cases),
+                         [](const ::testing::TestParamInfo<strided_layer_case>& info) {
                              return std::string(info.param.name);
                          });
 

@@ -30,7 +30,7 @@
  * linkage compiled in one of those units becomes a COMDAT holding AVX instructions, which the
  * linker may keep for baseline callers too; on a CPU without the extension that raises an
  * illegal-instruction fault, which terminates the process. This header therefore holds only
- * declarations, type aliases, a constexpr scalar and an aggregate with trivial special members.
+ * declarations, type aliases, a constexpr scalar and aggregates with trivial special members.
  * mismatch_sink declares no member with a body, and the AVX units only call it through a
  * reference, so they emit neither its constructor nor its vftable. Include nothing else here.
  *
@@ -98,9 +98,9 @@ protected:
  * @name Kernel entry types
  * Common semantics of the range entries (fill_stream, verify and verify_and_stream):
  * - A range is `words` 64-bit words starting at an 8-byte-aligned pointer. It may be as short as
- *   one word (BankStride visits single 64-byte lines) or several MiB, and its start and end may
- *   fall anywhere at 8-byte granularity: each kernel splits it into scalar edge words and
- *   aligned vectors itself. words == 0 does nothing, and verify then returns 0.
+ *   one word or several MiB, and its start and end may fall anywhere at 8-byte granularity: each
+ *   kernel splits it into scalar edge words and aligned vectors itself. words == 0 does nothing,
+ *   and verify then returns 0.
  * - Word p[i] has logical word index first_word_index + i, and its value is the stateless pattern
  *   function of (spec, first_word_index + i) from core/patterns/patterns.h, bit-identical to
  *   expected_value. The index is logical, never the virtual address.
@@ -173,6 +173,82 @@ using reread_fn = std::uint64_t (*)(const std::uint64_t* p) noexcept;
 
 /** @} */
 
+/* ---------------------------------------------------------------------------------------------
+ * Strided entries: the BankStride order in bulk
+ * ------------------------------------------------------------------------------------------- */
+
+/**
+ * The visits one strided kernel call makes: 64-byte lines a fixed stride apart within a sweep,
+ * each sweep starting one line further on. That is the RQ_ORDER_BANK_STRIDE order, whose
+ * reference definition is order_cursor (core/patterns/access_order.h); one call covers many of
+ * its visits, so a work group of 16,384 lines crosses the kernel table once rather than once per
+ * line, and pays no per-line range split or pattern-cursor construction.
+ *
+ * Visit k is the line at byte offset (k / lines_per_sweep) x 64 + (k % lines_per_sweep) x
+ * stride_bytes from the span start. A call makes visits first_visit to first_visit +
+ * visit_count - 1, in that order. With lines_per_sweep x stride_bytes equal to the span, visits
+ * 0 to span / 64 - 1 name every line of the span exactly once, so one phase may be issued as
+ * consecutive calls over consecutive slices of the visit sequence.
+ *
+ * Preconditions, which the kernels do not check: when visit_count is non-zero, stride_bytes is
+ * a non-zero multiple of 64, lines_per_sweep is non-zero, lines_per_sweep x stride_bytes is no
+ * larger than the span, and first_visit + visit_count <= lines_per_sweep x stride_bytes / 64.
+ * Every visited line then lies inside the span and distinct visits name distinct lines.
+ * visit_count == 0 makes a call do nothing, whatever the other fields hold.
+ *
+ * An aggregate without member initialisers, for the reason pattern_spec gives: initialise every
+ * field, for example strided_visits{stride, span / stride, first, count}.
+ */
+struct strided_visits {
+    /** Distance in bytes between consecutive visits of one sweep. */
+    std::uint64_t stride_bytes;
+    /** Visits per sweep: the span divided by the stride for a whole-span order. */
+    std::uint64_t lines_per_sweep;
+    /** Index k of the call's first visit in the order's visit sequence. */
+    std::uint64_t first_visit;
+    /** Visits the call makes. */
+    std::uint64_t visit_count;
+};
+
+/**
+ * @name Strided entry types
+ * Common semantics of fill_stream_strided and verify_strided:
+ * - `span` points at the span's first word and is 64-byte aligned, so every visited line is one
+ *   whole cache line and is handled with aligned vectors alone, with no scalar edge word.
+ * - Word span[j] has logical word index span_first_word_index + j, and its value is the stateless
+ *   pattern function of (spec, span_first_word_index + j), bit-identical to expected_value, as
+ *   for the range entries.
+ * - Each visited line's eight words are handled in ascending address order, and the lines in
+ *   visit order.
+ * - The kernels never check the stop flag, never count coverage and never fence: the step runner
+ *   sizes each call to one work group and composes the calls into the flush-before-verification
+ *   sequence, as for the range entries.
+ * @{
+ */
+
+/**
+ * Streams the pattern over every visited line with aligned non-temporal stores (MOVNTDQ or
+ * VMOVNTDQ). Each line is written whole by consecutive streaming stores, so its write-combining
+ * buffer fills completely. No fence, as for fill_stream_fn.
+ */
+using fill_stream_strided_fn = void (*)(std::uint64_t* span, const strided_visits& visits,
+                                        const pattern_spec& spec,
+                                        std::uint64_t span_first_word_index) noexcept;
+
+/**
+ * Loads every word of every visited line with aligned ordinary loads, never MOVNTDQA, and
+ * compares it with its regenerated expected value. Each mismatching word is reported to the sink
+ * individually, in visit order and ascending within a line. Returns the number of mismatching
+ * words. Relies on the caller having applied fence, flush and fence to every visited line since
+ * its last store or load, as for verify_fn.
+ */
+using verify_strided_fn = std::uint64_t (*)(const std::uint64_t* span, const strided_visits& visits,
+                                            const pattern_spec& spec,
+                                            std::uint64_t span_first_word_index,
+                                            mismatch_sink& sink) noexcept;
+
+/** @} */
+
 /**
  * One instruction-set level's kernels.
  *
@@ -201,6 +277,10 @@ struct kernel_table {
     verify_and_stream_fn verify_and_stream;
     /** Flushed re-read of one word; see reread_fn. */
     reread_fn reread;
+    /** Streaming fill of BankStride visits; see fill_stream_strided_fn. */
+    fill_stream_strided_fn fill_stream_strided;
+    /** Verification of BankStride visits; see verify_strided_fn. */
+    verify_strided_fn verify_strided;
 };
 
 /* ---------------------------------------------------------------------------------------------

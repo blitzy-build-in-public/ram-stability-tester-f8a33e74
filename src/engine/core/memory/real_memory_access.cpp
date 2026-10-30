@@ -29,6 +29,8 @@ real_memory_access::real_memory_access(const kernel_table& table) noexcept : ker
     assert(kernels_.verify != nullptr);
     assert(kernels_.verify_and_stream != nullptr);
     assert(kernels_.reread != nullptr);
+    assert(kernels_.fill_stream_strided != nullptr);
+    assert(kernels_.verify_strided != nullptr);
 }
 
 real_memory_access::~real_memory_access() = default;
@@ -70,6 +72,23 @@ std::uint64_t real_memory_access::verify_and_stream(const access_context& /*ctx*
                                                     mismatch_sink& sink) {
     return kernels_.verify_and_stream(words, word_count, expected, next, first_word_index,
                                       direction, sink);
+}
+
+// The strided kernels take only the visits, which already bound every line they touch; the span
+// word count is for substitute layers.
+void real_memory_access::stream_fill_strided(const access_context& /*ctx*/, std::uint64_t* span,
+                                             std::size_t /*span_word_count*/,
+                                             const strided_visits& visits, const pattern_spec& spec,
+                                             std::uint64_t span_first_word_index) {
+    kernels_.fill_stream_strided(span, visits, spec, span_first_word_index);
+}
+
+std::uint64_t
+real_memory_access::verify_strided(const access_context& /*ctx*/, const std::uint64_t* span,
+                                   std::size_t /*span_word_count*/, const strided_visits& visits,
+                                   const pattern_spec& expected,
+                                   std::uint64_t span_first_word_index, mismatch_sink& sink) {
+    return kernels_.verify_strided(span, visits, expected, span_first_word_index, sink);
 }
 
 // The reread kernel already carries the whole re-read rule (fence, flush of the line, fence,

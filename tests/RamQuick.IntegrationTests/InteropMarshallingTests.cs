@@ -2,11 +2,13 @@ using System.Collections;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Windows.Threading;
 using RamQuick.Core;
 using RamQuick.Interop;
+using RamQuick.Logging;
 using RamQuick.Plans;
 using Xunit;
 
@@ -16,12 +18,13 @@ namespace RamQuick.IntegrationTests;
 /// The engine boundary as the wrapper sees it, over the test-only engine library this process is bound to: the
 /// one-time binding, the managed mirrors of every ABI struct against the engine's own <c>sizeof</c>, the result-code
 /// mapping, the step limit and step shapes the wrapper checks before any native call, event delivery on the captured
-/// synchronization context, an injected affinity failure, and the stop ordering that lets a woken step gate find its
-/// reason already recorded. It also covers the wrapper's own contracts at that boundary: option validation and
-/// defaults, exception construction, the rejection of payloads that cannot belong to the configured session, handle
-/// and callback-state ownership on every creation failure, disposal from every thread a caller may use, the
-/// containment of exceptions thrown by step gates, fault sinks, event subscribers and the captured context, and the
-/// monitor work-area query that shares the engine's import resolver.
+/// synchronization context, one event at a time in engine order whatever the context, a Completed that survives a
+/// rejected terminal payload or a refused post, an injected affinity failure, and the stop ordering that lets a woken
+/// step gate find its reason already recorded. It also covers the wrapper's own contracts at that boundary: option
+/// validation and defaults, exception construction, the rejection of payloads that cannot belong to the configured
+/// session, handle and callback-state ownership on every creation failure, disposal from every thread a caller may
+/// use, the containment of exceptions thrown by progress sinks, step gates, fault sinks, event subscribers and the
+/// captured context as logged host faults, and the monitor work-area query that shares the engine's import resolver.
 /// </summary>
 /// <remarks>
 /// Every engine session sizes its region with <see cref="TestRegions.Bytes"/> for one worker per logical processor,
@@ -37,6 +40,18 @@ public sealed class InteropMarshallingTests
 
     // ERROR_INVALID_PARAMETER, the error the injected failing pin reports.
     private const uint AffinityWindowsError = 87;
+
+    // The app-errors.log source prefix RunController gives a fault caught in an engine callback or an event subscriber.
+    private const string EngineCallbackSourcePrefix = "EngineCallback:";
+
+    // The engine's default end_detail for a user stop, as a test-built terminal payload carries it.
+    private const string UserStopNativeDetail = "Stop requested by host: user";
+
+    // Header values of the terminal payloads RaiseTerminalPayload builds.
+    private const ulong TerminalPayloadErrors = 3;
+    private const ulong TerminalPayloadVerifiedBytes = 64UL << 20;
+    private const ulong TerminalPayloadElapsedMs = 1_500;
+    private const ulong TerminalPayloadFirstErrorMs = 250;
 
     // Sessions whose factory never reaches the engine allocate nothing, so any size the validation accepts will do.
     private const ulong UnallocatedRegionBytes = 256UL << 20;
@@ -65,6 +80,10 @@ public sealed class InteropMarshallingTests
     // its shape alone.
     private static readonly TimeSpan _shapeCaseHold = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan _shapeCaseBudget = TimeSpan.FromSeconds(10);
+
+    // How long the first lifecycle handlers of a delivery-order test block: long enough that an event delivered
+    // independently of them would overtake them.
+    private static readonly TimeSpan _slowHandlerDelay = TimeSpan.FromMilliseconds(300);
 
     private readonly EngineBindingFixture _binding;
     private readonly ITestOutputHelper _output;
@@ -714,8 +733,8 @@ public sealed class InteropMarshallingTests
         NativeEngine engine = TestEngines.Create();
         SystemSnapshot system = engine.QuerySystem();
 
-        // Created on the dispatcher so its events arrive in the order the engine raised them; a session created without a
-        // context posts each event to the thread pool, which preserves no order between Completed and Released.
+        // Created on the dispatcher, the context the App creates its sessions on, so its events arrive on that thread;
+        // Events_NoSynchronizationContext_RaisedOneAtATimeInEngineOrderAsync covers a session created without one.
         IEngineSession session = await ui.InvokeAsync(() => engine.CreateSession(CreateOptions(system, OneStepPlan())));
         try
         {
@@ -825,8 +844,8 @@ public sealed class InteropMarshallingTests
             return StepGateDecision.Abort;
         };
 
-        // Created on the dispatcher so its events arrive in the order the engine raised them, Prepared before Released; a
-        // session created without a context posts each event to the thread pool, which preserves no order between them.
+        // Created on the dispatcher, the context the App creates its sessions on, so its events arrive on that thread;
+        // Events_NoSynchronizationContext_RaisedOneAtATimeInEngineOrderAsync covers a session created without one.
         IEngineSession session = await ui.InvokeAsync(() => engine.CreateSession(CreateOptions(system, OneStepPlan(), gate: gate)));
         Volatile.Write(ref sessionBox.Value, session);
         try
@@ -1343,8 +1362,8 @@ public sealed class InteropMarshallingTests
             return StepGateDecision.Abort;
         };
 
-        // Created on the dispatcher so its events arrive in the order the engine raised them, Prepared before Released; a
-        // session created without a context posts each event to the thread pool, which preserves no order between them.
+        // Created on the dispatcher, the context the App creates its sessions on, so its events arrive on that thread;
+        // Events_NoSynchronizationContext_RaisedOneAtATimeInEngineOrderAsync covers a session created without one.
         IEngineSession session = await ui.InvokeAsync(() => engine.CreateSession(CreateOptions(system, OneStepPlan(), gate: gate)));
         Volatile.Write(ref sessionBox.Value, session);
         try
@@ -1388,6 +1407,786 @@ public sealed class InteropMarshallingTests
 
         Assert.Empty(ui.UnhandledExceptions);
         AssertNoLiveSessions();
+    }
+
+    [Fact(Timeout = TestTimeoutMs)]
+    public async Task CallbackFault_ProgressSinkThrows_ContainedLoggedAndRunEndsHostFaultAsync()
+    {
+        CancellationToken cancellation = TestContext.Current.CancellationToken;
+        using var dataRoot = new TempDataRoot();
+        using var ui = new DispatcherThread();
+        var faults = new CallbackFaultLog(dataRoot.Data);
+        var thrown = new InvalidOperationException("Injected ProgressSink failure " + Guid.NewGuid().ToString("N"));
+        int sinkCalls = 0;
+        NativeEngine engine = TestEngines.Create();
+        SystemSnapshot system = engine.QuerySystem();
+
+        // The sink throws on every snapshot; the engine raises the first on_progress at the first tick of step 0.
+        EngineSessionOptions options = CreateOptions(
+            system,
+            OneStepPlan(),
+            sink: _ =>
+            {
+                Interlocked.Increment(ref sinkCalls);
+                throw thrown;
+            },
+            faultSink: faults.Record);
+
+        IEngineSession session = await ui.InvokeAsync(() => engine.CreateSession(options));
+        try
+        {
+            EngineRunRecorder recorder = EngineRunRecorder.Attach(session);
+            FaultedRun run = await RunUntilReleasedAsync(session, recorder, ui, cancellation);
+            int calls = Volatile.Read(ref sinkCalls);
+            _output.WriteLine(string.Create(CultureInfo.InvariantCulture, $"Progress sink calls {calls}, faults reported {faults.Faults.Count}"));
+
+            // The on_progress thunk contained every throw on the coordinator and reported each one.
+            AssertHostFaultContained(run, recorder, faults, ui, "on_progress", thrown, caughtOnDispatcher: false);
+            Assert.Equal(calls, faults.Faults.Count);
+        }
+        finally
+        {
+            session.Dispose();
+        }
+
+        Assert.Empty(ui.UnhandledExceptions);
+        AssertNoLiveSessions();
+    }
+
+    [Fact(Timeout = TestTimeoutMs)]
+    public async Task CallbackFault_EventSubscriberThrows_LaterSubscriberServedLoggedAndRunEndsHostFaultAsync()
+    {
+        CancellationToken cancellation = TestContext.Current.CancellationToken;
+        using var dataRoot = new TempDataRoot();
+        using var ui = new DispatcherThread();
+        var faults = new CallbackFaultLog(dataRoot.Data);
+        var thrown = new InvalidOperationException("Injected Prepared subscriber failure " + Guid.NewGuid().ToString("N"));
+        int throwingHandlerCalls = 0;
+        var gateWakes = new ConcurrentQueue<bool>();
+        NativeEngine engine = TestEngines.Create();
+        SystemSnapshot system = engine.QuerySystem();
+
+        // The gate holds step 0 until the stop event wakes it, so the run cannot end before the subscriber's fault stops
+        // it, however late the dispatcher delivers Prepared. Woken, it aborts the step under the reason already recorded;
+        // a stop recorded before step 0 was reached skips the gate altogether.
+        EngineSessionOptions options = CreateOptions(
+            system,
+            OneStepPlan(),
+            gate: (_, stopEvent) =>
+            {
+                bool woken = stopEvent.WaitOne(_gateWakeTimeout);
+                gateWakes.Enqueue(woken);
+                return woken ? StepGateDecision.Abort : StepGateDecision.Continue;
+            },
+            faultSink: faults.Record);
+
+        IEngineSession session = await ui.InvokeAsync(() => engine.CreateSession(options));
+        try
+        {
+            // Subscribed before the recorder, so the recorder is a later subscriber to the same Prepared delivery.
+            session.Prepared += (_, _) =>
+            {
+                Interlocked.Increment(ref throwingHandlerCalls);
+                throw thrown;
+            };
+            EngineRunRecorder recorder = EngineRunRecorder.Attach(session);
+            FaultedRun run = await RunUntilReleasedAsync(session, recorder, ui, cancellation);
+            _output.WriteLine(string.Create(
+                CultureInfo.InvariantCulture,
+                $"Throwing Prepared handler calls {Volatile.Read(ref throwingHandlerCalls)}, gate wakes [{string.Join(", ", gateWakes)}]"));
+
+            // Contained per subscriber on the dispatcher: the throwing handler ran once, and the recorder after it still
+            // received Prepared.
+            Assert.Equal(1, Volatile.Read(ref throwingHandlerCalls));
+            Assert.Single(faults.Faults);
+            AssertHostFaultContained(run, recorder, faults, ui, "Prepared handler", thrown, caughtOnDispatcher: true);
+            Assert.True(
+                gateWakes.Count <= 1 && !gateWakes.Contains(false),
+                $"The step gate was not woken by the subscriber's stop within {_gateWakeTimeout.TotalSeconds:0} s: [{string.Join(", ", gateWakes)}].");
+        }
+        finally
+        {
+            session.Dispose();
+        }
+
+        Assert.Empty(ui.UnhandledExceptions);
+        AssertNoLiveSessions();
+    }
+
+    [Fact(Timeout = TestTimeoutMs)]
+    public async Task CallbackFault_StepGateThrows_StepStartsNoTrafficLoggedAndRunEndsHostFaultAsync()
+    {
+        CancellationToken cancellation = TestContext.Current.CancellationToken;
+        using var dataRoot = new TempDataRoot();
+        using var ui = new DispatcherThread();
+        var faults = new CallbackFaultLog(dataRoot.Data);
+        var thrown = new InvalidOperationException("Injected StepGate failure " + Guid.NewGuid().ToString("N"));
+        var gateSteps = new ConcurrentQueue<int>();
+        NativeEngine engine = TestEngines.Create();
+        SystemSnapshot system = engine.QuerySystem();
+        EngineSessionOptions options = CreateOptions(
+            system,
+            TwoStepPlan(),
+            gate: (step, _) =>
+            {
+                gateSteps.Enqueue(step.Index);
+                throw thrown;
+            },
+            faultSink: faults.Record);
+
+        IEngineSession session = await ui.InvokeAsync(() => engine.CreateSession(options));
+        try
+        {
+            EngineRunRecorder recorder = EngineRunRecorder.Attach(session);
+            FaultedRun run = await RunUntilReleasedAsync(session, recorder, ui, cancellation);
+            _output.WriteLine($"Step gate calls for steps [{string.Join(", ", gateSteps)}]");
+
+            // The on_step_starting thunk contained the throw on the coordinator and answered Abort, which ended the run at
+            // step 0 instead of going on to step 1.
+            Assert.Equal(new[] { 0 }, gateSteps);
+            Assert.Single(faults.Faults);
+            AssertHostFaultContained(run, recorder, faults, ui, "on_step_starting", thrown, caughtOnDispatcher: false);
+
+            // The aborted step started no traffic: nothing was reported, verified or independently counted.
+            Assert.Empty(recorder.StepStarted);
+            Assert.Empty(recorder.StepFinished);
+            Assert.Equal(0, run.Completed.StepsCompleted);
+            Assert.Empty(run.Completed.StepResults);
+            Assert.Equal(0UL, run.Completed.VerifiedBytes);
+            Assert.Equal(0UL, run.IndependentVerifiedBytes);
+        }
+        finally
+        {
+            session.Dispose();
+        }
+
+        Assert.Empty(ui.UnhandledExceptions);
+        AssertNoLiveSessions();
+    }
+
+    // Starts the session and follows its run through Released. The pending stop reason and the independently counted
+    // verified bytes are read once Completed has arrived, while the session is still alive.
+    private async Task<FaultedRun> RunUntilReleasedAsync(
+        IEngineSession session,
+        EngineRunRecorder recorder,
+        DispatcherThread ui,
+        CancellationToken cancellation)
+    {
+        session.Start();
+        EngineCompleted completed = await recorder.WaitCompletedAsync(_runTimeout, cancellation);
+        uint pendingReason = SessionProbe.GetPendingStopReason(session);
+        ulong independentVerifiedBytes = SessionProbe.GetIndependentVerifiedBytes(session);
+        EngineReleased released = await recorder.WaitReleasedAsync(_runTimeout, cancellation);
+        await ui.FlushAsync();
+
+        WriteEvents(recorder.Events, ui.ManagedThreadId);
+        _output.WriteLine(string.Create(
+            CultureInfo.InvariantCulture,
+            $"Completed: {completed.EndReason} ('{completed.EndDetail}'), pending reason {pendingReason}, steps completed "
+            + $"{completed.StepsCompleted}, verified {completed.VerifiedBytes} B, independently counted {independentVerifiedBytes} B; "
+            + $"released {released.ReleasedBytes} B in {released.ReleaseTime.TotalMilliseconds:0} ms"));
+        return new FaultedRun(completed, released, pendingReason, independentVerifiedBytes);
+    }
+
+    // The callback-exception contract every faulted run meets: each throw reached the fault sink under its callback name,
+    // on the thread that caught it, and was logged to app-errors.log; the host-fault stop it requested is the recorded
+    // reason and the end reason; and the run still delivered Completed then Released on the captured context, releasing
+    // the memory it had prepared.
+    private void AssertHostFaultContained(
+        FaultedRun run,
+        EngineRunRecorder recorder,
+        CallbackFaultLog faults,
+        DispatcherThread ui,
+        string callbackName,
+        Exception thrown,
+        bool caughtOnDispatcher)
+    {
+        IReadOnlyList<RecordedCallbackFault> reported = faults.Faults;
+        string logPath = faults.Data.AppErrorsLogPath;
+        string log = File.Exists(logPath) ? File.ReadAllText(logPath) : string.Empty;
+        string sourceLine = $"APP_ERROR source=\"{EngineCallbackSourcePrefix}{callbackName}\"";
+        int logged = log.Split('\n').Count(line => line.Contains(sourceLine, StringComparison.Ordinal));
+        _output.WriteLine(string.Create(
+            CultureInfo.InvariantCulture,
+            $"Faults reported: {reported.Count} [{string.Join(", ", reported.Select(fault => $"{fault.CallbackName} on thread {fault.ThreadId}").Distinct())}], "
+            + $"dispatcher thread {ui.ManagedThreadId}; app-errors.log blocks for {callbackName}: {logged}"));
+
+        Assert.NotEmpty(reported);
+        Assert.All(reported, fault =>
+        {
+            Assert.Equal(callbackName, fault.CallbackName);
+            Assert.Same(thrown, fault.Exception);
+            if (caughtOnDispatcher)
+            {
+                Assert.Equal(ui.ManagedThreadId, fault.ThreadId);
+            }
+            else
+            {
+                Assert.NotEqual(ui.ManagedThreadId, fault.ThreadId);
+            }
+        });
+
+        // Callback faults are logged to <data>\logs\app-errors.log, here under the test's own data folder.
+        Assert.Equal(Path.Combine(faults.Data.RootPath, "logs", "app-errors.log"), logPath, ignoreCase: true);
+        Assert.True(File.Exists(logPath), $"No app-errors.log was written at {logPath}.");
+        Assert.Equal(reported.Count, logged);
+        Assert.Contains(thrown.Message, log, StringComparison.Ordinal);
+
+        Assert.Equal(RunEndReason.HostFault, run.Completed.EndReason);
+        Assert.Equal(SessionProbe.ExpectedPendingReason(StopReason.HostFault), run.PendingReason);
+
+        IReadOnlyList<EngineEventKind> kinds = recorder.EventKinds;
+        Assert.Single(kinds, kind => kind == EngineEventKind.Completed);
+        Assert.Single(kinds, kind => kind == EngineEventKind.Released);
+        Assert.Equal(new[] { EngineEventKind.Completed, EngineEventKind.Released }, kinds.TakeLast(2));
+        Assert.All(recorder.EventThreadIds, threadId => Assert.Equal(ui.ManagedThreadId, threadId));
+        Assert.NotNull(recorder.Prepared);
+        Assert.True(run.Released.ReleasedBytes > 0, $"Released reported {run.Released.ReleasedBytes} bytes after Prepared.");
+    }
+
+    // A run a callback fault stopped, followed through Released, with the native probes read before disposal.
+    private sealed record FaultedRun(
+        EngineCompleted Completed,
+        EngineReleased Released,
+        uint PendingReason,
+        ulong IndependentVerifiedBytes);
+
+    // One fault the session reported to its CallbackFault sink, with the managed thread it was reported on.
+    private sealed record RecordedCallbackFault(string CallbackName, Exception Exception, int ThreadId);
+
+    // The tests' CallbackFault sink. It writes app-errors.log as RunController's sink does, but synchronously, so the log
+    // is complete once the run has ended. A callback's fault is reported on the coordinator and an event subscriber's on
+    // the dispatcher, so recording is thread-safe.
+    private sealed class CallbackFaultLog
+    {
+        private readonly ConcurrentQueue<RecordedCallbackFault> _faults = new();
+
+        public CallbackFaultLog(DataDirectory data) => Data = data;
+
+        public DataDirectory Data { get; }
+
+        public IReadOnlyList<RecordedCallbackFault> Faults => _faults.ToArray();
+
+        // Recorded before the write, so a logging failure cannot hide the fault from the test.
+        public void Record(string callbackName, Exception exception)
+        {
+            _faults.Enqueue(new RecordedCallbackFault(callbackName, exception, Environment.CurrentManagedThreadId));
+            ResultsLog.AppendAppError(Data, EngineCallbackSourcePrefix + callbackName, exception, DateTimeOffset.UtcNow);
+        }
+    }
+
+    [Theory(Timeout = TestTimeoutMs)]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Events_NoSynchronizationContext_RaisedOneAtATimeInEngineOrderAsync(bool stopBeforeStart)
+    {
+        CancellationToken cancellation = TestContext.Current.CancellationToken;
+        NativeEngine engine = TestEngines.Create();
+        SystemSnapshot system = engine.QuerySystem();
+        TestPlan plan = TwoStepPlan();
+        var coordinatorThreads = new ConcurrentQueue<int>();
+        EngineSessionOptions options = CreateOptions(
+            system,
+            plan,
+            gate: (_, _) =>
+            {
+                coordinatorThreads.Enqueue(Environment.CurrentManagedThreadId);
+                return StepGateDecision.Continue;
+            },
+            sink: _ => coordinatorThreads.Enqueue(Environment.CurrentManagedThreadId));
+
+        // No context is current, as on a host thread without a dispatcher, so the session posts to the thread pool,
+        // which on its own runs separate posts in parallel and in no fixed order.
+        IEngineSession session = CreateSessionUnder(context: null, engine, options);
+        try
+        {
+            // The probe brackets every delivery, and holds Prepared and Completed long enough for any later event
+            // delivered independently to overtake them.
+            var probe = new DeliveryProbe(_slowHandlerDelay, EngineEventKind.Prepared, EngineEventKind.Completed);
+            probe.SubscribeFirst(session);
+            EngineRunRecorder recorder = EngineRunRecorder.Attach(session);
+            probe.SubscribeLast(session);
+
+            if (stopBeforeStart)
+            {
+                session.RequestStop(StopReason.User);
+            }
+
+            session.Start();
+            EngineCompleted completed = await recorder.WaitCompletedAsync(_runTimeout, cancellation);
+            await recorder.WaitReleasedAsync(_runTimeout, cancellation);
+
+            IReadOnlyList<ProbedDelivery> deliveries = probe.Deliveries;
+            EngineEventKind[] kinds = recorder.EventKinds.ToArray();
+            int[] coordinator = coordinatorThreads.Distinct().ToArray();
+            _output.WriteLine(string.Create(
+                CultureInfo.InvariantCulture,
+                $"Events: {string.Join(" -> ", kinds.Where(kind => kind != EngineEventKind.ProgressChanged))}; "
+                + $"ProgressChanged x{kinds.Count(kind => kind == EngineEventKind.ProgressChanged)}; "
+                + $"delivery threads [{string.Join(", ", deliveries.Select(delivery => delivery.ThreadId).Distinct())}]; "
+                + $"most concurrent deliveries {probe.MaxConcurrentDeliveries}; coordinator threads [{string.Join(", ", coordinator)}]"));
+
+            // One delivery at a time, each seen whole by every subscriber in turn, none inside an engine callback.
+            Assert.Equal(1, probe.MaxConcurrentDeliveries);
+            Assert.Equal(kinds, deliveries.Select(delivery => delivery.Kind));
+            Assert.All(deliveries, delivery =>
+            {
+                Assert.False(delivery.InEngineCallback, $"{delivery.Kind} was raised inside an engine callback.");
+                Assert.DoesNotContain(delivery.ThreadId, coordinator);
+            });
+
+            if (stopBeforeStart)
+            {
+                Assert.Equal(new[] { EngineEventKind.Completed, EngineEventKind.Released }, kinds);
+                Assert.Equal(RunEndReason.UserStop, completed.EndReason);
+                Assert.Empty(completed.StepResults);
+            }
+            else
+            {
+                EngineEventKind[] lifecycle = kinds
+                    .Where(kind => kind is not (EngineEventKind.ProgressChanged or EngineEventKind.ErrorsDetected))
+                    .ToArray();
+                Assert.Equal(
+                    new[]
+                    {
+                        EngineEventKind.Prepared,
+                        EngineEventKind.StepStarted,
+                        EngineEventKind.StepFinished,
+                        EngineEventKind.StepStarted,
+                        EngineEventKind.StepFinished,
+                        EngineEventKind.Completed,
+                        EngineEventKind.Released,
+                    },
+                    lifecycle);
+                int preparedAt = Array.IndexOf(kinds, EngineEventKind.Prepared);
+                int completedAt = Array.IndexOf(kinds, EngineEventKind.Completed);
+                Assert.All(
+                    Enumerable.Range(0, kinds.Length).Where(i => kinds[i] == EngineEventKind.ProgressChanged),
+                    index => Assert.InRange(index, preparedAt + 1, completedAt - 1));
+
+                Assert.Equal(RunEndReason.Completed, completed.EndReason);
+                Assert.Equal(plan.Steps.Count, completed.StepsCompleted);
+                Assert.Equal(plan.Steps.Count, completed.StepResults.Count);
+
+                // The step outcomes the mapper handed over are the event's own snapshot: read-only, and no array to
+                // cast to.
+                AssertReadOnlySnapshot(completed.StepResults);
+            }
+        }
+        finally
+        {
+            session.Dispose();
+        }
+
+        AssertNoLiveSessions();
+    }
+
+    [Fact(Timeout = TestTimeoutMs)]
+    public async Task Completed_ContextRefusesItsPost_StillRaisedBeforeReleasedAsHostFaultAsync()
+    {
+        CancellationToken cancellation = TestContext.Current.CancellationToken;
+        using var dataRoot = new TempDataRoot();
+        var faults = new CallbackFaultLog(dataRoot.Data);
+        var context = new RefusingSynchronizationContext(refusals: 1);
+        NativeEngine engine = TestEngines.Create();
+        SystemSnapshot system = engine.QuerySystem();
+        IEngineSession session = CreateSessionUnder(context, engine, CreateOptions(system, OneStepPlan(), faultSink: faults.Record));
+        try
+        {
+            EngineRunRecorder recorder = EngineRunRecorder.Attach(session);
+
+            // A stop before start makes the engine raise Completed and then Released, so Completed's post is the first
+            // the context receives, and the one it refuses.
+            session.RequestStop(StopReason.User);
+            session.Start();
+            EngineCompleted completed = await recorder.WaitCompletedAsync(_runTimeout, cancellation);
+            await recorder.WaitReleasedAsync(_runTimeout, cancellation);
+            EngineCompleted engineResult = Assert.IsType<EngineCompleted>(SessionProbe.GetResult(session));
+            uint pendingReason = SessionProbe.GetPendingStopReason(session);
+            _output.WriteLine(string.Create(
+                CultureInfo.InvariantCulture,
+                $"Posts {context.Posts}; Completed {completed.EndReason} ('{completed.EndDetail}'); engine result {engineResult.EndReason} ('{engineResult.EndDetail}')"));
+
+            RecordedCallbackFault fault = Assert.Single(faults.Faults);
+            Assert.Equal("on_completed", fault.CallbackName);
+            Assert.Same(context.Refusal, fault.Exception);
+            Assert.Contains(context.Refusal.Message, File.ReadAllText(faults.Data.AppErrorsLogPath), StringComparison.Ordinal);
+
+            // The refused Completed stayed queued, and Released's post drained it first: one Completed, then Released,
+            // from one further post, never more posts than events.
+            Assert.Equal(new[] { EngineEventKind.Completed, EngineEventKind.Released }, recorder.EventKinds);
+            Assert.Equal(2, context.Posts);
+
+            // The managed outcome is the host fault the callback-exception policy requires. The engine's own
+            // first-writer reason is kept natively and named in the detail, with its diagnostics intact.
+            Assert.Equal(RunEndReason.UserStop, engineResult.EndReason);
+            Assert.Equal(SessionProbe.ExpectedPendingReason(StopReason.User), pendingReason);
+            Assert.Equal(RunEndReason.HostFault, completed.EndReason);
+            Assert.Equal(engineResult.NativeEndDetail, completed.NativeEndDetail);
+            Assert.Equal(engineResult.OsError, completed.OsError);
+            Assert.Equal(engineResult.TotalErrors, completed.TotalErrors);
+            Assert.Equal(engineResult.StepResults, completed.StepResults);
+            Assert.Equal(
+                $"{context.Refusal.Message} The engine ended the run with {RunEndReason.UserStop}: {engineResult.EndDetail}",
+                completed.EndDetail);
+        }
+        finally
+        {
+            session.Dispose();
+        }
+
+        AssertNoLiveSessions();
+    }
+
+    [Theory(Timeout = TestTimeoutMs)]
+    [InlineData(true, (uint)RqRunResult.Size, 0u, "null payload pointer", false)]
+    [InlineData(false, (uint)RqRunResult.Size, 1u, "step_results is null with a nonzero step_result_count", true)]
+    [InlineData(false, 96u, 0u, "struct_size is 96", false)]
+    public async Task Completed_TerminalPayloadRejected_RaisedOnceAsHostFaultFromTrustedHeaderAsync(
+        bool nullResult,
+        uint structSize,
+        uint stepResultCount,
+        string expectedFault,
+        bool headerTrusted)
+    {
+        CancellationToken cancellation = TestContext.Current.CancellationToken;
+        using var dataRoot = new TempDataRoot();
+        var faults = new CallbackFaultLog(dataRoot.Data);
+        NativeEngine engine = TestEngines.Create();
+        SystemSnapshot system = engine.QuerySystem();
+        IEngineSession session = CreateSessionUnder(context: null, engine, CreateOptions(system, OneStepPlan(), faultSink: faults.Record));
+        try
+        {
+            EngineRunRecorder recorder = EngineRunRecorder.Attach(session);
+
+            // Never started, so the engine itself never raises on_completed; the session's thunk receives only this
+            // payload, which the engine would have frozen and raised once.
+            Exception? escaped = Record.Exception(() => RaiseTerminalPayload(session, nullResult, structSize, stepResultCount));
+            EngineCompleted completed = await recorder.WaitCompletedAsync(_runTimeout, cancellation);
+            uint pendingReason = SessionProbe.GetPendingStopReason(session);
+            _output.WriteLine($"Completed {completed.EndReason} ('{completed.EndDetail}')");
+
+            Assert.Null(escaped);
+            RecordedCallbackFault fault = Assert.Single(faults.Faults);
+            Assert.Equal("on_completed", fault.CallbackName);
+            Assert.IsType<InvalidOperationException>(fault.Exception);
+            Assert.Contains(expectedFault, fault.Exception.Message, StringComparison.Ordinal);
+            Assert.Contains(fault.Exception.Message, File.ReadAllText(faults.Data.AppErrorsLogPath), StringComparison.Ordinal);
+            Assert.Equal(SessionProbe.ExpectedPendingReason(StopReason.HostFault), pendingReason);
+
+            Assert.Equal(new[] { EngineEventKind.Completed }, recorder.EventKinds);
+            Assert.Equal(RunEndReason.HostFault, completed.EndReason);
+            Assert.Equal(0, completed.StepsCompleted);
+            Assert.Empty(completed.StepResults);
+            if (headerTrusted)
+            {
+                Assert.Equal(TerminalPayloadErrors, completed.TotalErrors);
+                Assert.Equal(TerminalPayloadVerifiedBytes, completed.VerifiedBytes);
+                Assert.Equal(TimeSpan.FromMilliseconds(TerminalPayloadElapsedMs), completed.Elapsed);
+                Assert.Equal<TimeSpan?>(TimeSpan.FromMilliseconds(TerminalPayloadFirstErrorMs), completed.FirstErrorTime);
+                Assert.Equal(UserStopNativeDetail, completed.NativeEndDetail);
+                Assert.Equal(
+                    $"{fault.Exception.Message} The engine ended the run with {RunEndReason.UserStop}: {UserStopNativeDetail}",
+                    completed.EndDetail);
+            }
+            else
+            {
+                Assert.Equal(0UL, completed.TotalErrors);
+                Assert.Equal(0UL, completed.VerifiedBytes);
+                Assert.Equal(TimeSpan.Zero, completed.Elapsed);
+                Assert.Null(completed.FirstErrorTime);
+                Assert.Null(completed.NativeEndDetail);
+                Assert.Equal($"{fault.Exception.Message} The engine's end reason could not be read.", completed.EndDetail);
+            }
+
+            Assert.Equal(0u, completed.OsError);
+        }
+        finally
+        {
+            session.Dispose();
+        }
+
+        AssertNoLiveSessions();
+    }
+
+    [Theory(Timeout = TestTimeoutMs)]
+    [InlineData(2u, true)]
+    [InlineData(0u, false)]
+    public async Task Errors_NullRecordsPointer_RejectedAsHostFaultUnlessCountIsZeroAsync(uint count, bool rejected)
+    {
+        const ulong TotalErrors = 7;
+        CancellationToken cancellation = TestContext.Current.CancellationToken;
+        using var dataRoot = new TempDataRoot();
+        var faults = new CallbackFaultLog(dataRoot.Data);
+        NativeEngine engine = TestEngines.Create();
+        SystemSnapshot system = engine.QuerySystem();
+        IEngineSession session = CreateSessionUnder(context: null, engine, CreateOptions(system, OneStepPlan(), faultSink: faults.Record));
+        try
+        {
+            EngineRunRecorder recorder = EngineRunRecorder.Attach(session);
+            Exception? escaped = Record.Exception(() => RaiseErrorsWithNullRecords(session, count, TotalErrors));
+            uint pendingReason = SessionProbe.GetPendingStopReason(session);
+
+            // Stopped before start, the run raises Completed and Released after anything the batch queued, so their
+            // arrival shows every delivery of the batch has happened.
+            session.RequestStop(StopReason.User);
+            session.Start();
+            EngineCompleted completed = await recorder.WaitCompletedAsync(_runTimeout, cancellation);
+            await recorder.WaitReleasedAsync(_runTimeout, cancellation);
+            _output.WriteLine($"Events: {string.Join(" -> ", recorder.EventKinds)}; Completed {completed.EndReason}; pending reason after the batch {pendingReason}");
+
+            Assert.Null(escaped);
+            if (rejected)
+            {
+                RecordedCallbackFault fault = Assert.Single(faults.Faults);
+                Assert.Equal("on_errors", fault.CallbackName);
+                Assert.IsType<InvalidOperationException>(fault.Exception);
+                Assert.Contains("null records pointer", fault.Exception.Message, StringComparison.Ordinal);
+                Assert.Contains(string.Create(CultureInfo.InvariantCulture, $"count of {count}"), fault.Exception.Message, StringComparison.Ordinal);
+                Assert.Equal(SessionProbe.ExpectedPendingReason(StopReason.HostFault), pendingReason);
+                Assert.Empty(recorder.ErrorBatches);
+                Assert.Equal(new[] { EngineEventKind.Completed, EngineEventKind.Released }, recorder.EventKinds);
+                Assert.Equal(RunEndReason.HostFault, completed.EndReason);
+            }
+            else
+            {
+                Assert.Empty(faults.Faults);
+                Assert.Equal(SessionProbe.NoPendingReason, pendingReason);
+                EngineErrorsDetected batch = Assert.Single(recorder.ErrorBatches);
+                Assert.Empty(batch.Records);
+                Assert.Equal(TotalErrors, batch.TotalErrors);
+                Assert.Equal(
+                    new[] { EngineEventKind.ErrorsDetected, EngineEventKind.Completed, EngineEventKind.Released },
+                    recorder.EventKinds);
+                Assert.Equal(RunEndReason.UserStop, completed.EndReason);
+            }
+        }
+        finally
+        {
+            session.Dispose();
+        }
+
+        AssertNoLiveSessions();
+    }
+
+    [Fact]
+    public unsafe void EventLists_MappedFromPayload_BecomeTheEventSnapshotWhileCallerListsAreCopied()
+    {
+        IReadOnlyList<StepAttributes> steps = ScaledPlans.Attributes(TwoStepPlan());
+        RqErrorRecord[] nativeRecords = { ConfirmedError(sequence: 0, stepIndex: 0), ConfirmedError(sequence: 1, stepIndex: 1) };
+
+        // The mapper's own array becomes the batch's snapshot rather than being copied a second time.
+        IReadOnlyList<ErrorRecord> mapped = EngineEventMapper.ToErrorRecords(nativeRecords, steps, detailCap: nativeRecords.Length);
+        var batch = new EngineErrorsDetected(mapped, TotalErrors: 2);
+        Assert.Same(mapped, batch.Records);
+        AssertReadOnlySnapshot(batch.Records);
+
+        // A list a caller still holds writable is copied, even when it arrives read-only, so a later write never
+        // reaches the event.
+        var callerList = new List<ErrorRecord>(mapped);
+        var callerBatch = new EngineErrorsDetected(callerList.AsReadOnly(), TotalErrors: 2);
+        callerList[0] = callerList[1];
+        Assert.Same(mapped[0], callerBatch.Records[0]);
+        AssertReadOnlySnapshot(callerBatch.Records);
+
+        // The run result's step outcomes are the record's own snapshot as well: another record built from them shares
+        // them instead of copying, because nothing can write them.
+        var nativeSteps = new RqStepResult[]
+        {
+            new() { Index = 0, Completed = 1, Passes = 1, ActualMs = 10, VerifiedBytes = 1UL << 20 },
+            new() { Index = 1, Completed = 1, Passes = 1, ActualMs = 10, VerifiedBytes = 1UL << 20 },
+        };
+        EngineCompleted completed;
+        fixed (RqStepResult* stepResults = nativeSteps)
+        {
+            RqRunResult result = default;
+            result.StructSize = RqRunResult.Size;
+            result.EndReason = NativeConstants.EndCompleted;
+            result.StepsCompleted = (uint)nativeSteps.Length;
+            result.StepResultCount = (uint)nativeSteps.Length;
+            result.FirstErrorMs = NativeConstants.NoFirstError;
+            result.StepResults = stepResults;
+            completed = EngineEventMapper.ToCompleted(in result, steps);
+        }
+
+        Assert.Equal(new[] { 0, 1 }, completed.StepResults.Select(outcome => outcome.Attributes.Index));
+        AssertReadOnlySnapshot(completed.StepResults);
+        Assert.Same(completed.StepResults, (completed with { StepResults = completed.StepResults }).StepResults);
+        StepOutcome[] callerOutcomes = completed.StepResults.ToArray();
+        Assert.NotSame(callerOutcomes, (completed with { StepResults = callerOutcomes }).StepResults);
+    }
+
+    // Creates the session with context current on this thread, which is what CreateSession captures, and restores the
+    // thread's own context before the test awaits anything.
+    private static IEngineSession CreateSessionUnder(SynchronizationContext? context, NativeEngine engine, EngineSessionOptions options)
+    {
+        SynchronizationContext? previous = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(context);
+        try
+        {
+            return engine.CreateSession(options);
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previous);
+        }
+    }
+
+    // Raises on_completed on the session's thunk with a user-stop payload whose step results the ABI forbids or whose
+    // struct_size is foreign, or with a null pointer.
+    private static unsafe void RaiseTerminalPayload(IEngineSession session, bool nullResult, uint structSize, uint stepResultCount)
+    {
+        if (nullResult)
+        {
+            SessionProbe.RaiseCompleted(session, null);
+            return;
+        }
+
+        RqRunResult result = default;
+        result.StructSize = structSize;
+        result.EndReason = NativeConstants.EndUserStop;
+        result.StepsCompleted = 0;
+        result.StepResultCount = stepResultCount;
+        result.TotalErrors = TerminalPayloadErrors;
+        result.VerifiedBytes = TerminalPayloadVerifiedBytes;
+        result.ElapsedMs = TerminalPayloadElapsedMs;
+        result.FirstErrorMs = TerminalPayloadFirstErrorMs;
+        result.StepResults = null;
+        result.OsError = 0;
+        _ = FixedUtf8.Write(UserStopNativeDetail, result.EndDetail, NativeConstants.EndDetailSize);
+        SessionProbe.RaiseCompleted(session, &result);
+    }
+
+    private static unsafe void RaiseErrorsWithNullRecords(IEngineSession session, uint count, ulong totalErrors) =>
+        SessionProbe.RaiseErrors(session, null, count, totalErrors);
+
+    // A record the mapper accepts: a single flipped bit, verified after write, whose re-read matched the expected value.
+    private static RqErrorRecord ConfirmedError(ulong sequence, uint stepIndex)
+    {
+        const ulong Expected = 0x5555_5555_5555_5555UL;
+        const ulong Actual = Expected ^ 0x10UL;
+        return new RqErrorRecord
+        {
+            Sequence = sequence,
+            Address = 0x1000 + (sequence * 8),
+            RegionOffset = sequence * 8,
+            Expected = Expected,
+            Actual = Actual,
+            Reread = Expected,
+            BitMask = Expected ^ Actual,
+            StepIndex = stepIndex,
+            AccessType = (uint)AccessType.VerifyAfterWrite,
+            RereadOutcome = (uint)RereadOutcome.RereadMatchesExpected,
+            AddressKind = NativeConstants.AddressKindVirtual,
+            ActiveWorkers = 1,
+        };
+    }
+
+    // An event collection must be read-only through every interface it implements and must not be an array a
+    // subscriber could cast to and write.
+    private static void AssertReadOnlySnapshot<T>(IReadOnlyList<T> list)
+        where T : class
+    {
+        Assert.False(list is T[], $"The event list is a writable {typeof(T).Name}[].");
+        IList<T> asList = Assert.IsAssignableFrom<IList<T>>(list);
+        Assert.True(asList.IsReadOnly, "The event list reports itself writable.");
+        Assert.Throws<NotSupportedException>(() => asList[0] = asList[asList.Count - 1]);
+    }
+
+    // One delivery as the first subscriber saw it: the event, its thread, and whether it ran inside an engine callback.
+    private sealed record ProbedDelivery(EngineEventKind Kind, int ThreadId, bool InEngineCallback);
+
+    // Brackets every delivery of a session, from its first subscriber to its last, to count overlapping deliveries and
+    // record where each ran. Deliveries of the slow kinds are held at entry, so that any event delivered independently
+    // of them would overtake them.
+    private sealed class DeliveryProbe
+    {
+        private readonly TimeSpan _delay;
+        private readonly EngineEventKind[] _slowKinds;
+        private readonly ConcurrentQueue<ProbedDelivery> _deliveries = new();
+        private int _active;
+        private int _maxActive;
+
+        public DeliveryProbe(TimeSpan delay, params EngineEventKind[] slowKinds)
+        {
+            _delay = delay;
+            _slowKinds = slowKinds;
+        }
+
+        public int MaxConcurrentDeliveries => Volatile.Read(ref _maxActive);
+
+        public IReadOnlyList<ProbedDelivery> Deliveries => _deliveries.ToArray();
+
+        // Subscribed before every other handler of the session.
+        public void SubscribeFirst(IEngineSession session) => SubscribeAll(session, Enter);
+
+        // Subscribed after every other handler of the session.
+        public void SubscribeLast(IEngineSession session) => SubscribeAll(session, _ => Interlocked.Decrement(ref _active));
+
+        private static void SubscribeAll(IEngineSession session, Action<EngineEventKind> handler)
+        {
+            session.Prepared += (_, _) => handler(EngineEventKind.Prepared);
+            session.StepStarted += (_, _) => handler(EngineEventKind.StepStarted);
+            session.StepFinished += (_, _) => handler(EngineEventKind.StepFinished);
+            session.ProgressChanged += (_, _) => handler(EngineEventKind.ProgressChanged);
+            session.ErrorsDetected += (_, _) => handler(EngineEventKind.ErrorsDetected);
+            session.Completed += (_, _) => handler(EngineEventKind.Completed);
+            session.Released += (_, _) => handler(EngineEventKind.Released);
+        }
+
+        private void Enter(EngineEventKind kind)
+        {
+            int active = Interlocked.Increment(ref _active);
+            int observed = Volatile.Read(ref _maxActive);
+            while (active > observed)
+            {
+                int previous = Interlocked.CompareExchange(ref _maxActive, active, observed);
+                if (previous == observed)
+                {
+                    break;
+                }
+
+                observed = previous;
+            }
+
+            _deliveries.Enqueue(new ProbedDelivery(kind, Environment.CurrentManagedThreadId, CallbackThunks.IsInCallback));
+            if (Array.IndexOf(_slowKinds, kind) >= 0)
+            {
+                Thread.Sleep(_delay);
+            }
+        }
+    }
+
+    // A context that refuses its first posts, as a context that has shut down does, and runs every later post on the
+    // thread pool. It counts the posts it receives.
+    private sealed class RefusingSynchronizationContext : SynchronizationContext
+    {
+        private int _refusalsLeft;
+        private int _posts;
+
+        public RefusingSynchronizationContext(int refusals)
+        {
+            _refusalsLeft = refusals;
+            Refusal = new InvalidOperationException("Injected refusal of SynchronizationContext.Post " + Guid.NewGuid().ToString("N"));
+        }
+
+        // The exception every refused post throws.
+        public InvalidOperationException Refusal { get; }
+
+        public int Posts => Volatile.Read(ref _posts);
+
+        public override void Post(SendOrPostCallback d, object? state)
+        {
+            Interlocked.Increment(ref _posts);
+            if (Interlocked.Decrement(ref _refusalsLeft) >= 0)
+            {
+                throw Refusal;
+            }
+
+            base.Post(d, state);
+        }
+
+        public override SynchronizationContext CreateCopy() => this;
     }
 
     [Fact(Timeout = TestTimeoutMs)]

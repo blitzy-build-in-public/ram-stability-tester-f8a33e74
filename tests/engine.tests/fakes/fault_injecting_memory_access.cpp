@@ -7,10 +7,11 @@
  * ramquick_engine.dll, and never at a higher /arch level, so the STL is free to use here.
  *
  * @par Injection points
- * Every corruption is stored inside verify or verify_and_stream, immediately before the call is
- * forwarded. The step runner issues those calls after the range's last write and after its
- * fence, flush and fence, so that one point is each injection point of the verification plan:
- * - after a window's streamed write and fence (windowed steps);
+ * Every corruption is stored inside verify, verify_strided or verify_and_stream, immediately
+ * before the call is forwarded; a verify_strided call stores only on the lines it visits. The
+ * step runner issues those calls after the range's last write and after its fence, flush and
+ * fence, so that one point is each injection point of the verification plan:
+ * - after a window's streamed write and fence (windowed steps, BankStride included);
  * - after the slice write and the hold (hold steps);
  * - between a moving-inversion sweep's write and the next sweep's verification;
  * - after a turnaround block's write, before its own verification;
@@ -30,6 +31,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <new>
@@ -124,6 +126,31 @@ std::uint64_t claim_against_cap(std::atomic<std::uint64_t>& reserved, std::uint6
     return granted;
 }
 
+/**
+ * Whether a strided call visits the line holding span-relative byte offset `offset`; always true
+ * for a plain range (null visits), which verifies every word it covers.
+ *
+ * Visit k's line lies at (k / L) x 64 + (k % L) x s, so a line at offset o with o / s < L is
+ * visit ((o % s) / 64) x L + o / s; the preconditions in core/kernels/kernels.h make that the
+ * only visit that can name it. The call visits it when that k lies in
+ * [first_visit, first_visit + visit_count).
+ */
+bool on_visited_line(const strided_visits* visits, std::uint64_t offset) noexcept {
+    if (visits == nullptr) {
+        return true;
+    }
+    if (visits->visit_count == 0 || visits->stride_bytes == 0 || visits->lines_per_sweep == 0) {
+        return false;
+    }
+    const std::uint64_t line_in_sweep = offset / visits->stride_bytes;
+    if (line_in_sweep >= visits->lines_per_sweep) {
+        return false;
+    }
+    const std::uint64_t sweep = offset % visits->stride_bytes / k_cache_line_bytes;
+    const std::uint64_t visit = sweep * visits->lines_per_sweep + line_in_sweep;
+    return visit >= visits->first_visit && visit - visits->first_visit < visits->visit_count;
+}
+
 }  // namespace
 
 struct fault_injecting_memory_access::impl {
@@ -153,14 +180,36 @@ struct fault_injecting_memory_access::impl {
 
     /**
      * A worker's most recent target set, one cache line per worker so that workers looking up
-     * their own sets never share a line. The padding is explicit, so the alignment adds none
-     * and the type needs no padding warning suppressed.
+     * their own sets never share a line, and a repeat lookup touches no reference count that
+     * other workers also change. The slot's reference keeps its set alive after the table has
+     * reclaimed it, until this worker looks up another (step, pass). The padding is explicit,
+     * so the alignment adds none and the type needs no padding warning suppressed.
      */
     struct alignas(k_cache_line_bytes) worker_slot {
-        std::atomic<const target_set*> set{nullptr};
-        unsigned char padding[k_cache_line_bytes - sizeof(std::atomic<const target_set*>)];
+        /** Read and replaced only by the call holding `leased`, so no use of it races. */
+        std::shared_ptr<const target_set> set;
+        /**
+         * Taken without waiting by the call that uses `set`. Each worker index belongs to one
+         * worker thread, so the engine always finds it free; a concurrent caller reusing an
+         * index finds it taken and holds its own reference for the call instead.
+         */
+        std::atomic<bool> leased{false};
+        unsigned char padding[k_cache_line_bytes - sizeof(std::shared_ptr<const target_set>) -
+                              sizeof(std::atomic<bool>)];
     };
     static_assert(sizeof(worker_slot) == k_cache_line_bytes, "one cache line per worker slot");
+
+    /** A slot's lease for one lookup, returned on every exit, a throw included. */
+    class slot_lease {
+    public:
+        explicit slot_lease(worker_slot& slot) noexcept : slot_(slot) {}
+        ~slot_lease() { slot_.leased.store(false, std::memory_order_release); }
+        slot_lease(const slot_lease&) = delete;
+        slot_lease& operator=(const slot_lease&) = delete;
+
+    private:
+        worker_slot& slot_;
+    };
 
     explicit impl(const rq_fault_spec& spec)
         : kind(spec.kind), seed(spec.seed), max_injections(spec.max_injections),
@@ -198,7 +247,8 @@ struct fault_injecting_memory_access::impl {
 
     /**
      * Derives the targets of one (step, pass) from the seed alone, so the same seed always
-     * selects the same words, on every run and whichever worker asks first.
+     * selects the same words, on every run and whichever worker asks first, and a set rebuilt
+     * after its reclamation equals the original.
      *
      * Offsets are logical region offsets (address - access_context::region_base), so they do
      * not depend on where Windows placed each chunk. Targets at or beyond the bytes the engine
@@ -206,8 +256,8 @@ struct fault_injecting_memory_access::impl {
      *
      * @throws std::bad_alloc when the set cannot be allocated.
      */
-    std::unique_ptr<const target_set> build_set(std::uint64_t key) const {
-        auto set = std::make_unique<target_set>();
+    std::shared_ptr<const target_set> build_set(std::uint64_t key) const {
+        auto set = std::make_shared<target_set>();
         set->key = key;
         set->targets.reserve(static_cast<std::size_t>(targets_per_pass));
         const std::uint64_t key_hash = mix(key);
@@ -234,59 +284,97 @@ struct fault_injecting_memory_access::impl {
     }
 
     /**
-     * The target set of key, built on first use. A worker's slot answers repeat lookups for the
-     * (step, pass) it is in without a lock; otherwise a shared lookup finds a set another worker
-     * built, and only a miss takes the exclusive lock, rechecks and builds. Sets are never freed
-     * before the layer, so the pointers the slots hold stay valid.
+     * The target set of key from the shared table, built on a miss: a shared lookup finds a
+     * set another worker built, and only a miss takes the exclusive lock, rechecks and builds.
      *
-     * @throws std::bad_alloc when the set or its map node cannot be allocated.
+     * Building reclaims every table entry except the new set and the newest key's. The engine
+     * issues (step, pass) keys in ascending order, every verification of a pass ending at a
+     * phase barrier before the next pass's begin, so the table then holds one generation; a
+     * caller going back to an older key makes it hold two at most. Safety rests on ownership
+     * alone, never on that order: a worker slot or a call still holding a reclaimed set keeps
+     * it alive, and a reclaimed key asked for again is rebuilt identically (build_set).
+     *
+     * @throws std::bad_alloc when the set or its table node cannot be allocated; the table is
+     *         then unchanged.
      */
-    const target_set& find_set(std::uint32_t worker_index, std::uint64_t key) {
-        worker_slot* const slot = worker_index < k_worker_slots ? &slots[worker_index] : nullptr;
-        if (slot != nullptr) {
-            const target_set* const cached = slot->set.load(std::memory_order_acquire);
-            if (cached != nullptr && cached->key == key) {
-                return *cached;
-            }
-        }
-        const target_set* found = nullptr;
+    std::shared_ptr<const target_set> shared_set(std::uint64_t key) {
         {
             const std::shared_lock<std::shared_mutex> lock(sets_mutex);
             const auto it = sets.find(key);
             if (it != sets.end()) {
-                found = it->second.get();
+                return it->second;
             }
         }
-        if (found == nullptr) {
-            const std::unique_lock<std::shared_mutex> lock(sets_mutex);
-            auto it = sets.find(key);
-            if (it == sets.end()) {
-                it = sets.emplace(key, build_set(key)).first;
+        const std::unique_lock<std::shared_mutex> lock(sets_mutex);
+        auto it = sets.find(key);
+        if (it == sets.end()) {
+            it = sets.emplace(key, build_set(key)).first;
+            built_sets.fetch_add(1, std::memory_order_relaxed);
+            const auto newest = std::prev(sets.end());
+            for (auto other = sets.begin(); other != sets.end();) {
+                other = other == it || other == newest ? std::next(other) : sets.erase(other);
             }
-            found = it->second.get();
+            retained_sets.store(sets.size(), std::memory_order_relaxed);
         }
-        if (slot != nullptr) {
-            slot->set.store(found, std::memory_order_release);
+        return it->second;
+    }
+
+    /**
+     * Appends to `out` the candidates of every target of `set` inside [range_off, range_end)
+     * and, for a strided call, on a line its visits name, in ascending offset order. Allocates
+     * only when at least one target is kept, or for a plain range falls in it.
+     *
+     * @throws std::bad_alloc when `out` cannot be allocated.
+     */
+    static void collect_targets(const target_set& set, const std::uint64_t* words,
+                                std::uint64_t range_off, std::uint64_t range_end,
+                                const pattern_spec& expected, std::uint64_t first_word_index,
+                                const strided_visits* visits, std::vector<candidate>& out) {
+        const auto by_offset = [](const target& t, std::uint64_t offset) {
+            return t.offset < offset;
+        };
+        const auto first =
+            std::lower_bound(set.targets.begin(), set.targets.end(), range_off, by_offset);
+        const auto last = std::lower_bound(first, set.targets.end(), range_end, by_offset);
+        if (first == last) {
+            return;
         }
-        return *found;
+        if (visits == nullptr) {
+            // A strided call keeps only the targets on its own lines, so it grows `out` per
+            // target instead of reserving for the whole span.
+            out.reserve(static_cast<std::size_t>(last - first));
+        }
+        for (auto it = first; it != last; ++it) {
+            if (!on_visited_line(visits, it->offset - range_off)) {
+                continue;
+            }
+            const std::uint64_t j = (it->offset - range_off) / detail::k_word_bytes;
+            const std::uint64_t e = expected_value(expected, first_word_index + j);
+            out.push_back(
+                candidate{words + j, it->offset, e ^ (std::uint64_t{1} << it->bit), it->bit});
+        }
     }
 
     /**
      * Appends to `out` every word of the range that this call should corrupt, in ascending
-     * offset order. Allocates only when at least one target falls in the range.
+     * offset order: for a strided call (non-null visits) only the words on the lines it visits.
+     * Allocates only to build a (step, pass)'s target set that the table does not hold, and when
+     * at least one target falls in the range.
      *
      * @throws std::bad_alloc when a target set or `out` cannot be allocated.
      */
     void collect(const access_context& ctx, const std::uint64_t* words, std::uint64_t range_off,
                  std::uint64_t range_end, const pattern_spec& expected,
-                 std::uint64_t first_word_index, std::vector<candidate>& out) {
+                 std::uint64_t first_word_index, const strided_visits* visits,
+                 std::vector<candidate>& out) {
         if (range_end <= range_off) {
             // Only a range whose logical offset wraps 2^64 gets here, which a consistent
             // region_base never produces; it holds no target.
             return;
         }
         if (kind == RQ_FAULT_STUCK_BIT) {
-            if (stuck_offset < range_off || stuck_offset >= range_end) {
+            if (stuck_offset < range_off || stuck_offset >= range_end ||
+                !on_visited_line(visits, stuck_offset - range_off)) {
                 return;
             }
             const std::uint64_t j = (stuck_offset - range_off) / detail::k_word_bytes;
@@ -300,23 +388,25 @@ struct fault_injecting_memory_access::impl {
                 candidate{words + j, stuck_offset, e ^ (std::uint64_t{1} << stuck_bit), stuck_bit});
             return;
         }
-        const target_set& set = find_set(ctx.worker_index, set_key(ctx.step_index, ctx.pass_index));
-        const auto by_offset = [](const target& t, std::uint64_t offset) {
-            return t.offset < offset;
-        };
-        const auto first =
-            std::lower_bound(set.targets.begin(), set.targets.end(), range_off, by_offset);
-        const auto last = std::lower_bound(first, set.targets.end(), range_end, by_offset);
-        if (first == last) {
+        const std::uint64_t key = set_key(ctx.step_index, ctx.pass_index);
+        worker_slot* const slot =
+            ctx.worker_index < k_worker_slots ? &slots[ctx.worker_index] : nullptr;
+        if (slot != nullptr && !slot->leased.exchange(true, std::memory_order_acquire)) {
+            // A repeat lookup for the (step, pass) this worker is in takes no lock and leaves
+            // the shared reference count alone; only the worker's first call in a new pass
+            // reaches the table. The lease ends here, before the call is forwarded.
+            const slot_lease lease(*slot);
+            if (slot->set == nullptr || slot->set->key != key) {
+                slot->set = shared_set(key);
+            }
+            collect_targets(*slot->set, words, range_off, range_end, expected, first_word_index,
+                            visits, out);
             return;
         }
-        out.reserve(static_cast<std::size_t>(last - first));
-        for (auto it = first; it != last; ++it) {
-            const std::uint64_t j = (it->offset - range_off) / detail::k_word_bytes;
-            const std::uint64_t e = expected_value(expected, first_word_index + j);
-            out.push_back(
-                candidate{words + j, it->offset, e ^ (std::uint64_t{1} << it->bit), it->bit});
-        }
+        // Workers beyond the slots, and a concurrent caller reusing a leased worker index, hold
+        // their own reference for the call, so a reclamation cannot free the set under them.
+        const std::shared_ptr<const target_set> set = shared_set(key);
+        collect_targets(*set, words, range_off, range_end, expected, first_word_index, visits, out);
     }
 
     /**
@@ -374,14 +464,20 @@ struct fault_injecting_memory_access::impl {
     }
 
     /**
-     * The shared body of verify and verify_and_stream: stores this call's corruptions, forwards
-     * the call through `forward` with no lock held, then marks the corruptions verified.
+     * The shared body of verify, verify_strided and verify_and_stream: stores this call's
+     * corruptions, forwards the call through `forward` with no lock held, then marks the
+     * corruptions verified.
      *
      * `expected` is the pattern the range should hold when the forwarded call loads it, which
      * for a moving-inversion sweep is the sweep's expected spec, never its next one: in the
      * descending sweep that is the complement the ascending sweep streamed. Each sweep verifies
      * a word once, so a target can be injected, and logged, once per sweep, and each injection
      * yields one error record.
+     *
+     * For verify_strided, [words, words + word_count) is the span and `visits` the call's
+     * visits: only targets on visited lines are injected, because the window's other strided
+     * calls verify, and inject, the rest of the span. Null for the plain ranges, all of whose
+     * words the call verifies.
      *
      * The forwarded call is outside every try block, so an exception from the inner layer
      * propagates unchanged and is never mistaken for this layer's own allocation failure.
@@ -390,10 +486,20 @@ struct fault_injecting_memory_access::impl {
     std::uint64_t inject_then_forward(fault_injecting_memory_access& layer,
                                       const access_context& ctx, const std::uint64_t* words,
                                       std::size_t word_count, const pattern_spec& expected,
-                                      std::uint64_t first_word_index, Forward&& forward) {
+                                      std::uint64_t first_word_index, const strided_visits* visits,
+                                      Forward&& forward) {
         // Kind RQ_FAULT_NONE, every test session's default, stays a pure pass-through: no
-        // clock read, no lock, no store and no log entry.
-        if (!enabled || word_count == 0) {
+        // clock read, no lock, no store and no log entry. So does a call that verifies nothing.
+        if (!enabled || word_count == 0 || (visits != nullptr && visits->visit_count == 0)) {
+            return forward();
+        }
+        // Once the run-wide cap is spent no candidate can be claimed, so the call forwards at
+        // once: no clock read, no target lookup, no allocation, and no set built for a
+        // (step, pass) that could inject nothing. The load is only a snapshot, because
+        // log_candidates hands back a claim it could not log, so claim_against_cap stays the
+        // cap's one authority. Entries that calls still in flight logged are theirs to mark
+        // verified; this call returns before it could touch any.
+        if (layer.reserved_.load(std::memory_order_relaxed) >= max_injections) {
             return forward();
         }
         const std::uint64_t range_off = reinterpret_cast<std::uintptr_t>(words) - ctx.region_base;
@@ -416,7 +522,8 @@ struct fault_injecting_memory_access::impl {
         std::size_t first_entry = 0;
         std::size_t injected = 0;
         try {
-            collect(ctx, words, range_off, range_end, expected, first_word_index, candidates);
+            collect(ctx, words, range_off, range_end, expected, first_word_index, visits,
+                    candidates);
             if (!candidates.empty()) {
                 injected = log_candidates(layer, ctx, candidates, &first_entry);
             }
@@ -471,10 +578,17 @@ struct fault_injecting_memory_access::impl {
     /** Every logged injection, in logging order. */
     std::vector<rq_injected_fault> log;
 
-    /** Guards sets: shared for lookups, exclusive to build a missing set. */
+    /** Guards sets: shared for lookups, exclusive to build a missing set and reclaim others. */
     std::shared_mutex sets_mutex;
-    /** Target sets by (step, pass) key, kept for the layer's lifetime. */
-    std::map<std::uint64_t, std::unique_ptr<const target_set>> sets;
+    /**
+     * Target sets by (step, pass) key: the newest key's and the one built last, so one or two
+     * (see shared_set). Each entry shares ownership with the worker slots that cache it.
+     */
+    std::map<std::uint64_t, std::shared_ptr<const target_set>> sets;
+    /** sets.size(), stored under the exclusive lock so that the observer reads it lock-free. */
+    std::atomic<std::uint64_t> retained_sets{0};
+    /** Target sets built since construction, a rebuild of a reclaimed key included. */
+    std::atomic<std::uint64_t> built_sets{0};
     /** Per-worker cache of the last set looked up, indexed by access_context::worker_index. */
     std::array<worker_slot, k_worker_slots> slots{};
 };
@@ -509,7 +623,7 @@ std::uint64_t fault_injecting_memory_access::verify(const access_context& ctx,
                                                     std::uint64_t first_word_index, int direction,
                                                     mismatch_sink& sink) {
     return impl_->inject_then_forward(*this, ctx, words, word_count, expected, first_word_index,
-                                      [&] {
+                                      nullptr, [&] {
                                           return inner_->verify(ctx, words, word_count, expected,
                                                                 first_word_index, direction, sink);
                                       });
@@ -520,9 +634,26 @@ std::uint64_t fault_injecting_memory_access::verify_and_stream(
     const pattern_spec& expected, const pattern_spec& next, std::uint64_t first_word_index,
     int direction, mismatch_sink& sink) {
     return impl_->inject_then_forward(
-        *this, ctx, words, word_count, expected, first_word_index, [&] {
+        *this, ctx, words, word_count, expected, first_word_index, nullptr, [&] {
             return inner_->verify_and_stream(ctx, words, word_count, expected, next,
                                              first_word_index, direction, sink);
+        });
+}
+
+void fault_injecting_memory_access::stream_fill_strided(
+    const access_context& ctx, std::uint64_t* span, std::size_t span_word_count,
+    const strided_visits& visits, const pattern_spec& spec, std::uint64_t span_first_word_index) {
+    inner_->stream_fill_strided(ctx, span, span_word_count, visits, spec, span_first_word_index);
+}
+
+std::uint64_t fault_injecting_memory_access::verify_strided(
+    const access_context& ctx, const std::uint64_t* span, std::size_t span_word_count,
+    const strided_visits& visits, const pattern_spec& expected, std::uint64_t span_first_word_index,
+    mismatch_sink& sink) {
+    return impl_->inject_then_forward(
+        *this, ctx, span, span_word_count, expected, span_first_word_index, &visits, [&] {
+            return inner_->verify_strided(ctx, span, span_word_count, visits, expected,
+                                          span_first_word_index, sink);
         });
 }
 
@@ -554,6 +685,14 @@ std::uint64_t fault_injecting_memory_access::injection_count() const noexcept {
 
 std::uint64_t fault_injecting_memory_access::verified_opportunity_count() const noexcept {
     return verified_.load(std::memory_order_acquire);
+}
+
+std::uint64_t fault_injecting_memory_access::retained_target_set_count() const noexcept {
+    return impl_->retained_sets.load(std::memory_order_relaxed);
+}
+
+std::uint64_t fault_injecting_memory_access::built_target_set_count() const noexcept {
+    return impl_->built_sets.load(std::memory_order_relaxed);
 }
 
 }  // namespace rq::engine::test

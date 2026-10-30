@@ -260,6 +260,51 @@ TEST_P(PatternsEveryKind, ComplementFlagInvertsEveryBit) {
     }
 }
 
+TEST_P(PatternsEveryKind, SeekRepositionsLikeAFreshConstruction) {
+    // A cursor seeked away from wherever it stands, after some advances, must then follow the
+    // reference exactly as a cursor constructed at the target: odd and even targets, backwards
+    // and forwards, the top of the index range, and a return to its own construction word.
+    constexpr std::uint64_t built_at = 4096ULL + 7ULL;
+    constexpr std::uint64_t targets[] = {0ULL,          1ULL,    8192ULL, (1ULL << 37U) + 3ULL,
+                                         ~0ULL - 63ULL, built_at};
+    constexpr std::uint64_t sweep_words = 64;
+    const std::uint32_t kind = GetParam();
+    for (const std::uint64_t seed : k_seeds) {
+        for (const std::uint32_t pass : k_passes) {
+            for (const bool complement : {false, true}) {
+                const pattern_spec spec = make_spec(kind, seed, pass, complement);
+                for (const int direction : {1, -1}) {
+                    const std::uint64_t word_step = direction < 0 ? ~0ULL : 1ULL;
+                    pattern_cursor<isa_scalar> cursor(spec, built_at, direction);
+                    for (const std::uint64_t target : targets) {
+                        // Three advances first, so seek must also undo the alternating
+                        // parity swap and the counter steps.
+                        for (int step = 0; step < 3; ++step) {
+                            cursor.advance();
+                        }
+                        cursor.seek(target);
+                        pattern_cursor<isa_scalar> fresh(spec, target, direction);
+                        std::uint64_t word = target;
+                        for (std::uint64_t step = 0; step < sweep_words; ++step) {
+                            const std::uint64_t expected = expected_value(spec, word);
+                            ASSERT_EQ(cursor.word_index(), word)
+                                << where(spec, word) << ", direction " << direction << ", step "
+                                << step << " after seek(" << target << ")";
+                            ASSERT_EQ(cursor.current(), expected)
+                                << where(spec, word) << ", direction " << direction << ", step "
+                                << step << " after seek(" << target << ")";
+                            ASSERT_EQ(fresh.current(), expected) << where(spec, word);
+                            cursor.advance();
+                            fresh.advance();
+                            word += word_step;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // gtest names an instantiated suite "<prefix>/<suite>", so the prefix keeps the Patterns* filter
 // selecting these tests.
 INSTANTIATE_TEST_SUITE_P(PatternsAllKinds, PatternsEveryKind, ::testing::ValuesIn(k_all_kinds),

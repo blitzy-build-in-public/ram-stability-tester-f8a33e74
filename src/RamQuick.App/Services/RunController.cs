@@ -1267,8 +1267,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
         long startedAt = Stopwatch.GetTimestamp();
         try
         {
-            // Without a captured context the session delivers its events on the thread pool, in no order a barrier
-            // could queue behind.
+            // Without a captured context the session delivers its events in order through drain work items of its own
+            // on the thread pool. A barrier posted there would run beside them rather than queue behind them, so its
+            // completion could not show that the earlier events' handlers have run.
             if (eventContext is not null)
             {
                 switch (WaitForEarlierEvents(eventContext, stopEvent, ProgressJournal.AcknowledgmentTimeout))

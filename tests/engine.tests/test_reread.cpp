@@ -166,6 +166,10 @@ const char* primitive_name(primitive_kind kind) noexcept {
         return "verify_and_stream";
     case primitive_kind::reread_word:
         return "reread_word";
+    case primitive_kind::stream_fill_strided:
+        return "stream_fill_strided";
+    case primitive_kind::verify_strided:
+        return "verify_strided";
     }
     return "invalid primitive";
 }
@@ -287,6 +291,22 @@ public:
                                     int direction, mismatch_sink& sink) override {
         return inner_->verify_and_stream(ctx, words, word_count, expected, next, first_word_index,
                                          direction, sink);
+    }
+
+    void stream_fill_strided(const access_context& ctx, std::uint64_t* span,
+                             std::size_t span_word_count, const strided_visits& visits,
+                             const pattern_spec& spec,
+                             std::uint64_t span_first_word_index) override {
+        inner_->stream_fill_strided(ctx, span, span_word_count, visits, spec,
+                                    span_first_word_index);
+    }
+
+    std::uint64_t verify_strided(const access_context& ctx, const std::uint64_t* span,
+                                 std::size_t span_word_count, const strided_visits& visits,
+                                 const pattern_spec& expected, std::uint64_t span_first_word_index,
+                                 mismatch_sink& sink) override {
+        return inner_->verify_strided(ctx, span, span_word_count, visits, expected,
+                                      span_first_word_index, sink);
     }
 
     std::uint64_t reread_word(const access_context& ctx,

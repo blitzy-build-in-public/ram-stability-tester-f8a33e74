@@ -413,8 +413,10 @@ vec_t<Isa> walking_bits(std::uint64_t w) noexcept {
  * one block down for a descending sweep, which starts at the highest block.
  *
  * Each step is incremental: the random counters advance by one vector add, and the alternating
- * patterns keep their precomputed blocks. A kernel that needs single words, for an unaligned
- * edge or to re-check a mismatching block word by word, calls pattern_word with its own tag or
+ * patterns keep their precomputed blocks. seek() jumps to any other block just as cheaply, so a
+ * kernel that visits many short runs, such as the BankStride lines of a strided call, builds one
+ * cursor per call and seeks per run. A kernel that needs single words, for an unaligned edge or
+ * to re-check a mismatching block word by word, calls pattern_word with its own tag or
  * expected_value.
  *
  * Every member is a member of this class template, so its symbols carry the tag (see the file
@@ -439,9 +441,11 @@ public:
      *        is treated as -1 and any other value as +1.
      */
     pattern_cursor(const pattern_spec& spec, std::uint64_t block_first_word, int direction) noexcept
-        : counter_(detail::vec_splat<Isa>(0)), counter_step_(detail::vec_splat<Isa>(0)),
-          flip_(detail::vec_splat<Isa>(flip_of(spec))), alt_current_(detail::vec_splat<Isa>(0)),
-          alt_next_(detail::vec_splat<Isa>(0)), w_(block_first_word),
+        : counter_(detail::vec_splat<Isa>(0)), counter_origin_(detail::vec_splat<Isa>(0)),
+          counter_step_(detail::vec_splat<Isa>(0)), flip_(detail::vec_splat<Isa>(flip_of(spec))),
+          alt_current_(detail::vec_splat<Isa>(0)), alt_next_(detail::vec_splat<Isa>(0)),
+          alt_even_(detail::vec_splat<Isa>(0)), alt_odd_(detail::vec_splat<Isa>(0)),
+          w_(block_first_word),
           step_(direction < 0 ? std::uint64_t{0} - std::uint64_t{lanes} : std::uint64_t{lanes}),
           mode_(mode_of(spec.kind)) {
         std::uint64_t lane_values[lanes] = {};
@@ -453,23 +457,48 @@ public:
             const std::uint64_t key = pattern_pass_key<Isa>(spec.seed, spec.pass);
 #pragma loop(no_vector)
             for (std::size_t k = 0; k < lanes; ++k) {
-                lane_values[k] = key + k_splitmix_gamma * (block_first_word + k + 1);
+                lane_values[k] = key + k_splitmix_gamma * (k + 1);
             }
-            counter_ = detail::vec_load_lanes<Isa>(lane_values);
+            counter_origin_ = detail::vec_load_lanes<Isa>(lane_values);
             counter_step_ = detail::vec_splat<Isa>(k_splitmix_gamma * step_);
         } else if (mode_ == mode::alternating) {
+            // Every alternating value depends on its word index only through the index's parity
+            // (pattern_word), so the blocks whose lane 0 is an even or an odd word are the only
+            // two blocks there are.
 #pragma loop(no_vector)
             for (std::size_t k = 0; k < lanes; ++k) {
-                lane_values[k] = pattern_word<Isa>(spec, block_first_word + k);
+                lane_values[k] = pattern_word<Isa>(spec, k);
             }
-            alt_current_ = detail::vec_load_lanes<Isa>(lane_values);
-            // The next block in either direction: w + lanes and w - lanes have the same parity.
+            alt_even_ = detail::vec_load_lanes<Isa>(lane_values);
 #pragma loop(no_vector)
             for (std::size_t k = 0; k < lanes; ++k) {
-                lane_values[k] = pattern_word<Isa>(spec, block_first_word + lanes + k);
+                lane_values[k] = pattern_word<Isa>(spec, k + 1);
             }
-            alt_next_ = detail::vec_load_lanes<Isa>(lane_values);
+            alt_odd_ = detail::vec_load_lanes<Isa>(lane_values);
         }
+        seek(block_first_word);
+    }
+
+    /**
+     * Repositions the cursor on the block whose lane 0 is word block_first_word, exactly as a
+     * fresh construction with the same spec and direction would: current() and every later
+     * advance() then match that cursor's. Costs one scalar multiply and one vector add, against
+     * a construction's pattern_pass_key and lane loops, so a kernel visiting many short runs
+     * builds one cursor and seeks once per run.
+     *
+     * @param block_first_word Logical word index of lane 0 of the new block. Any value.
+     */
+    void seek(std::uint64_t block_first_word) noexcept {
+        w_ = block_first_word;
+        // Unconditional, as in advance(): outside random mode counter_ is never read. Lane k's
+        // input is pass key + gamma * (w + k + 1), the origin's lane plus gamma * w.
+        counter_ = detail::vec_add<Isa>(
+            counter_origin_, detail::vec_splat<Isa>(k_splitmix_gamma * block_first_word));
+        const bool odd = (block_first_word & 1) != 0;
+        alt_current_ = odd ? alt_odd_ : alt_even_;
+        // The block lanes words on: of the same parity for an even lane count, of the other for
+        // an odd one, which advance() swaps in.
+        alt_next_ = odd != (lanes % 2 != 0) ? alt_odd_ : alt_even_;
     }
 
     /**
@@ -542,14 +571,20 @@ private:
     // Vectors first, so their alignment needs no padding between members.
     /** Random mode: SplitMix64 input of each lane, pass key + gamma * (word + 1). */
     vec counter_;
+    /** Random mode: counter_ at word 0, pass key + gamma * (k + 1), which seek() offsets. */
+    vec counter_origin_;
     /** Random mode: added to counter_ by advance(), gamma times the signed word step. */
     vec counter_step_;
     /** Random and walking modes: XOR applied to the computed block. */
     vec flip_;
     /** Alternating mode: the current block's values, complement applied. */
     vec alt_current_;
-    /** Alternating mode: the other parity's block, swapped in by advance() for odd lanes. */
+    /** Alternating mode: the block lanes words on, swapped in by advance() for odd lanes. */
     vec alt_next_;
+    /** Alternating mode: the block whose lane 0 is an even word; seek() selects from the two. */
+    vec alt_even_;
+    /** Alternating mode: the block whose lane 0 is an odd word. */
+    vec alt_odd_;
     /** Logical word index of lane 0. */
     std::uint64_t w_;
     /** Added to w_ by advance(): +lanes or -lanes modulo 2^64. */

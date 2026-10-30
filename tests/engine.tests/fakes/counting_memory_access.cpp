@@ -15,11 +15,12 @@
  *
  * @par What the log is for
  * - Flush-before-verification: test_step_runner.cpp walks log_for_worker(w). For every line a
- *   verify or verify_and_stream record covers, it requires, since that line's previous
- *   store-type or load-type record, a fence, a flush whose range covers the line, and a fence,
- *   in that order. A reread_word record satisfies the rule on its own, because its kernel
- *   fences, flushes and fences the word's line itself. Hold steps must also show the
- *   phase_kind::pre_hold_flush phase between each pass's write and its verification.
+ *   verify or verify_and_stream record covers, or a verify_strided record visits, it requires,
+ *   since that line's previous store-type or load-type record, a fence, a flush whose range
+ *   covers the line, and a fence, in that order. A reread_word record satisfies the rule on its
+ *   own, because its kernel fences, flushes and fences the word's line itself. Hold steps must
+ *   also show the phase_kind::pre_hold_flush phase between each pass's write and its
+ *   verification.
  * - Turnaround timing: test_access_orders.cpp compares each turnaround verify's
  *   ctx.write_time_ns with the clock_ns and clock_after_ns that bracket the stream_fill of the
  *   same block, so the check holds whether the runner stamps the time just before or just after
@@ -49,7 +50,7 @@ static_assert(k_counting_step_slots >= k_max_step_count,
 
 namespace {
 
-// Records a worker's slot reserves on its first append: at 88 bytes a record, about 5.6 MiB per
+// Records a worker's slot reserves on its first append: at 120 bytes a record, about 7.5 MiB per
 // logging worker. Enough that a typical scaled run never reallocates mid-pass, while a slot that
 // never logs reserves nothing, so enabling the log for 1024 slots stays cheap.
 constexpr std::size_t k_initial_records_per_worker = 65'536;
@@ -65,7 +66,13 @@ std::uintptr_t address_of(const std::uint64_t* word) noexcept {
 // Coverage counts exactly the bytes a verification primitive compares; re-reads, fills, flushes
 // and fences never count, as the engine's coverage_counter defines.
 constexpr bool counts_as_verified(primitive_kind kind) noexcept {
-    return kind == primitive_kind::verify || kind == primitive_kind::verify_and_stream;
+    return kind == primitive_kind::verify || kind == primitive_kind::verify_and_stream ||
+           kind == primitive_kind::verify_strided;
+}
+
+// A strided call touches visit_count whole lines of its span, so its record's length is theirs.
+constexpr std::uint64_t visited_bytes(const strided_visits& visits) noexcept {
+    return visits.visit_count * k_cache_line_bytes;
 }
 
 // A layer with nothing to forward to would silently drop the step runner's traffic and count
@@ -126,11 +133,13 @@ struct counting_memory_access::impl {
      *
      * @param forward Performs the inner call with the caller's exact arguments; its result,
      *        the mismatch count or the re-read value, is returned unchanged.
+     * @param visits The strided kinds' visits, logged with the record; zero for other kinds.
      */
     template <typename Forward>
     auto track(primitive_kind kind, const access_context& ctx, std::uintptr_t begin,
-               std::uint64_t bytes, Forward&& forward) noexcept {
-        const entry call = enter(kind, ctx, begin, bytes);
+               std::uint64_t bytes, Forward&& forward,
+               const strided_visits& visits = strided_visits{}) noexcept {
+        const entry call = enter(kind, ctx, begin, bytes, visits);
         if constexpr (std::is_void_v<std::invoke_result_t<Forward&>>) {
             forward();
             leave(call);
@@ -143,7 +152,7 @@ struct counting_memory_access::impl {
 
     /** Counts the call, builds its record and reserves its log entry. */
     entry enter(primitive_kind kind, const access_context& ctx, std::uintptr_t begin,
-                std::uint64_t bytes) noexcept {
+                std::uint64_t bytes, const strided_visits& visits) noexcept {
         primitive_total.fetch_add(1, std::memory_order_relaxed);
         entry call{};
         call.record.seq = seq_source.fetch_add(1, std::memory_order_relaxed);
@@ -151,6 +160,7 @@ struct counting_memory_access::impl {
         call.record.worker = ctx.worker_index;
         call.record.begin = begin;
         call.record.bytes = bytes;
+        call.record.visits = visits;
         call.record.ctx = ctx;
         call.record.clock_ns = read_clock();
         call.record.clock_after_ns = 0;
@@ -298,6 +308,33 @@ counting_memory_access::verify_and_stream(const access_context& ctx, std::uint64
                             return inner_->verify_and_stream(ctx, words, word_count, expected, next,
                                                              first_word_index, direction, sink);
                         });
+}
+
+void counting_memory_access::stream_fill_strided(const access_context& ctx, std::uint64_t* span,
+                                                 std::size_t span_word_count,
+                                                 const strided_visits& visits,
+                                                 const pattern_spec& spec,
+                                                 std::uint64_t span_first_word_index) noexcept {
+    impl_->track(
+        primitive_kind::stream_fill_strided, ctx, address_of(span), visited_bytes(visits),
+        [&] {
+            inner_->stream_fill_strided(ctx, span, span_word_count, visits, spec,
+                                        span_first_word_index);
+        },
+        visits);
+}
+
+std::uint64_t counting_memory_access::verify_strided(
+    const access_context& ctx, const std::uint64_t* span, std::size_t span_word_count,
+    const strided_visits& visits, const pattern_spec& expected, std::uint64_t span_first_word_index,
+    mismatch_sink& sink) noexcept {
+    return impl_->track(
+        primitive_kind::verify_strided, ctx, address_of(span), visited_bytes(visits),
+        [&] {
+            return inner_->verify_strided(ctx, span, span_word_count, visits, expected,
+                                          span_first_word_index, sink);
+        },
+        visits);
 }
 
 std::uint64_t counting_memory_access::reread_word(const access_context& ctx,

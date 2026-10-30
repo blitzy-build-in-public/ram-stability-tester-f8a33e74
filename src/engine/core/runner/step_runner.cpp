@@ -65,6 +65,15 @@ constexpr std::size_t k_groups_per_window =
 /** 4 KiB turnaround blocks per work group: the turnaround stop-check interval (256 blocks). */
 constexpr std::uint64_t k_blocks_per_group = k_work_group_bytes / k_block_bytes;
 
+/** BankStride visits per work group: the 16,384 lines one strided call writes or verifies. */
+constexpr std::uint64_t k_lines_per_group = k_work_group_bytes / k_line_bytes;
+
+static_assert(k_span_granularity_bytes % k_work_group_bytes == 0,
+              "every window must be whole work groups, so each strided call makes exactly one "
+              "group's visits and the group's stamp, stop check and coverage stay exact");
+static_assert(k_lines_per_group * k_line_bytes == k_work_group_bytes,
+              "a strided call must verify exactly the coverage unit");
+
 /**
  * Ring of turnaround stream times, indexed by block number modulo its size. Block i is streamed
  * before block i - k_turnaround_distance is verified, so at most k_turnaround_distance + 1 stamps
@@ -233,9 +242,29 @@ private:
                                          params_.step_index, params_.pass, slice.logical_offset});
     }
 
+    /**
+     * Flushes [first_word, first_word + bytes) in consecutive groups of at most
+     * k_work_group_bytes, each line exactly once. The stop flag is checked before every group,
+     * the first included, so a stop waits for at most one group's flush however large the window
+     * or chunk, and one that arrived during the last write group ends the phase before any
+     * flush. No fence: the caller's one fence on each side of the whole range orders every
+     * group, so the split adds none.
+     *
+     * @return false as soon as a stop is seen, the rest of the range left unflushed; true once
+     *         every group was flushed.
+     */
+    bool flush_in_groups(const access_context& ctx, const std::uint64_t* first_word,
+                         std::uint64_t bytes);
     bool fence_flush_fence(const slice_view& slice, phase_kind phase, std::uint32_t access_type);
     bool windowed_window(const chunk_view& chunk, std::uint64_t window_offset,
                          std::uint64_t window_bytes);
+    /**
+     * A BankStride window: the same phases as windowed_window, with each 1 MiB work group of
+     * order_cursor's BankStride visits issued as one stream_fill_strided and later one
+     * verify_strided call rather than one call per 64-byte line.
+     */
+    bool bank_stride_window(const chunk_view& chunk, std::uint64_t window_offset,
+                            std::uint64_t window_bytes);
     bool turnaround_window(const chunk_view& chunk, std::uint64_t window_offset,
                            std::uint64_t window_bytes);
     bool hold_stream_slice(const slice_view& slice, std::vector<std::uint64_t>& stream_times);
@@ -247,6 +276,18 @@ private:
     const slice_range covered_;
 };
 
+bool phase_worker::flush_in_groups(const access_context& ctx, const std::uint64_t* first_word,
+                                   std::uint64_t bytes) {
+    for (std::uint64_t offset = 0; offset < bytes; offset += k_work_group_bytes) {
+        if (stop_requested()) {
+            return false;
+        }
+        deps_.memory.flush(ctx, first_word + offset / k_word_bytes,
+                           words_of(std::min(k_work_group_bytes, bytes - offset)));
+    }
+    return true;
+}
+
 bool phase_worker::fence_flush_fence(const slice_view& slice, phase_kind phase,
                                      std::uint32_t access_type) {
     if (slice.chunks.empty()) {
@@ -256,20 +297,22 @@ bool phase_worker::fence_flush_fence(const slice_view& slice, phase_kind phase,
     // First fence: every earlier streaming store and load of the slice is globally visible and
     // complete before any flush, so the flush writes back the new data rather than racing it.
     deps_.memory.fence(fence_ctx);
+    bool flushed = true;
     for (const chunk_view& chunk : slice.chunks) {
-        // One flush per chunk keeps the stop latency within one chunk's flush; whatever this
-        // phase would still protect is verified only after it, so a stop can end it here.
-        if (stop_requested()) {
-            return false;
-        }
         // Writes back and invalidates every line at every cache level, whatever left it cached:
-        // this phase's own accesses, an earlier pass or a hardware prefetch.
-        deps_.memory.flush(context(phase, access_type, chunk), chunk.base, words_of(chunk.bytes));
+        // this phase's own accesses, an earlier pass or a hardware prefetch. A chunk spans up to
+        // 256 MiB, so it is flushed in 1 MiB groups to keep the stop unit; whatever this phase
+        // would still protect is verified only after it, so a stop can end it between groups.
+        if (!flush_in_groups(context(phase, access_type, chunk), chunk.base, chunk.bytes)) {
+            flushed = false;
+            break;
+        }
     }
     // Second fence: the weakly ordered flushes complete before any later load, so the next
-    // verification of these lines is served from beyond the CPU caches.
+    // verification of these lines is served from beyond the CPU caches. A stop still gets it,
+    // so the flushes already issued are ordered before the phase is abandoned.
     deps_.memory.fence(fence_ctx);
-    return true;
+    return flushed;
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -277,12 +320,17 @@ bool phase_worker::fence_flush_fence(const slice_view& slice, phase_kind phase,
  * ------------------------------------------------------------------------------------------- */
 
 void phase_worker::windowed() {
+    // BankStride visits single 64-byte lines, which the cursor would yield one range, and so one
+    // interface and kernel call, per line; the strided primitives take a work group's visits in
+    // one call instead.
+    const bool strided = params_.order == RQ_ORDER_BANK_STRIDE;
     for (std::size_t s = covered_.first; s < covered_.last; ++s) {
         for (const chunk_view& chunk : deps_.slices[s].chunks) {
             // Windows are cut inside one chunk, a separate allocation, so no range spans two.
             for (std::uint64_t offset = 0; offset < chunk.bytes; offset += k_window_bytes) {
-                if (!windowed_window(chunk, offset,
-                                     std::min(k_window_bytes, chunk.bytes - offset))) {
+                const std::uint64_t window_bytes = std::min(k_window_bytes, chunk.bytes - offset);
+                if (!(strided ? bank_stride_window(chunk, offset, window_bytes)
+                              : windowed_window(chunk, offset, window_bytes))) {
                     return;
                 }
             }
@@ -293,7 +341,7 @@ void phase_worker::windowed() {
 bool phase_worker::windowed_window(const chunk_view& chunk, std::uint64_t window_offset,
                                    std::uint64_t window_bytes) {
     // The salt is the window's logical offset, unique in the region, so every window of every
-    // pass gets its own RandomBlocks permutation; BankStride takes its stride from the pass.
+    // pass gets its own RandomBlocks permutation. BankStride windows take bank_stride_window.
     order_cursor cursor(order_params{params_.order, window_bytes, params_.order_seed,
                                      params_.step_index, params_.pass,
                                      chunk.logical_offset + window_offset});
@@ -322,10 +370,16 @@ bool phase_worker::windowed_window(const chunk_view& chunk, std::uint64_t window
     // Fence, flush, fence over the window: the first fence makes the streaming stores globally
     // visible before the flush; the flush evicts any copy left cached by the previous pass's
     // verification or a prefetch; the second fence orders the flush before the verification
-    // loads, so none of them is served by a copy older than this pass's write.
+    // loads, so none of them is served by a copy older than this pass's write. A window spans
+    // up to 64 MiB, so it is flushed in 1 MiB groups to keep the stop unit.
     deps_.memory.fence(ctx);
-    deps_.memory.flush(ctx, address_in(chunk, window_offset), words_of(window_bytes));
+    const bool flushed = flush_in_groups(ctx, address_in(chunk, window_offset), window_bytes);
+    // Issued on a stop too, so the flushes already issued are ordered before the window is
+    // abandoned. A window whose flush was cut short is never verified, so none of it counts.
     deps_.memory.fence(ctx);
+    if (!flushed) {
+        return false;
+    }
 
     // The identical sequence and grouping as the write, so the k-th verified group carries the
     // k-th streamed group's stamp and time_since_write_us is exact to the group.
@@ -351,6 +405,63 @@ bool phase_worker::windowed_window(const chunk_view& chunk, std::uint64_t window
             ++group;
             group_bytes = 0;
         }
+    }
+    return true;
+}
+
+bool phase_worker::bank_stride_window(const chunk_view& chunk, std::uint64_t window_offset,
+                                      std::uint64_t window_bytes) {
+    // order_cursor's BankStride sequence over the window: visit k is the line at
+    // (k / L) * 64 + (k % L) * s, with s the pass's stride and L = window / s, so visits
+    // 0 ... window / 64 - 1 name every line once. Work group g is visits
+    // [g * k_lines_per_group, (g + 1) * k_lines_per_group), the g-th 1 MiB of that sequence,
+    // exactly the lines the cursor would yield as the g-th 1 MiB of ranges.
+    const std::uint64_t stride = bank_stride_bytes(params_.pass);
+    const std::uint64_t lines_per_sweep = window_bytes / stride;
+    const auto group_visits = [&](std::uint64_t group) noexcept {
+        return strided_visits{stride, lines_per_sweep, group * k_lines_per_group,
+                              k_lines_per_group};
+    };
+    std::uint64_t* const span = address_in(chunk, window_offset);
+    const std::size_t span_words = words_of(window_bytes);
+    const std::uint64_t span_first_word = logical_word(chunk, window_offset);
+    const std::uint64_t groups = window_bytes / k_work_group_bytes;
+    std::array<std::uint64_t, k_groups_per_window> stream_times{};
+    access_context ctx = context(phase_kind::write, 0, chunk);
+    for (std::uint64_t g = 0; g < groups; ++g) {
+        if (stop_requested()) {
+            // Nothing of this window has been verified yet, so none of it counts as coverage.
+            return false;
+        }
+        deps_.memory.stream_fill_strided(ctx, span, span_words, group_visits(g), params_.base,
+                                         span_first_word);
+        stream_times[static_cast<std::size_t>(g)] = deps_.clock.now_ns();
+    }
+
+    ctx.phase = phase_kind::verify;
+    ctx.access_type = params_.access_type;
+    // The window's one fence, flush and fence, as in windowed_window: it covers every line of
+    // the window, so it precedes the verification of each visited line. The second fence is
+    // issued on a stop too, and a window whose flush was cut short is never verified.
+    deps_.memory.fence(ctx);
+    const bool flushed = flush_in_groups(ctx, span, window_bytes);
+    deps_.memory.fence(ctx);
+    if (!flushed) {
+        return false;
+    }
+
+    // The same groups in the same order as the write, so group g verifies under group g's stamp
+    // and time_since_write_us is exact to the group.
+    worker_error_sink& sink = deps_.errors.sink(worker_);
+    for (std::uint64_t g = 0; g < groups; ++g) {
+        if (stop_requested()) {
+            return false;
+        }
+        ctx.write_time_ns = stream_times[static_cast<std::size_t>(g)];
+        sink.bind(ctx);
+        deps_.memory.verify_strided(ctx, span, span_words, group_visits(g), params_.base,
+                                    span_first_word, sink);
+        deps_.coverage.add(worker_, k_lines_per_group * k_line_bytes);
     }
     return true;
 }

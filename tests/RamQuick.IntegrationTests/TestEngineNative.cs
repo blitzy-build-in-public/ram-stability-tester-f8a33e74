@@ -834,6 +834,71 @@ internal static unsafe class SessionProbe
     /// <exception cref="InvalidOperationException">The session is not a native engine session, or has been disposed.</exception>
     public static EngineCompleted? GetResult(IEngineSession session) => AsEngineSession(session).GetResult();
 
+    /// <summary>
+    /// Calls the session's own <c>on_completed</c> thunk, through the callback table the session gave the engine, with
+    /// <paramref name="result"/>: a terminal payload the engine never produces, such as a null pointer or a step-result
+    /// array the ABI forbids. The call runs on the calling thread, which stands in for the coordinator.
+    /// </summary>
+    /// <param name="session">
+    /// A native engine session that has not been disposed and whose own run never reaches <c>on_completed</c>, such as
+    /// one never started.
+    /// </param>
+    /// <param name="result">The payload, valid for the duration of the call, or null.</param>
+    /// <exception cref="InvalidOperationException">
+    /// The session is not a native engine session, or has been disposed (<see cref="ObjectDisposedException"/>).
+    /// </exception>
+    public static void RaiseCompleted(IEngineSession session, RqRunResult* result)
+    {
+        SafeSessionHandle handle = AsEngineSession(session).Handle;
+        bool added = false;
+        try
+        {
+            // Held for the call, so a concurrent Dispose cannot free the GCHandle the thunk resolves user_data through.
+            handle.DangerousAddRef(ref added);
+            RqCallbacks callbacks = CallbackThunks.CreateTable(handle.CallbackUserData);
+            callbacks.OnCompleted(callbacks.UserData, result);
+        }
+        finally
+        {
+            if (added)
+            {
+                handle.DangerousRelease();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Calls the session's own <c>on_errors</c> thunk, through the callback table the session gave the engine, with
+    /// <paramref name="records"/>, <paramref name="count"/> and <paramref name="totalErrors"/> exactly as given, so a
+    /// test can pass a pointer and count the ABI forbids. The call runs on the calling thread, which stands in for the
+    /// coordinator.
+    /// </summary>
+    /// <param name="session">A native engine session that has not been disposed.</param>
+    /// <param name="records">The records, valid for the duration of the call, or null.</param>
+    /// <param name="count">The record count the engine would report.</param>
+    /// <param name="totalErrors">The true error total the engine would report.</param>
+    /// <exception cref="InvalidOperationException">
+    /// The session is not a native engine session, or has been disposed (<see cref="ObjectDisposedException"/>).
+    /// </exception>
+    public static void RaiseErrors(IEngineSession session, RqErrorRecord* records, uint count, ulong totalErrors)
+    {
+        SafeSessionHandle handle = AsEngineSession(session).Handle;
+        bool added = false;
+        try
+        {
+            handle.DangerousAddRef(ref added);
+            RqCallbacks callbacks = CallbackThunks.CreateTable(handle.CallbackUserData);
+            callbacks.OnErrors(callbacks.UserData, records, count, totalErrors);
+        }
+        finally
+        {
+            if (added)
+            {
+                handle.DangerousRelease();
+            }
+        }
+    }
+
     private static EngineSession AsEngineSession(IEngineSession session)
     {
         ArgumentNullException.ThrowIfNull(session);

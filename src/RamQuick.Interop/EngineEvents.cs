@@ -79,8 +79,9 @@ public sealed record EngineStepFinished(StepOutcome Outcome);
 /// <param name="Records">
 /// The detailed records confirmed since the previous batch, in confirmation order. Empty once the run's detail cap
 /// (<see cref="EngineSessionOptions.ErrorDetailCap"/>, 10,000 records by default) is reached, while
-/// <paramref name="TotalErrors"/> keeps rising. Copied on construction; it must not be <see langword="null"/> or
-/// contain <see langword="null"/>.
+/// <paramref name="TotalErrors"/> keeps rising. Copied on construction, unless it already is an immutable list these
+/// event records own, such as another batch's <see cref="Records"/>, which is shared; it must not be
+/// <see langword="null"/> or contain <see langword="null"/>.
 /// </param>
 /// <param name="TotalErrors">The run's exact true error total so far, from engine counters; never capped.</param>
 public sealed record EngineErrorsDetected(IReadOnlyList<ErrorRecord> Records, ulong TotalErrors)
@@ -93,8 +94,9 @@ public sealed record EngineErrorsDetected(IReadOnlyList<ErrorRecord> Records, ul
     /// <see cref="TotalErrors"/> keeps rising.
     /// </summary>
     /// <remarks>
-    /// A read-only copy taken when the record is created or initialized, so neither the source list nor a subscriber
-    /// can change the batch another subscriber receives.
+    /// A read-only list that nothing can write, taken when the record is created or initialized: a copy of the source
+    /// list, or the source itself when it already is such a list. Neither the source list nor a subscriber can change
+    /// the batch another subscriber receives.
     /// </remarks>
     /// <exception cref="ArgumentNullException">The list being set is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException">The list being set contains a <see langword="null"/> record.</exception>
@@ -115,7 +117,8 @@ public sealed record EngineErrorsDetected(IReadOnlyList<ErrorRecord> Records, ul
 /// <param name="EndReason">
 /// Why the run ended: the engine's first recorded end reason, which alone decides the terminal state. Native
 /// <c>internal_fault</c>, and any end-reason code this wrapper does not know, map to
-/// <see cref="RunEndReason.EngineFault"/>.
+/// <see cref="RunEndReason.EngineFault"/>. <see cref="RunEndReason.HostFault"/> instead when the session could not
+/// read or deliver the engine's result: <paramref name="EndDetail"/> then names the fault and the engine's own reason.
 /// </param>
 /// <param name="TotalErrors">The run's exact true error total, from engine counters; never capped.</param>
 /// <param name="VerifiedBytes">The bytes verified in the run, in bytes; the numerator of the run's coverage.</param>
@@ -125,8 +128,10 @@ public sealed record EngineErrorsDetected(IReadOnlyList<ErrorRecord> Records, ul
 /// </param>
 /// <param name="StepsCompleted">The number of steps that ran to the end of their schedule.</param>
 /// <param name="StepResults">
-/// One outcome per step whose gate let it run, in step order; empty when no step started. Copied on construction; it
-/// must not be <see langword="null"/> or contain <see langword="null"/>.
+/// One outcome per step whose gate let it run, in step order; empty when no step started. Copied on construction,
+/// unless it already is an immutable list these event records own, such as another result's
+/// <see cref="StepResults"/>, which is shared; it must not be <see langword="null"/> or contain
+/// <see langword="null"/>.
 /// </param>
 /// <param name="OsError">
 /// The Windows error code (<c>GetLastError</c>) of the failing call for affinity, memory and thread-creation faults,
@@ -142,7 +147,9 @@ public sealed record EngineErrorsDetected(IReadOnlyList<ErrorRecord> Records, ul
 /// <see cref="RunEndReason.InsufficientMemory"/> and <see cref="RunEndReason.EngineFault"/> whenever
 /// <paramref name="OsError"/> is nonzero, it reads "Windows error n: " followed by
 /// <paramref name="NativeEndDetail"/>, where n is <paramref name="OsError"/>. Otherwise it is
-/// <paramref name="NativeEndDetail"/>.
+/// <paramref name="NativeEndDetail"/>. When the session replaced the engine's reason with
+/// <see cref="RunEndReason.HostFault"/>, it reads "&lt;fault&gt; The engine ended the run with &lt;reason&gt;: " followed
+/// by the detail that reason would have had.
 /// </param>
 public sealed record EngineCompleted(
     RunEndReason EndReason,
@@ -162,8 +169,9 @@ public sealed record EngineCompleted(
     /// Gets one outcome per step whose gate let it run, in step order; empty when no step started.
     /// </summary>
     /// <remarks>
-    /// A read-only copy taken when the record is created or initialized, so neither the source list nor a subscriber
-    /// can change the outcomes another subscriber receives.
+    /// A read-only list that nothing can write, taken when the record is created or initialized: a copy of the source
+    /// list, or the source itself when it already is such a list. Neither the source list nor a subscriber can change
+    /// the outcomes another subscriber receives.
     /// </remarks>
     /// <exception cref="ArgumentNullException">The list being set is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException">The list being set contains a <see langword="null"/> outcome.</exception>
@@ -342,7 +350,8 @@ internal static unsafe class EngineEventMapper
 
     /// <summary>Maps the records of one <c>on_errors</c> batch.</summary>
     /// <param name="records">
-    /// The batch; empty when the engine passed a count of 0, as it does with a null pointer once the detail cap is reached.
+    /// The batch; empty when the engine passed a count of 0, as it does with a null pointer once the detail cap is
+    /// reached. The thunk rejects a null pointer with a nonzero count as an ABI fault before this is called.
     /// </param>
     /// <param name="steps">The session's copy of the plan's steps.</param>
     /// <param name="detailCap">
@@ -351,7 +360,9 @@ internal static unsafe class EngineEventMapper
     /// no single batch can hold more.
     /// </param>
     /// <returns>
-    /// A read-only list over a new array of managed records in batch order, or the shared empty read-only list.
+    /// A read-only list over a new array of managed records in batch order, or the shared empty read-only list. It
+    /// comes from <see cref="EngineEventLists.Own{T}"/>, so <see cref="EngineErrorsDetected"/> keeps it without a
+    /// second copy.
     /// </returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="detailCap"/> is below 1.</exception>
     /// <exception cref="InvalidOperationException">
@@ -384,7 +395,8 @@ internal static unsafe class EngineEventMapper
             mapped[i] = ToErrorRecord(in records[i], steps);
         }
 
-        return Array.AsReadOnly(mapped);
+        // Handed over rather than wrapped, so the event record takes this array as its snapshot instead of copying it.
+        return EngineEventLists.Own(mapped, nameof(records));
     }
 
     /// <summary>
@@ -444,10 +456,108 @@ internal static unsafe class EngineEventMapper
             Elapsed: FromMilliseconds(r.ElapsedMs),
             FirstErrorTime: r.FirstErrorMs == NativeConstants.NoFirstError ? null : FromMilliseconds(r.FirstErrorMs),
             StepsCompleted: (int)r.StepsCompleted,
-            StepResults: stepResults,
+
+            // Handed over, so the event record takes the mapped array as its snapshot instead of copying it.
+            StepResults: EngineEventLists.Own(stepResults, nameof(RqRunResult.StepResults)),
             OsError: r.OsError,
             NativeEndDetail: nativeDetail,
             EndDetail: FormatEndDetail(endReason, r.OsError, nativeDetail));
+    }
+
+    /// <summary>
+    /// Builds the <see cref="EngineCompleted"/> a session delivers in place of an <c>on_completed</c> payload that
+    /// <see cref="ToCompleted"/> rejected, from the header fields that can still be trusted.
+    /// </summary>
+    /// <param name="r">
+    /// The engine's rejected payload. Its header is copied only when <c>struct_size</c> is <see cref="RqRunResult.Size"/>,
+    /// because any other size leaves no field where this wrapper reads it; its step results are never read.
+    /// </param>
+    /// <param name="fault">The message of the exception that rejected the payload.</param>
+    /// <returns>
+    /// A <see cref="RunEndReason.HostFault"/> result, so the run ends ABORTED, with no step results. With a trusted
+    /// header it keeps the totals, times, <c>os_error</c> and <c>end_detail</c>, and its
+    /// <see cref="EngineCompleted.EndDetail"/> names <paramref name="fault"/> and the engine's own end reason; see
+    /// <see cref="DescribeTerminalFault"/>.
+    /// </returns>
+    /// <remarks>
+    /// It validates nothing and reads only fixed-size scalar fields and the bounded <c>end_detail</c> buffer, so it
+    /// cannot throw on a corrupted payload: the run's only Completed must not be lost to a second fault.
+    /// </remarks>
+    internal static EngineCompleted ToHostFaultCompleted(in RqRunResult r, string fault)
+    {
+        if (r.StructSize != (uint)RqRunResult.Size)
+        {
+            return ToHostFaultCompleted(fault);
+        }
+
+        string? nativeDetail = ReadEndDetail(in r);
+        RunEndReason engineReason = MapEndReason(r.EndReason);
+        return new EngineCompleted(
+            EndReason: RunEndReason.HostFault,
+            TotalErrors: r.TotalErrors,
+            VerifiedBytes: r.VerifiedBytes,
+            Elapsed: FromMilliseconds(r.ElapsedMs),
+            FirstErrorTime: r.FirstErrorMs == NativeConstants.NoFirstError ? null : FromMilliseconds(r.FirstErrorMs),
+
+            // The step results are what the engine and this wrapper disagree on, so none is reported as completed.
+            StepsCompleted: 0,
+            StepResults: ReadOnlyCollection<StepOutcome>.Empty,
+            OsError: r.OsError,
+            NativeEndDetail: nativeDetail,
+            EndDetail: DescribeTerminalFault(fault, engineReason, FormatEndDetail(engineReason, r.OsError, nativeDetail)));
+    }
+
+    /// <summary>
+    /// Builds the <see cref="EngineCompleted"/> a session delivers when the engine raised <c>on_completed</c> with no
+    /// payload to read.
+    /// </summary>
+    /// <param name="fault">The message of the fault that left no payload, such as a null result pointer.</param>
+    /// <returns>
+    /// A <see cref="RunEndReason.HostFault"/> result with zero totals, no step results and no native diagnostics, whose
+    /// <see cref="EngineCompleted.EndDetail"/> names <paramref name="fault"/> and that the engine's own end reason is
+    /// unknown.
+    /// </returns>
+    internal static EngineCompleted ToHostFaultCompleted(string fault)
+    {
+        return new EngineCompleted(
+            EndReason: RunEndReason.HostFault,
+            TotalErrors: 0,
+            VerifiedBytes: 0,
+            Elapsed: TimeSpan.Zero,
+            FirstErrorTime: null,
+            StepsCompleted: 0,
+            StepResults: ReadOnlyCollection<StepOutcome>.Empty,
+            OsError: 0,
+            NativeEndDetail: null,
+            EndDetail: DescribeTerminalFault(fault, engineReason: null, engineDetail: null));
+    }
+
+    /// <summary>
+    /// Composes the <see cref="EngineCompleted.EndDetail"/> of a run the wrapper ends as
+    /// <see cref="RunEndReason.HostFault"/> because the engine's terminal result could not be read or delivered. The
+    /// engine's first-writer end reason is kept beside the fault rather than lost, since the managed reason replaces it.
+    /// </summary>
+    /// <param name="fault">The message of the fault.</param>
+    /// <param name="engineReason">The engine's own end reason, or <see langword="null"/> when it could not be read.</param>
+    /// <param name="engineDetail">
+    /// The end detail of <paramref name="engineReason"/> as <see cref="FormatEndDetail"/> composes it, or
+    /// <see langword="null"/> when it has none.
+    /// </param>
+    /// <returns>
+    /// "&lt;fault&gt; The engine ended the run with &lt;reason&gt;: &lt;detail&gt;", without the detail when it is
+    /// <see langword="null"/>, or "&lt;fault&gt; The engine's end reason could not be read." when
+    /// <paramref name="engineReason"/> is <see langword="null"/>.
+    /// </returns>
+    internal static string DescribeTerminalFault(string fault, RunEndReason? engineReason, string? engineDetail)
+    {
+        if (engineReason is not { } reason)
+        {
+            return fault + " The engine's end reason could not be read.";
+        }
+
+        return string.IsNullOrEmpty(engineDetail)
+            ? string.Create(CultureInfo.InvariantCulture, $"{fault} The engine ended the run with {reason}.")
+            : string.Create(CultureInfo.InvariantCulture, $"{fault} The engine ended the run with {reason}: {engineDetail}");
     }
 
     /// <summary>Maps an <c>on_released</c> payload.</summary>
@@ -618,18 +728,30 @@ internal static unsafe class EngineEventMapper
 /// Takes the private, read-only copies that keep the collections of the engine event records immutable.
 /// </summary>
 /// <remarks>
+/// <para>
 /// One event instance reaches every subscriber, so a collection it exposes must be neither the caller's list, which
 /// the caller could still change, nor a writable array, which a subscriber could cast to and change.
+/// </para>
+/// <para>
+/// The mapper builds each event's collection in an array of its own, so copying that array again on construction
+/// would only double the work for a batch of up to the detail cap. <see cref="Own{T}"/> therefore wraps such an array
+/// in a list type only this class creates, and <see cref="Snapshot{T}"/> takes that list as it is. Every other list,
+/// including any caller-supplied <see cref="ReadOnlyCollection{T}"/>, whose wrapped list may still be written, is
+/// copied.
+/// </para>
 /// </remarks>
 internal static class EngineEventLists
 {
-    /// <summary>Copies a list into a new read-only list that nothing else references.</summary>
+    /// <summary>
+    /// Copies a list into a new read-only list that nothing else references, unless it already is one: a list from
+    /// <see cref="Own{T}"/> is returned as it is.
+    /// </summary>
     /// <typeparam name="T">The element type.</typeparam>
     /// <param name="source">The list to copy; later changes to it do not reach the copy.</param>
     /// <param name="paramName">The parameter or property name an argument exception reports.</param>
     /// <returns>
-    /// A read-only wrapper over a new array, which cannot be cast to an array or written through
-    /// <see cref="IList{T}"/>; the shared empty read-only list when <paramref name="source"/> is empty.
+    /// A read-only wrapper over an array that nothing else can write, which cannot be cast to an array or written
+    /// through <see cref="IList{T}"/>; the shared empty read-only list when <paramref name="source"/> is empty.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="source"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException"><paramref name="source"/> contains a <see langword="null"/> element.</exception>
@@ -638,16 +760,42 @@ internal static class EngineEventLists
     {
         ArgumentNullException.ThrowIfNull(source, paramName);
 
-        T[] copy = source.ToArray();
-        if (copy.Length == 0)
+        // Already immutable and checked for null elements when it was created, so it is shared rather than copied.
+        if (source is OwnedList<T>)
+        {
+            return source;
+        }
+
+        return Own(source.ToArray(), paramName);
+    }
+
+    /// <summary>
+    /// Takes ownership of an array its creator has just filled and will neither change nor expose again, and returns
+    /// it as the read-only list <see cref="Snapshot{T}"/> keeps without a copy.
+    /// </summary>
+    /// <typeparam name="T">The element type.</typeparam>
+    /// <param name="items">The array; no reference to it may remain writable anywhere else.</param>
+    /// <param name="paramName">The parameter or property name an argument exception reports.</param>
+    /// <returns>
+    /// A read-only wrapper over <paramref name="items"/>, which cannot be cast to an array or written through
+    /// <see cref="IList{T}"/>; the shared empty read-only list when <paramref name="items"/> is empty.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="items"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="items"/> contains a <see langword="null"/> element.</exception>
+    internal static IReadOnlyList<T> Own<T>(T[] items, string paramName)
+        where T : class
+    {
+        ArgumentNullException.ThrowIfNull(items, paramName);
+
+        if (items.Length == 0)
         {
             return ReadOnlyCollection<T>.Empty;
         }
 
-        for (int index = 0; index < copy.Length; index++)
+        for (int index = 0; index < items.Length; index++)
         {
             // The element type is non-nullable, but a caller can still pass a list holding null.
-            if (copy[index] is null)
+            if (items[index] is null)
             {
                 throw new ArgumentException(
                     string.Create(CultureInfo.InvariantCulture, $"The element at index {index} is null."),
@@ -655,6 +803,16 @@ internal static class EngineEventLists
             }
         }
 
-        return Array.AsReadOnly(copy);
+        return new OwnedList<T>(items);
+    }
+
+    // The only list Snapshot trusts: created solely by Own, over an array nothing else can write. Sealed and private,
+    // so no subclass can reach the wrapped array through ReadOnlyCollection's protected Items.
+    private sealed class OwnedList<T> : ReadOnlyCollection<T>
+    {
+        internal OwnedList(T[] items)
+            : base(items)
+        {
+        }
     }
 }

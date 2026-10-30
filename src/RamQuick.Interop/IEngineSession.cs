@@ -108,7 +108,9 @@ public interface IEngineSession : IDisposable
     /// <summary>
     /// Raised exactly once per started session, after every worker has joined, with the run's end reason and true
     /// totals. The end reason is the first one the engine recorded and alone decides the terminal state. The locked
-    /// memory is released afterwards, and <see cref="Released"/> follows.
+    /// memory is released afterwards, and <see cref="Released"/> follows. When the engine's result cannot be read or
+    /// delivered, it is still raised, once and before <see cref="Released"/>, as a host fault whose end detail names
+    /// the fault and the engine's own reason.
     /// </summary>
     event EventHandler<EngineCompleted>? Completed;
 

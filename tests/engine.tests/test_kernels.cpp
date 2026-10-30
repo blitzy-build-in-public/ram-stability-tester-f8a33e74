@@ -6,6 +6,10 @@
  *   out-of-line expected_value, over every pattern kind, pass, complement flag, direction, start
  *   offset within a cache line and range length the kernels split differently; the shape of the
  *   three raw tables; and the baseline flush and re-read helpers.
+ * - KernelsStrided*: the BankStride entries of every set against expected_value and, for the
+ *   AVX sets, against SSE2, over every kind, the three strides, 2 MiB, 6 MiB and 64 MiB spans
+ *   and calls that start or end mid-sweep; and the identity of their visit sequence with
+ *   order_cursor's BankStride ranges.
  * - IsaDispatch*: the pure select_isa over synthetic cpu_features built from the bit constants
  *   in core/kernels/isa_dispatch.h, tables_for over synthetic selections, and a host sanity
  *   check that expects nothing of the host CPU.
@@ -16,9 +20,11 @@
  * illegal-instruction fault, an SEH exception nothing catches. Reading the tables' function
  * pointers executes nothing, so the table and tables_for tests need no particular CPU.
  *
- * Buffers are committed with VirtualAlloc, never locked, and stay below 2 MiB each. Each flush
- * and re-read check touches a handful of lines once: no flush-and-reload loop over a small
- * address set, the access style the product's stress bound excludes.
+ * Buffers are committed with VirtualAlloc and never locked. The range buffers stay below 2 MiB
+ * each; the strided buffers hold one 64 MiB window, the largest span the step runner issues, so
+ * the 8 KiB stride's 8,192-line sweeps are reached. Each flush and re-read check touches a
+ * handful of lines once: no flush-and-reload loop over a small address set, the access style the
+ * product's stress bound excludes.
  *
  * Every kernel assertion names the ISA, pattern, pass, complement flag, direction, first word
  * index, word count and start offset, so a failure identifies the exact case.
@@ -33,10 +39,12 @@
 #include <ostream>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "ramquick_engine.h"
 #include "core/patterns/patterns.h"
+#include "core/patterns/access_order.h"
 #include "core/kernels/kernels.h"
 #include "core/kernels/isa_dispatch.h"
 
@@ -660,6 +668,329 @@ std::string tables_for_param_name(const ::testing::TestParamInfo<tables_for_para
 
 class IsaDispatchTablesFor : public ::testing::TestWithParam<tables_for_param> {};
 
+/* ---------------------------------------------------------------------------------------------
+ * Strided kernels: spans, visit slices and reports
+ * ------------------------------------------------------------------------------------------- */
+
+constexpr std::uint64_t k_strided_mib = std::uint64_t{1} << 20U;
+
+/** Lines one strided call of the step runner visits: one 1 MiB work group. */
+constexpr std::uint64_t k_group_visits = k_strided_mib / k_cache_line_bytes;
+
+/**
+ * Span sizes: the smallest window, a window that is not a power of two, and the largest window
+ * (k_max_window_bytes), where the 8 KiB stride gives 8,192 lines per sweep.
+ */
+constexpr std::uint64_t k_small_strided_spans[] = {2U * k_strided_mib, 6U * k_strided_mib};
+constexpr std::uint64_t k_largest_strided_span = k_max_window_bytes;
+
+/**
+ * Logical index of each span's first word: 0, and an odd index beyond 2^32, so that every
+ * visited line starts at an odd word, the alternating patterns at their other parity and the
+ * walking bit at an odd rotation.
+ */
+constexpr std::uint64_t k_strided_first_words[] = {0ULL, (1ULL << 37U) + 3ULL};
+
+/** Words of a strided buffer: guard, the largest span, guard. */
+constexpr std::size_t k_strided_buffer_words =
+    k_guard_words + static_cast<std::size_t>(k_largest_strided_span / sizeof(std::uint64_t)) +
+    k_guard_words;
+
+static_assert(k_guard_words * sizeof(std::uint64_t) % k_cache_line_bytes == 0,
+              "the span after the leading guard must start on a 64-byte boundary");
+
+/** Byte offset of visit k from the span start: the kernels.h formula, restated independently. */
+constexpr std::uint64_t visit_offset(const strided_visits& visits, std::uint64_t k) noexcept {
+    return k / visits.lines_per_sweep * k_cache_line_bytes +
+           k % visits.lines_per_sweep * visits.stride_bytes;
+}
+
+/**
+ * The slices of one phase's visit sequence a test issues: the whole phase in one call; a call
+ * that starts and ends mid-sweep (first_visit and visit_count both off a multiple of
+ * lines_per_sweep); and, where the span holds two, the step runner's second work group.
+ */
+std::vector<strided_visits> visit_slices(std::uint64_t span_bytes, std::uint64_t stride) {
+    const std::uint64_t lines_per_sweep = span_bytes / stride;
+    const std::uint64_t total = span_bytes / k_cache_line_bytes;
+    std::vector<strided_visits> slices{strided_visits{stride, lines_per_sweep, 0U, total}};
+    const std::uint64_t first = lines_per_sweep / 2U + 3U;
+    slices.push_back(strided_visits{stride, lines_per_sweep, first,
+                                    std::min(total - first, 3U * lines_per_sweep + 5U)});
+    if (total >= 2U * k_group_visits) {
+        slices.push_back(strided_visits{stride, lines_per_sweep, k_group_visits, k_group_visits});
+    }
+    return slices;
+}
+
+/** One strided kernel invocation. */
+struct strided_case {
+    std::uint32_t isa;
+    pattern_spec spec;
+    std::uint64_t span_bytes;
+    std::uint64_t first_word_index;
+    strided_visits visits;
+};
+
+/** Failure context naming every parameter of a strided case. */
+::testing::Message where(const strided_case& c) {
+    ::testing::Message message;
+    message << "ISA " << isa_display_name(c.isa) << ", pattern " << kind_name(c.spec.kind)
+            << ", pass " << c.spec.pass << ", complement " << (c.spec.complement ? "on" : "off")
+            << ", span " << c.span_bytes / k_strided_mib << " MiB, first word index "
+            << c.first_word_index << ", stride " << c.visits.stride_bytes << ", lines per sweep "
+            << c.visits.lines_per_sweep << ", visits [" << c.visits.first_visit << ", +"
+            << c.visits.visit_count << ")";
+    return message;
+}
+
+/**
+ * Whether a call visits the line of its span with this index: visit_offset inverted. The line
+ * at byte offset o, inside lines_per_sweep strides of the span start, is visit
+ * (o % stride) / 64 * lines_per_sweep + o / stride; no line beyond is ever visited. Arithmetic
+ * rather than a per-line table, which Debug's checked containers make the strided tests'
+ * slowest step.
+ */
+constexpr bool visits_line(const strided_visits& visits, std::uint64_t line) noexcept {
+    const std::uint64_t offset = line * k_cache_line_bytes;
+    if (offset >= visits.lines_per_sweep * visits.stride_bytes) {
+        return false;
+    }
+    const std::uint64_t visit =
+        offset % visits.stride_bytes / k_cache_line_bytes * visits.lines_per_sweep +
+        offset / visits.stride_bytes;
+    return visit >= visits.first_visit && visit - visits.first_visit < visits.visit_count;
+}
+
+/**
+ * Succeeds when every visited line holds expected_value for its words and every other line of
+ * the span still holds k_guard_value; otherwise names the first wrong word.
+ */
+::testing::AssertionResult strided_fill_correct(const std::uint64_t* span, const strided_case& c) {
+    const std::uint64_t lines = c.span_bytes / k_cache_line_bytes;
+    for (std::uint64_t line = 0; line < lines; ++line) {
+        const bool visited = visits_line(c.visits, line);
+        const auto first = static_cast<std::size_t>(line * k_line_words);
+        for (std::size_t w = 0; w < k_line_words; ++w) {
+            const std::uint64_t want =
+                visited ? expected_value(c.spec, c.first_word_index + first + w) : k_guard_value;
+            if (span[first + w] != want) {
+                return ::testing::AssertionFailure()
+                       << (visited ? "visited" : "unvisited") << " line " << line << ", word " << w
+                       << " holds " << hex64(span[first + w]) << ", expected " << hex64(want);
+            }
+        }
+    }
+    return ::testing::AssertionSuccess();
+}
+
+/** Writes expected_value into every word of the lines a call visits. */
+void write_visited_lines(std::uint64_t* span, const strided_case& c) {
+    for (std::uint64_t k = c.visits.first_visit; k < c.visits.first_visit + c.visits.visit_count;
+         ++k) {
+        const std::size_t first = static_cast<std::size_t>(visit_offset(c.visits, k) / 8U);
+        for (std::size_t w = 0; w < k_line_words; ++w) {
+            span[first + w] = expected_value(c.spec, c.first_word_index + first + w);
+        }
+    }
+}
+
+/**
+ * Corrupts words of the visited lines and, where one exists, a word of an unvisited line, which
+ * no report may name. Returns the mismatches verify_strided must report, in visit order and
+ * ascending within a line: words 0 and 7 of the first visited line, words 2 and 3 of a middle
+ * one and word 7 of the last one.
+ */
+std::vector<observed_mismatch> corrupt_visited_lines(std::uint64_t* span, const strided_case& c) {
+    const strided_visits& v = c.visits;
+    const std::uint64_t last = v.first_visit + v.visit_count - 1U;
+    const std::pair<std::uint64_t, std::size_t> targets[] = {
+        {v.first_visit, 0U},
+        {v.first_visit, 7U},
+        {v.first_visit + v.visit_count / 2U, 2U},
+        {v.first_visit + v.visit_count / 2U, 3U},
+        {last, 7U}};
+    std::vector<observed_mismatch> expected;
+    std::pair<std::uint64_t, std::size_t> previous{0U, 0U};
+    for (const auto& [visit, w] : targets) {
+        if (!expected.empty() && std::pair<std::uint64_t, std::size_t>{visit, w} <= previous) {
+            continue;  // A call of one or two visits names a line more than once.
+        }
+        previous = {visit, w};
+        const std::size_t word = static_cast<std::size_t>(visit_offset(v, visit) / 8U) + w;
+        const std::uint64_t want = expected_value(c.spec, c.first_word_index + word);
+        span[word] = want ^ (std::uint64_t{1} << ((word * 7U + 63U) % 64U));
+        expected.push_back(observed_mismatch{word, want, span[word], span[word]});
+    }
+    const std::uint64_t lines = c.span_bytes / k_cache_line_bytes;
+    std::uint64_t unvisited = 0;
+    while (unvisited < lines && visits_line(v, unvisited)) {
+        ++unvisited;
+    }
+    if (unvisited < lines) {
+        const auto word = static_cast<std::size_t>(unvisited * k_line_words + 5U);
+        span[word] = ~expected_value(c.spec, c.first_word_index + word);
+    }
+    return expected;
+}
+
+/** Succeeds when the sink saw exactly `expected`, in that order, with every value intact. */
+::testing::AssertionResult strided_reports_match(const recording_sink& sink,
+                                                 const std::uint64_t* span,
+                                                 const std::vector<observed_mismatch>& expected) {
+    if (sink.overflow() != 0U) {
+        return ::testing::AssertionFailure()
+               << sink.overflow() << " reports beyond the recording capacity";
+    }
+    if (sink.reports().size() != expected.size()) {
+        return ::testing::AssertionFailure() << sink.reports().size() << " reports for "
+                                             << expected.size() << " corruptions on visited lines";
+    }
+    for (std::size_t k = 0; k < expected.size(); ++k) {
+        const recording_sink::report& r = sink.reports()[k];
+        const observed_mismatch seen{static_cast<std::size_t>(r.address - span), r.expected,
+                                     r.actual, r.in_memory};
+        if (!(seen == expected[k])) {
+            return ::testing::AssertionFailure() << "report " << k << " is " << seen << " where "
+                                                 << expected[k] << " comes next in visit order";
+        }
+    }
+    return ::testing::AssertionSuccess();
+}
+
+/**
+ * Records the line sequence of a verification in which every word mismatches: each visited
+ * line must yield its eight words as eight consecutive reports, ascending, with actual the
+ * complement of expected. Storage is reserved up front, so on_mismatch never allocates.
+ */
+class line_order_sink final : public mismatch_sink {
+public:
+    line_order_sink(const std::uint64_t* span, std::size_t lines) : span_(span) {
+        line_offsets_.reserve(lines);
+    }
+    ~line_order_sink() = default;
+    line_order_sink(const line_order_sink&) = delete;
+    line_order_sink& operator=(const line_order_sink&) = delete;
+
+    void on_mismatch(const std::uint64_t* address, std::uint64_t expected,
+                     std::uint64_t actual) noexcept override {
+        const auto word = static_cast<std::uint64_t>(address - span_);
+        const std::uint64_t position = reports_++ % k_line_words;
+        if (actual != ~expected) {
+            ++wrong_values_;
+        }
+        if (position == 0U) {
+            line_word_ = word;
+            if (word % k_line_words != 0U) {
+                ++broken_lines_;
+            }
+            if (line_offsets_.size() == line_offsets_.capacity()) {
+                ++overflow_;
+            } else {
+                line_offsets_.push_back(word * sizeof(std::uint64_t));
+            }
+        } else if (word != line_word_ + position) {
+            ++broken_lines_;
+        }
+    }
+
+    /** Byte offset of each visited line from the span start, in report order. */
+    const std::vector<std::uint64_t>& line_offsets() const noexcept { return line_offsets_; }
+    std::uint64_t reports() const noexcept { return reports_; }
+    /** Reports that broke the eight-ascending-words-per-line shape. */
+    std::uint64_t broken_lines() const noexcept { return broken_lines_; }
+    std::uint64_t wrong_values() const noexcept { return wrong_values_; }
+    std::uint64_t overflow() const noexcept { return overflow_; }
+
+private:
+    const std::uint64_t* span_;
+    std::vector<std::uint64_t> line_offsets_;
+    std::uint64_t line_word_ = 0;
+    std::uint64_t reports_ = 0;
+    std::uint64_t broken_lines_ = 0;
+    std::uint64_t wrong_values_ = 0;
+    std::uint64_t overflow_ = 0;
+};
+
+/**
+ * One kernel set and one pattern kind for the strided entries. SetUp skips the test before its
+ * body can execute a kernel the host lacks. The spans sit k_guard_words into committed, unlocked
+ * buffers, 64-byte aligned, with guard words on both sides.
+ */
+class KernelsStrided : public ::testing::TestWithParam<kernel_param> {
+protected:
+    void SetUp() override {
+        require_isa(isa());
+        if (IsSkipped()) {
+            return;
+        }
+        ASSERT_TRUE(tested_buffer_.valid() && reference_buffer_.valid())
+            << "VirtualAlloc failed with Windows error " << GetLastError();
+        ASSERT_EQ(reinterpret_cast<std::uintptr_t>(span(tested_buffer_)) % k_cache_line_bytes, 0U);
+    }
+
+    std::uint32_t isa() const { return std::get<0>(GetParam()); }
+    std::uint32_t kind() const { return std::get<1>(GetParam()); }
+    const kernel_table& tested() const { return table_of(isa()); }
+    bool compare_with_sse2() const { return isa() != RQ_ISA_SSE2; }
+
+    static std::uint64_t* span(test_buffer& buffer) noexcept {
+        return buffer.data() + k_guard_words;
+    }
+
+    /**
+     * Fills the span with k_guard_value, arms the guards, runs fill_stream_strided with one
+     * table and fences.
+     */
+    static std::uint64_t* run_strided_fill(const kernel_table& table, test_buffer& buffer,
+                                           const strided_case& c) {
+        std::uint64_t* const s = span(buffer);
+        const auto words = static_cast<std::size_t>(c.span_bytes / sizeof(std::uint64_t));
+        std::fill(s, s + words, k_guard_value);
+        arm_guards(s, words);
+        table.fill_stream_strided(s, c.visits, c.spec, c.first_word_index);
+        table.full_fence();
+        return s;
+    }
+
+    test_buffer tested_buffer_{k_strided_buffer_words};
+    test_buffer reference_buffer_{k_strided_buffer_words};
+};
+
+/** A spec and the logical index of the span's first word it is written from. */
+struct strided_start {
+    pattern_spec spec;
+    std::uint64_t first_word_index;
+};
+
+/**
+ * The starts of a kind a strided test runs over the small spans: passes 0 to 3, alternating the
+ * complement flag, the first two at word 0 and the last two at the odd index. Each line's start
+ * parity combined with the pass (what selects an alternating block) thus meets both complement
+ * flags in both parities. Pairing rather than crossing the specs with the indices halves the
+ * strided tests' run time without reaching another code path.
+ */
+std::vector<strided_start> strided_starts_of(std::uint32_t kind) {
+    return {strided_start{pattern_spec{kind, k_seed, 0U, false}, k_strided_first_words[0]},
+            strided_start{pattern_spec{kind, k_seed, 1U, true}, k_strided_first_words[0]},
+            strided_start{pattern_spec{kind, k_seed, 2U, false}, k_strided_first_words[1]},
+            strided_start{pattern_spec{kind, k_seed, 3U, true}, k_strided_first_words[1]}};
+}
+
+/** One kernel set for the visit-order identity test. */
+class KernelsStridedOrder : public ::testing::TestWithParam<std::uint32_t> {
+protected:
+    void SetUp() override {
+        require_isa(GetParam());
+        if (IsSkipped()) {
+            return;
+        }
+        ASSERT_TRUE(buffer_.valid()) << "VirtualAlloc failed with Windows error " << GetLastError();
+    }
+
+    test_buffer buffer_{k_strided_buffer_words};
+};
+
 }  // namespace
 
 /* ---------------------------------------------------------------------------------------------
@@ -879,6 +1210,186 @@ INSTANTIATE_TEST_SUITE_P(KernelsAllSetsAndKinds, KernelsEquivalence,
                          kernel_param_name);
 
 /* ---------------------------------------------------------------------------------------------
+ * Strided kernels: every set against expected_value, the AVX sets also against SSE2
+ * ------------------------------------------------------------------------------------------- */
+
+TEST_P(KernelsStrided, FillStreamStridedWritesExactlyTheVisitedLines) {
+    // Every start, stride and slice over the 2 MiB and 6 MiB spans, with the SSE2 result
+    // compared byte for byte; the 64 MiB window once per stride, whole phase.
+    for (const strided_start& start : strided_starts_of(kind())) {
+        for (const std::uint64_t span_bytes : k_small_strided_spans) {
+            for (const std::uint64_t stride : k_bank_strides) {
+                for (const strided_visits& visits : visit_slices(span_bytes, stride)) {
+                    const strided_case c{isa(), start.spec, span_bytes, start.first_word_index,
+                                         visits};
+                    const auto words = static_cast<std::size_t>(span_bytes / 8U);
+                    const std::uint64_t* const out = run_strided_fill(tested(), tested_buffer_, c);
+                    ASSERT_TRUE(guards_intact(out, words)) << where(c);
+                    ASSERT_TRUE(strided_fill_correct(out, c)) << where(c);
+                    if (compare_with_sse2()) {
+                        const std::uint64_t* const reference =
+                            run_strided_fill(k_kernels_sse2, reference_buffer_, c);
+                        ASSERT_EQ(std::memcmp(out, reference, words * sizeof(std::uint64_t)), 0)
+                            << "differs from the SSE2 reference, " << where(c);
+                    }
+                }
+            }
+        }
+    }
+    const pattern_spec spec{kind(), k_seed, 1U, false};
+    for (const std::uint64_t stride : k_bank_strides) {
+        const strided_case c{isa(), spec, k_largest_strided_span, k_strided_first_words[1],
+                             visit_slices(k_largest_strided_span, stride).front()};
+        const std::uint64_t* const out = run_strided_fill(tested(), tested_buffer_, c);
+        ASSERT_TRUE(guards_intact(out, static_cast<std::size_t>(c.span_bytes / 8U))) << where(c);
+        ASSERT_TRUE(strided_fill_correct(out, c)) << where(c);
+    }
+}
+
+TEST_P(KernelsStrided, VerifyStridedAcceptsCorrectDataWithoutCallingTheSink) {
+    std::uint64_t* const s = span(tested_buffer_);
+    for (const strided_start& start : strided_starts_of(kind())) {
+        for (const std::uint64_t span_bytes : k_small_strided_spans) {
+            for (const std::uint64_t stride : k_bank_strides) {
+                for (const strided_visits& visits : visit_slices(span_bytes, stride)) {
+                    const strided_case c{isa(), start.spec, span_bytes, start.first_word_index,
+                                         visits};
+                    write_visited_lines(s, c);
+                    for (const kernel_table* table : {&tested(), &k_kernels_sse2}) {
+                        recording_sink sink;
+                        ASSERT_EQ(
+                            table->verify_strided(s, visits, c.spec, c.first_word_index, sink), 0U)
+                            << isa_display_name(table->isa) << " set, " << where(c);
+                        ASSERT_TRUE(sink.reports().empty() && sink.overflow() == 0U)
+                            << sink.reports().size() << " sink calls, "
+                            << isa_display_name(table->isa) << " set, " << where(c);
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST_P(KernelsStrided, VerifyStridedReportsCorruptionsInVisitOrderLikeSse2) {
+    std::uint64_t* const s = span(tested_buffer_);
+    const auto run = [&](const strided_case& c) {
+        write_visited_lines(s, c);
+        const std::vector<observed_mismatch> expected = corrupt_visited_lines(s, c);
+        for (const kernel_table* table : {&tested(), &k_kernels_sse2}) {
+            recording_sink sink;
+            ASSERT_EQ(table->verify_strided(s, c.visits, c.spec, c.first_word_index, sink),
+                      static_cast<std::uint64_t>(expected.size()))
+                << isa_display_name(table->isa) << " set, " << where(c);
+            ASSERT_TRUE(strided_reports_match(sink, s, expected))
+                << isa_display_name(table->isa) << " set, " << where(c);
+        }
+    };
+    for (const strided_start& start : strided_starts_of(kind())) {
+        for (const std::uint64_t span_bytes : k_small_strided_spans) {
+            for (const std::uint64_t stride : k_bank_strides) {
+                for (const strided_visits& visits : visit_slices(span_bytes, stride)) {
+                    ASSERT_NO_FATAL_FAILURE(run(strided_case{isa(), start.spec, span_bytes,
+                                                             start.first_word_index, visits}));
+                }
+            }
+        }
+    }
+    // The 64 MiB window: the mid-sweep slice and a work group, at every stride.
+    const pattern_spec spec{kind(), k_seed, 2U, true};
+    for (const std::uint64_t stride : k_bank_strides) {
+        const std::vector<strided_visits> slices = visit_slices(k_largest_strided_span, stride);
+        for (std::size_t i = 1; i < slices.size(); ++i) {
+            ASSERT_NO_FATAL_FAILURE(run(strided_case{isa(), spec, k_largest_strided_span,
+                                                     k_strided_first_words[1], slices[i]}));
+        }
+    }
+}
+
+TEST_P(KernelsStrided, ZeroVisitsAreANoOpWhateverTheOtherFields) {
+    const pattern_spec spec{kind(), k_seed, 0U, false};
+    constexpr std::size_t words = k_line_words * 4U;
+    const strided_visits empty_calls[] = {
+        strided_visits{0U, 0U, 0U, 0U},
+        strided_visits{k_bank_strides[0], 256U, 7U, 0U},
+    };
+    std::uint64_t* const s = span(tested_buffer_);
+    for (const strided_visits& visits : empty_calls) {
+        const strided_case c{isa(), spec, words * sizeof(std::uint64_t), 0U, visits};
+        std::fill(s, s + words, k_guard_value);
+        arm_guards(s, words);
+        tested().fill_stream_strided(s, visits, spec, 0U);
+        tested().full_fence();
+        recording_sink sink;
+        // Every word mismatches spec, so a single load would be reported.
+        ASSERT_EQ(tested().verify_strided(s, visits, spec, 0U, sink), 0U) << where(c);
+        ASSERT_TRUE(sink.reports().empty()) << where(c);
+        ASSERT_TRUE(guards_intact(s, words)) << where(c);
+        ASSERT_TRUE(std::all_of(s, s + words, [](std::uint64_t w) { return w == k_guard_value; }))
+            << "a zero-visit fill wrote memory, " << where(c);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(KernelsStridedSetsAndKinds, KernelsStrided,
+                         ::testing::Combine(::testing::ValuesIn(k_all_isas),
+                                            ::testing::ValuesIn(k_all_kinds)),
+                         kernel_param_name);
+
+// The strided kernels' visit sequence is the BankStride order itself: issued work group by work
+// group as the step runner issues it, over a span in which every word mismatches, the line
+// sequence the reports reveal must equal order_cursor's BankStride ranges, in order.
+TEST_P(KernelsStridedOrder, VisitSequenceEqualsTheBankStrideCursor) {
+    const kernel_table& table = table_of(GetParam());
+    std::uint64_t* const s = buffer_.data() + k_guard_words;
+    constexpr std::uint64_t spans[] = {2U * k_strided_mib, 6U * k_strided_mib,
+                                       k_largest_strided_span};
+    for (const std::uint64_t span_bytes : spans) {
+        for (std::uint32_t pass = 0; pass < 3U; ++pass) {
+            const std::uint64_t stride = bank_stride_bytes(pass);
+            const std::uint64_t lines = span_bytes / k_cache_line_bytes;
+            const pattern_spec spec{RQ_PATTERN_RANDOM, k_seed, pass, false};
+            const pattern_spec complement{RQ_PATTERN_RANDOM, k_seed, pass, true};
+            const std::uint64_t first = 4097U * k_line_words;
+            k_kernels_sse2.fill_stream(s, static_cast<std::size_t>(span_bytes / 8U), complement,
+                                       first, 1);
+            k_kernels_sse2.full_fence();
+
+            line_order_sink sink(s, static_cast<std::size_t>(lines));
+            std::uint64_t mismatches = 0;
+            for (std::uint64_t group = 0; group < lines / k_group_visits; ++group) {
+                const strided_visits visits{stride, span_bytes / stride, group * k_group_visits,
+                                            k_group_visits};
+                mismatches += table.verify_strided(s, visits, spec, first, sink);
+            }
+            const std::string where_text = std::string(isa_display_name(GetParam())) + ", span " +
+                                           std::to_string(span_bytes / k_strided_mib) +
+                                           " MiB, pass " + std::to_string(pass);
+            ASSERT_EQ(mismatches, lines * k_line_words) << where_text;
+            ASSERT_EQ(sink.reports(), lines * k_line_words) << where_text;
+            ASSERT_EQ(sink.overflow(), 0U) << where_text;
+            ASSERT_EQ(sink.broken_lines(), 0U)
+                << "reports not eight ascending words per line, " << where_text;
+            ASSERT_EQ(sink.wrong_values(), 0U) << where_text;
+
+            order_cursor cursor(
+                order_params{RQ_ORDER_BANK_STRIDE, span_bytes, k_seed, 0U, pass, 0U});
+            ASSERT_EQ(cursor.total_ranges(), lines) << where_text;
+            order_range range{};
+            std::size_t k = 0;
+            while (cursor.next(range)) {
+                ASSERT_EQ(range.length, k_cache_line_bytes) << where_text;
+                ASSERT_EQ(sink.line_offsets()[k], range.offset)
+                    << "visit " << k << " differs from the cursor, " << where_text;
+                ++k;
+            }
+            ASSERT_EQ(k, sink.line_offsets().size()) << where_text;
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(KernelsStridedAllSets, KernelsStridedOrder,
+                         ::testing::ValuesIn(k_all_isas), isa_param_name);
+
+/* ---------------------------------------------------------------------------------------------
  * Raw tables: tags, baseline helpers and distinct vector entries
  * ------------------------------------------------------------------------------------------- */
 
@@ -889,6 +1400,8 @@ TEST_P(KernelsRawTable, IsTaggedWithItsSetAndUsesTheBaselineHelpers) {
     EXPECT_TRUE(table.fill_stream != nullptr);
     EXPECT_TRUE(table.verify != nullptr);
     EXPECT_TRUE(table.verify_and_stream != nullptr);
+    EXPECT_TRUE(table.fill_stream_strided != nullptr);
+    EXPECT_TRUE(table.verify_strided != nullptr);
     EXPECT_EQ(table.full_fence, &full_fence_mfence);
     // The raw sets use CLFLUSHOPT; tables_for patches CLFLUSH in where it is absent.
     EXPECT_EQ(table.flush_range, &flush_range_clflushopt);
@@ -908,6 +1421,10 @@ TEST(KernelsTables, VectorEntriesAreDistinctPerSet) {
             EXPECT_NE(sets[a]->verify, sets[b]->verify)
                 << isa_display_name(sets[a]->isa) << " and " << isa_display_name(sets[b]->isa);
             EXPECT_NE(sets[a]->verify_and_stream, sets[b]->verify_and_stream)
+                << isa_display_name(sets[a]->isa) << " and " << isa_display_name(sets[b]->isa);
+            EXPECT_NE(sets[a]->fill_stream_strided, sets[b]->fill_stream_strided)
+                << isa_display_name(sets[a]->isa) << " and " << isa_display_name(sets[b]->isa);
+            EXPECT_NE(sets[a]->verify_strided, sets[b]->verify_strided)
                 << isa_display_name(sets[a]->isa) << " and " << isa_display_name(sets[b]->isa);
         }
     }
@@ -988,6 +1505,8 @@ TEST_P(IsaDispatchTablesFor, CopiesTheSelectedSetAndPatchesFlushesWithoutClflush
     EXPECT_EQ(table.fill_stream, expected_set.fill_stream);
     EXPECT_EQ(table.verify, expected_set.verify);
     EXPECT_EQ(table.verify_and_stream, expected_set.verify_and_stream);
+    EXPECT_EQ(table.fill_stream_strided, expected_set.fill_stream_strided);
+    EXPECT_EQ(table.verify_strided, expected_set.verify_strided);
     EXPECT_EQ(table.full_fence, &full_fence_mfence);
     EXPECT_EQ(table.flush_range, clflushopt ? &flush_range_clflushopt : &flush_range_clflush);
     EXPECT_EQ(table.reread, clflushopt ? &reread_clflushopt : &reread_clflush);

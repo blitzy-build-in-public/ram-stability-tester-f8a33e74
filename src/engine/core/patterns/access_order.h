@@ -11,7 +11,10 @@
  * @par Which order a step uses
  * - Windowed steps (no hold) write and then verify each window in the step's access order. The
  *   verify phase uses a cursor with identical parameters (or reset()), so both phases visit the
- *   same sequence and each verified group can be paired with its write time.
+ *   same sequence and each verified group can be paired with its write time. BankStride
+ *   windows differ in form only: the runner issues their visits in bulk through
+ *   IMemoryAccess::stream_fill_strided and verify_strided, one call per 1 MiB of the visit
+ *   sequence order_cursor defines here, which stays the reference definition of the order.
  * - Turnaround steps execute one turnaround_schedule per window per pass.
  * - Hold steps write and verify the whole slice in RQ_ORDER_RANDOM_BLOCKS order, whatever the
  *   step's access order.

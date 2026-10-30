@@ -1,7 +1,8 @@
 /**
  * @file kernels_avx2.cpp
- * @brief The AVX2 kernel set: streaming fill, verification and moving-inversion sweeps over
- *        four-word YMM vectors, the engine's full-speed baseline.
+ * @brief The AVX2 kernel set: streaming fill, verification, moving-inversion sweeps and the
+ *        strided BankStride fill and verification over four-word YMM vectors, the engine's
+ *        full-speed baseline.
  *
  * engine_core.vcxproj compiles this unit, and only this unit, with /arch:AVX2, so any
  * instruction the compiler emits here may be VEX-encoded and would fault on a CPU without AVX2.
@@ -246,6 +247,98 @@ std::uint64_t verify_and_stream_avx2(std::uint64_t* p, std::size_t words,
     return mismatches;
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * Strided kernels. Contracts: fill_stream_strided_fn and verify_strided_fn in kernels.h. One call
+ * makes a work group's BankStride visits; the span is 64-byte aligned, so every line is two
+ * aligned vectors and no edge word occurs.
+ * ------------------------------------------------------------------------------------------- */
+
+/** Words per visited line: two YMM vectors. */
+constexpr std::size_t k_line_words = k_cache_line_bytes / sizeof(std::uint64_t);
+
+static_assert(k_line_words % avx2::lanes == 0, "a cache line must hold whole AVX2 vectors");
+
+/**
+ * Calls block(w, expected) for each aligned vector of the lines a strided call's visits name: the
+ * lines in visit order, the two vectors of a line ascending. w is the word offset of the vector's
+ * lane 0 from the span start, and expected holds the pattern values of its four words. block
+ * returns true when it has made an out-of-line call.
+ *
+ * The first visit costs one division; every later one advances the line and sweep counters,
+ * because a division per visit would cost more than the line's own stores. One cursor serves the
+ * whole call and is repositioned per line, so no line pays a pattern-key computation or a cursor
+ * construction.
+ *
+ * The cursor and the counters are locals here and block receives only values: MSVC keeps in
+ * memory a cursor that a kernel's lambda captures by reference, storing its counter and word
+ * index every vector. No YMM register keeps its value across a call under the x64 convention, so
+ * after block's call the cursor re-derives its block from its word index with seek(); a counter
+ * held live across that call instead lives on the stack, stored and reloaded every vector. The v143
+ * Release listing shows the cursor's counter, word index and mode in registers throughout the
+ * vector loop of both kernels; its loop-invariant members are read from the cursor on the stack.
+ */
+template <class Block>
+__forceinline void for_each_visited_block(const strided_visits& visits, const pattern_spec& spec,
+                                          std::uint64_t span_first_word_index,
+                                          Block&& block) noexcept {
+    // Copied, so that the kernel's stores through the span need not be assumed to change them and
+    // no line reloads them.
+    const std::uint64_t visit_count = visits.visit_count;
+    if (visit_count == 0) {
+        return;
+    }
+    const std::uint64_t lines_per_sweep = visits.lines_per_sweep;
+    const std::uint64_t stride_words = visits.stride_bytes / sizeof(std::uint64_t);
+    std::uint64_t line = visits.first_visit % lines_per_sweep;
+    std::uint64_t sweep_start = visits.first_visit / lines_per_sweep * k_line_words;
+    std::uint64_t offset = sweep_start + line * stride_words;
+    avx2_cursor cursor(spec, span_first_word_index, 1);
+    for (std::uint64_t n = 0; n != visit_count; ++n) {
+        cursor.seek(span_first_word_index + offset);
+        for (std::size_t i = 0; i != k_line_words; i += avx2::lanes) {
+            if (block(static_cast<std::size_t>(offset) + i, cursor.current())) [[unlikely]] {
+                cursor.seek(cursor.word_index());
+            }
+            cursor.advance();
+        }
+        if (++line == lines_per_sweep) {
+            // The next sweep starts one line further on.
+            line = 0;
+            sweep_start += k_line_words;
+            offset = sweep_start;
+        } else {
+            offset += stride_words;
+        }
+    }
+}
+
+void fill_stream_strided_avx2(std::uint64_t* span, const strided_visits& visits,
+                              const pattern_spec& spec,
+                              std::uint64_t span_first_word_index) noexcept {
+    for_each_visited_block(visits, spec, span_first_word_index,
+                           [span](std::size_t w, __m256i value) {
+                               _mm256_stream_si256(reinterpret_cast<__m256i*>(span + w), value);
+                               return false;
+                           });
+}
+
+std::uint64_t verify_strided_avx2(const std::uint64_t* span, const strided_visits& visits,
+                                  const pattern_spec& spec, std::uint64_t span_first_word_index,
+                                  mismatch_sink& sink) noexcept {
+    std::uint64_t mismatches = 0;
+    for_each_visited_block(
+        visits, spec, span_first_word_index, [&](std::size_t w, __m256i expected) {
+            const std::uint64_t* block = span + w;
+            const __m256i loaded = _mm256_load_si256(reinterpret_cast<const __m256i*>(block));
+            if (!all_lanes_equal(loaded, expected)) {
+                mismatches += report_block(block, loaded, expected, false, sink);
+                return true;
+            }
+            return false;
+        });
+    return mismatches;
+}
+
 }  // namespace
 
 // The raw set uses the CLFLUSHOPT helpers. tables_for substitutes the CLFLUSH ones on CPUs that
@@ -259,6 +352,8 @@ constinit const kernel_table k_kernels_avx2 = {
     .verify = &verify_avx2,
     .verify_and_stream = &verify_and_stream_avx2,
     .reread = &reread_clflushopt,
+    .fill_stream_strided = &fill_stream_strided_avx2,
+    .verify_strided = &verify_strided_avx2,
 };
 
 }  // namespace rq::engine

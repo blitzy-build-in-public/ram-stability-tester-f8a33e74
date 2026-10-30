@@ -1,4 +1,5 @@
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -249,9 +250,19 @@ internal static unsafe class CallbackThunks
 
         public uint Deliver(EngineSession session)
         {
+            // The ABI allows a null pointer only with a count of 0. A nonzero count advertises records that cannot be
+            // read, so it is an ABI fault, which Run reports as a host fault, rather than an empty batch that would
+            // silently drop them.
+            if (_records == null && _count != 0)
+            {
+                throw new InvalidOperationException(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The engine raised {CallbackName} with a null records pointer and a count of {_count}."));
+            }
+
             // Once the detail cap is reached, batches carry no records (count 0, null pointer) while the true total
             // keeps rising, so an empty batch is still delivered for its total.
-            ReadOnlySpan<RqErrorRecord> records = _records == null || _count == 0
+            ReadOnlySpan<RqErrorRecord> records = _count == 0
                 ? ReadOnlySpan<RqErrorRecord>.Empty
                 : new ReadOnlySpan<RqErrorRecord>(_records, checked((int)_count));
             session.OnNativeErrors(records, _totalErrors);
@@ -269,7 +280,18 @@ internal static unsafe class CallbackThunks
 
         public uint Deliver(EngineSession session)
         {
-            session.OnNativeCompleted(in Payload(_result, CallbackName));
+            // Unlike the other payloads, a null result is not thrown here: on_completed is raised once, and an
+            // exception would drop the run's only Completed, so the session reports the fault and still delivers a
+            // host-fault Completed.
+            if (_result == null)
+            {
+                session.OnNativeCompletedWithoutResult();
+            }
+            else
+            {
+                session.OnNativeCompleted(in *_result);
+            }
+
             return NativeConstants.ActionContinue;
         }
     }

@@ -14,21 +14,24 @@
  * address, bit mask, step and pass, as multisets, with nothing unmatched on either side.
  *
  * @par Survivable injection points
- * A corruption is applied only inside verify and verify_and_stream, immediately before the call
- * is forwarded to the inner layer. The step runner issues those calls after the range's last
- * write and after its fence, flush and fence, so nothing can overwrite a corruption before the
- * forwarded verification checks it. That one point covers every injection point of the
- * verification plan:
- * - windowed steps: a window's verify, after its streamed write and fence;
+ * A corruption is applied only inside verify, verify_strided and verify_and_stream, immediately
+ * before the call is forwarded to the inner layer. The step runner issues those calls after the
+ * range's last write and after its fence, flush and fence, so nothing can overwrite a
+ * corruption before the forwarded verification checks it. A verify_strided call is offered only
+ * the targets on the lines it visits: the rest of its span is verified by the window's other
+ * strided calls, each of which injects its own lines' targets. That one point covers every
+ * injection point of the verification plan:
+ * - windowed steps: a window's verify or BankStride verify_strided, after its streamed write and
+ *   fence;
  * - hold steps: the slice's verify, after the slice write and the hold;
  * - moving inversion: each sweep's verify_and_stream, between the values the base write or the
  *   previous sweep streamed and this sweep's loads;
  * - turnaround: block i - 4's verify, after that block's write and before its own verification;
  * - delay-dependent faults: the same point, just before the verification load, gated on age.
  *
- * stream_fill, fence, flush and reread_word forward unchanged: a store anywhere else could be
- * overwritten before it is checked. The error collector's flushed re-read therefore sees the
- * stored wrong value, and a single-bit flip reports RQ_REREAD_REPEATS_ACTUAL.
+ * stream_fill, stream_fill_strided, fence, flush and reread_word forward unchanged: a store
+ * anywhere else could be overwritten before it is checked. The error collector's flushed re-read
+ * therefore sees the stored wrong value, and a single-bit flip reports RQ_REREAD_REPEATS_ACTUAL.
  *
  * @par Fault kinds
  * Targets are logical region byte offsets (address - access_context::region_base), so they do
@@ -69,7 +72,8 @@
  * - verified_opportunity = 0 and reserved0 = 0.
  *
  * verified_opportunity becomes 1 once the forwarded call for that range has returned. The kernel
- * verifies the whole range in one call, so every logged injection of a completed run is verified.
+ * verifies the whole range, or every visited line, in one call, so every logged injection of a
+ * completed run is verified.
  * 0 survives only when the forwarded call throws or the process dies inside it, which keeps the
  * ABI field honest.
  *
@@ -77,7 +81,19 @@
  * spec.max_injections caps the logged injections of the whole run, across all workers; 0 means
  * none. Candidates beyond the cap are neither stored nor logged. Moving inversion verifies twice
  * per pass, so a target can be injected, and logged, twice in one pass, once per sweep; the tests
- * match by multiset.
+ * match by multiset. Once the cap is spent, verify, verify_strided and verify_and_stream forward
+ * at once, with no clock read, target lookup or allocation, so the rest of a long run builds no
+ * target set.
+ *
+ * @par Target sets
+ * A (step, pass)'s targets are built on its first lookup and shared by every worker. The engine
+ * issues (step, pass) keys in ascending order, all verifications of a pass ending at a phase
+ * barrier before the next pass's begin, so the layer's table keeps only the newest pass's set,
+ * two at most when a caller goes back to an older key, and each worker's lookup cache keeps at
+ * most its own last set alive. Retained memory is therefore bounded by the worker count, not by
+ * the passes run. A reclaimed set asked for again is rebuilt identically, being a function of
+ * seed, step and pass alone. retained_target_set_count() and built_target_set_count() expose
+ * this to the tests.
  *
  * @par Threading
  * Every worker calls concurrently on disjoint ranges. The log is guarded by a mutex and the
@@ -91,14 +107,15 @@
  * design limits. That is a property of the design, not a measurement.
  *
  * @par Exceptions
- * As in IMemoryAccess, only reread_word is noexcept: stream_fill, fence, flush, verify and
- * verify_and_stream propagate whatever an inner IMemoryAccess implementation throws, and the
- * worker thread entry points turn that into a stop with RQ_END_INTERNAL_FAULT. In the standard
- * stacks the inner layer is counting_memory_access, whose six overrides are noexcept and which
- * contains its own log-allocation failure by setting log_overflowed() instead of throwing, so no
- * primitive exception reaches this layer from it: an exception escaping its inner layer or its
- * observer calls std::terminate instead. When this layer cannot allocate its own bookkeeping, a
- * target set or a log entry, it skips injection for that call and still forwards it.
+ * As in IMemoryAccess, only reread_word is noexcept: stream_fill, stream_fill_strided, fence,
+ * flush, verify, verify_strided and verify_and_stream propagate whatever an inner IMemoryAccess
+ * implementation throws, and the worker thread entry points turn that into a stop with
+ * RQ_END_INTERNAL_FAULT. In the standard stacks the inner layer is counting_memory_access, whose
+ * eight overrides are noexcept and which contains its own log-allocation failure by setting
+ * log_overflowed() instead of throwing, so no primitive exception reaches this layer from it:
+ * an exception escaping its inner layer or its observer calls std::terminate instead. When this
+ * layer cannot allocate its own bookkeeping, a target set or a log entry, it skips injection for
+ * that call and still forwards it.
  */
 #pragma once
 
@@ -122,7 +139,8 @@ namespace rq::engine::test {
 /**
  * Corrupts words of a verified range just before forwarding the verification, logs every
  * corruption, and forwards every other primitive unchanged. See the file comment for the
- * injection points, the fault kinds, the log and the threading contract.
+ * injection points, the fault kinds, the log, the target-set lifetime and the threading
+ * contract.
  *
  * Neither copyable nor movable: the session owns it through std::unique_ptr<IMemoryAccess>, and
  * tests and test_exports.cpp hold non-owning pointers to it for the session's lifetime.
@@ -200,6 +218,29 @@ public:
                                     const pattern_spec& next, std::uint64_t first_word_index,
                                     int direction, mismatch_sink& sink) override;
 
+    /** Forwards unchanged: a corruption stored here could be overwritten before it is checked. */
+    void stream_fill_strided(const access_context& ctx, std::uint64_t* span,
+                             std::size_t span_word_count, const strided_visits& visits,
+                             const pattern_spec& spec,
+                             std::uint64_t span_first_word_index) override;
+
+    /**
+     * As verify, for the lines `visits` names: injects exactly the targets of ctx's
+     * (step, pass), and the stuck word, that lie on a line this call visits, then forwards the
+     * call with its original arguments and no lock held, then marks their log entries verified.
+     * A target elsewhere in the span is left to the call that visits its line, so each target
+     * is injected once per verification of its word.
+     *
+     * Word j of the span has logical index span_first_word_index + j, so its expected value is
+     * expected_value(expected, span_first_word_index + j).
+     *
+     * @return The inner layer's mismatch count, unchanged.
+     */
+    std::uint64_t verify_strided(const access_context& ctx, const std::uint64_t* span,
+                                 std::size_t span_word_count, const strided_visits& visits,
+                                 const pattern_spec& expected, std::uint64_t span_first_word_index,
+                                 mismatch_sink& sink) override;
+
     /**
      * Forwards unchanged, so the flushed re-read returns the stored corruption. Runs re-entrantly
      * from inside this layer's own verify or verify_and_stream, which hold no lock at that point.
@@ -237,11 +278,29 @@ public:
      */
     std::uint64_t verified_opportunity_count() const noexcept;
 
+    /**
+     * Number of target sets the layer's shared table holds: 0 before the first target lookup,
+     * then 1 while (step, pass) keys arrive in ascending order, as the engine issues them, and 2
+     * at most in any order. Sets that only a worker's lookup cache or an in-flight call still
+     * references are not counted: each worker keeps at most one, its last, alive until it looks
+     * up another (step, pass) or the layer is destroyed. Stays 0 for RQ_FAULT_STUCK_BIT and for
+     * a spec that injects nothing, which look no targets up. Lock-free.
+     */
+    std::uint64_t retained_target_set_count() const noexcept;
+
+    /**
+     * Number of target sets built since construction, each rebuild of a reclaimed (step, pass)
+     * included. Stops growing once spec().max_injections is spent, because a call that starts
+     * after that looks no targets up. Lock-free.
+     */
+    std::uint64_t built_target_set_count() const noexcept;
+
 private:
     /**
-     * The mutex-guarded log, the per-(step, pass) target sets with their per-worker lookup
-     * cache, and the constants derived from the spec. Defined in the .cpp, so the containers and
-     * locks behind them stay private to the implementation and its includers never compile them.
+     * The mutex-guarded log, the table of in-flight (step, pass) target sets with their
+     * per-worker lookup cache, and the constants derived from the spec. Defined in the .cpp, so
+     * the containers and locks behind them stay private to the implementation and its includers
+     * never compile them.
      */
     struct impl;
 

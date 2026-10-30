@@ -130,6 +130,41 @@ public:
                                     int direction, mismatch_sink& sink) override;
 
     /**
+     * kernel_table::fill_stream_strided over the visited lines of the span. ctx and
+     * span_word_count are unused. No fence.
+     *
+     * @param ctx Issuing context; ignored.
+     * @param span First word of the span, 64-byte aligned.
+     * @param span_word_count Words in the span; ignored, because the kernel needs only the
+     *        visits.
+     * @param visits The call's visits; visit_count 0 does nothing.
+     * @param spec Pattern instance whose values the visited lines receive.
+     * @param span_first_word_index Logical word index of span[0].
+     */
+    void stream_fill_strided(const access_context& ctx, std::uint64_t* span,
+                             std::size_t span_word_count, const strided_visits& visits,
+                             const pattern_spec& spec,
+                             std::uint64_t span_first_word_index) override;
+
+    /**
+     * kernel_table::verify_strided over the visited lines of the span, reporting each mismatch
+     * to `sink`. ctx and span_word_count are unused.
+     *
+     * @param ctx Issuing context; ignored.
+     * @param span First word of the span, 64-byte aligned.
+     * @param span_word_count Words in the span; ignored.
+     * @param visits The call's visits; visit_count 0 does nothing and returns 0.
+     * @param expected Pattern instance the visited lines should hold.
+     * @param span_first_word_index Logical word index of span[0].
+     * @param sink Receives each mismatching word in visit order, ascending within a line.
+     * @return Number of mismatching words.
+     */
+    std::uint64_t verify_strided(const access_context& ctx, const std::uint64_t* span,
+                                 std::size_t span_word_count, const strided_visits& visits,
+                                 const pattern_spec& expected, std::uint64_t span_first_word_index,
+                                 mismatch_sink& sink) override;
+
+    /**
      * kernel_table::reread: MFENCE, flush of the word's line, MFENCE, one volatile load. ctx is
      * unused. Never counts as coverage.
      *

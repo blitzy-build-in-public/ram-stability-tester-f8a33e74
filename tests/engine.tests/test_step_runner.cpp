@@ -23,7 +23,17 @@
  *   flush covering the line and a fence after the line's previous store or load; hold steps show
  *   the same sequence before the hold and again after it. Each line is flushed exactly as often
  *   per pass as the rule requires, never more: no flush-and-reload over a small address set,
- *   the access style the product's stress bound excludes.
+ *   the access style the product's stress bound excludes. No flush call covers more than one
+ *   1 MiB work group, the unit after which workers check the stop flag. A BankStride pass
+ *   issues exactly one strided stream and one strided verification per 1 MiB, whose lines
+ *   expand to order_cursor's BankStride sequence.
+ * - StepRunnerFlushStop: a stop that lands during the first 1 MiB of every window or slice
+ *   flush (windowed in two orders, pre-hold, post-hold, moving-inversion base write and sweep),
+ *   or during a window's final write group, ends the phase within one work group of flushing,
+ *   with its closing fence, no verification after the stop and no coverage for the cut window
+ *   or slice.
+ * - StepRunnerBankStrideStop: a stop during a BankStride window's verification ends it after
+ *   the 1 MiB strided verification in flight, whose bytes alone are counted.
  *
  * Holds of 5 s finish instantly in fake time, while real worker threads still stream, flush and
  * verify real memory, so regions stay at 16 MiB or less. No test depends on an instruction set
@@ -40,6 +50,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <random>
 #include <span>
@@ -55,6 +66,7 @@
 #include "core/memory/memory_access.h"
 #include "core/memory/memory_region.h"
 #include "core/memory/real_memory_access.h"
+#include "core/patterns/access_order.h"
 #include "core/runner/coverage_counter.h"
 #include "core/runner/step_runner.h"
 #include "core/runner/worker_pool.h"
@@ -83,14 +95,12 @@ constexpr std::uint32_t k_detail_cap = 10'000;
 /** Region of the scheduling tests: one minimal 2 MiB slice keeps 20-pass runs fast. */
 constexpr std::uint64_t k_schedule_region_bytes = 2 * k_mib;
 
-/** Region of the flush-rule tests: 262,144 lines, one chunk and one window per slice. */
-constexpr std::uint64_t k_flush_region_bytes = 16 * k_mib;
-
 /**
- * Region of the BankStride flush-rule case: one record per 64-byte line, so 4 MiB keeps three
- * passes at about 393,000 records, within the log cap below.
+ * Region of the flush-rule tests: 262,144 lines, one chunk and one window per slice. BankStride
+ * included: its windows are issued as one strided stream and one strided verification per
+ * 1 MiB, so its log is as short as the sequential orders'.
  */
-constexpr std::uint64_t k_line_order_region_bytes = 4 * k_mib;
+constexpr std::uint64_t k_flush_region_bytes = 16 * k_mib;
 
 /** Per-worker log cap of the flush-rule tests. */
 constexpr std::size_t k_max_log_records = std::size_t{1} << 20;
@@ -179,11 +189,19 @@ const char* primitive_name(primitive_kind kind) noexcept {
         return "verify_and_stream";
     case primitive_kind::reread_word:
         return "reread_word";
+    case primitive_kind::stream_fill_strided:
+        return "stream_fill_strided";
+    case primitive_kind::verify_strided:
+        return "verify_strided";
     }
     return "invalid primitive";
 }
 
-/** One-letter tags of the per-pass signatures: the primitive, then its phase. */
+/**
+ * One-letter tags of the per-pass signatures: the primitive, then its phase. The strided
+ * primitives have letters of their own, so a BankStride pass that fell back to per-line
+ * stream_fill and verify calls would not match its signature.
+ */
 char primitive_letter(primitive_kind kind) noexcept {
     switch (kind) {
     case primitive_kind::stream_fill:
@@ -198,8 +216,17 @@ char primitive_letter(primitive_kind kind) noexcept {
         return 'M';
     case primitive_kind::reread_word:
         return 'R';
+    case primitive_kind::stream_fill_strided:
+        return 'T';
+    case primitive_kind::verify_strided:
+        return 'U';
     }
     return '?';
+}
+
+/** Whether a record is one of the strided primitives, whose begin is its span's first byte. */
+constexpr bool is_strided(primitive_kind kind) noexcept {
+    return kind == primitive_kind::stream_fill_strided || kind == primitive_kind::verify_strided;
 }
 
 char phase_letter(phase_kind phase) noexcept {
@@ -220,12 +247,51 @@ char phase_letter(phase_kind phase) noexcept {
     return '?';
 }
 
-/** "verify 0x... +1048576 B (pass 2, phase verify, worker 0)" for failure messages. */
+/**
+ * "verify 0x... +1048576 B (pass 2, phase verify, worker 0)" for failure messages; a strided
+ * record also names its visits: "verify_strided 0x... +1048576 B, visits [16384, +16384) of
+ * 1024 lines per sweep at stride 65536 (...)".
+ */
 std::string describe(const primitive_record& record) {
-    return std::string(primitive_name(record.kind)) + " " + hex64(record.begin) + " +" +
-           std::to_string(record.bytes) + " B (pass " + std::to_string(record.ctx.pass_index) +
-           ", phase " + phase_name(record.ctx.phase) + ", worker " + std::to_string(record.worker) +
-           ")";
+    std::string text = std::string(primitive_name(record.kind)) + " " + hex64(record.begin) + " +" +
+                       std::to_string(record.bytes) + " B";
+    if (is_strided(record.kind)) {
+        text += ", visits [" + std::to_string(record.visits.first_visit) + ", +" +
+                std::to_string(record.visits.visit_count) + ") of " +
+                std::to_string(record.visits.lines_per_sweep) + " lines per sweep at stride " +
+                std::to_string(record.visits.stride_bytes);
+    }
+    return text + " (pass " + std::to_string(record.ctx.pass_index) + ", phase " +
+           phase_name(record.ctx.phase) + ", worker " + std::to_string(record.worker) + ")";
+}
+
+/** Byte offset of visit k of a strided record from its span's first byte (kernels.h). */
+constexpr std::uint64_t strided_visit_offset(const strided_visits& visits,
+                                             std::uint64_t k) noexcept {
+    return k / visits.lines_per_sweep * k_cache_line_bytes +
+           k % visits.lines_per_sweep * visits.stride_bytes;
+}
+
+/**
+ * Whether a verification record read the word at `address`: inside [begin, begin + bytes) for
+ * a plain range; on one of the lines the call visited for a strided record.
+ */
+bool record_covers(const primitive_record& record, std::uintptr_t address) noexcept {
+    if (address < record.begin) {
+        return false;
+    }
+    const std::uint64_t offset = address - record.begin;
+    if (!is_strided(record.kind)) {
+        return offset < record.bytes;
+    }
+    const strided_visits& v = record.visits;
+    if (v.stride_bytes == 0 || v.lines_per_sweep == 0 ||
+        offset >= v.lines_per_sweep * v.stride_bytes) {
+        return false;
+    }
+    const std::uint64_t visit =
+        offset % v.stride_bytes / k_cache_line_bytes * v.lines_per_sweep + offset / v.stride_bytes;
+    return visit >= v.first_visit && visit - v.first_visit < v.visit_count;
 }
 
 std::uint64_t abs_diff(std::uint64_t a, std::uint64_t b) noexcept {
@@ -306,6 +372,7 @@ public:
     const std::string& setup_error() const noexcept { return setup_error_; }
 
     fake_clock& clock() noexcept { return clock_; }
+    stop_signal& stop() noexcept { return stop_; }
     counting_memory_access& memory() noexcept { return *memory_; }
     error_collector& errors() noexcept { return *errors_; }
     std::span<const slice_view> slices() const noexcept { return slices_; }
@@ -612,7 +679,8 @@ private:
  *
  * Positions are 1-based log indices, 0 meaning none, so "a fence after position p" is simply
  * "the latest fence position is greater than p". Per line it keeps the line's last store or load
- * (stream_fill, verify, verify_and_stream, reread_word) and the first flush covering the line
+ * (stream_fill, verify, verify_and_stream, reread_word, and the strided stream and verification
+ * of the lines they visit) and the first flush covering the line
  * that some fence separates from that access. A verification then needs that flush and a later
  * fence. Choosing the earliest such flush is exact: if any fence, flush, fence sequence follows
  * the access, the earliest fence-preceded flush is followed by its final fence too.
@@ -651,6 +719,10 @@ public:
             if (record.kind == primitive_kind::fence) {
                 last_fence_ = pos;
                 last_fence_by_phase_[static_cast<std::size_t>(record.ctx.phase)] = pos;
+                continue;
+            }
+            if (is_strided(record.kind)) {
+                check_strided(record, pos);
                 continue;
             }
             std::size_t first = 0;
@@ -708,6 +780,32 @@ private:
         return last_fence_by_phase_[static_cast<std::size_t>(phase)];
     }
 
+    /**
+     * A strided record touches the lines it visits, not the range [begin, begin + bytes): each
+     * visited line is checked like a line of a plain stream or verification. The span its visits
+     * address, lines_per_sweep strides from begin, must lie inside one chunk.
+     */
+    void check_strided(const primitive_record& record, std::uint32_t pos) {
+        const strided_visits& v = record.visits;
+        const bool well_formed = v.stride_bytes != 0 && v.stride_bytes % k_cache_line_bytes == 0 &&
+                                 v.lines_per_sweep != 0 && v.visit_count != 0 &&
+                                 record.bytes == v.visit_count * k_cache_line_bytes &&
+                                 v.first_visit + v.visit_count <=
+                                     v.lines_per_sweep * (v.stride_bytes / k_cache_line_bytes);
+        std::size_t first = 0;
+        std::size_t last = 0;
+        if (!well_formed ||
+            !lines_.resolve(record.begin, v.lines_per_sweep * v.stride_bytes, first, last)) {
+            fail_record(record, pos, "visits of whole lines of a span inside one chunk");
+            return;
+        }
+        for (std::uint64_t k = v.first_visit; k < v.first_visit + v.visit_count; ++k) {
+            on_line(record, pos,
+                    first +
+                        static_cast<std::size_t>(strided_visit_offset(v, k) / k_cache_line_bytes));
+        }
+    }
+
     void on_line(const primitive_record& record, std::uint32_t pos, std::size_t line) {
         line_state& state = states_[line];
         const std::uint32_t pass_plus_one = record.ctx.pass_index + 1;
@@ -725,12 +823,14 @@ private:
             break;
         case primitive_kind::verify:
         case primitive_kind::verify_and_stream:
+        case primitive_kind::verify_strided:
             ++state.pass_verifies;
             ++state.total_verifies;
             check_verification(state, record, pos, line);
             mark_access(state, record.kind, pos);
             break;
         case primitive_kind::stream_fill:
+        case primitive_kind::stream_fill_strided:
             if (kind_ == step_kind::moving_inversion &&
                 state.access_kind == primitive_kind::verify_and_stream) {
                 check_sweep_followed(state, record, pos, line);
@@ -920,8 +1020,10 @@ private:
 
 /**
  * One pass of one worker's log as primitive-and-phase letter pairs, re-reads left out. Runs of
- * equal non-fence pairs collapse into one pair, so a window's thousands of BankStride lines read
- * as one "Sw"; fences never collapse, so every fence shows.
+ * equal non-fence pairs collapse into one pair, so a window's 1 MiB streams read as one "Sw" (one
+ * "Tw" for BankStride's strided streams) and its 1 MiB flush groups as one "Xv"; fences never
+ * collapse, so every fence shows and "FXF" means exactly one fence on each side of a window's or
+ * slice's flushes.
  */
 std::string pass_signature(const std::vector<primitive_record>& log, std::uint32_t pass) {
     std::string signature;
@@ -966,17 +1068,20 @@ std::size_t window_count(std::span<const slice_view> slices) noexcept {
 
 /**
  * The signature one pass must have when one worker covers every slice:
- * - windowed, per window: stream, then fence, flush, fence and verify (phase verify);
+ * - windowed, per window: stream, then fence, flush, fence and verify (phase verify); in the
+ *   BankStride order the stream and the verification are strided calls only;
  * - hold, per slice: stream and the pre-hold fence, flush, fence; then, after the hold, per
  *   slice: fence, flush, fence (phase verify) and verify;
  * - moving inversion, per slice and per sweep: the base write, then each verify-and-stream
  *   sweep, each followed by fence, flush, fence in its own phase.
  * Turnaround is checked action by action instead (expected_turnaround_pass).
  */
-std::string expected_signature(step_kind kind, std::span<const slice_view> slices) {
+std::string expected_signature(step_kind kind, std::uint32_t order,
+                               std::span<const slice_view> slices) {
     switch (kind) {
     case step_kind::windowed:
-        return repeated("SwFvXvFvVv", window_count(slices));
+        return repeated(order == RQ_ORDER_BANK_STRIDE ? "TwFvXvFvUv" : "SwFvXvFvVv",
+                        window_count(slices));
     case step_kind::hold:
         return repeated("SwFpXpFp", slices.size()) + repeated("FvXvFvVv", slices.size());
     case step_kind::moving_inversion:
@@ -1107,6 +1212,74 @@ void expect_inversion_sweeps(const std::vector<primitive_record>& log, std::uint
 }
 
 /**
+ * Asserts the interface calls of one BankStride pass: no plain stream, verification or
+ * verify-and-stream; per window, one stream_fill_strided (phase write) and one verify_strided
+ * (phase verify) per 1 MiB work group, so each MiB crosses the memory interface once each way.
+ * Each call covers its group's 16,384 visits at the pass's stride, and a window's calls of
+ * either kind, expanded line by line, yield exactly order_cursor's BankStride ranges in order.
+ */
+void expect_bank_stride_pass(const std::vector<primitive_record>& log, std::uint32_t pass,
+                             std::span<const slice_view> slices, std::uint64_t covered_bytes) {
+    constexpr std::uint64_t group_visits = k_work_group_bytes / k_cache_line_bytes;
+    const std::uint64_t stride = bank_stride_bytes(pass);
+    const std::vector<primitive_record> records = pass_records(log, pass);
+    const auto plain = std::count_if(records.begin(), records.end(), [](const primitive_record& r) {
+        return r.kind == primitive_kind::stream_fill || r.kind == primitive_kind::verify ||
+               r.kind == primitive_kind::verify_and_stream;
+    });
+    EXPECT_EQ(plain, 0) << "BankStride pass " << pass << " issued per-range calls";
+
+    for (const primitive_kind kind :
+         {primitive_kind::stream_fill_strided, primitive_kind::verify_strided}) {
+        const phase_kind phase =
+            kind == primitive_kind::stream_fill_strided ? phase_kind::write : phase_kind::verify;
+        std::uint64_t calls = 0;
+        std::size_t windows = 0;
+        std::uintptr_t span = 0;
+        std::uint64_t span_visits = 0;
+        std::uint64_t next_visit = 0;
+        std::optional<order_cursor> cursor;
+        for (const primitive_record& record : records) {
+            if (record.kind != kind) {
+                continue;
+            }
+            const strided_visits& v = record.visits;
+            if (!cursor || record.begin != span) {
+                ASSERT_EQ(next_visit, span_visits)
+                    << "the previous window was left part-visited before " << describe(record);
+                ASSERT_NE(v.lines_per_sweep, 0u) << describe(record);
+                span = record.begin;
+                span_visits = v.lines_per_sweep * stride / k_cache_line_bytes;
+                next_visit = 0;
+                cursor.emplace(
+                    order_params{RQ_ORDER_BANK_STRIDE, v.lines_per_sweep * stride, 0, 0, pass, 0});
+                ++windows;
+            }
+            ++calls;
+            ASSERT_EQ(record.ctx.phase, phase) << describe(record);
+            ASSERT_EQ(v.stride_bytes, stride) << describe(record);
+            ASSERT_EQ(v.first_visit, next_visit) << describe(record);
+            ASSERT_EQ(v.visit_count, group_visits) << describe(record);
+            ASSERT_EQ(record.bytes, k_work_group_bytes) << describe(record);
+            for (std::uint64_t k = v.first_visit; k < v.first_visit + v.visit_count; ++k) {
+                order_range range{};
+                ASSERT_TRUE(cursor->next(range)) << "visit " << k << " beyond the cursor's ranges";
+                ASSERT_TRUE(range.offset == strided_visit_offset(v, k) &&
+                            range.length == k_cache_line_bytes)
+                    << "visit " << k << " at offset " << strided_visit_offset(v, k)
+                    << " where the cursor yields " << range.offset << " +" << range.length << ": "
+                    << describe(record);
+            }
+            next_visit += v.visit_count;
+        }
+        EXPECT_EQ(next_visit, span_visits) << "the last window was left part-visited";
+        EXPECT_EQ(windows, window_count(slices)) << primitive_name(kind);
+        EXPECT_EQ(calls, covered_bytes / k_work_group_bytes)
+            << primitive_name(kind) << " calls of BankStride pass " << pass;
+    }
+}
+
+/**
  * Asserts the re-reads of one worker's log: one per injected word, each a single 8-byte
  * reread_word right after the verification that found the mismatch (only other re-reads in
  * between), with that verification's context in which only the phase changed. No fence or
@@ -1132,10 +1305,10 @@ void expect_rereads(const std::vector<primitive_record>& log,
         ASSERT_GT(j, 0u) << "re-read without a preceding verification: " << describe(reread);
         const primitive_record& verification = log[j - 1];
         ASSERT_TRUE(verification.kind == primitive_kind::verify ||
-                    verification.kind == primitive_kind::verify_and_stream)
+                    verification.kind == primitive_kind::verify_and_stream ||
+                    verification.kind == primitive_kind::verify_strided)
             << "re-read " << describe(reread) << " follows " << describe(verification);
-        EXPECT_TRUE(reread.begin >= verification.begin &&
-                    reread.begin - verification.begin < verification.bytes)
+        EXPECT_TRUE(record_covers(verification, reread.begin))
             << "re-read " << describe(reread) << " lies outside " << describe(verification);
         EXPECT_EQ(reread.ctx.step_index, verification.ctx.step_index);
         EXPECT_EQ(reread.ctx.pass_index, verification.ctx.pass_index);
@@ -1146,12 +1319,16 @@ void expect_rereads(const std::vector<primitive_record>& log,
     EXPECT_EQ(rereads, injected.size());
 }
 
-/** Sum of the bytes of every verify and verify_and_stream record: what coverage counts. */
+/**
+ * Sum of the bytes of every verify, verify_and_stream and verify_strided record (a strided
+ * record's bytes are its visited lines): what coverage counts.
+ */
 std::uint64_t logged_verified_bytes(const std::vector<primitive_record>& log) noexcept {
     std::uint64_t bytes = 0;
     for (const primitive_record& record : log) {
         if (record.kind == primitive_kind::verify ||
-            record.kind == primitive_kind::verify_and_stream) {
+            record.kind == primitive_kind::verify_and_stream ||
+            record.kind == primitive_kind::verify_strided) {
             bytes += record.bytes;
         }
     }
@@ -1668,7 +1845,7 @@ constexpr flush_case k_flush_cases[] = {
     {"WindowedCheckerboardSequentialDescending", RQ_PATTERN_CHECKERBOARD,
      RQ_ORDER_SEQUENTIAL_DESCENDING, RQ_THREADS_ALL, 0, 1, k_flush_region_bytes},
     {"WindowedHighToggleBankStride", RQ_PATTERN_HIGH_TOGGLE, RQ_ORDER_BANK_STRIDE, RQ_THREADS_ALL,
-     0, 1, k_line_order_region_bytes},
+     0, 1, k_flush_region_bytes},
     {"WindowedRandomRandomBlocks", RQ_PATTERN_RANDOM, RQ_ORDER_RANDOM_BLOCKS, RQ_THREADS_ALL, 0, 1,
      k_flush_region_bytes},
     {"HoldRandomBlocksFiveSeconds", RQ_PATTERN_RANDOM, RQ_ORDER_RANDOM_BLOCKS, RQ_THREADS_ALL,
@@ -1724,6 +1901,15 @@ TEST_P(StepRunnerFlushRule, EveryVerifiedLineFollowsFenceFlushFenceOnEveryPass) 
     checker.check(log);
     EXPECT_EQ(checker.failure_count(), 0u) << checker.report();
 
+    // Workers check the stop flag every 1 MiB, so no flush call may cover more than one work
+    // group, however large its window or slice. The signatures below still hold exactly one
+    // fence on each side of the flushes, so splitting adds no fence.
+    const auto oversized = std::find_if(log.begin(), log.end(), [](const primitive_record& r) {
+        return r.kind == primitive_kind::flush && r.bytes > k_work_group_bytes;
+    });
+    EXPECT_TRUE(oversized == log.end())
+        << "flush longer than one work group: " << describe(*oversized);
+
     // The phase structure of every pass.
     for (std::uint32_t pass = 0; pass < outcome.passes; ++pass) {
         SCOPED_TRACE("pass " + std::to_string(pass));
@@ -1732,12 +1918,20 @@ TEST_P(StepRunnerFlushRule, EveryVerifiedLineFollowsFenceFlushFenceOnEveryPass) 
             expect_turnaround_pass(log, pass, fixture.slices());
             break;
         case step_kind::moving_inversion:
-            EXPECT_EQ(pass_signature(log, pass), expected_signature(kind, fixture.slices()));
+            EXPECT_EQ(pass_signature(log, pass),
+                      expected_signature(kind, c.order, fixture.slices()));
             expect_inversion_sweeps(log, pass, lines, fixture.tested_bytes());
             break;
         case step_kind::windowed:
+            EXPECT_EQ(pass_signature(log, pass),
+                      expected_signature(kind, c.order, fixture.slices()));
+            if (c.order == RQ_ORDER_BANK_STRIDE) {
+                expect_bank_stride_pass(log, pass, fixture.slices(), fixture.tested_bytes());
+            }
+            break;
         case step_kind::hold:
-            EXPECT_EQ(pass_signature(log, pass), expected_signature(kind, fixture.slices()));
+            EXPECT_EQ(pass_signature(log, pass),
+                      expected_signature(kind, c.order, fixture.slices()));
             break;
         }
     }
@@ -1764,6 +1958,214 @@ INSTANTIATE_TEST_SUITE_P(StepRunnerPhaseKinds, StepRunnerFlushRule,
                          [](const ::testing::TestParamInfo<flush_case>& info) {
                              return std::string(info.param.name);
                          });
+
+/* ---------------------------------------------------------------------------------------------
+ * Stop granularity of the window and slice flushes
+ * ------------------------------------------------------------------------------------------- */
+
+/**
+ * The counting layer's observer of one stop test: requests a user stop on worker 0's
+ * occurrence-th record of one primitive kind in one phase of pass 0, and keeps that record's seq.
+ *
+ * The observer runs after the call was forwarded, so the stop lands as if it had arrived while
+ * that call was still executing: from the worker's side, the record is the work in flight when
+ * the stop arrived. Installed on construction and removed on destruction. The tests run one
+ * worker, so every member is used only on its thread while a step runs, or by the test after.
+ */
+class stop_on_record {
+public:
+    stop_on_record(runner_fixture& fixture, primitive_kind kind, phase_kind phase,
+                   std::uint32_t occurrence)
+        : memory_(fixture.memory()), stop_(fixture.stop()), kind_(kind), phase_(phase),
+          occurrence_(occurrence) {
+        memory_.set_observer([this](const primitive_record& record) { on_primitive(record); });
+    }
+
+    ~stop_on_record() { memory_.set_observer({}); }
+
+    stop_on_record(const stop_on_record&) = delete;
+    stop_on_record& operator=(const stop_on_record&) = delete;
+    stop_on_record(stop_on_record&&) = delete;
+    stop_on_record& operator=(stop_on_record&&) = delete;
+
+    /** Whether the triggering record was issued. Read after the run. */
+    bool triggered() const noexcept { return triggered_; }
+
+    /** seq of the triggering record. Meaningful once triggered(). */
+    std::uint64_t trigger_seq() const noexcept { return trigger_seq_; }
+
+private:
+    void on_primitive(const primitive_record& record) noexcept {
+        if (triggered_ || record.worker != 0 || record.ctx.pass_index != 0 ||
+            record.kind != kind_ || record.ctx.phase != phase_) {
+            return;
+        }
+        if (++seen_ == occurrence_) {
+            triggered_ = true;
+            trigger_seq_ = record.seq;
+            stop_.request(RQ_END_USER_STOP);
+        }
+    }
+
+    counting_memory_access& memory_;
+    stop_signal& stop_;
+    const primitive_kind kind_;
+    const phase_kind phase_;
+    const std::uint32_t occurrence_;
+    std::uint32_t seen_ = 0;
+    bool triggered_ = false;
+    std::uint64_t trigger_seq_ = 0;
+};
+
+struct flush_stop_case {
+    const char* name;
+    std::uint32_t pattern;
+    std::uint32_t order;
+    std::uint32_t hold_ms;
+    /** The record of pass 0 whose observer requests the stop: kind, phase and 1-based count. */
+    primitive_kind trigger_kind;
+    phase_kind trigger_phase;
+    std::uint32_t trigger_occurrence;
+    /** The phase whose fence, flush, fence the stop cuts short. */
+    phase_kind cut_phase;
+    /**
+     * Flush bytes the worker may issue from the triggering record on, that record included: one
+     * work group when the stop lands during a flush, none when it lands before the first.
+     */
+    std::uint64_t max_flushed_from_stop;
+    /** Whole-slice verifications completed before the stop: the coverage the step keeps. */
+    std::uint32_t verified_slices;
+};
+
+void PrintTo(const flush_stop_case& c, std::ostream* os) {
+    *os << c.name;
+}
+
+/** The final 1 MiB stream of a SequentialAscending window of the 16 MiB, one-worker region. */
+constexpr std::uint32_t k_final_write_group =
+    static_cast<std::uint32_t>(k_flush_region_bytes / k_work_group_bytes);
+
+/**
+ * Every flush of a window or slice, each stopped during its first 1 MiB group, plus a windowed
+ * stop during the final write group, which must end the window before any flush; the windowed
+ * cases also in the BankStride order, whose windows are issued as strided calls.
+ */
+constexpr flush_stop_case k_flush_stop_cases[] = {
+    {"WindowedVerifyFlush", RQ_PATTERN_RANDOM, RQ_ORDER_SEQUENTIAL_ASCENDING, 0,
+     primitive_kind::flush, phase_kind::verify, 1, phase_kind::verify, k_work_group_bytes, 0},
+    {"WindowedFinalWriteGroup", RQ_PATTERN_RANDOM, RQ_ORDER_SEQUENTIAL_ASCENDING, 0,
+     primitive_kind::stream_fill, phase_kind::write, k_final_write_group, phase_kind::verify, 0, 0},
+    {"BankStrideVerifyFlush", RQ_PATTERN_RANDOM, RQ_ORDER_BANK_STRIDE, 0, primitive_kind::flush,
+     phase_kind::verify, 1, phase_kind::verify, k_work_group_bytes, 0},
+    {"BankStrideFinalWriteGroup", RQ_PATTERN_RANDOM, RQ_ORDER_BANK_STRIDE, 0,
+     primitive_kind::stream_fill_strided, phase_kind::write, k_final_write_group,
+     phase_kind::verify, 0, 0},
+    {"HoldPreHoldFlush", RQ_PATTERN_RANDOM, RQ_ORDER_RANDOM_BLOCKS, 5'000, primitive_kind::flush,
+     phase_kind::pre_hold_flush, 1, phase_kind::pre_hold_flush, k_work_group_bytes, 0},
+    {"HoldVerifyFlushAfterTheHold", RQ_PATTERN_RANDOM, RQ_ORDER_RANDOM_BLOCKS, 5'000,
+     primitive_kind::flush, phase_kind::verify, 1, phase_kind::verify, k_work_group_bytes, 0},
+    {"MovingInversionBaseWriteFlush", RQ_PATTERN_MOVING_INVERSION_WALKING,
+     RQ_ORDER_SEQUENTIAL_ASCENDING, 0, primitive_kind::flush, phase_kind::write, 1,
+     phase_kind::write, k_work_group_bytes, 0},
+    {"MovingInversionSweepFlush", RQ_PATTERN_MOVING_INVERSION_RANDOM, RQ_ORDER_SEQUENTIAL_ASCENDING,
+     0, primitive_kind::flush, phase_kind::sweep, 1, phase_kind::sweep, k_work_group_bytes, 1},
+};
+
+class StepRunnerFlushStop : public ::testing::TestWithParam<flush_stop_case> {};
+
+TEST_P(StepRunnerFlushStop, EndsThePhaseWithinOneWorkGroupAndVerifiesNothingAfter) {
+    const flush_stop_case& c = GetParam();
+    // One worker, one 16 MiB chunk and window: a flush issued whole would run 16 work groups
+    // past the stop.
+    runner_fixture fixture(harness_options{1, k_flush_region_bytes, true});
+    ASSERT_TRUE(fixture.ready()) << fixture.setup_error();
+    const std::uint32_t pass_ms =
+        static_cast<std::uint32_t>(k_flush_pass_ns / k_ns_per_ms) + c.hold_ms;
+    const rq_step_def step =
+        make_step(c.pattern, c.order, RQ_THREADS_ALL, c.hold_ms, k_flush_passes * pass_ms);
+    stop_on_record trigger(fixture, c.trigger_kind, c.trigger_phase, c.trigger_occurrence);
+    recording_observer observer;
+
+    const step_outcome outcome = fixture.run(step, k_flush_step_index, observer);
+
+    ASSERT_FALSE(fixture.memory().log_overflowed())
+        << "a check over a truncated log proves nothing";
+    ASSERT_TRUE(trigger.triggered()) << "pass 0 never issued the triggering record";
+    EXPECT_FALSE(outcome.completed);
+    EXPECT_EQ(outcome.passes, 0u);
+
+    const std::vector<primitive_record> log = fixture.memory().log_for_worker(0);
+    ASSERT_FALSE(log.empty());
+    std::uint64_t flushed_from_stop = 0;
+    std::uint32_t cut_phase_fences = 0;
+    for (const primitive_record& record : log) {
+        EXPECT_EQ(record.ctx.pass_index, 0u) << "a pass began after the stop: " << describe(record);
+        if (record.kind == primitive_kind::fence && record.ctx.phase == c.cut_phase) {
+            ++cut_phase_fences;
+        }
+        if (record.seq < trigger.trigger_seq()) {
+            continue;
+        }
+        if (record.kind == primitive_kind::flush) {
+            flushed_from_stop += record.bytes;
+        }
+        EXPECT_FALSE(record.kind == primitive_kind::verify ||
+                     record.kind == primitive_kind::verify_and_stream ||
+                     record.kind == primitive_kind::verify_strided)
+            << "verification after the stop: " << describe(record);
+    }
+    EXPECT_LE(flushed_from_stop, c.max_flushed_from_stop);
+
+    // The closing fence ends the phase on the stop too, so the flushes already issued are
+    // ordered before it is abandoned; no fence is added inside the flush.
+    const primitive_record& last = log.back();
+    EXPECT_EQ(last.kind, primitive_kind::fence) << describe(last);
+    EXPECT_EQ(last.ctx.phase, c.cut_phase) << describe(last);
+    EXPECT_EQ(cut_phase_fences, 2u);
+
+    // The window or slice whose flush was cut short is never verified, so it adds no coverage.
+    const std::uint64_t expected_verified =
+        std::uint64_t{c.verified_slices} * fixture.tested_bytes();
+    EXPECT_EQ(logged_verified_bytes(log), expected_verified);
+    EXPECT_EQ(fixture.memory().verified_bytes_for_step(k_flush_step_index), expected_verified);
+    EXPECT_EQ(outcome.verified_bytes, expected_verified);
+}
+
+INSTANTIATE_TEST_SUITE_P(StepRunnerFlushStops, StepRunnerFlushStop,
+                         ::testing::ValuesIn(k_flush_stop_cases),
+                         [](const ::testing::TestParamInfo<flush_stop_case>& info) {
+                             return std::string(info.param.name);
+                         });
+
+// A BankStride window verifies one 1 MiB work group per strided call and checks the stop flag
+// before each: a stop that lands during a group's verification keeps that group's bytes and
+// verifies nothing more.
+TEST(StepRunnerBankStrideStop, EndsVerificationAfterTheWorkGroupInFlight) {
+    constexpr std::uint32_t stop_group = 3;
+    runner_fixture fixture(harness_options{1, k_flush_region_bytes, true});
+    ASSERT_TRUE(fixture.ready()) << fixture.setup_error();
+    const rq_step_def step =
+        make_step(RQ_PATTERN_RANDOM, RQ_ORDER_BANK_STRIDE, RQ_THREADS_ALL, 0,
+                  k_flush_passes * static_cast<std::uint32_t>(k_flush_pass_ns / k_ns_per_ms));
+    stop_on_record trigger(fixture, primitive_kind::verify_strided, phase_kind::verify, stop_group);
+    recording_observer observer;
+
+    const step_outcome outcome = fixture.run(step, k_flush_step_index, observer);
+
+    ASSERT_FALSE(fixture.memory().log_overflowed())
+        << "a check over a truncated log proves nothing";
+    ASSERT_TRUE(trigger.triggered()) << "pass 0 never issued the triggering verification";
+    EXPECT_FALSE(outcome.completed);
+    EXPECT_EQ(outcome.passes, 0u);
+    const std::vector<primitive_record> log = fixture.memory().log_for_worker(0);
+    ASSERT_FALSE(log.empty());
+    EXPECT_EQ(log.back().seq, trigger.trigger_seq())
+        << "a primitive followed the stop: " << describe(log.back());
+    const std::uint64_t expected_verified = std::uint64_t{stop_group} * k_work_group_bytes;
+    EXPECT_EQ(logged_verified_bytes(log), expected_verified);
+    EXPECT_EQ(fixture.memory().verified_bytes_for_step(k_flush_step_index), expected_verified);
+    EXPECT_EQ(outcome.verified_bytes, expected_verified);
+}
 
 /* ---------------------------------------------------------------------------------------------
  * The checker itself: a sequence that breaks the rule must be reported, with what is missing

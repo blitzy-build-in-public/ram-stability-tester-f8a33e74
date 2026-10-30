@@ -164,6 +164,10 @@ const char* primitive_name(primitive_kind kind) noexcept {
         return "verify_and_stream";
     case primitive_kind::reread_word:
         return "reread_word";
+    case primitive_kind::stream_fill_strided:
+        return "stream_fill_strided";
+    case primitive_kind::verify_strided:
+        return "verify_strided";
     }
     return "invalid primitive";
 }

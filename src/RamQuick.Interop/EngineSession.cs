@@ -28,15 +28,17 @@ internal unsafe delegate int NativeSessionFactory(RqSessionConfig* config, RqCal
 /// <b>Ownership.</b> The only object native code can reach is the <see cref="Interop.CallbackState"/>, through the
 /// <see cref="GCHandle"/> whose address the engine holds as <c>user_data</c>; it refers back to this session only
 /// weakly. Every edge of the session points outward: to its handle, its callback state, its options (which hold the
-/// step gate, progress sink and fault sink) and its event subscribers. Posted work items carry the weak reference and
-/// the event record, never the session. The only strong edge into a session is therefore its owner's field, so a
-/// session its owner abandons undisposed becomes unreachable, and its handle's critical finalizer destroys the native
-/// session, releases the locked memory and frees the GCHandle, even when a step gate's target holds the session.
+/// step gate, progress sink and fault sink), its delivery queue and its event subscribers. Queued events, and the
+/// work item that drains them, carry the weak reference and the event record, never the session. The only strong
+/// edge into a session is therefore its owner's field, so a session its owner abandons undisposed becomes unreachable,
+/// and its handle's critical finalizer destroys the native session, releases the locked memory and frees the GCHandle,
+/// even when a step gate's target holds the session.
 /// </para>
 /// <para>
 /// <b>Threading.</b> The <c>OnNative*</c> handlers run on the engine's coordinator thread, called by
 /// <see cref="CallbackThunks"/>, which contains every exception they throw. Only the step gate and the progress sink run
-/// there synchronously; everything else is posted. <see cref="Start"/>, <see cref="RequestStop"/> and
+/// there synchronously; everything else is posted, and raised one event at a time in the order the engine raised it,
+/// whatever the captured context. <see cref="Start"/>, <see cref="RequestStop"/> and
 /// <see cref="Dispose"/> may be called from any thread except that <see cref="Dispose"/> is refused inside a callback.
 /// </para>
 /// </remarks>
@@ -49,6 +51,7 @@ internal sealed class EngineSession : IEngineSession
     private const string ErrorsDetectedHandlerName = "ErrorsDetected handler";
     private const string CompletedHandlerName = "Completed handler";
     private const string ReleasedHandlerName = "Released handler";
+    private const string CompletedCallbackName = "on_completed";
 
     private readonly SafeSessionHandle _handle;
     private readonly CallbackState _state;
@@ -58,11 +61,18 @@ internal sealed class EngineSession : IEngineSession
     private readonly EngineSessionOptions _options;
     private readonly ReadOnlyCollection<StepAttributes> _steps;
 
+    // Owned by the session, an outward edge; it holds the context and the queued events, never the session.
+    private readonly DeliveryQueue _deliveries;
+
     // 0 or 1, written with Interlocked or Volatile: Start, Dispose and the coordinator's callbacks run on different
     // threads.
     private int _started;
     private int _completed;
     private int _disposed;
+
+    // The message of a refused Completed post, written on the coordinator before the post that drains Completed: the
+    // queued Completed is then raised as the host fault that ended the run on the managed side.
+    private string? _completedPostFault;
 
     private EngineSession(
         SafeSessionHandle handle,
@@ -74,6 +84,7 @@ internal sealed class EngineSession : IEngineSession
         _state = state;
         _options = options;
         _steps = steps;
+        _deliveries = new DeliveryQueue(state.Context);
     }
 
     /// <inheritdoc/>
@@ -122,10 +133,18 @@ internal sealed class EngineSession : IEngineSession
     /// <param name="factory">The native creation call: <c>rq_session_create</c>, or a test substitute.</param>
     /// <returns>The session, owned by the caller, who disposes it once <see cref="Released"/> has been raised.</returns>
     /// <remarks>
+    /// <para>
     /// Events are posted to <see cref="SynchronizationContext.Current"/> as captured here. When no context is current,
-    /// as in <c>RamQuick.TestHost</c> or a test without a dispatcher, a plain <see cref="SynchronizationContext"/> is
-    /// used, whose <see cref="SynchronizationContext.Post"/> queues to the thread pool, so subscribers never run on the
-    /// coordinator.
+    /// as on a host or test thread without a dispatcher, a plain <see cref="SynchronizationContext"/> is used, whose
+    /// <see cref="SynchronizationContext.Post"/> queues to the thread pool, so subscribers never run on the coordinator.
+    /// </para>
+    /// <para>
+    /// Whatever the context, events are raised one at a time, first in first out: they wait in the session's delivery
+    /// queue, and a single work item at a time is posted to drain it. The thread pool runs separate posts in parallel
+    /// and in no fixed order, so posting each event on its own would let <see cref="Released"/> overtake
+    /// <see cref="Completed"/> or two handlers overlap; and a handler that pumps a dispatcher cannot receive the next
+    /// event inside its own. The context receives at most one post per event.
+    /// </para>
     /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="options"/> or <paramref name="factory"/> is null.</exception>
     /// <exception cref="ArgumentException">
@@ -363,13 +382,50 @@ internal sealed class EngineSession : IEngineSession
     /// <see cref="Completed"/>.
     /// </summary>
     /// <param name="result">The engine's payload, whose step results are valid only during the call.</param>
+    /// <remarks>
+    /// The engine raises <c>on_completed</c> once, with a result it has already frozen, so no later stop can produce
+    /// another. A fault here is therefore reported (fault sink, host-fault stop request) and never rethrown to the
+    /// thunk, which would drop the run's only Completed: a payload that cannot be mapped is replaced by a host-fault
+    /// result built from its trusted header, and a refused post still raises Completed, as a host fault, before
+    /// <see cref="Released"/>.
+    /// </remarks>
     internal void OnNativeCompleted(in RqRunResult result)
     {
         // Recorded before mapping: the native run has ended whether or not its payload maps, and Dispose then has no
         // stop left to request.
         Volatile.Write(ref _completed, 1);
-        EngineCompleted completed = EngineEventMapper.ToCompleted(in result, _steps);
-        Post(completed, static (session, e) => session.Raise(session.Completed, e, CompletedHandlerName));
+
+        EngineCompleted completed;
+        bool engineOutcome;
+        try
+        {
+            completed = EngineEventMapper.ToCompleted(in result, _steps);
+            engineOutcome = true;
+        }
+        catch (Exception exception)
+        {
+            ReportCompletedFault(exception);
+            completed = EngineEventMapper.ToHostFaultCompleted(in result, exception.Message);
+            engineOutcome = false;
+        }
+
+        PostCompleted(completed, engineOutcome);
+    }
+
+    /// <summary>
+    /// Handles an <c>on_completed</c> the engine raised with a null result pointer: records that the run has ended,
+    /// reports the ABI fault and posts a host-fault <see cref="Completed"/> with no native data.
+    /// </summary>
+    /// <remarks>
+    /// A null payload is an ABI violation like any other, but it is still the run's only Completed; see
+    /// <see cref="OnNativeCompleted"/>.
+    /// </remarks>
+    internal void OnNativeCompletedWithoutResult()
+    {
+        Volatile.Write(ref _completed, 1);
+        var exception = new InvalidOperationException("The engine raised on_completed with a null payload pointer.");
+        ReportCompletedFault(exception);
+        PostCompleted(EngineEventMapper.ToHostFaultCompleted(exception.Message), engineOutcome: false);
     }
 
     /// <summary>
@@ -548,8 +604,9 @@ internal sealed class EngineSession : IEngineSession
         }
     }
 
-    // Posts one event record to the captured context. The work item holds the record and the weak session reference
-    // only, never the session, so a queued event cannot keep an abandoned session alive.
+    // Queues one event record for delivery on the captured context, after every event queued before it. The queued
+    // event holds the record and the weak session reference only, never the session, so a queued event cannot keep an
+    // abandoned session alive. A context that refuses the drain's post leaves the event queued and throws.
     private void Post<TEvent>(TEvent record, Action<EngineSession, TEvent> raise)
         where TEvent : class
     {
@@ -558,7 +615,60 @@ internal sealed class EngineSession : IEngineSession
             return;
         }
 
-        _state.Context.Post(PostedEvent<TEvent>.Deliver, new PostedEvent<TEvent>(_state.Session, record, raise));
+        _deliveries.Enqueue(new PostedEvent<TEvent>(_state.Session, record, raise));
+    }
+
+    // Posts the run's only Completed and contains a refused post. The refused event stays queued, and the post of
+    // Released drains it first, so Completed still precedes Released; when the engine withholds Released, because it
+    // could not free a chunk, it stays queued with its fault already reported. engineOutcome is false when the record
+    // is already a host-fault replacement, whose detail names the earlier fault and is kept.
+    private void PostCompleted(EngineCompleted completed, bool engineOutcome)
+    {
+        try
+        {
+            Post(completed, static (session, e) => session.Raise(session.Completed, session.WithCompletedPostFault(e), CompletedHandlerName));
+        }
+        catch (Exception exception)
+        {
+            // The report's stop request changes nothing natively once the result is frozen, so the managed outcome is
+            // recorded here instead: the queued Completed is raised as the host fault the callback-exception policy
+            // requires, never as a run that silently lost an event.
+            if (engineOutcome)
+            {
+                Volatile.Write(ref _completedPostFault, exception.Message);
+            }
+
+            ReportCompletedFault(exception);
+        }
+    }
+
+    // Reports a fault of on_completed. The handler must still deliver the run's only Completed afterwards, so not even
+    // the stop request, the one part of ReportCallbackFault that can throw, may end it early.
+    private void ReportCompletedFault(Exception exception)
+    {
+        try
+        {
+            ReportCallbackFault(CompletedCallbackName, exception);
+        }
+        catch (Exception)
+        {
+            // Deliberately discarded: the native run has already ended, so a failed stop request changes nothing, and
+            // the fault itself has reached the sink.
+        }
+    }
+
+    // The Completed actually raised: the engine's own result, or, after a refused post, the same result ended as a host
+    // fault, keeping its totals, step outcomes and native diagnostics, with the engine's reason named in the detail.
+    private EngineCompleted WithCompletedPostFault(EngineCompleted completed)
+    {
+        string? fault = Volatile.Read(ref _completedPostFault);
+        return fault is null
+            ? completed
+            : completed with
+            {
+                EndReason = RunEndReason.HostFault,
+                EndDetail = EngineEventMapper.DescribeTerminalFault(fault, completed.EndReason, completed.EndDetail),
+            };
     }
 
     // Raises an event on the captured context, one subscriber at a time, so a subscriber that throws neither skips the
@@ -599,9 +709,15 @@ internal sealed class EngineSession : IEngineSession
         }
     }
 
-    // A posted event: the weak session reference, the record and a static raise delegate. Deliver is a cached static
-    // callback, so posting allocates only this carrier and captures nothing.
-    private sealed class PostedEvent<TEvent>
+    // One queued event delivery, whatever its record type.
+    private interface IPostedEvent
+    {
+        void Deliver();
+    }
+
+    // A posted event: the weak session reference, the record and a static raise delegate, so posting allocates only
+    // this carrier and captures nothing.
+    private sealed class PostedEvent<TEvent> : IPostedEvent
         where TEvent : class
     {
         private readonly WeakReference<EngineSession> _session;
@@ -615,14 +731,124 @@ internal sealed class EngineSession : IEngineSession
             _raise = raise;
         }
 
-        internal static SendOrPostCallback Deliver { get; } = static state => ((PostedEvent<TEvent>)state!).Raise();
-
-        private void Raise()
+        public void Deliver()
         {
             // A session collected before delivery has no subscribers left to notify.
             if (_session.TryGetTarget(out EngineSession? session))
             {
                 _raise(session, _record);
+            }
+        }
+    }
+
+    // Delivers one session's events on its captured context one at a time, in the order they were queued. Each event
+    // posted on its own would give no such guarantee: the base SynchronizationContext runs every post on its own
+    // thread-pool work item, in parallel and in no fixed order. So at most one drain work item is posted or running at a
+    // time; it raises the queued events in order until the queue is empty. The queue holds the context and the queued
+    // events, which reference the session only weakly, so neither it nor a pending drain keeps the session alive.
+    private sealed class DeliveryQueue
+    {
+        // Cached, so scheduling a drain allocates nothing; the queue itself is the work item's state.
+        private static readonly SendOrPostCallback _drain = static state => ((DeliveryQueue)state!).Drain();
+
+        private readonly SynchronizationContext _context;
+        private readonly Queue<IPostedEvent> _pending = new();
+        private readonly object _sync = new();
+
+        // Guarded by _sync.
+        private DrainState _drainState;
+
+        internal DeliveryQueue(SynchronizationContext context)
+        {
+            _context = context;
+        }
+
+        private enum DrainState
+        {
+            // No drain is posted or running; the next Enqueue posts one.
+            Idle,
+
+            // A drain has been posted and has not started yet.
+            Scheduled,
+
+            // A drain is raising events; Enqueue only queues, and the running drain reaches the new event.
+            Draining,
+        }
+
+        // Queues an event and, when no drain is posted or running, posts one. A context that refuses the post leaves the
+        // event queued, so the drain the next Enqueue posts delivers it first, and its exception reaches the caller.
+        internal void Enqueue(IPostedEvent posted)
+        {
+            lock (_sync)
+            {
+                _pending.Enqueue(posted);
+                if (_drainState != DrainState.Idle)
+                {
+                    return;
+                }
+
+                _drainState = DrainState.Scheduled;
+            }
+
+            // Posted outside the lock: a context that runs posts inline, such as ImmediateSynchronizationContext in the
+            // tests, drains on this thread, and its handlers may queue further events.
+            try
+            {
+                _context.Post(_drain, this);
+            }
+            catch (Exception)
+            {
+                lock (_sync)
+                {
+                    // Only a drain that never started is withdrawn: one the context ran inline before throwing has
+                    // already settled the state itself.
+                    if (_drainState == DrainState.Scheduled)
+                    {
+                        _drainState = DrainState.Idle;
+                    }
+                }
+
+                throw;
+            }
+        }
+
+        private void Drain()
+        {
+            while (true)
+            {
+                IPostedEvent? next;
+                lock (_sync)
+                {
+                    // Emptiness and the return to Idle are one step under the lock, so an event queued concurrently
+                    // either is dequeued here or finds the queue Idle and posts a new drain; it is never stranded.
+                    if (!_pending.TryDequeue(out next))
+                    {
+                        _drainState = DrainState.Idle;
+                        return;
+                    }
+
+                    _drainState = DrainState.Draining;
+                }
+
+                bool delivered = false;
+                try
+                {
+                    next.Deliver();
+                    delivered = true;
+                }
+                finally
+                {
+                    if (!delivered)
+                    {
+                        // The exception reaches the context, as from any posted work item. Returning to Idle lets the
+                        // next Enqueue post a fresh drain for the events still queued, instead of leaving them behind a
+                        // drain that no longer runs.
+                        lock (_sync)
+                        {
+                            _drainState = DrainState.Idle;
+                        }
+                    }
+                }
             }
         }
     }

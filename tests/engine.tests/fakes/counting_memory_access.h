@@ -41,12 +41,22 @@ enum class primitive_kind : std::uint32_t {
      * fence, flush and fence, so no separate fence or flush records precede it. Never counts.
      */
     reread_word,
+    /**
+     * IMemoryAccess::stream_fill_strided: a store-type access to each line its record's visits
+     * name, not to the whole span.
+     */
+    stream_fill_strided,
+    /**
+     * IMemoryAccess::verify_strided: a load-type access to each line its record's visits name;
+     * counts visit_count x 64 verified bytes.
+     */
+    verify_strided,
 };
 
 /**
  * One primitive call as the layer saw it on entry, plus the clock readings around it.
  *
- * Plain data, copied into the log, into snapshots and into std::sort; on x64 it occupies 88
+ * Plain data, copied into the log, into snapshots and into std::sort; on x64 it occupies 120
  * bytes, which is what tests size counting_options::max_records_per_worker against.
  */
 struct primitive_record {
@@ -63,11 +73,20 @@ struct primitive_record {
     std::uint32_t worker = 0;
     /**
      * First byte of the call's range: the words pointer for stream_fill, flush, verify and
-     * verify_and_stream, the word for reread_word, 0 for fence.
+     * verify_and_stream, the span pointer for the strided kinds, the word for reread_word, 0 for
+     * fence.
      */
     std::uintptr_t begin = 0;
-    /** Length of the range in bytes: word_count x 8, 8 for reread_word, 0 for fence. */
+    /**
+     * Length of the range in bytes: word_count x 8, 8 for reread_word, 0 for fence, and for the
+     * strided kinds visits.visit_count x 64, the bytes the call visits rather than the span's.
+     */
     std::uint64_t bytes = 0;
+    /**
+     * The strided kinds: the call's visits, relative to begin, which name the lines the call
+     * touches (strided_visits in core/kernels/kernels.h). All zero for every other kind.
+     */
+    strided_visits visits{};
     /** Copy of the call's access_context. */
     access_context ctx{};
     /** counting_options::clock read on entry, before forwarding; 0 without a clock. */
@@ -125,8 +144,9 @@ inline constexpr std::uint32_t k_counting_step_slots = 1024;
  * the memory under test, and so adds no stress beyond the runner's (stress bound).
  *
  * @par Two independent counts
- * - verified_bytes() sums word_count x 8 over every verify and verify_and_stream call, and
- *   verified_bytes_for_step() does so per ctx.step_index.
+ * - verified_bytes() sums word_count x 8 over every verify and verify_and_stream call and
+ *   visit_count x 64 over every verify_strided call, and verified_bytes_for_step() does so per
+ *   ctx.step_index.
  * - primitive_count() counts every call of any kind.
  *
  * They are kept apart from the engine's coverage_counter on purpose: success criterion 5 holds
@@ -218,6 +238,27 @@ public:
                                     int direction, mismatch_sink& sink) noexcept override;
 
     /**
+     * Counts, logs (begin = span, bytes = visit_count x 64, with the visits) and forwards
+     * stream_fill_strided.
+     */
+    void stream_fill_strided(const access_context& ctx, std::uint64_t* span,
+                             std::size_t span_word_count, const strided_visits& visits,
+                             const pattern_spec& spec,
+                             std::uint64_t span_first_word_index) noexcept override;
+
+    /**
+     * Counts, logs (begin = span, bytes = visit_count x 64, with the visits) and forwards
+     * verify_strided, then adds visit_count x 64 to the verified totals: every visited line is
+     * compared whole, whatever the mismatches, and the rest of the span is not verified.
+     *
+     * @return The inner layer's mismatch count.
+     */
+    std::uint64_t verify_strided(const access_context& ctx, const std::uint64_t* span,
+                                 std::size_t span_word_count, const strided_visits& visits,
+                                 const pattern_spec& expected, std::uint64_t span_first_word_index,
+                                 mismatch_sink& sink) noexcept override;
+
+    /**
      * Counts, logs (begin = word, bytes = 8) and forwards reread_word. Re-reads never add to the
      * verified totals: coverage excludes them.
      *
@@ -226,7 +267,10 @@ public:
     std::uint64_t reread_word(const access_context& ctx,
                               const std::uint64_t* word) noexcept override;
 
-    /** Sum of word_count x 8 over every verify and verify_and_stream call since the last reset. */
+    /**
+     * Sum of word_count x 8 over every verify and verify_and_stream call, and of visit_count x 64
+     * over every verify_strided call, since the last reset.
+     */
     std::uint64_t verified_bytes() const noexcept;
 
     /**
