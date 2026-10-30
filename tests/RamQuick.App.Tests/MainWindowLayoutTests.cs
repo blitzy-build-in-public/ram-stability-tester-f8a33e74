@@ -42,7 +42,8 @@ namespace RamQuick.App.Tests;
 /// </summary>
 /// <remarks>
 /// Every <see cref="MainWindow"/> is built and measured on the STA thread of <see cref="WpfStaFixture"/>, which also
-/// holds the application's shared resources. This is the only test class that creates WPF windows.
+/// holds the application's shared resources. This is the only test class that creates the main window;
+/// <see cref="MessageBoxUserPromptTests"/> builds the question dialog on threads of its own.
 /// </remarks>
 public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
 {

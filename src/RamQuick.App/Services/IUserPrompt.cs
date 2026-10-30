@@ -28,7 +28,8 @@ public enum PromptResult
 /// </summary>
 /// <remarks>
 /// <para>
-/// The production implementation, <c>MessageBoxUserPrompt</c>, shows WPF message boxes; tests
+/// The production implementation, <c>MessageBoxUserPrompt</c>, asks questions in a modal WPF
+/// dialog that answers No to Esc and Close, and shows messages in WPF message boxes; tests
 /// substitute <c>FakeUserPrompt</c>, which records each call and returns scripted answers.
 /// </para>
 /// <para>

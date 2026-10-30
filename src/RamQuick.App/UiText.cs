@@ -254,6 +254,28 @@ public static class UiText
         "RAMQuick needs Administrator rights to lock memory for testing and to read temperature sensors. Restart as Administrator?";
 
     /// <summary>
+    /// The label of the button that accepts a Yes/No question, such as the elevation offer. The underscore is not
+    /// shown: it makes Y the button's access key.
+    /// </summary>
+    public const string PromptYesLabel = "_Yes";
+
+    /// <summary>
+    /// The label of the button that declines a Yes/No question, such as the elevation offer. The underscore is not
+    /// shown: it makes N the button's access key.
+    /// </summary>
+    public const string PromptNoLabel = "_No";
+
+    /// <summary>
+    /// The automation name of the button that accepts a Yes/No question.
+    /// </summary>
+    public const string PromptYesAutomationName = "Yes";
+
+    /// <summary>
+    /// The automation name of the button that declines a Yes/No question.
+    /// </summary>
+    public const string PromptNoAutomationName = "No";
+
+    /// <summary>
     /// The notice shown while the process is not elevated.
     /// </summary>
     public const string NotElevatedNotice = "Not running as Administrator — press Start to restart as Administrator";

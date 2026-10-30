@@ -43,7 +43,7 @@ RAMQuick starts with the rights of the user who launched it (its manifest reques
 > RAMQuick needs Administrator rights to lock memory for testing and to read temperature sensors. Restart as Administrator?
 
 - **Yes** restarts RAMQuick through the Windows UAC prompt.
-- **No**, or declining the UAC prompt, keeps the window open without elevation. The notice line then reads "Not running as Administrator — press Start to restart as Administrator", and pressing Start shows the same dialog instead of starting a test.
+- **No**, Esc, closing the dialog, or declining the UAC prompt keeps the window open without elevation. The notice line then reads "Not running as Administrator — press Start to restart as Administrator", and pressing Start shows the same dialog instead of starting a test.
 
 Elevation happens only through UAC consent. RAMQuick never grants a privilege to any account. It uses large pages only when the "Lock pages in memory" privilege (`SeLockMemoryPrivilege`) is already held, which Windows does not grant by default; otherwise it tests standard 4 KiB pages locked in memory. The summary records which page mode was used.
 
