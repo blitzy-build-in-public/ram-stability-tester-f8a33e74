@@ -1,3 +1,4 @@
+using System.Globalization;
 using RamQuick.Core;
 
 namespace RamQuick.Logging;
@@ -20,10 +21,21 @@ namespace RamQuick.Logging;
 /// Summaries: a file under a summary's final name that parses with the run's id is kept. A missing summary is
 /// rebuilt by <see cref="RunSummary.Build"/> from the journal records alone, never from this launch's machine
 /// state, and published through <see cref="ResultsLog.PublishFile"/>, the JSON before the text. A final file
-/// that does not parse, cannot be read or names another run is left untouched, and the rebuilt summary goes
-/// to the recovered name, <c>&lt;base&gt;-recovered-summary.json</c> or <c>.txt</c>, instead. Rebuilt summaries
-/// carry no error detail and no cause hints. The crashed run's <c>.log</c> is never modified; it keeps
-/// whatever detail it had flushed.
+/// that does not parse (<see cref="RunSummaryJson.TryDeserialize"/> refuses it), cannot be read or names
+/// another run is left untouched, and the rebuilt summary goes to the recovered name,
+/// <c>&lt;base&gt;-recovered-summary.json</c> or <c>.txt</c>, instead. Rebuilt summaries carry no error
+/// detail and no cause hints. The crashed run's <c>.log</c> is never modified; it keeps whatever detail it
+/// had flushed.
+/// </para>
+/// <para>
+/// Damaged data: a journal line can parse and still hold a value no run writes: a quantity above
+/// 2^53 - 1, the bound the summary schema keeps every integer within, or a negative plan budget. A total the
+/// summary derives from the records is held to the same bound: the plan's time and coverage targets, and the
+/// error total of a run without a <c>result</c>, which sums the last <c>stepEnd</c> of each step. Before a
+/// summary is rebuilt, the run's records are checked. A damaged run publishes nothing,
+/// <see cref="JournalRecovery.PublicationError"/> names the first damaged field and where the kept journal
+/// is, and the outcome keeps the run's kind, as for a failed publication. A run whose summaries are all
+/// on disk needs no rebuild, so it is retired as usual, and the other runs of the journal are recovered.
 /// </para>
 /// <para>
 /// Crash consistency: the journal is deleted only once every summary it describes is on disk and an <c>end</c>
@@ -48,8 +60,10 @@ namespace RamQuick.Logging;
 /// </para>
 /// <para>
 /// Threading: stateless and thread-safe. It performs synchronous file I/O, so <c>RunController</c> calls it on
-/// the thread pool, never on the UI thread. It never throws for an I/O failure or a damaged journal; it reports
-/// them through <see cref="JournalRecovery.PublicationError"/>. Files are written only under
+/// the thread pool, never on the UI thread. It never throws for an I/O failure, a damaged journal or a damaged
+/// summary file. An I/O failure and a journal value out of range are reported through
+/// <see cref="JournalRecovery.PublicationError"/>; a malformed journal line is skipped, and a summary file
+/// that does not parse is left untouched as another run's. Files are written only under
 /// <c>&lt;data&gt;\logs\</c> and <c>&lt;data&gt;\journal\</c>.
 /// </para>
 /// </remarks>
@@ -60,6 +74,12 @@ public static class CrashDetector
     private const string FallbackBaseNamePrefix = "RamQuick-recovered-";
 
     private const string JournalUnreadablePrefix = "The progress journal could not be read: ";
+
+    private const string JournalDamagedPrefix = "The progress journal holds damaged data: ";
+
+    // The summary schema keeps every integer quantity below 2^53, so that a JSON number reads back exactly. No run
+    // writes a larger one, so a journal value above this bound is damage, and no summary is rebuilt from it.
+    private const long MaxQuantity = (1L << 53) - 1;
 
     /// <summary>
     /// Recovers the progress journal at <see cref="DataDirectory.JournalPath"/>, if there is one.
@@ -126,7 +146,7 @@ public static class CrashDetector
             return new JournalRecovery { JournalDeleted = TryDelete(storage) };
         }
 
-        var publication = new Publication();
+        var publication = new Publication(storage.Location);
         JournalRecovery latest = JournalRecovery.None;
         foreach (RunRecords run in runs)
         {
@@ -186,6 +206,15 @@ public static class CrashDetector
     {
         Placement<RunSummary> json = files.PlaceJson();
         Placement<string> text = files.PlaceText();
+        JournalRecovery completed = identified with
+        {
+            Kind = JournalRecoveryKind.CompletedUnpublished,
+            Summary = json.Kept,
+        };
+        if (publication.RejectsDamaged(run, json, text))
+        {
+            return completed;
+        }
 
         // Each missing summary is rebuilt from the journal, even beside a kept JSON summary that holds the
         // run's error detail, so that a rebuilt file only ever states what the journal captured.
@@ -193,11 +222,7 @@ public static class CrashDetector
         publication.Publish(json, () => RunSummaryJson.Serialize(rebuilt));
         publication.Publish(text, () => TextSummaryFormatter.Format(rebuilt));
 
-        return identified with
-        {
-            Kind = JournalRecoveryKind.CompletedUnpublished,
-            Summary = json.Kept ?? rebuilt,
-        };
+        return completed with { Summary = json.Kept ?? rebuilt };
     }
 
     private static JournalRecovery RecoverUnfinished(
@@ -215,12 +240,9 @@ public static class CrashDetector
             return identified with { Summary = published };
         }
 
-        RunSummary partial = RunSummary.Build(run.ToSource());
-        publication.Publish(json, () => RunSummaryJson.Serialize(partial));
-        publication.Publish(files.PlaceText(), () => TextSummaryFormatter.Format(partial));
-
+        Placement<string> text = files.PlaceText();
         JournalStepStart? lastStep = run.LastStep;
-        return identified with
+        JournalRecovery unfinished = identified with
         {
             Kind = JournalRecoveryKind.Unfinished,
             InPreparation = lastStep is null,
@@ -228,8 +250,17 @@ public static class CrashDetector
             StepCount = lastStep is { Count: > 0 } ? lastStep.Count : run.Begin.Steps.Count,
             LastStepName = run.LastStepName,
             LastHeartbeatUtc = run.LastBeat?.Utc is { } utc && utc != default ? utc : null,
-            Summary = json.Kept ?? partial,
+            Summary = json.Kept,
         };
+        if (publication.RejectsDamaged(run, json, text))
+        {
+            return unfinished;
+        }
+
+        RunSummary partial = RunSummary.Build(run.ToSource());
+        publication.Publish(json, () => RunSummaryJson.Serialize(partial));
+        publication.Publish(text, () => TextSummaryFormatter.Format(partial));
+        return unfinished with { Summary = json.Kept ?? partial };
     }
 
     // Probing through the path helper keeps one base-name rule: the one ResultsLog applies to every path.
@@ -370,10 +401,27 @@ public static class CrashDetector
     private sealed class Publication
     {
         private readonly List<string> _files = new();
+        private readonly string _journalLocation;
+
+        public Publication(string journalLocation) => _journalLocation = journalLocation;
 
         public IReadOnlyList<string> Files => _files;
 
         public string? Error { get; private set; }
+
+        // A summary is rebuilt from the journal only when one of the run's documents is due, so only then are its
+        // records checked. A damaged run publishes nothing: a rebuilt summary would state values no run measured.
+        // The error keeps the journal, and the message says where it is, so the user can find the kept file.
+        public bool RejectsDamaged(RunRecords run, Placement<RunSummary> json, Placement<string> text)
+        {
+            if ((json.TargetPath is null && text.TargetPath is null) || run.FindDamage() is not { } damage)
+            {
+                return false;
+            }
+
+            Error ??= $"{JournalDamagedPrefix}{damage}. The journal is kept at '{_journalLocation}'.";
+            return true;
+        }
 
         // Rendering is deferred until a file is due, so a kept summary costs no serialization.
         public void Publish<T>(Placement<T> placement, Func<string> render)
@@ -482,6 +530,78 @@ public static class CrashDetector
             return runs;
         }
 
+        // The first value in this run's records that no run writes, as a short reason naming the field and its
+        // record, or null when every value is in range. Every quantity must stay within MaxQuantity, and so must
+        // every total Build derives from them: the plan's budgets, and the error total of a run without a result,
+        // which sums the last stepEnd per step number. A total is checked after the fields it sums, so a single
+        // bad value is named as itself. A measured duration may be negative after a clock step and Build clamps
+        // it, so only its upper bound is checked.
+        public string? FindDamage()
+        {
+            if (BeginDamage(Begin) is { } beginDamage)
+            {
+                return beginDamage;
+            }
+
+            if (Prepared is { TestedBytes: > MaxQuantity })
+            {
+                return OutOfRange("testedBytes", "the prepared record");
+            }
+
+            foreach (JournalStepEnd end in _stepEnds)
+            {
+                string? field = end.ActualMs > MaxQuantity ? "actualMs"
+                    : end.OverrunMs > MaxQuantity ? "overrunMs"
+                    : end.VerifiedBytes > MaxQuantity ? "verifiedBytes"
+                    : end.Errors > MaxQuantity ? "errors"
+                    : null;
+                if (field is not null)
+                {
+                    return OutOfRange(StepField(end.Index, field), "a stepEnd record");
+                }
+            }
+
+            foreach (JournalBeat beat in _beats)
+            {
+                string? field = beat.ElapsedMs > MaxQuantity ? "elapsedMs"
+                    : beat.Errors > MaxQuantity ? "errors"
+                    : null;
+                if (field is not null)
+                {
+                    return OutOfRange(field, "a beat record");
+                }
+            }
+
+            if (Result is { } result)
+            {
+                string? field = result.TotalErrors > MaxQuantity ? "totalErrors"
+                    : result.VerifiedBytes > MaxQuantity ? "verifiedBytes"
+                    : result.ElapsedMs > MaxQuantity ? "elapsedMs"
+                    : result.FirstErrorMs > MaxQuantity ? "firstErrorMs"
+                    : null;
+                if (field is not null)
+                {
+                    return OutOfRange(field, "the result record");
+                }
+            }
+
+            if (Released is { } released)
+            {
+                string? field = released.ReleaseMs > MaxQuantity ? "releaseMs"
+                    : released.ReleasedBytes > MaxQuantity ? "releasedBytes"
+                    : null;
+                if (field is not null)
+                {
+                    return OutOfRange(field, "the released record");
+                }
+            }
+
+            // A run with a result reports the result's total, so only a run without one publishes this sum.
+            return Result is null && StepErrorsTotalExceedsBound()
+                ? OutOfRange("the steps' total errors", "the stepEnd records")
+                : null;
+        }
+
         // Every value comes from this run's records. Build keeps the last stepEnd per step number, folds the
         // last heartbeat into the temperatures, and reports a run without a result as unfinished.
         public RunSummarySource ToSource() => new()
@@ -527,5 +647,79 @@ public static class CrashDetector
                     break;
             }
         }
+
+        // Whether the sum Build takes for the error total of a run without a result, over the last stepEnd per step
+        // number, exceeds MaxQuantity. Every term is already within MaxQuantity, and the sum is compared after each
+        // one, so it cannot overflow before it is found too large.
+        private bool StepErrorsTotalExceedsBound()
+        {
+            var latestErrors = new Dictionary<int, ulong>();
+            foreach (JournalStepEnd end in _stepEnds)
+            {
+                latestErrors[end.Index] = end.Errors;
+            }
+
+            ulong total = 0;
+            foreach (ulong errors in latestErrors.Values)
+            {
+                total += errors;
+                if (total > MaxQuantity)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // Budgets and holds are written from non-negative plan durations, so each must lie within 0 to MaxQuantity,
+        // and the time and coverage budgets' totals, the plan's targets, within MaxQuantity. A null step entry,
+        // which a damaged line can hold, is skipped, as Build skips it.
+        private static string? BeginDamage(JournalBegin begin)
+        {
+            const string BeginRecord = "the begin record";
+            long totalBudgetMs = 0;
+            long totalCoveragePercent = 0;
+            for (int position = 0; position < begin.Steps.Count; position++)
+            {
+                if (begin.Steps[position] is not { } step)
+                {
+                    continue;
+                }
+
+                // Named by position, as JournalBegin.Create numbers the steps, so a damaged number cannot
+                // misname the step.
+                string? field = step.TimeBudgetMs is < 0 or > MaxQuantity ? "timeBudgetMs"
+                    : step.HoldMs is < 0 or > MaxQuantity ? "holdMs"
+                    : step.CoverageBudgetPercent < 0 ? "coverageBudgetPercent"
+                    : null;
+                if (field is not null)
+                {
+                    return OutOfRange(StepField(position + 1, field), BeginRecord);
+                }
+
+                // Each total and each term are at most MaxQuantity, so neither sum can overflow before it is compared.
+                totalBudgetMs += step.TimeBudgetMs;
+                totalCoveragePercent += step.CoverageBudgetPercent;
+                string? total = totalBudgetMs > MaxQuantity ? "timeBudgetMs"
+                    : totalCoveragePercent > MaxQuantity ? "coverageBudgetPercent"
+                    : null;
+                if (total is not null)
+                {
+                    return OutOfRange("the steps' total " + total, BeginRecord);
+                }
+            }
+
+            string? quantity = begin.AvailableBytes > MaxQuantity ? "availableBytes"
+                : begin.PlannedBytes > MaxQuantity ? "plannedBytes"
+                : begin.Memory.InstalledBytes > MaxQuantity ? "memory.installedBytes"
+                : null;
+            return quantity is null ? null : OutOfRange(quantity, BeginRecord);
+        }
+
+        private static string StepField(int number, string field) =>
+            string.Create(CultureInfo.InvariantCulture, $"step {number}'s {field}");
+
+        private static string OutOfRange(string field, string record) => $"{field} in {record} is out of range";
     }
 }

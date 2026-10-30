@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
@@ -14,12 +15,13 @@ namespace RamQuick.IntegrationTests;
 /// <summary>
 /// The engine boundary as the wrapper sees it, over the test-only engine library this process is bound to: the
 /// one-time binding, the managed mirrors of every ABI struct against the engine's own <c>sizeof</c>, the result-code
-/// mapping, event delivery on the captured synchronization context, an injected affinity failure, and the stop
-/// ordering that lets a woken step gate find its reason already recorded. It also covers the wrapper's own contracts
-/// at that boundary: option validation and defaults, exception construction, the rejection of payloads that cannot
-/// belong to the configured session, handle and callback-state ownership on every creation failure, disposal from
-/// every thread a caller may use, the containment of exceptions thrown by step gates, fault sinks, event subscribers
-/// and the captured context, and the monitor work-area query that shares the engine's import resolver.
+/// mapping, the step limit and step shapes the wrapper checks before any native call, event delivery on the captured
+/// synchronization context, an injected affinity failure, and the stop ordering that lets a woken step gate find its
+/// reason already recorded. It also covers the wrapper's own contracts at that boundary: option validation and
+/// defaults, exception construction, the rejection of payloads that cannot belong to the configured session, handle
+/// and callback-state ownership on every creation failure, disposal from every thread a caller may use, the
+/// containment of exceptions thrown by step gates, fault sinks, event subscribers and the captured context, and the
+/// monitor work-area query that shares the engine's import resolver.
 /// </summary>
 /// <remarks>
 /// Every engine session sizes its region with <see cref="TestRegions.Bytes"/> for one worker per logical processor,
@@ -58,6 +60,11 @@ public sealed class InteropMarshallingTests
     {
         "on_prepared", "on_step_starting", "on_step_finished", "on_progress", "on_errors", "on_completed", "on_released",
     };
+
+    // A hold and a budget that meet the plan validator's 2.5 × hold rule, so a shape case differs from a valid step in
+    // its shape alone.
+    private static readonly TimeSpan _shapeCaseHold = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan _shapeCaseBudget = TimeSpan.FromSeconds(10);
 
     private readonly EngineBindingFixture _binding;
     private readonly ITestOutputHelper _output;
@@ -282,9 +289,11 @@ public sealed class InteropMarshallingTests
                 IsaOverride = InstructionSet.Avx512,
                 Steps = new[]
                 {
+                    // A hold step must declare RandomBlocks, the order it writes its whole slice in.
                     step with
                     {
                         Name = new string('n', NativeConstants.NameSize - 1),
+                        Order = AccessOrder.RandomBlocks,
                         Hold = TimeSpan.FromMilliseconds(1),
                         TimeBudget = TimeSpan.FromMilliseconds(uint.MaxValue),
                         CoverageBudgetPercent = (int)(uint.MaxValue / 100),
@@ -599,13 +608,115 @@ public sealed class InteropMarshallingTests
         Assert.Equal(liveBefore, SessionProbe.LiveSessionCount());
     }
 
+    [Fact]
+    public void CreateSession_MaxStepCountSteps_AcceptedByValidateAndTheEngine()
+    {
+        // The managed limit is the engine's k_max_step_count: a list exactly at it passes both checks, so the managed
+        // guard rejects nothing the engine would run.
+        Assert.Equal(1024, EngineSessionOptions.MaxStepCount);
+
+        NativeEngine engine = TestEngines.Create();
+        SystemSnapshot system = engine.QuerySystem();
+        EngineSessionOptions options = CreateOptions(system, DistinctSteps(EngineSessionOptions.MaxStepCount));
+
+        Assert.Null(Record.Exception(options.Validate));
+        IEngineSession session = engine.CreateSession(options);
+        session.Dispose();
+        AssertNoLiveSessions();
+    }
+
+    [Fact]
+    public void CreateSession_StepCountAboveMax_RejectedFromTheCountBeforeAnyStepIsRead()
+    {
+        var factory = new RecordingSessionFactory();
+        NativeEngine engine = factory.CreateEngine();
+        SystemSnapshot system = engine.QuerySystem();
+        var steps = new UnreadableStepList(EngineSessionOptions.MaxStepCount + 1);
+        EngineSessionOptions options = CreateOptions(system, steps);
+
+        ArgumentException validateError = Assert.Throws<ArgumentException>(options.Validate);
+        _output.WriteLine($"Validate threw: {validateError.Message}");
+        Assert.Equal(nameof(EngineSessionOptions.Steps), validateError.ParamName);
+        Assert.Contains("1024", validateError.Message, StringComparison.Ordinal);
+        Assert.Contains("1025", validateError.Message, StringComparison.Ordinal);
+        Assert.Equal(0, steps.Reads);
+
+        // The session validates before it copies the list or marshals a step, so no element is read and the engine is
+        // never called.
+        ArgumentException createError = Assert.Throws<ArgumentException>(() => engine.CreateSession(options));
+        _output.WriteLine($"CreateSession threw: {createError.Message}");
+        Assert.Equal(nameof(EngineSessionOptions.Steps), createError.ParamName);
+        Assert.Equal(0, steps.Reads);
+        Assert.Equal(0, factory.Calls);
+        AssertNoLiveSessions();
+    }
+
+    // Each case is a Standard step given a hold: on an order other than RandomBlocks, or on a moving-inversion pattern.
+    // The first is the plan-data repro, Quick's high-toggle sweep with a 2 s hold.
+    [Theory]
+    [InlineData(0, PatternKind.HighToggle, AccessOrder.SequentialAscending, "must be RandomBlocks")]
+    [InlineData(1, PatternKind.Random, AccessOrder.BankStride, "must be RandomBlocks")]
+    [InlineData(2, PatternKind.Random, AccessOrder.Turnaround, "must be RandomBlocks")]
+    [InlineData(3, PatternKind.MovingInversionWalking, AccessOrder.RandomBlocks, "takes no hold")]
+    [InlineData(6, PatternKind.MovingInversionRandom, AccessOrder.SequentialAscending, "takes no hold")]
+    public void CreateSession_HoldStepShapeTheEngineDoesNotRun_RejectedNamingTheStepBeforeAnyNativeCall(
+        int standardStepIndex,
+        PatternKind pattern,
+        AccessOrder order,
+        string expectedRule)
+    {
+        StepDefinition baseline = TestPlans.Standard.Steps[standardStepIndex];
+        Assert.Equal(pattern, baseline.Pattern);
+        StepAttributes step = baseline.ToAttributes(0) with
+        {
+            Order = order,
+            Hold = _shapeCaseHold,
+            TimeBudget = _shapeCaseBudget,
+        };
+
+        var factory = new RecordingSessionFactory();
+        NativeEngine engine = factory.CreateEngine();
+        EngineSessionOptions options = CreateOptions(engine.QuerySystem(), new[] { step });
+
+        // Without the managed shape rules the engine's bare RQ_E_INVALID_ARGUMENT would be the only report.
+        ArgumentException exception = Assert.Throws<ArgumentException>(() => engine.CreateSession(options));
+        _output.WriteLine(exception.Message);
+        Assert.Equal(nameof(EngineSessionOptions.Steps), exception.ParamName);
+        Assert.Contains("Steps[0]", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(baseline.Name, exception.Message, StringComparison.Ordinal);
+        Assert.Contains(expectedRule, exception.Message, StringComparison.Ordinal);
+        Assert.Equal(0, factory.Calls);
+        AssertNoLiveSessions();
+    }
+
+    [Theory]
+    [InlineData("MovingInversionOnTurnaroundWithoutHold")]
+    [InlineData("HoldOnRandomBlocksWithHighTogglePattern")]
+    [InlineData("RefreshHoldAsShipped")]
+    public void CreateSession_StepShapeTheEngineRuns_AcceptedByValidateAndTheEngine(string caseName)
+    {
+        StepAttributes step = BuildSupportedShape(caseName);
+        NativeEngine engine = TestEngines.Create();
+        EngineSessionOptions options = CreateOptions(engine.QuerySystem(), new[] { step });
+
+        // The real rq_session_create accepts the shape, so the managed rules reject nothing the engine runs.
+        Assert.Null(Record.Exception(options.Validate));
+        IEngineSession session = engine.CreateSession(options);
+        session.Dispose();
+        AssertNoLiveSessions();
+    }
+
     [Fact(Timeout = TestTimeoutMs)]
     public async Task Start_CalledTwiceThenAfterDispose_ThrowsInvalidOperationThenObjectDisposedAsync()
     {
         CancellationToken cancellation = TestContext.Current.CancellationToken;
+        using var ui = new DispatcherThread();
         NativeEngine engine = TestEngines.Create();
         SystemSnapshot system = engine.QuerySystem();
-        IEngineSession session = engine.CreateSession(CreateOptions(system, OneStepPlan()));
+
+        // Created on the dispatcher so its events arrive in the order the engine raised them; a session created without a
+        // context posts each event to the thread pool, which preserves no order between Completed and Released.
+        IEngineSession session = await ui.InvokeAsync(() => engine.CreateSession(CreateOptions(system, OneStepPlan())));
         try
         {
             EngineRunRecorder recorder = EngineRunRecorder.Attach(session);
@@ -643,6 +754,7 @@ public sealed class InteropMarshallingTests
         // After disposal RequestStop does nothing and Dispose is idempotent.
         session.RequestStop(StopReason.User);
         session.Dispose();
+        Assert.Empty(ui.UnhandledExceptions);
         AssertNoLiveSessions();
     }
 
@@ -696,6 +808,7 @@ public sealed class InteropMarshallingTests
     public async Task StepGate_DisposesItsSessionThenAborts_DisposeIsRefusedAndRunEndsWithHostFaultAsync()
     {
         CancellationToken cancellation = TestContext.Current.CancellationToken;
+        using var ui = new DispatcherThread();
         NativeEngine engine = TestEngines.Create();
         SystemSnapshot system = engine.QuerySystem();
 
@@ -712,7 +825,9 @@ public sealed class InteropMarshallingTests
             return StepGateDecision.Abort;
         };
 
-        IEngineSession session = engine.CreateSession(CreateOptions(system, OneStepPlan(), gate: gate));
+        // Created on the dispatcher so its events arrive in the order the engine raised them, Prepared before Released; a
+        // session created without a context posts each event to the thread pool, which preserves no order between them.
+        IEngineSession session = await ui.InvokeAsync(() => engine.CreateSession(CreateOptions(system, OneStepPlan(), gate: gate)));
         Volatile.Write(ref sessionBox.Value, session);
         try
         {
@@ -741,6 +856,7 @@ public sealed class InteropMarshallingTests
             session.Dispose();
         }
 
+        Assert.Empty(ui.UnhandledExceptions);
         AssertNoLiveSessions();
     }
 
@@ -1196,6 +1312,7 @@ public sealed class InteropMarshallingTests
         CancellationToken cancellation = TestContext.Current.CancellationToken;
         Assert.Equal(expectedPendingReason, SessionProbe.ExpectedPendingReason(reason));
 
+        using var ui = new DispatcherThread();
         NativeEngine engine = TestEngines.Create();
         SystemSnapshot system = engine.QuerySystem();
 
@@ -1226,7 +1343,9 @@ public sealed class InteropMarshallingTests
             return StepGateDecision.Abort;
         };
 
-        IEngineSession session = engine.CreateSession(CreateOptions(system, OneStepPlan(), gate: gate));
+        // Created on the dispatcher so its events arrive in the order the engine raised them, Prepared before Released; a
+        // session created without a context posts each event to the thread pool, which preserves no order between them.
+        IEngineSession session = await ui.InvokeAsync(() => engine.CreateSession(CreateOptions(system, OneStepPlan(), gate: gate)));
         Volatile.Write(ref sessionBox.Value, session);
         try
         {
@@ -1267,6 +1386,7 @@ public sealed class InteropMarshallingTests
             session.Dispose();
         }
 
+        Assert.Empty(ui.UnhandledExceptions);
         AssertNoLiveSessions();
     }
 
@@ -1306,9 +1426,43 @@ public sealed class InteropMarshallingTests
 
     private static IReadOnlyList<StepAttributes> OneStepAttributes() => ScaledPlans.Attributes(OneStepPlan());
 
+    // Moving inversion ignores the order it declares and has no hold (the Quick step 4 control run with Turnaround); a
+    // hold on RandomBlocks with a pattern other than moving inversion; and Quick's refresh hold as shipped.
+    private static StepAttributes BuildSupportedShape(string caseName) => caseName switch
+    {
+        "MovingInversionOnTurnaroundWithoutHold" => TestPlans.Quick.Steps[3].ToAttributes(0) with { Order = AccessOrder.Turnaround },
+        "HoldOnRandomBlocksWithHighTogglePattern" => TestPlans.Quick.Steps[0].ToAttributes(0) with
+        {
+            Order = AccessOrder.RandomBlocks,
+            Hold = _shapeCaseHold,
+            TimeBudget = _shapeCaseBudget,
+        },
+        "RefreshHoldAsShipped" => TestPlans.Quick.Steps[4].ToAttributes(0),
+        _ => throw new ArgumentOutOfRangeException(nameof(caseName), caseName, "Unknown supported step shape."),
+    };
+
+    // Copies of Quick's second step, each at its own position and with its own name, because the engine requires the
+    // names of a plan to be unique.
+    private static StepAttributes[] DistinctSteps(int count)
+    {
+        StepAttributes template = TestPlans.Quick.Steps[1].ToAttributes(0);
+        return Enumerable.Range(0, count)
+            .Select(index => template with { Index = index, Name = string.Create(CultureInfo.InvariantCulture, $"Step {index:D4}") })
+            .ToArray();
+    }
+
     private static EngineSessionOptions CreateOptions(
         SystemSnapshot system,
         TestPlan plan,
+        int? workerCount = null,
+        StepGate? gate = null,
+        ProgressSink? sink = null,
+        CallbackFaultSink? faultSink = null) =>
+        CreateOptions(system, ScaledPlans.Attributes(plan), workerCount, gate, sink, faultSink);
+
+    private static EngineSessionOptions CreateOptions(
+        SystemSnapshot system,
+        IReadOnlyList<StepAttributes> steps,
         int? workerCount = null,
         StepGate? gate = null,
         ProgressSink? sink = null,
@@ -1321,7 +1475,7 @@ public sealed class InteropMarshallingTests
             MinRegionBytes = regionBytes,
             WorkerCount = workerCount ?? system.LogicalProcessors,
             Seed = Seed,
-            Steps = ScaledPlans.Attributes(plan),
+            Steps = steps,
             StepGate = gate,
             ProgressSink = sink,
             CallbackFault = faultSink,
@@ -1554,6 +1708,51 @@ public sealed class InteropMarshallingTests
         public override void Post(SendOrPostCallback d, object? state) => throw new InvalidOperationException(RejectedPostMessage);
 
         public override SynchronizationContext CreateCopy() => this;
+    }
+
+    // A step list that reports a count but counts and fails every read of its elements, through the indexer or either
+    // enumerator, so a validator that traversed, copied or marshalled the list is caught however it read it.
+    private sealed class UnreadableStepList : IReadOnlyList<StepAttributes>
+    {
+        private int _reads;
+
+        public UnreadableStepList(int count)
+        {
+            Count = count;
+        }
+
+        public int Count { get; }
+
+        public int Reads => Volatile.Read(ref _reads);
+
+        public StepAttributes this[int index] =>
+            throw RecordRead(string.Create(CultureInfo.InvariantCulture, $"the indexer [{index}]"));
+
+        public IEnumerator<StepAttributes> GetEnumerator() => throw RecordRead("GetEnumerator()");
+
+        IEnumerator IEnumerable.GetEnumerator() => throw RecordRead("IEnumerable.GetEnumerator()");
+
+        private InvalidOperationException RecordRead(string member)
+        {
+            Interlocked.Increment(ref _reads);
+            return new InvalidOperationException(
+                $"The step list was read through {member}; a list longer than the limit must be rejected from its count alone.");
+        }
+    }
+
+    // A native session factory that counts its calls and refuses each with RQ_E_INVALID_ARGUMENT, creating no native
+    // session, so a test can tell a managed rejection, which never calls it, from the engine's.
+    private sealed unsafe class RecordingSessionFactory
+    {
+        private int _calls;
+
+        public int Calls => Volatile.Read(ref _calls);
+
+        public NativeEngine CreateEngine() => new((_, _, _) =>
+        {
+            Interlocked.Increment(ref _calls);
+            return (int)EngineResultCode.InvalidArgument;
+        });
     }
 }
 

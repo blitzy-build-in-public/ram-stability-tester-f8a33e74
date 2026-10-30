@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -468,6 +469,69 @@ public sealed partial class ResultsLogTests
     }
 
     [Fact]
+    public async Task LogStopRequested_EngineDecisionTime_WritesWholeMillisecondsIntoTestAsync()
+    {
+        using var root = new TestDataRoot();
+        using ResultsLog log = Open(root, CreateTime(), new ScriptedRunIds(JournalSamples.RunIdA));
+
+        log.LogStopRequested(_t0, nameof(RunEndReason.FirstError), TimeSpan.FromTicks(521_259_999));
+
+        string line = Assert.Single(await ReadLogLinesAsync(log));
+        Assert.Equal(Utc(_t0) + " STOP_REQUESTED reason=FirstError time_into_test_ms=52125", line);
+    }
+
+    [Theory]
+    [InlineData(FreeTextEvent.JournalFailure, AccountLocation.DataFolder)]
+    [InlineData(FreeTextEvent.JournalFailure, AccountLocation.LocalAppData)]
+    [InlineData(FreeTextEvent.JournalFailure, AccountLocation.RoamingAppData)]
+    [InlineData(FreeTextEvent.JournalFailure, AccountLocation.UserProfile)]
+    [InlineData(FreeTextEvent.JournalFailure, AccountLocation.UserNameSegment)]
+    [InlineData(FreeTextEvent.JournalFailure, AccountLocation.ProfileSibling)]
+    [InlineData(FreeTextEvent.Notice, AccountLocation.DataFolder)]
+    [InlineData(FreeTextEvent.Notice, AccountLocation.LocalAppData)]
+    [InlineData(FreeTextEvent.Notice, AccountLocation.RoamingAppData)]
+    [InlineData(FreeTextEvent.Notice, AccountLocation.UserProfile)]
+    [InlineData(FreeTextEvent.Notice, AccountLocation.UserNameSegment)]
+    [InlineData(FreeTextEvent.Notice, AccountLocation.ProfileSibling)]
+    [InlineData(FreeTextEvent.CallbackFault, AccountLocation.DataFolder)]
+    [InlineData(FreeTextEvent.CallbackFault, AccountLocation.LocalAppData)]
+    [InlineData(FreeTextEvent.CallbackFault, AccountLocation.RoamingAppData)]
+    [InlineData(FreeTextEvent.CallbackFault, AccountLocation.UserProfile)]
+    [InlineData(FreeTextEvent.CallbackFault, AccountLocation.UserNameSegment)]
+    [InlineData(FreeTextEvent.CallbackFault, AccountLocation.ProfileSibling)]
+    public async Task LogFreeText_AccountLocations_WrittenAsPlaceholdersAsync(FreeTextEvent freeTextEvent, AccountLocation location)
+    {
+        using var root = new TestDataRoot();
+        using ResultsLog log = Open(root, CreateTime(), new ScriptedRunIds(JournalSamples.RunIdA));
+        (string path, string expectedPath) = AccountLocationText(location, root);
+        string message = $"The process cannot access the file '{path}' because it is being used by another process.";
+
+        (string eventName, string key, string valuePrefix) = LogFreeText(log, freeTextEvent, message);
+
+        string line = Assert.Single(await ReadLogLinesAsync(log));
+        Assert.Equal(eventName, EventOf(line));
+        AssertFields(line, key + "=" + Quoted(valuePrefix + message.Replace(path, expectedPath, StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task LogCallbackFault_WritesSourceAndExceptionTypeAndMessageAsync()
+    {
+        using var root = new TestDataRoot();
+        using ResultsLog log = Open(root, CreateTime(), new ScriptedRunIds(JournalSamples.RunIdA));
+        DateTimeOffset caughtUtc = _t0 + TimeSpan.FromMilliseconds(1_500);
+
+        var exception = new InvalidOperationException("Sink \"failed\"\r\nagain");
+
+        log.LogCallbackFault(caughtUtc, "EngineCallback:ProgressChanged handler", exception);
+
+        string line = Assert.Single(await ReadLogLinesAsync(log));
+        Assert.Equal(
+            Utc(caughtUtc) + " CALLBACK_FAULT source=\"EngineCallback:ProgressChanged handler\""
+                + " error=\"System.InvalidOperationException: Sink \\\"failed\\\"  again\"",
+            line);
+    }
+
+    [Fact]
     public async Task LogEvents_ReservedOrUndefinedValues_WrittenByNameAsync()
     {
         using var root = new TestDataRoot();
@@ -618,6 +682,109 @@ public sealed partial class ResultsLogTests
     }
 
     [Fact]
+    public async Task LogErrors_CallerReusesItsList_LogHoldsRecordsAsPassedAsync()
+    {
+        using var root = new TestDataRoot();
+        using ResultsLog log = Open(root, CreateTime(), new ScriptedRunIds(JournalSamples.RunIdA));
+        IReadOnlyList<ErrorRecord> passed = JournalSamples.ErrorRecords(3);
+        var reused = new ReusableRecordList(passed);
+
+        // The caller refills its list for its next batch as soon as the call returns, before or after the drain
+        // has rendered this one.
+        log.LogErrors(reused, 3);
+        reused.Refill(JournalSamples.ErrorRecords(8)[7]);
+
+        string[] lines = await ReadLogLinesAsync(log);
+
+        Assert.Equal(passed.Count, lines.Length);
+        for (int i = 0; i < passed.Count; i++)
+        {
+            AssertFields(
+                lines[i],
+                "seq=" + i.ToString(Invariant),
+                "time_into_test_ms=" + (72_000 + i).ToString(Invariant),
+                "address=" + SummaryFormat.Hex64(passed[i].Address),
+                "actual=" + SummaryFormat.Hex64(passed[i].Actual));
+        }
+
+        // Only the call itself read the caller's list: the drain rendered the log's own copy.
+        Assert.Equal(0, reused.ReadsOffCallerThread);
+    }
+
+    [Fact]
+    public async Task LogErrors_LinesCarryTimeAndStepCountOfTheCallAsync()
+    {
+        const int LargeBatch = 1_000;
+        using var root = new TestDataRoot();
+        FakeTimeProvider time = CreateTime();
+        using ResultsLog log = Open(root, time, new ScriptedRunIds(JournalSamples.RunIdA));
+        IReadOnlyList<ErrorRecord> records = JournalSamples.ErrorRecords(LargeBatch + 2);
+        log.LogRunStarting(JournalSamples.BeginA(_t0));
+
+        // The large batch keeps the drain rendering while the clock and the plan's step count move on.
+        log.LogErrors(records.Take(LargeBatch).ToArray(), LargeBatch);
+        time.Advance(TimeSpan.FromSeconds(1));
+        DateTimeOffset secondCallUtc = time.GetUtcNow();
+        log.LogErrors(new[] { records[LargeBatch] }, LargeBatch + 1);
+        time.Advance(TimeSpan.FromSeconds(1));
+        DateTimeOffset thirdCallUtc = time.GetUtcNow();
+        log.LogRunStarting(JournalSamples.BeginA(_t0, stepCount: 3));
+        log.LogErrors(new[] { records[LargeBatch + 1] }, LargeBatch + 2);
+        time.Advance(TimeSpan.FromSeconds(1));
+
+        string[] lines = await ReadLogLinesAsync(log);
+        string[] errorLines = lines.Where(line => EventOf(line) == "ERROR").ToArray();
+
+        Assert.Equal(records.Count, errorLines.Length);
+        Assert.All(errorLines[..LargeBatch], line =>
+        {
+            Assert.StartsWith(Utc(_t0) + " ERROR ", line, StringComparison.Ordinal);
+            AssertFields(line, "step=2/6", "total=1000");
+        });
+        Assert.StartsWith(Utc(secondCallUtc) + " ERROR ", errorLines[LargeBatch], StringComparison.Ordinal);
+        AssertFields(errorLines[LargeBatch], "seq=1000", "step=2/6", "total=1001");
+        Assert.StartsWith(Utc(thirdCallUtc) + " ERROR ", errorLines[^1], StringComparison.Ordinal);
+        AssertFields(errorLines[^1], "seq=1001", "step=2/3", "total=1002");
+    }
+
+    [Fact]
+    public async Task LogErrors_BatchesOfManyWritesBetweenEvents_KeepQueueOrderAsync()
+    {
+        // Each batch spans several of the drain's writes, and the second one reaches the cap.
+        const int FirstBatch = 600;
+        using var root = new TestDataRoot();
+        using ResultsLog log = Open(root, CreateTime(), new ScriptedRunIds(JournalSamples.RunIdA));
+        IReadOnlyList<ErrorRecord> records = JournalSamples.ErrorRecords(ErrorGrouping.StoredDetailCap + 5);
+
+        log.LogStepStarted(1, 6, records[0].StepName);
+        log.LogErrors(records.Take(FirstBatch).ToArray(), FirstBatch);
+        log.LogNotice("between batches");
+        log.LogErrors(records.Skip(FirstBatch).ToArray(), (ulong)records.Count);
+        log.LogNotice("after the cap");
+
+        string[] lines = await ReadLogLinesAsync(log);
+
+        string[] expectedEvents = new[] { "STEP_START" }
+            .Concat(Enumerable.Repeat("ERROR", FirstBatch))
+            .Append("NOTICE")
+            .Concat(Enumerable.Repeat("ERROR", ErrorGrouping.StoredDetailCap - FirstBatch))
+            .Append("ERROR_CAP_REACHED")
+            .Append("NOTICE")
+            .ToArray();
+        Assert.Equal(expectedEvents, lines.Select(EventOf));
+        AssertFields(lines[FirstBatch + 1], "message=\"between batches\"");
+        AssertFields(Line(lines, "ERROR_CAP_REACHED"), "stored=10000", "total=10005");
+        AssertFields(lines[^1], "message=\"after the cap\"");
+
+        // The records keep the caller's order across the drain's writes and across the two batches.
+        string[] errorLines = lines.Where(line => EventOf(line) == "ERROR").ToArray();
+        for (int i = 0; i < errorLines.Length; i++)
+        {
+            AssertFields(errorLines[i], "seq=" + i.ToString(Invariant));
+        }
+    }
+
+    [Fact]
     public async Task LogMethods_InvalidArguments_ThrowAndWriteNothingAsync()
     {
         using var root = new TestDataRoot();
@@ -647,6 +814,9 @@ public sealed partial class ResultsLogTests
         Assert.Throws<ArgumentNullException>(() => log.LogJournalFailure(null!));
         Assert.Throws<ArgumentNullException>(() => log.LogStopRequested(_t0, null!));
         Assert.Throws<ArgumentNullException>(() => log.LogNotice(null!));
+        Assert.Throws<ArgumentNullException>(() => log.LogCallbackFault(_t0, null!, new InvalidOperationException("Unused")));
+        Assert.Throws<ArgumentException>(() => log.LogCallbackFault(_t0, " ", new InvalidOperationException("Unused")));
+        Assert.Throws<ArgumentNullException>(() => log.LogCallbackFault(_t0, "EngineCallback:on_progress", null!));
 
         Assert.Empty(await ReadLogLinesAsync(log));
     }
@@ -711,10 +881,11 @@ public sealed partial class ResultsLogTests
         Assert.Equal(TextSummaryFormatter.Format(summary), text);
         Assert.Equal(JournalSamples.RunIdA, TextSummaryFormatter.TryParseRunId(text));
 
+        // The .log names each file relative to the data folder, whose location can name the Windows account.
         string[] lines = await ReadLogLinesAsync(log);
         Assert.Equal(new[] { "SUMMARY_PUBLISHED", "SUMMARY_PUBLISHED" }, lines.Select(EventOf));
-        AssertFields(lines[0], "path=" + Quoted(log.SummaryJsonPath));
-        AssertFields(lines[1], "path=" + Quoted(log.SummaryTextPath));
+        AssertFields(lines[0], "path=" + Quoted(@"logs\" + log.BaseName + "-summary.json"));
+        AssertFields(lines[1], "path=" + Quoted(@"logs\" + log.BaseName + "-summary.txt"));
     }
 
     [Theory]
@@ -742,11 +913,17 @@ public sealed partial class ResultsLogTests
         Assert.True(File.Exists(other));
         Assert.Empty(Directory.GetFiles(root.Data.LogsDirectory, "*.tmp"));
 
+        // Paths are relative to the data folder, and the error writes the data folder's location as <data>.
         string[] lines = await ReadLogLinesAsync(log);
         string failed = Assert.Single(lines, line => EventOf(line) == "SUMMARY_FAILED");
-        AssertFields(failed, "path=" + Quoted(existing), "error=" + Quoted(result.Error!));
+        AssertFields(
+            failed,
+            "path=" + Quoted(@"logs\" + Path.GetFileName(existing)),
+            "error=" + Quoted(result.Error!.Replace(root.Data.RootPath, "<data>", StringComparison.OrdinalIgnoreCase)));
         string published = Assert.Single(lines, line => EventOf(line) == "SUMMARY_PUBLISHED");
-        AssertFields(published, "path=" + Quoted(other));
+        AssertFields(published, "path=" + Quoted(@"logs\" + Path.GetFileName(other)));
+        string escapedRoot = Quoted(root.Data.RootPath)[1..^1];
+        Assert.All(lines, line => Assert.DoesNotContain(escapedRoot, line, StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -1029,17 +1206,17 @@ public sealed partial class ResultsLogTests
             stored + (truncated ? " (truncated: total exceeds stored detail)" : string.Empty) + LineEnd,
             text,
             StringComparison.Ordinal);
-        if (storedCount >= ErrorGrouping.StoredDetailCap)
-        {
-            Assert.Contains(LineEnd + "Grouped from the first 10,000 errors" + LineEnd, text, StringComparison.Ordinal);
-            Assert.Contains("  Showing the 100 largest of 10,000 groups." + LineEnd, text, StringComparison.Ordinal);
-            Assert.Contains("Stored error records (first 100 of 10,000)" + LineEnd, text, StringComparison.Ordinal);
-        }
-        else
-        {
-            Assert.Contains(LineEnd + "Errors by address" + LineEnd, text, StringComparison.Ordinal);
-            Assert.Contains("Stored error records (3)" + LineEnd, text, StringComparison.Ordinal);
-        }
+        Assert.Contains(
+            LineEnd + (storedCount >= ErrorGrouping.StoredDetailCap ? "Grouped from the first 10,000 errors" : "Errors by address") + LineEnd,
+            text,
+            StringComparison.Ordinal);
+        Assert.Contains("Stored error records (" + storedCount.ToString("N0", Invariant) + ")" + LineEnd, text, StringComparison.Ordinal);
+
+        // The text renders the same data as the JSON: every stored group and every stored record, even at the cap.
+        Assert.Equal(summary.Errors.Groups.Count, GroupRowCount(text, "virtual address"));
+        Assert.Equal(storedCount, RecordHeaderCount(text));
+        Assert.DoesNotContain("Showing", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("beyond the stored-detail cap", text, StringComparison.Ordinal);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -1321,9 +1498,126 @@ public sealed partial class ResultsLogTests
         AssertTextLines(
             text,
             "Detail: Engine error  " + forged + " end",
-            "  0x0000023A4F7C1D48  1 error  bits 3, 7  first step 'Random bank thrash'",
-            "  0x0000023A4F7C1D48  1 error  bits not hex  first step 'Random bank thrash'",
+            "  virtual address 0x0000023A4F7C1D48  1 error  bits 3, 7  first step 'Random bank thrash'"
+                + "  first error at 72.000 s  last error at 72.000 s",
+            "  virtual address 0x0000023A4F7C1D48  1 error  bits not hex  first step 'Random bank thrash'"
+                + "  first error at 72.000 s  last error at 72.000 s",
             "  1. Step 'Random bank thrash' at 72.000 s \u2014 virtual address 0x0000023A4F7C1D48 \u2014 bits 3, 7");
+    }
+
+    [Fact]
+    public void TextSummary_StoredDetail_RendersPrimaryMechanismGroupTimesAndEveryRecordField()
+    {
+        // Two records at one word: the AAP's example error, then one whose every other stored value differs.
+        ErrorRecord first = JournalSamples.ErrorRecords(1)[0];
+        ErrorRecord second = first with
+        {
+            Sequence = 41,
+            PassIndex = 3,
+            AccessType = AccessType.TurnaroundRead,
+            TimeSinceWrite = TimeSpan.FromMicroseconds(2_500_125),
+            TimeIntoTest = TimeSpan.FromSeconds(80.25),
+            WorkerIndex = 70,
+            LogicalProcessor = 6,
+            ProcessorGroup = 1,
+            ActiveWorkers = 128,
+        };
+        RunSummary summary = CompletedSummary(new[] { first, second }, TwoHints());
+
+        string text = TextSummaryFormatter.Format(summary);
+
+        AssertTextLines(
+            text,
+            "  virtual address 0x0000023A4F7C1D48  2 errors  bits 49  first step 'Random bank thrash'"
+                + "  first error at 72.000 s  last error at 80.250 s",
+            "Stored error records (2)",
+            "  1. Step 'Random bank thrash' at 72.000 s \u2014 virtual address 0x0000023A4F7C1D48 \u2014 bits 49",
+            "     expected 0x5A3C5A3C5A3C5A3C, actual 0x5A3E5A3C5A3C5A3C, re-read 0x5A3E5A3C5A3C5A3C "
+                + "(repeated wrong value: likely write or storage fault)",
+            "     bit mask 0x0002000000000000, sequence 0, region offset 209,460,552 bytes, step index 1, pass index 0",
+            "     access type VerifyAfterWrite, time since write 0.00075 s, worker index 0, processor group 0, "
+                + "logical processor 0, active workers 7",
+            "  2. Step 'Random bank thrash' at 80.250 s \u2014 virtual address 0x0000023A4F7C1D48 \u2014 bits 49",
+            "     bit mask 0x0002000000000000, sequence 41, region offset 209,460,552 bytes, step index 1, pass index 3",
+            "     access type TurnaroundRead, time since write 2.500125 s, worker index 70, processor group 1, "
+                + "logical processor 6, active workers 128");
+
+        // Every step row carries its primary mechanism, in the JSON's order: after the hold, before the budget.
+        string[] lines = text.Split(LineEnd);
+        string header = Assert.Single(lines, line => line.StartsWith("#  Name", StringComparison.Ordinal));
+        int column = header.IndexOf("Primary mechanism", StringComparison.Ordinal);
+        Assert.InRange(
+            column,
+            header.IndexOf("Hold s", StringComparison.Ordinal) + 1,
+            header.IndexOf("Planned s", StringComparison.Ordinal) - 1);
+        string[] stepRows = lines.Where(line => StepRowPattern().IsMatch(line)).ToArray();
+        Assert.Equal(summary.Steps.Count, stepRows.Length);
+        for (int i = 0; i < stepRows.Length; i++)
+        {
+            string mechanism = summary.Steps[i].PrimaryMechanism;
+            Assert.False(string.IsNullOrEmpty(mechanism), "The sample step has no primary mechanism.");
+            Assert.StartsWith(mechanism + " ", stepRows[i][column..], StringComparison.Ordinal);
+        }
+    }
+
+    [Theory]
+    [InlineData("Virtual", "virtual address")]
+    [InlineData(null, "virtual address")]
+    [InlineData("", "virtual address")]
+    [InlineData(" \r\n ", "virtual address")]
+    [InlineData("Physical", "physical address")]
+    public void TextSummary_GroupRows_NameTheSummaryAddressKind(string? addressKind, string expectedLabel)
+    {
+        // The schema gives a group's word address no kind of its own: it takes the summary's memory address kind,
+        // and virtual, the only v1 kind, when the document did not capture one.
+        RunSummary summary = CompletedSummary(JournalSamples.ErrorRecords(3), TwoHints());
+        RunSummary rendered = summary with { Memory = summary.Memory with { AddressKind = addressKind } };
+
+        string[] lines = TextSummaryFormatter.Format(rendered).Split(LineEnd);
+
+        int header = Array.IndexOf(lines, "Errors by address");
+        Assert.True(header >= 0, "The text summary has no group list.");
+        string[] rows = lines.Skip(header + 1).TakeWhile(line => line.Length > 0).ToArray();
+        Assert.Equal(summary.Errors.Groups.Count, rows.Length);
+        for (int i = 0; i < rows.Length; i++)
+        {
+            Assert.StartsWith(
+                "  " + expectedLabel + " " + summary.Errors.Groups[i].WordAddress + "  ",
+                rows[i],
+                StringComparison.Ordinal);
+        }
+    }
+
+    [Theory]
+    [InlineData(1, "1 more group is", "1 more record is")]
+    [InlineData(2, "2 more groups are", "2 more records are")]
+    public void TextSummary_DamagedDocumentBeyondCap_ListsCapAndCountsTheRest(int extra, string groupsLeft, string recordsLeft)
+    {
+        // The engine stores at most the cap, so only a damaged or foreign document read back holds more.
+        RunSummary summary = CompletedSummary(JournalSamples.ErrorRecords(ErrorGrouping.StoredDetailCap), TwoHints(), 25_000UL);
+        SummaryErrors errors = summary.Errors;
+        RunSummary damaged = summary with
+        {
+            Errors = errors with
+            {
+                Groups = errors.Groups.Concat(Enumerable.Repeat(errors.Groups[^1], extra)).ToArray(),
+                Records = errors.Records.Concat(Enumerable.Repeat(errors.Records[^1], extra)).ToArray(),
+            },
+        };
+
+        string text = TextSummaryFormatter.Format(damaged);
+
+        const string NotListed = " beyond the stored-detail cap of 10,000 and not listed.";
+        AssertTextLines(
+            text,
+            "Grouped from the first 10,000 errors",
+            "  " + groupsLeft + NotListed,
+            "Stored error records (" + (ErrorGrouping.StoredDetailCap + extra).ToString("N0", Invariant) + ")",
+            "  " + recordsLeft + NotListed);
+        Assert.Equal(ErrorGrouping.StoredDetailCap, GroupRowCount(text, "virtual address"));
+        Assert.Equal(ErrorGrouping.StoredDetailCap, RecordHeaderCount(text));
+        Assert.Contains(LineEnd + "  10000. Step '", text, StringComparison.Ordinal);
+        Assert.DoesNotContain(LineEnd + "  10001. Step '", text, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -1420,11 +1714,11 @@ public sealed partial class ResultsLogTests
         Assert.StartsWith(first, both, StringComparison.Ordinal);
         Assert.Equal(
             Utc(_t0) + " APP_ERROR source=\"EngineCallback:on_progress\"" + LineEnd
-                + "System.InvalidOperationException: First callback failure" + LineEnd + LineEnd,
+                + "  System.InvalidOperationException: First callback failure" + LineEnd + LineEnd,
             first);
         Assert.Equal(
             Utc(secondUtc) + " APP_ERROR source=\"DispatcherUnhandledException\"" + LineEnd
-                + "System.IO.IOException: Second \"failure\"" + LineEnd + LineEnd,
+                + "  System.IO.IOException: Second \"failure\"" + LineEnd + LineEnd,
             both[first.Length..]);
         Assert.Equal(2, both.Split(LineEnd).Count(line => EventOf(line) == "APP_ERROR"));
     }
@@ -1444,7 +1738,7 @@ public sealed partial class ResultsLogTests
         Assert.StartsWith(first, both, StringComparison.Ordinal);
         Assert.Equal(
             Utc(queuedUtc) + " APP_ERROR source=\"EngineCallback:on_step_finished\"" + LineEnd
-                + "System.InvalidOperationException: Queued failure" + LineEnd + LineEnd,
+                + "  System.InvalidOperationException: Queued failure" + LineEnd + LineEnd,
             both[first.Length..]);
     }
 
@@ -1458,8 +1752,74 @@ public sealed partial class ResultsLogTests
         string text = await File.ReadAllTextAsync(root.Data.AppErrorsLogPath, Cancellation);
         Assert.Equal(
             Utc(_t0) + " APP_ERROR source=\"EngineCallback:on_errors\"" + LineEnd
-                + typeof(UnformattableException).FullName
+                + "  " + typeof(UnformattableException).FullName
                 + " (its text could not be formatted: System.InvalidOperationException)" + LineEnd + LineEnd,
+            text);
+    }
+
+    [Theory]
+    [InlineData("11111111-1111-4111-8111-111111111111", " run_id=11111111111141118111111111111111")]
+    [InlineData("00000000-0000-0000-0000-000000000000", "")]
+    [InlineData(null, "")]
+    public async Task AppendAppError_RunInProgress_HeaderCarriesItsRunIdAsync(string? runId, string expectedField)
+    {
+        using var root = new TestDataRoot();
+        Guid? id = runId is null ? null : Guid.Parse(runId, Invariant);
+
+        ResultsLog.AppendAppError(root.Data, "EngineCallback:on_progress", new InvalidOperationException("Sink failed"), _t0, id);
+
+        string text = await File.ReadAllTextAsync(root.Data.AppErrorsLogPath, Cancellation);
+        Assert.Equal(
+            Utc(_t0) + " APP_ERROR source=\"EngineCallback:on_progress\"" + expectedField + LineEnd
+                + "  System.InvalidOperationException: Sink failed" + LineEnd + LineEnd,
+            text);
+    }
+
+    [Theory]
+    [InlineData("\r\n")]
+    [InlineData("\n")]
+    [InlineData("\r")]
+    [InlineData("\u2028")]
+    public async Task AppendAppError_MultiLineMessage_OnlyTheHeaderStartsAtTheMarginAsync(string lineBreak)
+    {
+        using var root = new TestDataRoot();
+        const string Forged = "2030-01-01T00:00:00.000Z APP_ERROR source=\"Forged\"";
+        var exception = new InvalidOperationException("first line" + lineBreak + Forged + lineBreak + lineBreak + "last line");
+
+        ResultsLog.AppendAppError(root.Data, "QaEdge.Forged", exception, _t0);
+
+        // Every line of the text is indented, an empty one included, so a blank line still ends only the entry.
+        string text = await File.ReadAllTextAsync(root.Data.AppErrorsLogPath, Cancellation);
+        Assert.Equal(
+            Utc(_t0) + " APP_ERROR source=\"QaEdge.Forged\"" + LineEnd
+                + "  System.InvalidOperationException: first line" + LineEnd
+                + "  " + Forged + LineEnd
+                + "  " + LineEnd
+                + "  last line" + LineEnd + LineEnd,
+            text);
+        Assert.Single(text.Split(LineEnd), line => EventOf(line) == "APP_ERROR");
+    }
+
+    [Theory]
+    [InlineData(AccountLocation.DataFolder)]
+    [InlineData(AccountLocation.LocalAppData)]
+    [InlineData(AccountLocation.RoamingAppData)]
+    [InlineData(AccountLocation.UserProfile)]
+    [InlineData(AccountLocation.UserNameSegment)]
+    [InlineData(AccountLocation.ProfileSibling)]
+    public async Task AppendAppError_AccountLocationsInExceptionText_WrittenAsPlaceholdersAsync(AccountLocation location)
+    {
+        using var root = new TestDataRoot();
+        (string path, string expectedPath) = AccountLocationText(location, root);
+
+        var exception = new IOException($"Could not find a part of the path '{path}'.");
+
+        ResultsLog.AppendAppError(root.Data, "UnhandledException", exception, _t0);
+
+        string text = await File.ReadAllTextAsync(root.Data.AppErrorsLogPath, Cancellation);
+        Assert.Equal(
+            Utc(_t0) + " APP_ERROR source=\"UnhandledException\"" + LineEnd
+                + $"  System.IO.IOException: Could not find a part of the path '{expectedPath}'." + LineEnd + LineEnd,
             text);
     }
 
@@ -1509,6 +1869,73 @@ public sealed partial class ResultsLogTests
         ResultsLog? log = ResultsLog.OpenRun(root.Data, Quick, _t0, time, runIds.Next);
         Assert.NotNull(log);
         return log;
+    }
+
+    // Logs message through the event, and returns the event, the key of the field that carries it and the text that
+    // precedes it in that field.
+    private static (string EventName, string Key, string ValuePrefix) LogFreeText(
+        ResultsLog log,
+        FreeTextEvent freeTextEvent,
+        string message)
+    {
+        switch (freeTextEvent)
+        {
+            case FreeTextEvent.JournalFailure:
+                log.LogJournalFailure(message);
+                return ("JOURNAL_FAILURE", "message", string.Empty);
+            case FreeTextEvent.Notice:
+                log.LogNotice(message);
+                return ("NOTICE", "message", string.Empty);
+            case FreeTextEvent.CallbackFault:
+                log.LogCallbackFault(_t0, "EngineCallback:on_progress", new IOException(message));
+                return ("CALLBACK_FAULT", "error", "System.IO.IOException: ");
+            default:
+                throw new ArgumentOutOfRangeException(nameof(freeTextEvent), freeTextEvent, "Not a free-text event of these tests.");
+        }
+    }
+
+    // A path naming the account, built from the folders Windows reports for it, and the text the logs write in its
+    // place. Only the text is used: nothing is ever written under the profile.
+    private static (string Path, string Expected) AccountLocationText(AccountLocation location, TestDataRoot root)
+    {
+        switch (location)
+        {
+            case AccountLocation.DataFolder:
+                return (
+                    Path.Combine(root.Data.RootPath, "journal", DataDirectory.JournalFileName),
+                    @"<data>\journal\" + DataDirectory.JournalFileName);
+            case AccountLocation.LocalAppData:
+                return (
+                    Path.Combine(
+                        KnownFolder(Environment.SpecialFolder.LocalApplicationData), "RamQuick", "journal", "active-run.jsonl"),
+                    @"%LOCALAPPDATA%\RamQuick\journal\active-run.jsonl");
+            case AccountLocation.RoamingAppData:
+                return (
+                    Path.Combine(KnownFolder(Environment.SpecialFolder.ApplicationData), "RamQuick", "notes.txt"),
+                    @"%APPDATA%\RamQuick\notes.txt");
+            case AccountLocation.UserProfile:
+                // Case and separator style do not matter, and a trailing separator stays.
+                return (
+                    KnownFolder(Environment.SpecialFolder.UserProfile).ToUpperInvariant().Replace('\\', '/') + "/Desktop/",
+                    "%USERPROFILE%/Desktop/");
+            case AccountLocation.UserNameSegment:
+                string userName = Environment.UserName;
+                Assert.SkipWhen(string.IsNullOrWhiteSpace(userName), "Windows reports no user name for this account.");
+                return (@"\\fileserver\home\" + userName + @"\RamQuick", @"\\fileserver\home\%USERNAME%\RamQuick");
+            case AccountLocation.ProfileSibling:
+                // A folder whose name merely starts with the profile's is another folder, written as it is.
+                string sibling = KnownFolder(Environment.SpecialFolder.UserProfile) + "-archive-7f3c";
+                return (sibling, sibling);
+            default:
+                throw new ArgumentOutOfRangeException(nameof(location), location, "Not an account location of these tests.");
+        }
+    }
+
+    private static string KnownFolder(Environment.SpecialFolder folder)
+    {
+        string path = Environment.GetFolderPath(folder, Environment.SpecialFolderOption.DoNotVerify);
+        Assert.SkipWhen(string.IsNullOrEmpty(path), $"Windows reports no {folder} folder for this account.");
+        return Path.TrimEndingDirectorySeparator(path);
     }
 
     private static RunSummary CompletedSummary(
@@ -1674,6 +2101,13 @@ public sealed partial class ResultsLogTests
         }
     }
 
+    // A group row of the text summary: two spaces, the address label, then the word address.
+    private static int GroupRowCount(string text, string addressLabel) =>
+        text.Split(LineEnd).Count(line => line.StartsWith("  " + addressLabel + " 0x", StringComparison.Ordinal));
+
+    private static int RecordHeaderCount(string text) =>
+        text.Split(LineEnd).Count(line => RecordHeaderPattern().IsMatch(line));
+
     // The .log's quoting of free text: \" and \\ escaped, control characters written as spaces.
     private static string Quoted(string value)
     {
@@ -1761,6 +2195,33 @@ public sealed partial class ResultsLogTests
     [GeneratedRegex(@"^ *\d+ {2}\S", RegexOptions.CultureInvariant)]
     private static partial Regex StepRowPattern();
 
+    // The first line of a stored error record in the text summary: its 1-based number, then its step.
+    [GeneratedRegex(@"^  \d+\. Step '", RegexOptions.CultureInvariant)]
+    private static partial Regex RecordHeaderPattern();
+
+    /// <summary>
+    /// The events whose free-text message the redaction tests write.
+    /// </summary>
+    public enum FreeTextEvent
+    {
+        JournalFailure,
+        Notice,
+        CallbackFault,
+    }
+
+    /// <summary>
+    /// A location that names the Windows account, as it appears in a message.
+    /// </summary>
+    public enum AccountLocation
+    {
+        DataFolder,
+        LocalAppData,
+        RoamingAppData,
+        UserProfile,
+        UserNameSegment,
+        ProfileSibling,
+    }
+
     /// <summary>
     /// A run-id source that returns its ids in order, counts the calls and fails the test past its script.
     /// </summary>
@@ -1777,6 +2238,48 @@ public sealed partial class ResultsLogTests
             Assert.True(Calls < _ids.Length, "OpenRun drew more run ids than the test scripted.");
             return _ids[Calls++];
         }
+    }
+
+    /// <summary>
+    /// A caller's list that it refills for its next batch, counting every read made off the thread that created
+    /// it: a log that kept the list past the call would read it on its drain.
+    /// </summary>
+    private sealed class ReusableRecordList : IReadOnlyList<ErrorRecord>
+    {
+        private readonly int _callerThreadId = Environment.CurrentManagedThreadId;
+        private readonly ErrorRecord[] _records;
+        private int _readsOffCallerThread;
+
+        public ReusableRecordList(IEnumerable<ErrorRecord> records) => _records = records.ToArray();
+
+        public int Count => _records.Length;
+
+        public int ReadsOffCallerThread => Volatile.Read(ref _readsOffCallerThread);
+
+        public ErrorRecord this[int index]
+        {
+            get
+            {
+                if (Environment.CurrentManagedThreadId != _callerThreadId)
+                {
+                    Interlocked.Increment(ref _readsOffCallerThread);
+                }
+
+                return _records[index];
+            }
+        }
+
+        public void Refill(ErrorRecord record) => Array.Fill(_records, record);
+
+        public IEnumerator<ErrorRecord> GetEnumerator()
+        {
+            for (int index = 0; index < _records.Length; index++)
+            {
+                yield return this[index];
+            }
+        }
+
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
     /// <summary>

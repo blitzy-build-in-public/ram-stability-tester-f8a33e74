@@ -9,14 +9,17 @@
       1. Constraints           scripts/check-constraints.ps1: no networking, system-configuration
                                or out-of-layer native-call APIs in src/.
       2. Native style          clang-format --style=file --dry-run --Werror over every *.h and
-                               *.cpp file under src/engine and tests/engine.tests (root
-                               .clang-format), in batches of 50 files.
+                               *.cpp file under src/engine and tests/engine.tests
+                               (root .clang-format), in batches of 50 files.
       3. Validation self-test  scripts/Summarize-ValidationRuns.ps1 -SelfTest, run in its own
                                PowerShell process. It passes only on exit code 0 with at least
                                one PASS case and no FAIL case.
       4. Build                 Visual Studio's MSBuild on RamQuick.sln with -restore, Platform
-                               x64 and the chosen configuration. A failed build ends the run
-                               here, because there is nothing to test.
+                               x64 and the chosen configuration. The restore runs in locked
+                               mode against the committed packages.lock.json files, so a lock
+                               file that no longer matches the package pins fails the build
+                               (NU1004) instead of being rewritten. A failed build ends the
+                               run here, because there is nothing to test.
       5. Third-party notices   Every MPL-2.0 package in the closure frozen by
                                src/RamQuick.App/packages.lock.json must have a
                                THIRD-PARTY-NOTICES.txt entry with its package ID, its exact
@@ -1097,15 +1100,18 @@ function Invoke-ValidationSelfTest {
 }
 
 function Invoke-SolutionBuild {
-    # -restore generates or refreshes each managed project's committed packages.lock.json
-    # (RestorePackagesWithLockFile=true in Directory.Build.props) and restores GoogleTest 1.18.0
-    # for the native test projects through vcpkg manifest mode (x64-windows-static) into
-    # vcpkg_installed/. -nodeReuse:false and UseSharedCompilation=false leave no MSBuild node or
-    # compiler server running after the build, holding files or this run's environment.
+    # -restore runs in locked mode (RestoreLockedMode=true): each managed project restores
+    # exactly the closure its committed packages.lock.json freezes, and a lock file that no
+    # longer matches Directory.Packages.props or a project file fails the build (NU1004) instead
+    # of being rewritten (Directory.Build.props sets RestorePackagesWithLockFile and leaves this
+    # switch to the scripts). -restore also restores GoogleTest 1.18.0 for the native test
+    # projects through vcpkg manifest mode (x64-windows-static) into vcpkg_installed/.
+    # -nodeReuse:false and UseSharedCompilation=false leave no MSBuild node or compiler server
+    # running after the build, holding files or this run's environment.
     $arguments = @(
         $SolutionPath, '-restore', '-m', '-nologo', '-v:minimal',
         ('-p:Configuration={0}' -f $Configuration), '-p:Platform=x64',
-        '-nodeReuse:false', '-p:UseSharedCompilation=false'
+        '-p:RestoreLockedMode=true', '-nodeReuse:false', '-p:UseSharedCompilation=false'
     )
     $code = Invoke-NativeTool -FilePath $script:Toolchain.MSBuild -ArgumentList $arguments -StepName 'Build'
     if ($code -ne 0) {

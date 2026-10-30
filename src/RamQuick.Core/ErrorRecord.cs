@@ -9,7 +9,7 @@ namespace RamQuick.Core;
 /// </summary>
 /// <remarks>
 /// <para>
-/// The record carries every field the error analysis reads (address, bit position, step, access
+/// The record carries every field relevant to error analysis (address, bit position, step, access
 /// type, time since write, thread) and every field the UI and logs display (step name, time into
 /// test, address, expected, actual and re-read values). At most 10,000 records are stored per run;
 /// the true error total is kept separately from engine counters and is never derived from them.
@@ -153,7 +153,10 @@ public sealed record ErrorRecord
 
     /// <summary>
     /// Gets the number of workers active in the step: every worker in an <c>All</c>-thread step,
-    /// half of them in a <c>Half</c>-thread step. The Load rule uses it to separate the two.
+    /// half of them, rounded up, in a <c>Half</c>-thread step. It is recorded per error so the
+    /// results log's ERROR lines and the summary's <c>errors.records[]</c> show the load each error
+    /// occurred under. The Load rule does not read it: it classifies errors by the thread mode of
+    /// their step, <see cref="StepAttributes.Threads"/>.
     /// Source: <c>rq_error_record.active_workers</c>.
     /// </summary>
     public required int ActiveWorkers { get; init; }

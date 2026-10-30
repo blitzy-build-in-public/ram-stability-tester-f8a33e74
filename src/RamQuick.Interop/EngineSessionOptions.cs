@@ -130,6 +130,16 @@ public sealed class EngineSessionOptions
     public const ulong DefaultMinRegionBytes = 1UL << 30;
 
     /// <summary>
+    /// The most steps a session may hold: 1,024, the engine's limit. <c>rq_session_create</c> rejects a longer step
+    /// array with <c>RQ_E_INVALID_ARGUMENT</c>.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Validate"/> rejects a longer <see cref="Steps"/> list from its count alone, before reading any
+    /// element, so an oversized list is never traversed, copied or marshalled.
+    /// </remarks>
+    public const int MaxStepCount = 1024;
+
+    /// <summary>
     /// The default <see cref="ProgressInterval"/>: 250 ms, so progress reaches the UI at 4 Hz.
     /// </summary>
     public static readonly TimeSpan DefaultProgressInterval = TimeSpan.FromMilliseconds(250);
@@ -208,10 +218,12 @@ public sealed class EngineSessionOptions
 
     /// <summary>
     /// Gets the plan's ordered steps, mapped from <c>RamQuick.Plans.StepDefinition</c> by the caller, because this
-    /// library never references the plans. At least one step; <see cref="StepAttributes.Index"/> equals each step's
-    /// position, and every step name is non-empty, free of NUL characters, well-formed and at most 63 UTF-8 bytes.
-    /// Names are rejected rather than truncated, because the session reports step names from this managed copy.
-    /// Native <c>rq_session_config.steps</c> and <c>step_count</c>.
+    /// library never references the plans. At least one step and at most <see cref="MaxStepCount"/>;
+    /// <see cref="StepAttributes.Index"/> equals each step's position, and every step name is non-empty, free of NUL
+    /// characters, well-formed and at most 63 UTF-8 bytes. Names are rejected rather than truncated, because the session
+    /// reports step names from this managed copy. A step with a hold uses <see cref="AccessOrder.RandomBlocks"/>, the
+    /// order in which it writes its whole slice, and a pattern other than moving inversion, whose own whole-slice
+    /// sweeps take no hold. Native <c>rq_session_config.steps</c> and <c>step_count</c>.
     /// </summary>
     public required IReadOnlyList<StepAttributes> Steps { get; init; }
 
@@ -249,8 +261,10 @@ public sealed class EngineSessionOptions
     /// <see cref="InstructionSet"/>.
     /// </exception>
     /// <exception cref="ArgumentException">
-    /// <see cref="Steps"/> is null or empty, or a step is null, out of position, or has an invalid name, pattern,
-    /// access order, thread mode, hold, time budget or coverage budget.
+    /// <see cref="Steps"/> is null, empty or longer than <see cref="MaxStepCount"/>; a step is null, out of position,
+    /// or has an invalid name, pattern, access order, thread mode, hold, time budget or coverage budget; or a step has
+    /// a shape the engine does not run: a hold with a moving-inversion pattern, or a hold with an access order other
+    /// than <see cref="AccessOrder.RandomBlocks"/>.
     /// </exception>
     public void Validate()
     {
@@ -286,6 +300,16 @@ public sealed class EngineSessionOptions
         if (steps is null || steps.Count == 0)
         {
             throw new ArgumentException("A session needs at least one step.", nameof(Steps));
+        }
+
+        // Decided from the count alone, before any element is read: the session copies and marshals every step it
+        // accepts, so an oversized list must fail here rather than after that work, at the engine's own limit.
+        if (steps.Count > MaxStepCount)
+        {
+            throw new ArgumentException(
+                $"{nameof(Steps)} holds {steps.Count} steps; a session holds at most {MaxStepCount}, "
+                + "the engine's limit.",
+                nameof(Steps));
         }
 
         Span<byte> nameScratch = stackalloc byte[MaxStepNameBytes];
@@ -329,6 +353,26 @@ public sealed class EngineSessionOptions
             if (step.Hold != TimeSpan.Zero && !FitsNativeMilliseconds(step.Hold))
             {
                 throw StepError(i, $"has the hold {step.Hold}; it must be zero or {NativeMillisecondsRange}.");
+            }
+
+            // Only the step shapes the engine runs: rq_session_create rejects any other with a bare
+            // RQ_E_INVALID_ARGUMENT, so they are checked here, where the error can name the step. A hold step writes its
+            // whole slice in RandomBlocks order, so requiring it to declare that order keeps the order the summary and
+            // the analyzer read equal to the order that runs.
+            if (IsMovingInversion(step.Pattern) && step.HasHold)
+            {
+                throw StepError(
+                    i,
+                    $"(\"{step.Name}\") has the pattern {step.Pattern} with the hold {step.Hold}; moving inversion runs "
+                    + "its own whole-slice sweeps and takes no hold.");
+            }
+            else if (step.HasHold && step.Order != AccessOrder.RandomBlocks)
+            {
+                throw StepError(
+                    i,
+                    $"(\"{step.Name}\") has the hold {step.Hold} with the access order {step.Order}; a hold step writes "
+                    + $"its whole slice in {nameof(AccessOrder.RandomBlocks)} order, so its order must be "
+                    + $"{nameof(AccessOrder.RandomBlocks)}.");
             }
 
             if (step.CoverageBudgetPercent < 1 || step.CoverageBudgetPercent > MaxCoverageBudgetPercent)
@@ -381,6 +425,9 @@ public sealed class EngineSessionOptions
         long wholeMilliseconds = value.Ticks / TimeSpan.TicksPerMillisecond;
         return wholeMilliseconds >= 1 && wholeMilliseconds <= uint.MaxValue;
     }
+
+    private static bool IsMovingInversion(PatternKind pattern) =>
+        pattern is PatternKind.MovingInversionWalking or PatternKind.MovingInversionRandom;
 
     private static ArgumentException StepError(int index, string problem) =>
         new($"{nameof(Steps)}[{index}] {problem}", nameof(Steps));

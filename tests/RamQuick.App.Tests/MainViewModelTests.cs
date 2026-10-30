@@ -62,6 +62,9 @@ public sealed class MainViewModelTests
     /// <summary>Every <see cref="CauseCategory"/>, for the per-category hint item checks.</summary>
     public static TheoryData<CauseCategory> AllCauseCategories => new(Enum.GetValues<CauseCategory>());
 
+    /// <summary>Every <see cref="TestType"/>, for the per-type selector entry checks.</summary>
+    public static TheoryData<TestType> AllTestTypes => new(Enum.GetValues<TestType>());
+
     // ---------------------------------------------------------------------------------------------
     // Defaults, surface and settings
     // ---------------------------------------------------------------------------------------------
@@ -93,6 +96,21 @@ public sealed class MainViewModelTests
 
         // Until launch recovery has finished, nothing can start and the settings stay locked.
         AssertControls(viewModel, canStart: false, canStop: false, inProgress: false, canChangeSettings: false);
+    }
+
+    [Theory]
+    [MemberData(nameof(AllTestTypes))]
+    public void TestTypeOption_ToString_IsTheDisplayTextAssistiveTechnologyReads(TestType type)
+    {
+        using var harness = new ControllerHarness();
+        using MainViewModel viewModel = CreateViewModel(harness);
+
+        // The selector's item and selection automation names fall back to the entry's ToString, so it must be the
+        // label the entry shows, never the record's member listing.
+        TestTypeOption option = Assert.Single(viewModel.TestTypeOptions, candidate => candidate.Value == type);
+
+        Assert.Equal(UiText.TestTypeDisplay(type), option.Text);
+        Assert.Equal(option.Text, option.ToString());
     }
 
     [Fact]
@@ -978,7 +996,12 @@ public sealed class MainViewModelTests
         Assert.Equal("5, 17", item.BitsText);
         Assert.Equal(group.FirstStepName, item.FirstStepName);
         Assert.Equal("01:12", item.FirstTimeText);
-        Assert.Equal(Format(UiText.ErrorGroupFormat, item.AddressText, item.CountText, item.BitsText, group.FirstStepName), item.Text);
+        Assert.Equal(
+            Format(UiText.ErrorGroupFormat, UiText.VirtualAddressLabel, item.AddressText, item.CountText, item.BitsText, group.FirstStepName),
+            item.Text);
+
+        // The displayed line labels the address as virtual, as the first-error message does.
+        Assert.StartsWith(VirtualAddressToken + " 0x0000023A4F7C1D48", item.Text, StringComparison.Ordinal);
         Assert.Equal(item.Text, item.ToString());
     }
 

@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Reflection;
@@ -208,6 +209,12 @@ public sealed class RunControllerOptions
 /// </remarks>
 public sealed partial class RunController : ObservableObject, IDisposable
 {
+    /// <summary>
+    /// The number of largest error groups <see cref="ErrorGroups"/> holds at most: the 100 groups the result panel
+    /// lists.
+    /// </summary>
+    public const int MaxErrorGroups = 100;
+
     private const string AppErrorSource = "RunController";
     private const string FatalErrorSource = "UnhandledException";
     private const string EngineCallbackSourcePrefix = "EngineCallback:";
@@ -377,9 +384,15 @@ public sealed partial class RunController : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Gets the stored error records grouped by 8-byte word address, largest groups first. A new list instance is
-    /// assigned whenever the groups change.
+    /// Gets the largest groups of the current or last run's stored error records by 8-byte word address: at most
+    /// <see cref="MaxErrorGroups"/>, largest first, in the order of <see cref="ErrorGrouping.Group"/>. A new list
+    /// instance is assigned whenever the groups change, and the instance is kept while a batch leaves them unchanged.
     /// </summary>
+    /// <remarks>
+    /// The groups are derived from the stored records only, at most <see cref="ErrorGrouping.StoredDetailCap"/>, never
+    /// from <see cref="TotalErrors"/>. Each error batch updates them in time proportional to its own size plus
+    /// <see cref="MaxErrorGroups"/>, never to the number of records stored before it.
+    /// </remarks>
     public IReadOnlyList<ErrorGroup> ErrorGroups
     {
         get => _errorGroups;
@@ -714,7 +727,8 @@ public sealed partial class RunController : ObservableObject, IDisposable
     /// application's unhandled-exception handlers on any thread; never throws.
     /// </summary>
     /// <remarks>
-    /// The exception is appended synchronously to <c>&lt;data&gt;\logs\app-errors.log</c> when a data folder exists.
+    /// The exception is appended synchronously to <c>&lt;data&gt;\logs\app-errors.log</c> when a data folder exists,
+    /// with the id of the run in progress, if any.
     /// The session is then disposed, which stops the engine, joins its threads and releases the memory; its journal
     /// is left in place, so the next launch reports the run.
     /// </remarks>
@@ -722,9 +736,10 @@ public sealed partial class RunController : ObservableObject, IDisposable
     public void HandleFatalException(Exception exception)
     {
         DataDirectory? dataDirectory = _dataDirectory;
+        Guid? runId = Volatile.Read(ref _run)?.Log.RunId;
         if (dataDirectory is not null && exception is not null)
         {
-            ResultsLog.AppendAppError(dataDirectory, FatalErrorSource, exception, _timeProvider.GetUtcNow());
+            ResultsLog.AppendAppError(dataDirectory, FatalErrorSource, exception, _timeProvider.GetUtcNow(), runId);
         }
 
         try
@@ -737,7 +752,8 @@ public sealed partial class RunController : ObservableObject, IDisposable
             // lands; the process is ending, and Windows reclaims the locked pages with it.
             if (dataDirectory is not null)
             {
-                ResultsLog.AppendAppError(dataDirectory, FatalErrorSource, disposeFailure, _timeProvider.GetUtcNow());
+                ResultsLog.AppendAppError(
+                    dataDirectory, FatalErrorSource, disposeFailure, _timeProvider.GetUtcNow(), runId);
             }
         }
     }
@@ -1145,6 +1161,10 @@ public sealed partial class RunController : ObservableObject, IDisposable
     private void StartSession(RunContext run)
     {
         StartRequest request = run.Request;
+
+        // Read in the same synchronous frame as CreateSession, so it is the very context the session posts its
+        // events to, and the step gate's barrier queues behind them.
+        SynchronizationContext? eventContext = SynchronizationContext.Current;
         var options = new EngineSessionOptions
         {
             RegionBytes = request.RegionBytes,
@@ -1153,7 +1173,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
             Steps = request.Steps,
             StopOnError = request.StopOnError,
             Seed = SeedFrom(run.Begin.RunId),
-            StepGate = (step, stopEvent) => GateStep(run, step, stopEvent),
+            StepGate = (step, stopEvent) => GateStep(run, eventContext, step, stopEvent),
             ProgressSink = run.Journal.PublishProgress,
             CallbackFault = (callbackName, exception) => RecordCallbackFault(run, callbackName, exception),
         };
@@ -1186,13 +1206,37 @@ public sealed partial class RunController : ObservableObject, IDisposable
     }
 
     // Runs on the engine coordinator before each step's memory traffic. It touches only the journal, which is
-    // thread-safe, and the run's atomically published fields.
-    private static StepGateDecision GateStep(RunContext run, EngineStepStarted step, WaitHandle stopEvent)
+    // thread-safe, the run's atomically published fields, and the UI context, to which it first posts a barrier: the
+    // prepared and stepEnd records of the events raised before this step are journalled by their UI-thread handlers,
+    // and the step record must follow them, or a crash in the step's first moments would lose the previous step.
+    private static StepGateDecision GateStep(
+        RunContext run,
+        SynchronizationContext? eventContext,
+        EngineStepStarted step,
+        WaitHandle stopEvent)
     {
+        // One real-time budget covers the barrier and the acknowledgment, so a stalled UI thread and a stalled disk
+        // together still hold the engine no longer than the journal's bound.
+        long startedAt = Stopwatch.GetTimestamp();
         try
         {
+            // Without a captured context the session delivers its events on the thread pool, in no order a barrier
+            // could queue behind.
+            if (eventContext is not null)
+            {
+                switch (WaitForEarlierEvents(eventContext, stopEvent, ProgressJournal.AcknowledgmentTimeout))
+                {
+                    case EventBarrierOutcome.Stopped:
+                        // As for a stop during the acknowledgment wait: the engine ends with the recorded reason.
+                        return StepGateDecision.Abort;
+                    case EventBarrierOutcome.TimedOut:
+                        return FailStep(run, UiText.JournalAcknowledgmentTimedOut);
+                }
+            }
+
             JournalAck ack = run.Journal.RecordStepStarting(step.Index, step.Count, step.Name);
-            JournalAckStatus status = ack.Wait(stopEvent, ProgressJournal.AcknowledgmentTimeout);
+            TimeSpan remaining = ProgressJournal.AcknowledgmentTimeout - Stopwatch.GetElapsedTime(startedAt);
+            JournalAckStatus status = ack.Wait(stopEvent, remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero);
             return status switch
             {
                 JournalAckStatus.Acknowledged => StepGateDecision.Continue,
@@ -1209,25 +1253,56 @@ public sealed partial class RunController : ObservableObject, IDisposable
         }
     }
 
+    // The UI context runs its posts in order, so once the barrier has run, every handler of an event posted before it
+    // has offered its record to the journal. The barrier holds only its completion source, never a run, journal or
+    // session, so a barrier still queued when its run is abandoned keeps none of them alive.
+    private static EventBarrierOutcome WaitForEarlierEvents(
+        SynchronizationContext eventContext,
+        WaitHandle stopEvent,
+        TimeSpan timeout)
+    {
+        var barrier = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        eventContext.Post(static state => ((TaskCompletionSource)state!).TrySetResult(), barrier);
+        Task delivered = barrier.Task;
+        try
+        {
+            int signalled = WaitHandle.WaitAny(new[] { ((IAsyncResult)delivered).AsyncWaitHandle, stopEvent }, timeout);
+            if (signalled == 0 || delivered.IsCompleted)
+            {
+                return EventBarrierOutcome.Delivered;
+            }
+
+            return signalled == WaitHandle.WaitTimeout ? EventBarrierOutcome.TimedOut : EventBarrierOutcome.Stopped;
+        }
+        catch (ObjectDisposedException)
+        {
+            // Only a session being destroyed disposes its stop event, so the wait ends as a stop, as the journal
+            // acknowledgment's own wait ends.
+            return delivered.IsCompleted ? EventBarrierOutcome.Delivered : EventBarrierOutcome.Stopped;
+        }
+    }
+
     // The host-fault stop is recorded before Abort is returned, so the aborted step starts no traffic and the run
-    // ends HostFault rather than with an unexplained gate abort.
+    // ends HostFault rather than with an unexplained gate abort. The failure is logged as it happens, ahead of its
+    // stop; both lines are only enqueued, so the coordinator performs no I/O.
     private static StepGateDecision FailStep(RunContext run, string failure)
     {
         run.TryRecordJournalFailure(failure);
-        run.Session?.RequestStop(StopReason.HostFault);
+        LogJournalFailureOnce(run);
+        RequestEngineStop(run, StopReason.HostFault);
         return StepGateDecision.Abort;
     }
 
-    // Runs on the engine coordinator or the UI thread; non-blocking, and the app-error write goes to the thread pool.
+    // Runs on the engine coordinator or the UI thread; non-blocking: the app-error write goes to the thread pool and
+    // the .log lines are only enqueued. CALLBACK_FAULT records the cause of the host-fault stop that follows it.
     private static void RecordCallbackFault(RunContext run, string callbackName, Exception exception)
     {
-        ResultsLog.QueueAppError(
-            run.Request.DataDirectory,
-            EngineCallbackSourcePrefix + callbackName,
-            exception,
-            run.TimeProvider.GetUtcNow());
+        string source = EngineCallbackSourcePrefix + callbackName;
+        DateTimeOffset caughtUtc = run.TimeProvider.GetUtcNow();
+        ResultsLog.QueueAppError(run.Request.DataDirectory, source, exception, caughtUtc, run.Log.RunId);
+        run.Log.LogCallbackFault(caughtUtc, source, exception);
         run.TryRecordCallbackFault(exception.Message);
-        run.Session?.RequestStop(StopReason.HostFault);
+        RequestEngineStop(run, StopReason.HostFault);
     }
 
     private static ulong SeedFrom(Guid runId)
@@ -1373,8 +1448,17 @@ public sealed partial class RunController : ObservableObject, IDisposable
                 ErrorRecord[] accepted = e.Records.Take(room).ToArray();
                 run.Stored.AddRange(accepted);
                 FirstError ??= run.Stored[0];
-                ErrorGroups = ErrorGrouping.Group(run.Stored);
+                ErrorGroups = run.Groups.Add(accepted);
                 run.Log.LogErrors(accepted, Math.Max(TotalErrors, e.TotalErrors));
+            }
+
+            // With Stop on error on, the engine stopped itself at the first confirmed error, before reporting it; the
+            // record's test time is the decision's, on the engine clock that COMPLETED elapsed_ms also uses. Once a
+            // stop line exists, only Completed shows whether this error ended the run, and ConcludeAsync logs it then.
+            if (run.Request.StopOnError && e.Records.Count > 0 && run.TryClaimFirstErrorStopOnReport())
+            {
+                run.Log.LogStopRequested(
+                    _timeProvider.GetUtcNow(), nameof(RunEndReason.FirstError), e.Records[0].TimeIntoTest);
             }
 
             if (e.TotalErrors > TotalErrors)
@@ -1426,10 +1510,13 @@ public sealed partial class RunController : ObservableObject, IDisposable
         }
     }
 
-    // An exception in a handler must never reach the dispatcher mid-run: it is logged and ends the run HostFault.
+    // An exception in a handler must never reach the dispatcher mid-run: it is logged and ends the run HostFault, and
+    // the run's .log records it as that stop's cause.
     private void OnHandlerFault(RunContext run, string handlerName, Exception exception)
     {
-        ReportAppError(handlerName, exception);
+        DateTimeOffset caughtUtc = _timeProvider.GetUtcNow();
+        ReportAppError(handlerName, exception, caughtUtc);
+        run.Log.LogCallbackFault(caughtUtc, AppErrorSourceOf(handlerName), exception);
         run.TryRecordCallbackFault(exception.Message);
         if (!run.Concluded && StateMachine.IsRunInProgress)
         {
@@ -1450,25 +1537,32 @@ public sealed partial class RunController : ObservableObject, IDisposable
         RequestEngineStop(run, StopReason.HostFault);
     }
 
+    // Called from the coordinator (a failed step gate) and the UI thread (a failure seen on Progress); the first
+    // recorded failure is logged once, when it is recorded.
     private static void LogJournalFailureOnce(RunContext run)
     {
-        if (!run.JournalFailureLogged && run.JournalFailureText is { } failure)
+        if (run.JournalFailureText is { } failure && run.TryClaimJournalFailureLog())
         {
-            run.JournalFailureLogged = true;
             run.Log.LogJournalFailure(failure);
         }
     }
 
-    private void RequestEngineStop(RunContext run, StopReason reason)
+    // Every stop the controller asks for, from the UI or the coordinator thread: the engine records the reason before
+    // this returns, and the controller's first request gets its STOP_REQUESTED line, stamped at the request, unless a
+    // reported first-error stop was logged before it; later requests, which the engine ignores, add none. Logging
+    // only enqueues, so the coordinator performs no I/O.
+    private static void RequestEngineStop(RunContext run, StopReason reason)
     {
-        run.Session?.RequestStop(reason);
-        string reasonName = reason switch
+        if (run.RequestStop(reason))
         {
-            StopReason.User => nameof(RunEndReason.UserStop),
-            StopReason.Thermal => nameof(RunEndReason.Thermal),
-            _ => nameof(RunEndReason.HostFault),
-        };
-        run.Log.LogStopRequested(_timeProvider.GetUtcNow(), reasonName);
+            string reasonName = reason switch
+            {
+                StopReason.User => nameof(RunEndReason.UserStop),
+                StopReason.Thermal => nameof(RunEndReason.Thermal),
+                _ => nameof(RunEndReason.HostFault),
+            };
+            run.Log.LogStopRequested(run.TimeProvider.GetUtcNow(), reasonName);
+        }
     }
 
     private void UpdateTruncation(RunContext run) =>
@@ -1696,7 +1790,15 @@ public sealed partial class RunController : ObservableObject, IDisposable
             conclusion.StepResults.Count > 0 ? conclusion.StepResults : run.OutcomesSnapshot());
         run.FinalOutcomes = outcomes;
 
-        LogJournalFailureOnce(run);
+        // The engine's end reason is authoritative. A first-error stop not logged yet, because its error report never
+        // arrived or a request logged after the engine had stopped came first, is logged now, stamped as COMPLETED so
+        // no stamp decreases. A first error that lost to an earlier stop was no stop decision and gets no line.
+        if (conclusion.EndReason == RunEndReason.FirstError && run.TryClaimFirstErrorStopOnCompletion())
+        {
+            run.Log.LogStopRequested(
+                conclusion.CompletedUtc, nameof(RunEndReason.FirstError), conclusion.FirstErrorTime);
+        }
+
         run.Log.LogCompleted(
             conclusion.CompletedUtc,
             conclusion.EndReason,
@@ -1958,13 +2060,21 @@ public sealed partial class RunController : ObservableObject, IDisposable
         return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
     }
 
-    private void ReportAppError(string where, Exception exception)
+    private void ReportAppError(string where, Exception exception) =>
+        ReportAppError(where, exception, _timeProvider.GetUtcNow());
+
+    // The entry carries the id of the run in progress or still publishing, when there is one, so it can be tied to
+    // that run's .log. Called on the UI thread and from the thread pool, so the run is read with Volatile.
+    private void ReportAppError(string where, Exception exception, DateTimeOffset utc)
     {
         if (_dataDirectory is { } dataDirectory)
         {
-            ResultsLog.QueueAppError(dataDirectory, $"{AppErrorSource}.{where}", exception, _timeProvider.GetUtcNow());
+            Guid? runId = Volatile.Read(ref _run)?.Log.RunId;
+            ResultsLog.QueueAppError(dataDirectory, AppErrorSourceOf(where), exception, utc, runId);
         }
     }
+
+    private static string AppErrorSourceOf(string where) => $"{AppErrorSource}.{where}";
 
     private sealed record StartRequest(
         TestType TestType,
@@ -1995,17 +2105,31 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
     private sealed record ReleaseNotice(EngineReleased Released, DateTimeOffset ReceivedUtc);
 
+    // How the step gate's wait for the events posted before it ended.
+    private enum EventBarrierOutcome
+    {
+        Delivered,
+        Stopped,
+        TimedOut,
+    }
+
     /// <summary>
     /// The state of one accepted run, from Preparing until its session is disposed. The session, journal-failure
-    /// and callback-fault fields are published atomically because the coordinator thread reads or writes them;
-    /// everything else belongs to the UI thread.
+    /// and callback-fault fields are published atomically, and the stop decision is taken under a lock, because the
+    /// coordinator thread reads or writes them; everything else belongs to the UI thread.
     /// </summary>
     private sealed class RunContext
     {
         private readonly List<StepOutcome> _outcomes = new();
+
+        // Orders the controller's stop requests and guards both stop-line flags; see RequestStop.
+        private readonly object _stopGate = new();
         private IEngineSession? _session;
         private string? _journalFailureText;
         private string? _callbackFaultText;
+        private int _journalFailureLogged;
+        private bool _stopDecisionLogged;
+        private bool _firstErrorStopLogged;
 
         public RunContext(
             StartRequest request,
@@ -2052,6 +2176,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
         public List<ErrorRecord> Stored { get; } = new();
 
+        // The largest groups of Stored, updated batch by batch alongside it.
+        public IncrementalErrorGrouping Groups { get; } = new(MaxErrorGroups);
+
         public IReadOnlyList<StepOutcome> FinalOutcomes { get; set; } = Array.Empty<StepOutcome>();
 
         public JournalResult? Result { get; set; }
@@ -2065,8 +2192,6 @@ public sealed partial class RunController : ObservableObject, IDisposable
         public SensorStatus? LastRamStatus { get; set; }
 
         public bool JournalFailureAnswered { get; set; }
-
-        public bool JournalFailureLogged { get; set; }
 
         public TaskCompletionSource ConclusionStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -2083,12 +2208,63 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
         public IEngineSession? TakeSession() => Interlocked.Exchange(ref _session, null);
 
+        // Asks the engine to stop and returns whether this request gets the run's request line, which goes to the first
+        // stop the controller requests or sees reported. The engine keeps the first reason it records; requests are
+        // made under one lock, so the first claim is always the request the engine received first among the
+        // controller's, whichever thread made it. The engine's RequestStop never blocks, so the coordinator waits at
+        // most for another one.
+        public bool RequestStop(StopReason reason)
+        {
+            lock (_stopGate)
+            {
+                Session?.RequestStop(reason);
+                return ClaimStopDecision();
+            }
+        }
+
+        // Claims the request line for the engine's own first-error stop when its error report arrives before any
+        // stop line: the engine stopped itself before reporting, so that error is then the run's only stop decision.
+        public bool TryClaimFirstErrorStopOnReport()
+        {
+            lock (_stopGate)
+            {
+                if (!ClaimStopDecision())
+                {
+                    return false;
+                }
+
+                _firstErrorStopLogged = true;
+                return true;
+            }
+        }
+
+        // Claims the first-error line once Completed shows that the engine's first error ended the run, whether or
+        // not a request line was logged before it: any such request reached the engine after its first-error stop, so
+        // the first-writer-wins engine ignored it. True at most once per run.
+        public bool TryClaimFirstErrorStopOnCompletion()
+        {
+            lock (_stopGate)
+            {
+                if (_firstErrorStopLogged)
+                {
+                    return false;
+                }
+
+                _firstErrorStopLogged = true;
+                _stopDecisionLogged = true;
+                return true;
+            }
+        }
+
         // First writer wins: the gate's failure and the journal's own failure describe the same root cause.
         public void TryRecordJournalFailure(string failure) =>
             Interlocked.CompareExchange(ref _journalFailureText, failure, null);
 
         public void TryRecordCallbackFault(string failure) =>
             Interlocked.CompareExchange(ref _callbackFaultText, failure, null);
+
+        // True for the first caller only: the coordinator and the UI thread can both log the journal failure.
+        public bool TryClaimJournalFailureLog() => Interlocked.Exchange(ref _journalFailureLogged, 1) == 0;
 
         public void RecordOutcome(StepOutcome outcome)
         {
@@ -2104,6 +2280,17 @@ public sealed partial class RunController : ObservableObject, IDisposable
         }
 
         public IReadOnlyList<StepOutcome> OutcomesSnapshot() => _outcomes.ToArray();
+
+        private bool ClaimStopDecision()
+        {
+            if (_stopDecisionLogged)
+            {
+                return false;
+            }
+
+            _stopDecisionLogged = true;
+            return true;
+        }
     }
 }
 

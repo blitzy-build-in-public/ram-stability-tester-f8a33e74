@@ -32,13 +32,16 @@ namespace rq::engine {
 
 namespace {
 
-/** Closes a kernel handle on scope exit; used for the process token. */
+/**
+ * Closes a kernel handle on scope exit; used for the process token. A failed close reaches the
+ * debugger through close_handle_checked, the most a destructor can do about it.
+ */
 class scoped_handle {
 public:
     explicit scoped_handle(HANDLE handle) noexcept : handle_(handle) {}
     ~scoped_handle() {
         if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE) {
-            CloseHandle(handle_);
+            close_handle_checked(handle_, L"process token (lock-pages privilege adjustment)");
         }
     }
     scoped_handle(const scoped_handle&) = delete;

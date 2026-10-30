@@ -116,7 +116,14 @@ struct simd<isa_avx512> {
 struct pattern_spec {
     /** RQ_PATTERN_* value. core/session.cpp has validated its range before any step runs. */
     std::uint32_t kind;
-    /** Session seed, rq_session_config.seed. Only the random patterns use it. */
+    /**
+     * The step's pattern seed, step_pattern_seed(rq_session_config.seed, step_index) from
+     * core/runner/step_runner.h, as the step runner passes it through every IMemoryAccess call.
+     * The step index is mixed in so that steps sharing a pattern do not write identical data.
+     * Only RQ_PATTERN_RANDOM and RQ_PATTERN_MOVING_INVERSION_RANDOM use it. It is not the
+     * access-order seed: the RandomBlocks permutation is keyed by the raw session seed. So
+     * regenerating a word from a saved session seed needs the step's seed derived first.
+     */
     std::uint64_t seed;
     /** The step's pass index, from 0. Selects the per-pass inversion and the random stream. */
     std::uint32_t pass;

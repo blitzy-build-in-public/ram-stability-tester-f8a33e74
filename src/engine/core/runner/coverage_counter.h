@@ -74,8 +74,11 @@ constexpr double coverage_percent(std::uint64_t verified_bytes,
 /**
  * Session-wide and per-step verified-byte totals, fed by one padded slot per worker.
  *
- * Owned by the session and shared by its workers and its coordinator for the session's
- * lifetime. Non-copyable and non-movable, because workers hold references to it while they run.
+ * Created by the session's coordinator during preparation, one per run, and held with that
+ * run's other resources (run_resources in core/session.cpp). Shared by the run's workers and
+ * the coordinator, and destroyed in the coordinator's tail once the workers have joined and
+ * on_completed has returned. Non-copyable and non-movable, because workers hold references to
+ * it while they run.
  *
  * @par Threading
  * - add() and publish() are worker-side: each worker calls them only with its own
@@ -95,11 +98,13 @@ public:
     /**
      * Allocates one zeroed slot per worker; the session and step totals start at 0.
      *
-     * Called by the session before any worker starts.
+     * Called by the coordinator during preparation, before the pool starts any worker.
      *
      * @param worker_count Number of workers; valid worker indices are 0 to worker_count - 1.
-     * @throws std::bad_alloc when the slots cannot be allocated. Session construction runs
-     *         inside the engine boundary's try/catch, which converts it to a result code.
+     * @throws std::bad_alloc when the slots cannot be allocated. rq_session_start returns RQ_OK
+     *         without waiting for preparation, so no result code can carry it: the coordinator
+     *         converts it into a stop with RQ_END_INTERNAL_FAULT, reported through on_completed
+     *         and then on_released, with no on_prepared.
      */
     explicit coverage_counter(std::uint32_t worker_count)
         : slots_(std::make_unique<worker_slot[]>(worker_count)) {}

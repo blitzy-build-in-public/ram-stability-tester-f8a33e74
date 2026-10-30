@@ -1,5 +1,10 @@
 using System.ComponentModel;
 using System.Windows;
+using System.Windows.Automation;
+using System.Windows.Automation.Peers;
+using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Media;
 using System.Windows.Threading;
 using RamQuick.App.Services;
 using RamQuick.App.ViewModels;
@@ -26,9 +31,56 @@ namespace RamQuick.App;
 /// The constructor does no work, so tests can create the application and call <c>InitializeComponent()</c> only to
 /// load the shared resources of <c>App.xaml</c>.
 /// </para>
+/// <para>
+/// The application also announces the main window's live regions to assistive technology; see
+/// <see cref="LiveRegionProperty"/>.
+/// </para>
 /// </remarks>
 public partial class App : Application
 {
+    /// <summary>
+    /// Identifies the <c>LiveRegion</c> attached property: the <see cref="LiveRegion"/> whose text a
+    /// <see cref="TextBlock"/> shows, which makes it one copy of that live region. The default is
+    /// <see cref="LiveRegion.None"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WPF never raises <see cref="AutomationEvents.LiveRegionChanged"/> by itself, so a text binding alone does not
+    /// tell a screen reader that a verdict, the first error or a notice has appeared while keyboard focus is elsewhere.
+    /// The application raises it, from the view, without code-behind. Each copy of a live region opts in from XAML with
+    /// three settings: <c>AutomationProperties.LiveSetting</c> other than <c>Off</c>, this property naming the region,
+    /// and <c>NotifyOnTargetUpdated=True</c> on the binding that supplies the announced text:
+    /// </para>
+    /// <code language="xml">
+    /// &lt;TextBlock AutomationProperties.LiveSetting="Polite"
+    ///            app:App.LiveRegion="Notice"
+    ///            Text="{Binding NoticeText, NotifyOnTargetUpdated=True}" /&gt;
+    /// </code>
+    /// <para>
+    /// The announced text is the copy's automation name, or its text when no name is set. A change is announced once
+    /// the binding, template and layout work it causes has run, so the properties one change raises together lead to
+    /// one announcement, and only when it is a change: the notice and the result when their text differs from the
+    /// one last announced, the first-error message only when it appears, not as its error count grows. Text that is
+    /// re-raised unchanged, as the notice is on every sensor reading, is never announced again.
+    /// </para>
+    /// <para>
+    /// The copies of a region in one window share what has been announced, and only a copy that the current layout
+    /// shows announces, so a region shown twice, as the compact layout shows the notice and the first error, and a
+    /// template copy created when the layout changes, never repeat an announcement. An empty text clears the region,
+    /// so the next text is announced even when it equals the last one, as when a new run ends with the same verdict.
+    /// </para>
+    /// <para>
+    /// A change is raised only while a UI Automation client listens for it. A screen reader that is already running
+    /// connects to a newly shown window only after it has appeared, so a change that no client hears is tried again
+    /// every 250 ms for two seconds, and at every later update of its text, until one does.
+    /// </para>
+    /// </remarks>
+    public static readonly DependencyProperty LiveRegionProperty = DependencyProperty.RegisterAttached(
+        "LiveRegion",
+        typeof(LiveRegion),
+        typeof(App),
+        new PropertyMetadata(LiveRegion.None));
+
     private const int ExitCodeClosed = 0;
     private const int ExitCodeFailure = 1;
     private const int ExitCodeAlreadyRunning = 2;
@@ -38,9 +90,24 @@ public partial class App : Application
     private const string ClosingErrorSource = "App.Closing";
     private const string ExitErrorSource = "App.OnExit";
     private const string FatalErrorSource = "UnhandledException";
+    private const string LiveRegionErrorSource = "App.LiveRegion";
+
+    // How many times a live-region change that no UI Automation client heard is tried again, and how often: about two
+    // seconds, which covers a running screen reader connecting to the window once it has appeared.
+    private const int LiveRegionRetries = 8;
 
     // Covers an elevated restart: the instance that launched it holds the mutex until its window has closed.
     private static readonly TimeSpan _singleInstanceWait = TimeSpan.FromSeconds(5);
+
+    private static readonly TimeSpan _liveRegionRetryInterval = TimeSpan.FromMilliseconds(250);
+
+    // Per-window live-region state lives on the window itself, as WorkAreaSizing keeps its sizing state, so two
+    // windows, or two tests, never share it, and it is collected with its window.
+    private static readonly DependencyProperty _liveRegionStateProperty = DependencyProperty.RegisterAttached(
+        "LiveRegionState",
+        typeof(Dictionary<LiveRegion, LiveRegionState>),
+        typeof(App),
+        new PropertyMetadata(null));
 
     private SingleInstanceGuard? _guard;
     private DataDirectory? _dataDirectory;
@@ -56,6 +123,48 @@ public partial class App : Application
     // An exception the dispatcher leaves unhandled reaches AppDomain.UnhandledException as the same object; it is
     // reported once.
     private Exception? _reportedFatalException;
+
+    // Registered once per process, before any window exists: Main constructs the application before anything else,
+    // and the test fixture that loads App.xaml constructs it too. One class handler adds nothing to the text elements
+    // that are not live regions.
+    static App()
+    {
+        EventManager.RegisterClassHandler(
+            typeof(TextBlock),
+            Binding.TargetUpdatedEvent,
+            new EventHandler<DataTransferEventArgs>(OnTextBlockTargetUpdated));
+    }
+
+    /// <summary>
+    /// Gets or sets the test seam that stands in for UI Automation's listener check. When set, it is called with each
+    /// text element and text the application is about to announce, and returns whether a listener hears it, in place
+    /// of checking for a listening client and a shown window; the event is raised only when it returns
+    /// <see langword="true"/>. <see langword="null"/>, the default, is the only value outside tests.
+    /// </summary>
+    internal static Func<TextBlock, string, bool>? AnnouncementSink { get; set; }
+
+    /// <summary>Gets the live region a text element shows.</summary>
+    /// <param name="element">The text element.</param>
+    /// <returns>The value of the <c>LiveRegion</c> attached property.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="element"/> is <see langword="null"/>.</exception>
+    [AttachedPropertyBrowsableForType(typeof(TextBlock))]
+    public static LiveRegion GetLiveRegion(TextBlock element)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        return (LiveRegion)element.GetValue(LiveRegionProperty);
+    }
+
+    /// <summary>
+    /// Makes a text element one copy of a live region, or, with <see cref="LiveRegion.None"/>, no live region.
+    /// </summary>
+    /// <param name="element">The text element.</param>
+    /// <param name="value">The live region whose text the element shows.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="element"/> is <see langword="null"/>.</exception>
+    public static void SetLiveRegion(TextBlock element, LiveRegion value)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        element.SetValue(LiveRegionProperty, value);
+    }
 
     /// <summary>
     /// Starts the application: checks the platform, acquires the single-instance guard, resolves the data folder,
@@ -333,4 +442,255 @@ public partial class App : Application
             LogAppError(_dataDirectory, ExitErrorSource, exception);
         }
     }
+
+    // A live region's text was transferred, changed or not. A cleared region is recorded at once: a run can clear it
+    // and show the same text again before the dispatcher judges either, and that text is then a change. Any other text
+    // is judged below binding, layout and template work, so the text, the copy's visibility and the layout triggers all
+    // reflect the whole change, and the several properties one change raises are judged on their final values.
+    private static void OnTextBlockTargetUpdated(object? sender, DataTransferEventArgs e)
+    {
+        try
+        {
+            if (sender is not TextBlock textBlock || !ReferenceEquals(e.TargetObject, textBlock))
+            {
+                return;
+            }
+
+            LiveRegion region = GetLiveRegion(textBlock);
+            if (region == LiveRegion.None)
+            {
+                return;
+            }
+
+            if (AnnouncedText(textBlock).Length > 0)
+            {
+                _ = textBlock.Dispatcher.InvokeAsync(() => AnnounceLiveRegionChange(textBlock), DispatcherPriority.Background);
+            }
+            else if (PlacementOf(textBlock).Window is { } window)
+            {
+                LiveRegionStateOf(window, region).Clear();
+            }
+        }
+        catch (Exception exception)
+        {
+            ReportLiveRegionFailure(exception);
+        }
+    }
+
+    // Announces a copy's text when it is a change no copy of its region has announced, and the current layout shows
+    // this copy. Never throws: a failed announcement must not end the run, so it is logged instead.
+    private static void AnnounceLiveRegionChange(TextBlock textBlock)
+    {
+        try
+        {
+            LiveRegion region = GetLiveRegion(textBlock);
+            (Window? window, bool isShown) = PlacementOf(textBlock);
+            if (region == LiveRegion.None || window is null)
+            {
+                return;
+            }
+
+            LiveRegionState state = LiveRegionStateOf(window, region);
+            string text = AnnouncedText(textBlock);
+            if (text.Length == 0)
+            {
+                state.Clear();
+                return;
+            }
+
+            // A collapsed copy, or one not marked live, leaves the change to the copy the layout shows.
+            if (!isShown
+                || AutomationProperties.GetLiveSetting(textBlock) == AutomationLiveSetting.Off
+                || IsSameChange(region, state.Announced, text))
+            {
+                return;
+            }
+
+            bool heard = AnnouncementSink is { } sink ? sink(textBlock, text) : CanBeHeard(textBlock);
+            if (!heard)
+            {
+                state.WaitForListener(region, textBlock, text);
+                return;
+            }
+
+            // Recorded before the event is raised, so a raise that fails is reported once rather than at every later
+            // update of the same text.
+            state.MarkAnnounced(text);
+            (UIElementAutomationPeer.FromElement(textBlock) ?? UIElementAutomationPeer.CreatePeerForElement(textBlock))
+                ?.RaiseAutomationEvent(AutomationEvents.LiveRegionChanged);
+        }
+        catch (Exception exception)
+        {
+            ReportLiveRegionFailure(exception);
+        }
+    }
+
+    // Logged off the UI thread, as the application's other error reports are.
+    private static void ReportLiveRegionFailure(Exception exception)
+    {
+        DataDirectory? dataDirectory = Current is App app ? Volatile.Read(ref app._dataDirectory) : null;
+        _ = Task.Run(() => LogAppError(dataDirectory, LiveRegionErrorSource, exception));
+    }
+
+    // A UI Automation client listens for live-region changes, and the element is in a shown window that can carry the
+    // event to it.
+    private static bool CanBeHeard(TextBlock textBlock) =>
+        AutomationPeer.ListenerExists(AutomationEvents.LiveRegionChanged)
+        && PresentationSource.FromVisual(textBlock) is not null;
+
+    // What a screen reader reads for the element, and so what its live-region change announces: its automation name
+    // where the element sets one, as the result does to carry the verdict with its reason, otherwise its text, which is
+    // then its automation name too. A set name that is empty leaves the region empty.
+    private static string AnnouncedText(TextBlock textBlock) =>
+        DependencyPropertyHelper.GetValueSource(textBlock, AutomationProperties.NameProperty).BaseValueSource
+            != BaseValueSource.Default
+            ? AutomationProperties.GetName(textBlock) ?? string.Empty
+            : textBlock.Text ?? string.Empty;
+
+    // Whether a region's text is a change it has already announced. The first-error message is announced when it
+    // appears and its error count then grows in place, so any two of its texts are the same change; the result and the
+    // notice change whenever their text does.
+    private static bool IsSameChange(LiveRegion region, string announced, string text) =>
+        region == LiveRegion.FirstError
+            ? announced.Length > 0
+            : string.Equals(announced, text, StringComparison.Ordinal);
+
+    // The window that holds an element, and whether the current layout shows the element there: neither it nor an
+    // ancestor below the window is collapsed or hidden. The window's own visibility does not count, so a window that is
+    // never shown, as in the layout tests, decides as a shown one would; CanBeHeard decides whether it can be heard.
+    // Template content is reached through visual parents, content that has not been laid out yet through logical ones.
+    private static (Window? Window, bool IsShown) PlacementOf(DependencyObject element)
+    {
+        bool isShown = true;
+        DependencyObject? current = element;
+        while (current is not null)
+        {
+            if (current is Window window)
+            {
+                return (window, isShown);
+            }
+
+            if (current is UIElement { Visibility: not Visibility.Visible })
+            {
+                isShown = false;
+            }
+
+            current = (current is Visual ? VisualTreeHelper.GetParent(current) : null) ?? LogicalTreeHelper.GetParent(current);
+        }
+
+        return (null, false);
+    }
+
+    private static LiveRegionState LiveRegionStateOf(Window window, LiveRegion region)
+    {
+        if (window.GetValue(_liveRegionStateProperty) is not Dictionary<LiveRegion, LiveRegionState> regions)
+        {
+            regions = new Dictionary<LiveRegion, LiveRegionState>();
+            window.SetValue(_liveRegionStateProperty, regions);
+        }
+
+        if (!regions.TryGetValue(region, out LiveRegionState? state))
+        {
+            state = new LiveRegionState();
+            regions.Add(region, state);
+        }
+
+        return state;
+    }
+
+    // One live region of one window: the text it last announced, and a change still waiting for a listener. Used on
+    // the window's UI thread only.
+    private sealed class LiveRegionState
+    {
+        private DispatcherTimer? _retryTimer;
+        private TextBlock? _retryTarget;
+        private string? _unheard;
+        private int _retriesLeft;
+
+        // The text last announced; empty before the first announcement and once the region has been cleared.
+        public string Announced { get; private set; } = string.Empty;
+
+        public void MarkAnnounced(string text)
+        {
+            Announced = text;
+            StopWaiting();
+        }
+
+        // The region shows nothing, as at the start of a run: whatever it shows next is a change, even the same text.
+        public void Clear()
+        {
+            Announced = string.Empty;
+            StopWaiting();
+        }
+
+        // Tries an unheard change again from the copy that could not announce it. A new change gets every retry; the
+        // same change re-raised gets only those left, so a region no client listens to stops retrying.
+        public void WaitForListener(LiveRegion region, TextBlock textBlock, string text)
+        {
+            if (_unheard is null || !IsSameChange(region, _unheard, text))
+            {
+                _retriesLeft = LiveRegionRetries;
+            }
+
+            _unheard = text;
+            _retryTarget = textBlock;
+            if (_retriesLeft == 0 || _retryTimer is { IsEnabled: true })
+            {
+                return;
+            }
+
+            _retriesLeft--;
+            if (_retryTimer is null)
+            {
+                _retryTimer = new DispatcherTimer(DispatcherPriority.Background, textBlock.Dispatcher)
+                {
+                    Interval = _liveRegionRetryInterval,
+                };
+                _retryTimer.Tick += OnRetryTick;
+            }
+
+            _retryTimer.Start();
+        }
+
+        private void StopWaiting()
+        {
+            _retryTimer?.Stop();
+            _retryTarget = null;
+            _unheard = null;
+            _retriesLeft = 0;
+        }
+
+        private void OnRetryTick(object? sender, EventArgs e)
+        {
+            _retryTimer?.Stop();
+            if (_retryTarget is { } target)
+            {
+                AnnounceLiveRegionChange(target);
+            }
+        }
+    }
+}
+
+/// <summary>
+/// A live region of the main window: text that assistive technology announces when it changes, whichever control has
+/// keyboard focus. Set on each copy of the region's text through <see cref="App.LiveRegionProperty"/>.
+/// </summary>
+public enum LiveRegion
+{
+    /// <summary>Not a live region; changes are never announced. The default.</summary>
+    None,
+
+    /// <summary>
+    /// The verdict with its reason, shown in a terminal state: announced when a verdict appears and whenever the
+    /// verdict or its reason changes.
+    /// </summary>
+    Result,
+
+    /// <summary>
+    /// The first-error message: announced once when it appears, not again as its error count grows.
+    /// </summary>
+    FirstError,
+
+    /// <summary>The notice line: announced whenever it shows a different, non-empty notice.</summary>
+    Notice,
 }

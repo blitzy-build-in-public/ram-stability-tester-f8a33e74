@@ -36,7 +36,7 @@ namespace rq::engine {
 
 namespace {
 
-/** Owns one Win32 handle and closes it with CloseHandle. */
+/** Owns one Win32 handle (a worker thread) and closes it through close_handle_checked. */
 class unique_handle {
 public:
     unique_handle() noexcept = default;
@@ -60,7 +60,9 @@ public:
 
     void reset() noexcept {
         if (handle_ != nullptr) {
-            CloseHandle(handle_);
+            // A failed close is reported and the handle given up all the same: closing the
+            // value again could close a handle that has since been reused for another object.
+            close_handle_checked(handle_, L"worker thread handle");
             handle_ = nullptr;
         }
     }

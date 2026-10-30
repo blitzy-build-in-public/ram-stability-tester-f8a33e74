@@ -34,6 +34,11 @@
  * Nothing here needs elevation: the engine raises the minimum working set before locking, which
  * the default policy permits. The suite fails, rather than skips, when less than 2 GiB of
  * physical memory is available, because the latency it gates is defined on a 1 GiB region.
+ *
+ * CloseHandleChecked and CloseHandleCheckedFailure cover close_handle_checked, through which the
+ * stop signal and the engine's other handle owners close their handles: a failed close is
+ * reported once, to the caller and to the debugger, and never retried. They need neither memory
+ * nor elevation, so the 2 GiB precondition does not apply to them.
  */
 #include <gtest/gtest.h>
 #include <windows.h>
@@ -48,8 +53,10 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ostream>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <tuple>
@@ -896,6 +903,248 @@ const auto k_all_cases =
 INSTANTIATE_TEST_SUITE_P(StopAtRandomPoints, StopLatency,
                          ::testing::Combine(k_all_cases, ::testing::Range(0, k_points_per_kind)),
                          case_name);
+
+/* ---------------------------------------------------------------------------------------------
+ * Checked handle close
+ * ------------------------------------------------------------------------------------------- */
+
+/**
+ * Collects the lines the constructing thread writes with OutputDebugStringW while it lives.
+ *
+ * OutputDebugStringW raises DBG_PRINTEXCEPTION_WIDE_C, whose first two parameters are the line's
+ * length including its terminator and its address, and handles that exception itself when no
+ * debugger is attached. A first vectored handler sees it before then, so the line can be read in
+ * process, without a debugger and without the DBWIN buffer that every process on the host shares.
+ * The handler only copies the text, never allocates, and continues the search for every
+ * exception, so the output is unchanged and a fault still ends the process as the engine's error
+ * contract requires. Lines of other threads are ignored. One capture may exist at a time.
+ */
+class debugger_line_capture {
+public:
+    /** @throws std::runtime_error when the vectored handler cannot be registered. */
+    debugger_line_capture() : thread_id_(GetCurrentThreadId()) {
+        active_.store(this, std::memory_order_release);
+        cookie_ = AddVectoredExceptionHandler(1, &debugger_line_capture::on_exception);
+        if (cookie_ == nullptr) {
+            active_.store(nullptr, std::memory_order_release);
+            throw std::runtime_error("AddVectoredExceptionHandler failed");
+        }
+    }
+    ~debugger_line_capture() {
+        RemoveVectoredExceptionHandler(cookie_);
+        active_.store(nullptr, std::memory_order_release);
+    }
+    debugger_line_capture(const debugger_line_capture&) = delete;
+    debugger_line_capture& operator=(const debugger_line_capture&) = delete;
+
+    /** Every line written so far; one beyond k_max_lines is counted as an empty entry. */
+    std::vector<std::wstring> lines() const {
+        std::vector<std::wstring> result;
+        for (std::size_t i = 0; i < count_; ++i) {
+            result.emplace_back(i < k_max_lines ? std::wstring(text_[i].data(), length_[i])
+                                                : std::wstring());
+        }
+        return result;
+    }
+
+private:
+    static constexpr std::size_t k_max_lines = 8;
+    static constexpr std::size_t k_max_line_chars = 512;
+
+    static LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) noexcept {
+        const EXCEPTION_RECORD& record = *info->ExceptionRecord;
+        debugger_line_capture* const capture = active_.load(std::memory_order_acquire);
+        if (record.ExceptionCode != DBG_PRINTEXCEPTION_WIDE_C || record.NumberParameters < 2 ||
+            capture == nullptr || GetCurrentThreadId() != capture->thread_id_) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        const std::size_t index = capture->count_++;
+        const auto* const text = reinterpret_cast<const wchar_t*>(record.ExceptionInformation[1]);
+        const std::size_t with_terminator =
+            static_cast<std::size_t>(record.ExceptionInformation[0]);
+        if (index < k_max_lines && text != nullptr && with_terminator > 0) {
+            const std::size_t length = std::min(with_terminator - 1, k_max_line_chars);
+            std::copy_n(text, length, capture->text_[index].data());
+            capture->length_[index] = length;
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    static inline std::atomic<debugger_line_capture*> active_{nullptr};
+
+    const DWORD thread_id_;
+    PVOID cookie_ = nullptr;
+    // Written only by the handler on thread_id_, which is also the only reader.
+    std::size_t count_ = 0;
+    std::array<std::array<wchar_t, k_max_line_chars>, k_max_lines> text_{};
+    std::array<std::size_t, k_max_lines> length_{};
+};
+
+/**
+ * A name no other event has, so a test can confirm that an event object was destroyed by opening
+ * it by name, instead of probing a closed handle value the process may already have reused.
+ */
+std::wstring unique_event_name() {
+    static std::atomic<std::uint32_t> next{0};
+    return L"Local\\RAMQuick.engine.tests.CloseHandleChecked." +
+           std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(next.fetch_add(1));
+}
+
+/** Creates an unsignalled manual-reset event under a new name. */
+HANDLE create_named_event(const std::wstring& name) {
+    const HANDLE event = CreateEventW(nullptr, TRUE, FALSE, name.c_str());
+    if (event == nullptr) {
+        ADD_FAILURE() << "CreateEventW failed (Windows error " << GetLastError() << ")";
+    }
+    return event;
+}
+
+/** Succeeds when no event object of this name exists any more: its last handle was closed. */
+::testing::AssertionResult event_destroyed(const std::wstring& name) {
+    const HANDLE reopened = OpenEventW(SYNCHRONIZE, FALSE, name.c_str());
+    if (reopened != nullptr) {
+        close_handle_checked(reopened, L"reopened test event");
+        return ::testing::AssertionFailure() << "the event object still exists";
+    }
+    const DWORD error = GetLastError();
+    if (error != ERROR_FILE_NOT_FOUND) {
+        return ::testing::AssertionFailure()
+               << "OpenEventW failed with Windows error " << error << ", not ERROR_FILE_NOT_FOUND";
+    }
+    return ::testing::AssertionSuccess();
+}
+
+/**
+ * Under a debugger CloseHandle raises an exception for a handle it cannot close instead of
+ * returning FALSE, and the debugger consumes debug output before any vectored handler sees it.
+ */
+constexpr char k_debugger_skip[] =
+    "a debugger turns a refused CloseHandle into an exception and consumes debug output";
+
+static_assert(noexcept(close_handle_checked(nullptr, nullptr)),
+              "handle owners call close_handle_checked from destructors");
+
+TEST(CloseHandleChecked, ClosesTheHandleAndWritesNothing) {
+    debugger_line_capture capture;
+    const std::wstring name = unique_event_name();
+    const HANDLE event = create_named_event(name);
+    ASSERT_NE(event, nullptr);
+
+    EXPECT_EQ(close_handle_checked(event, L"test event"), static_cast<DWORD>(ERROR_SUCCESS));
+    EXPECT_TRUE(event_destroyed(name));
+    EXPECT_TRUE(capture.lines().empty());
+}
+
+TEST(CloseHandleChecked, StopSignalReportsAFailedCloseOfItsEvent) {
+    if (IsDebuggerPresent()) {
+        GTEST_SKIP() << k_debugger_skip;
+    }
+    debugger_line_capture capture;
+    auto signal = std::make_unique<stop_signal>();
+    const HANDLE event = signal->event_handle();
+    ASSERT_TRUE(
+        SetHandleInformation(event, HANDLE_FLAG_PROTECT_FROM_CLOSE, HANDLE_FLAG_PROTECT_FROM_CLOSE))
+        << "SetHandleInformation failed (Windows error " << GetLastError() << ")";
+
+    // The destructor's close is refused; it reports that once and gives the event up.
+    signal.reset();
+    EXPECT_EQ(capture.lines(),
+              std::vector<std::wstring>{L"RAMQuick engine: CloseHandle of the session stop event "
+                                        L"failed (Windows error 6)\n"});
+
+    // The event is still open, so the test closes it; a second close would fail.
+    ASSERT_TRUE(SetHandleInformation(event, HANDLE_FLAG_PROTECT_FROM_CLOSE, 0))
+        << "SetHandleInformation failed (Windows error " << GetLastError() << ")";
+    EXPECT_EQ(close_handle_checked(event, L"test event"), static_cast<DWORD>(ERROR_SUCCESS));
+    EXPECT_EQ(capture.lines().size(), 1U);
+}
+
+/** One description a failed close is reported with. */
+struct close_failure_case {
+    const char* name;
+    /** The description passed to close_handle_checked; nullopt passes null. */
+    std::optional<std::wstring> what;
+    /** Whether the line is too long for the diagnostic and must be cut. */
+    bool cut;
+};
+
+void PrintTo(const close_failure_case& value, std::ostream* os) {
+    *os << value.name;
+}
+
+/**
+ * Succeeds when lines holds exactly one line: full itself or, when cut, a shorter line that
+ * begins as full does and still ends with its newline.
+ */
+::testing::AssertionResult reported_once(const std::vector<std::wstring>& lines,
+                                         const std::wstring& full, bool cut) {
+    if (lines.size() != 1U) {
+        return ::testing::AssertionFailure() << lines.size() << " debugger lines, not 1";
+    }
+    const std::wstring& line = lines.front();
+    const bool matches = cut ? !line.empty() && line.size() < full.size() && line.back() == L'\n' &&
+                                   full.compare(0, line.size() - 1, line, 0, line.size() - 1) == 0
+                             : line == full;
+    if (!matches) {
+        return ::testing::AssertionFailure() << "line \"" << line << "\" is not "
+                                             << (cut ? "a cut of " : "") << "\"" << full << "\"";
+    }
+    return ::testing::AssertionSuccess();
+}
+
+class CloseHandleCheckedFailure : public ::testing::TestWithParam<close_failure_case> {};
+
+TEST_P(CloseHandleCheckedFailure, ReportsOnceAndLeavesTheHandleOpen) {
+    if (IsDebuggerPresent()) {
+        GTEST_SKIP() << k_debugger_skip;
+    }
+    const close_failure_case& param = GetParam();
+    const wchar_t* const what = param.what ? param.what->c_str() : nullptr;
+    debugger_line_capture capture;
+    const std::wstring name = unique_event_name();
+    const HANDLE event = create_named_event(name);
+    ASSERT_NE(event, nullptr);
+    // A handle protected from close makes CloseHandle fail while the handle stays valid.
+    ASSERT_TRUE(
+        SetHandleInformation(event, HANDLE_FLAG_PROTECT_FROM_CLOSE, HANDLE_FLAG_PROTECT_FROM_CLOSE))
+        << "SetHandleInformation failed (Windows error " << GetLastError() << ")";
+
+    // Windows reports the refused close of a protected handle as ERROR_INVALID_HANDLE.
+    EXPECT_EQ(close_handle_checked(event, what), static_cast<DWORD>(ERROR_INVALID_HANDLE));
+
+    const std::wstring full = L"RAMQuick engine: CloseHandle of the " +
+                              (what != nullptr ? std::wstring(what) : std::wstring(L"handle")) +
+                              L" failed (Windows error 6)\n";
+    EXPECT_TRUE(reported_once(capture.lines(), full, param.cut));
+
+    // Neither forced closed nor stripped of its protection: the event is still open and usable.
+    DWORD flags = 0;
+    EXPECT_TRUE(GetHandleInformation(event, &flags))
+        << "GetHandleInformation failed (Windows error " << GetLastError() << ")";
+    EXPECT_EQ(flags & HANDLE_FLAG_PROTECT_FROM_CLOSE,
+              static_cast<DWORD>(HANDLE_FLAG_PROTECT_FROM_CLOSE));
+    EXPECT_EQ(WaitForSingleObject(event, 0), static_cast<DWORD>(WAIT_TIMEOUT));
+
+    // Once closable, one call closes it, the object goes away and nothing more is written.
+    ASSERT_TRUE(SetHandleInformation(event, HANDLE_FLAG_PROTECT_FROM_CLOSE, 0))
+        << "SetHandleInformation failed (Windows error " << GetLastError() << ")";
+    EXPECT_EQ(close_handle_checked(event, what), static_cast<DWORD>(ERROR_SUCCESS));
+    EXPECT_TRUE(event_destroyed(name));
+    EXPECT_EQ(capture.lines().size(), 1U);
+}
+
+/** Test-name suffix: the case's name, for example overlong. */
+std::string failure_case_name(const ::testing::TestParamInfo<close_failure_case>& info) {
+    return info.param.name;
+}
+
+const auto k_failure_cases =
+    ::testing::Values(close_failure_case{"described", L"test event", false},
+                      close_failure_case{"undescribed", std::nullopt, false},
+                      close_failure_case{"overlong", std::wstring(400, L'w'), true});
+
+INSTANTIATE_TEST_SUITE_P(Descriptions, CloseHandleCheckedFailure, k_failure_cases,
+                         failure_case_name);
 
 }  // namespace
 }  // namespace rq::engine::test

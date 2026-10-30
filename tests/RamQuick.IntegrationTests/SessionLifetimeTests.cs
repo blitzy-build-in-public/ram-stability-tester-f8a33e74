@@ -1,7 +1,9 @@
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
+using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using RamQuick.App.Services;
 using RamQuick.Core;
 using RamQuick.Interop;
@@ -16,7 +18,8 @@ namespace RamQuick.IntegrationTests;
 /// writer thread and its heartbeat timer, the work items posted to the UI dispatcher) may have a strong path to an
 /// <c>EngineSession</c> or to its owner. A session whose owner lets it go undisposed must therefore be collected, its
 /// <c>SafeSessionHandle</c>'s critical finalizer must destroy the native session, releasing the locked region, and free
-/// the <c>GCHandle</c>, after which the <c>CallbackState</c> is collected too.
+/// the <c>GCHandle</c>, after which the <c>CallbackState</c> is collected too. A disposed session must be destroyed the
+/// same way when a callback still holds its handle, so that the last release runs on the coordinator.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -34,7 +37,7 @@ namespace RamQuick.IntegrationTests;
 /// </para>
 /// <para>
 /// <c>rq_test_live_session_count</c> reaching 0 proves that <c>rq_session_destroy</c> ran for the abandoned session.
-/// Neither test disposes or shuts down what it abandons: that would replace the finalizer path under test.
+/// Neither abandonment test disposes or shuts down what it abandons: that would replace the finalizer path under test.
 /// </para>
 /// </remarks>
 public sealed class SessionLifetimeTests
@@ -52,6 +55,12 @@ public sealed class SessionLifetimeTests
     private static readonly TimeSpan _collectionTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan _collectionPause = TimeSpan.FromMilliseconds(100);
     private static readonly TimeSpan _settleTimeout = TimeSpan.FromSeconds(10);
+
+    // The callback-held handle race: how long the gate keeps holding the handle for the concurrent Dispose to dispose
+    // it, how often it looks, and how long Dispose may take to stop, join and release the region once the gate lets go.
+    private static readonly TimeSpan _heldHandleDisposeTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan _heldHandlePollInterval = TimeSpan.FromMilliseconds(5);
+    private static readonly TimeSpan _disposeTimeout = TimeSpan.FromSeconds(60);
 
     private readonly ITestOutputHelper _output;
 
@@ -172,6 +181,81 @@ public sealed class SessionLifetimeTests
     }
 
     /// <summary>
+    /// A callback-origin <c>rq_session_*</c> call holds the session's handle, as every marshalled handle argument does,
+    /// while a concurrent <c>Dispose</c> disposes it, so the last reference is dropped on the coordinator inside the
+    /// callback, where <c>rq_session_destroy</c> is refused. The session must still be destroyed before
+    /// <c>Dispose</c> returns, and its <c>GCHandle</c> freed, so the <c>CallbackState</c> becomes collectible.
+    /// </summary>
+    [Fact(Timeout = 180_000)]
+    public async Task CallbackHeldHandle_DisposedConcurrently_IsDestroyedOffCoordinatorAsync()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        await AssertNoLiveSessionAsync();
+
+        using var ui = new DispatcherThread();
+        var keepAlive = new KeepAlive();
+
+        HeldHandleProbe probe;
+        int liveAfterDispose;
+        try
+        {
+            probe = await ui.InvokeAsync(() => StartHandleHoldingSession(keepAlive));
+            await probe.Holding.WaitAsync(_callbackTimeout, cancellationToken);
+
+            // Exactly the run's own session, so a count of 0 once Dispose returns is its destruction.
+            int liveBeforeDispose = SessionProbe.LiveSessionCount();
+            Assert.True(
+                liveBeforeDispose == 1,
+                string.Create(CultureInfo.InvariantCulture, $"Expected the run's session to be the only live native session before Dispose; {liveBeforeDispose} are live."));
+
+            // The gate now holds the handle on the coordinator after its own rq_session_stop, and keeps holding until
+            // this Dispose has disposed the handle, so the gate's release is the last one.
+            await Task.Run(() => DisposeSession(keepAlive), cancellationToken).WaitAsync(_disposeTimeout, cancellationToken);
+            liveAfterDispose = SessionProbe.LiveSessionCount();
+        }
+        catch
+        {
+            await ReleaseAfterFailureAsync(ui, keepAlive);
+            throw;
+        }
+
+        // Drops the session and its gate; once the GCHandle is freed nothing roots the CallbackState any more.
+        keepAlive.Clear();
+
+        HeldHandleObservation observed = await probe.Observation.WaitAsync(_callbackTimeout, cancellationToken);
+        CollectionOutcome outcome = await CollectUntilAsync(() => !IsTargetAlive(probe.CallbackState), ui, _collectionTimeout);
+        string description = string.Create(
+            CultureInfo.InvariantCulture,
+            $"Step gate: handle disposed while held {observed.DisposedWhileHeld}, last reference released by the gate "
+            + $"{observed.ReleasedLast}, held for {observed.HeldFor.TotalSeconds:0.000} s, fault {observed.Fault?.GetType().Name ?? "none"}; "
+            + $"live native sessions when Dispose returned: {liveAfterDispose}; "
+            + $"CallbackState collected {outcome.Collected} after {outcome.Iterations} forced full collection(s) in "
+            + $"{outcome.Elapsed.TotalSeconds:0.00} s.");
+        _output.WriteLine(description);
+
+        Assert.True(observed.Fault is null, $"The step gate failed, so the race was not set up: {observed.Fault}");
+        Assert.True(
+            observed.DisposedWhileHeld,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"Dispose did not dispose the handle within {_heldHandleDisposeTimeout.TotalSeconds:0} s while the step gate held it, so "
+                + $"the race under test never happened. {description}"));
+        Assert.True(
+            observed.ReleasedLast,
+            $"The step gate's release did not drop the handle's last reference, so the release never ran inside the callback. {description}");
+        Assert.True(
+            liveAfterDispose == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{liveAfterDispose} native session(s) were still live when Dispose returned: the native session and its coordinator "
+                + $"thread leaked, because the last release ran rq_session_destroy on the coordinator (RQ_E_INVALID_STATE) or Dispose "
+                + $"returned before the release finished. {description}"));
+        Assert.True(
+            outcome.Collected,
+            $"The CallbackState is still rooted: its GCHandle and stop event leaked, because no successful rq_session_destroy freed them. {description}");
+    }
+
+    /// <summary>
     /// Builds the production controller graph over an instrumented test engine. Runs on the dispatcher thread, because
     /// the controller has UI-thread affinity and its sessions post their events to the context captured there.
     /// </summary>
@@ -245,6 +329,43 @@ public sealed class SessionLifetimeTests
             new WeakReference<GateTarget>(target),
             counters);
     }
+
+    /// <summary>
+    /// Creates and starts a one-step session over the test engine whose step gate holds the session's handle across a
+    /// concurrent <c>Dispose</c>. Runs on the dispatcher thread, so the session posts its events there.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static HeldHandleProbe StartHandleHoldingSession(KeepAlive keepAlive)
+    {
+        NativeEngine engine = TestEngines.Create();
+        SystemSnapshot system = engine.QuerySystem();
+        ulong regionBytes = TestRegions.Bytes(system, TestRegions.Mib256);
+        var gate = new HandleHoldingGate();
+
+        IEngineSession session = engine.CreateSession(new EngineSessionOptions
+        {
+            RegionBytes = regionBytes,
+            MinRegionBytes = regionBytes,
+            WorkerCount = system.LogicalProcessors,
+            Steps = ScaledPlans.Attributes(ScaledPlans.Custom((0, _stepBudget))),
+            StepGate = gate.Gate,
+        });
+
+        // Kept before Start, so a failing Start still leaves the session to the failure cleanup.
+        keepAlive.Add(session);
+        keepAlive.Add(gate);
+        gate.Session = (EngineSession)session;
+        session.Start();
+
+        return new HeldHandleProbe(
+            gate.Holding,
+            gate.Observation,
+            new WeakReference<object>(SessionProbe.GetCallbackState(session)));
+    }
+
+    // Out of line, so the session lives only in this frame and never in the awaiting test's state machine.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void DisposeSession(KeepAlive keepAlive) => keepAlive.Get<IEngineSession>().Dispose();
 
     // A factory of its own, so the sink's closure holds the counters alone.
     private static ProgressSink CountingSink(CallbackCounters counters) => _ => counters.OnProgressSink();
@@ -494,6 +615,106 @@ public sealed class SessionLifetimeTests
         }
     }
 
+    /// <summary>
+    /// A step gate that, on the coordinator inside <c>on_step_starting</c>, holds the session's handle exactly as a
+    /// marshalled handle argument does, requests a stop through the session (a callback-origin
+    /// <c>rq_session_stop</c>), and keeps holding until a concurrent <c>Dispose</c> has disposed the handle, so its
+    /// release is the last reference, dropped inside the callback. It never throws and always releases its hold.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="SafeHandle.IsClosed"/> turns true only when the last reference is released, so while the gate holds
+    /// one, the disposal shows only in <see cref="SafeHandle"/>'s private state word, whose bit 1 is its Disposed flag.
+    /// </remarks>
+    private sealed class HandleHoldingGate
+    {
+        private const string SafeHandleStateField = "_state";
+        private const int SafeHandleDisposedBit = 0b10;
+
+        private readonly TaskCompletionSource _holding = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<HeldHandleObservation> _observation =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private int _calls;
+
+        /// <summary>Gets or sets the session whose gate this is; set before the session starts.</summary>
+        public EngineSession? Session { get; set; }
+
+        /// <summary>Gets a task that completes once the gate holds the handle and has requested its stop.</summary>
+        public Task Holding => _holding.Task;
+
+        /// <summary>Gets a task that completes with what the gate saw, once it has released the handle.</summary>
+        public Task<HeldHandleObservation> Observation => _observation.Task;
+
+        public StepGateDecision Gate(EngineStepStarted step, WaitHandle stopEvent)
+        {
+            // The Abort below ends the run at its first step, so no later gate call takes part in the race.
+            if (Interlocked.Increment(ref _calls) != 1)
+            {
+                return StepGateDecision.Abort;
+            }
+
+            SafeSessionHandle? handle = null;
+            bool added = false;
+            bool disposedWhileHeld = false;
+            bool releasedLast = false;
+            Exception? fault = null;
+            var held = new Stopwatch();
+            try
+            {
+                FieldInfo state = typeof(SafeHandle).GetField(SafeHandleStateField, BindingFlags.Instance | BindingFlags.NonPublic)
+                    ?? throw new InvalidOperationException(
+                        $"SafeHandle has no private {SafeHandleStateField} field, so the gate cannot see the concurrent Dispose.");
+                EngineSession session = Session
+                    ?? throw new InvalidOperationException("The step gate ran before the test published its session.");
+                handle = session.Handle;
+                handle.DangerousAddRef(ref added);
+                held.Start();
+                session.RequestStop(StopReason.User);
+                _holding.TrySetResult();
+
+                while (!IsDisposed(handle, state) && held.Elapsed < _heldHandleDisposeTimeout)
+                {
+                    Thread.Sleep(_heldHandlePollInterval);
+                }
+
+                disposedWhileHeld = IsDisposed(handle, state);
+            }
+            catch (Exception exception)
+            {
+                fault = exception;
+            }
+            finally
+            {
+                if (added)
+                {
+                    try
+                    {
+                        handle!.DangerousRelease();
+
+                        // The release that drops the last reference closes the handle before it returns.
+                        releasedLast = handle.IsClosed;
+                    }
+                    catch (Exception exception)
+                    {
+                        fault ??= exception;
+                    }
+                }
+            }
+
+            // Completes the signal too when the gate failed before raising it, so the test fails at once with the cause.
+            if (fault is not null)
+            {
+                _holding.TrySetException(fault);
+            }
+
+            _observation.TrySetResult(new HeldHandleObservation(disposedWhileHeld, releasedLast, held.Elapsed, fault));
+            return StepGateDecision.Abort;
+        }
+
+        private static bool IsDisposed(SafeHandle handle, FieldInfo state) =>
+            ((int)state.GetValue(handle)! & SafeHandleDisposedBit) != 0;
+    }
+
     /// <summary>Named weak references whose targets a test expects to be collected.</summary>
     private sealed class TrackedReferences
     {
@@ -527,6 +748,15 @@ public sealed class SessionLifetimeTests
         WeakReference<object> CallbackState,
         WeakReference<GateTarget> Target,
         CallbackCounters Counters);
+
+    private sealed record HeldHandleProbe(
+        Task Holding,
+        Task<HeldHandleObservation> Observation,
+        WeakReference<object> CallbackState);
+
+    // What the handle-holding gate saw: whether Dispose disposed the handle while the gate held it, whether the gate's
+    // release then dropped the last reference, how long it held the handle, and what kept it from setting up the race.
+    private sealed record HeldHandleObservation(bool DisposedWhileHeld, bool ReleasedLast, TimeSpan HeldFor, Exception? Fault);
 
     private sealed record StartOutcome(StartResult Result, string? Notice);
 

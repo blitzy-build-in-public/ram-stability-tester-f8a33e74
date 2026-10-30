@@ -73,7 +73,9 @@ public sealed record StepDefinition
     /// A hold step writes in <see cref="AccessOrder.RandomBlocks"/> order and waits on the
     /// session's stop event rather than sleeping, so a stop is never held behind the hold. Its
     /// verifications are <c>VerifyAfterHold</c>, which is how errors that appear only after data
-    /// sat idle point at refresh and retention.
+    /// sat idle point at refresh and retention. A step with a hold must therefore declare
+    /// <see cref="AccessOrder.RandomBlocks"/> and a pattern other than moving inversion, which
+    /// <c>TestPlanValidator</c> checks.
     /// </remarks>
     public TimeSpan Hold { get; init; } = TimeSpan.Zero;
 

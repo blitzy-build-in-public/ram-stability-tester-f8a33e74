@@ -26,16 +26,16 @@ namespace RamQuick.Plans;
 public sealed record PlanViolation(int? StepIndex, string? StepName, string Message);
 
 /// <summary>
-/// Checks a <see cref="TestPlan"/> against the step-definition rules, the native field ranges and
-/// the hold rule, and reports every violation at once.
+/// Checks a <see cref="TestPlan"/> against the step-definition rules, the native field ranges, the
+/// step shapes the engine runs and the hold rule, and reports every violation at once.
 /// </summary>
 /// <remarks>
 /// <para>
 /// Validation is advisory data checking. Neither <see cref="TestPlan"/> nor
 /// <see cref="StepDefinition"/> calls it, so tests can build scaled plans that deliberately break
 /// a rule, such as budgets divided by 10 with the 5 s holds kept, and the engine still runs them.
-/// The managed wrapper rejects values it cannot marshal before any native call, and the engine
-/// validates its own inputs again.
+/// The managed wrapper rejects values it cannot marshal, and step shapes the engine does not run,
+/// before any native call, and the engine validates its own inputs again.
 /// </para>
 /// <para>
 /// The built-in plans in <c>TestPlans</c> validate with no violations.
@@ -79,8 +79,8 @@ public static class TestPlanValidator
     /// </list>
     /// <para>
     /// Step rules, from the step-definition contract of <see cref="StepDefinition"/>, the
-    /// <c>rq_step_def</c> field widths of <c>ramquick_engine.h</c>, and the pass scheduler's hold
-    /// rule:
+    /// <c>rq_step_def</c> field widths of <c>ramquick_engine.h</c>, the step shapes
+    /// <c>rq_session_create</c> accepts, and the pass scheduler's hold rule:
     /// </para>
     /// <list type="bullet">
     /// <item><description>
@@ -116,6 +116,13 @@ public static class TestPlanValidator
     /// <item><description>
     /// <see cref="StepDefinition.Mechanisms"/> includes the primary mechanism and holds no bit
     /// outside the defined <see cref="InstabilityMechanism"/> members.
+    /// </description></item>
+    /// <item><description>
+    /// The step shape rule, the shapes the engine runs: a step with a hold has a pattern other
+    /// than <see cref="PatternKind.MovingInversionWalking"/> and
+    /// <see cref="PatternKind.MovingInversionRandom"/>, whose own whole-slice sweeps take no hold,
+    /// and the order <see cref="AccessOrder.RandomBlocks"/>, in which it writes its whole slice. A
+    /// moving-inversion step with a hold is reported once, for its pattern, whatever its order.
     /// </description></item>
     /// <item><description>
     /// The hold rule: a step with a hold has a time budget of at least
@@ -214,6 +221,23 @@ public static class TestPlanValidator
         }
 
         ValidateMechanisms(step.PrimaryMechanism, step.Mechanisms, label, Report);
+
+        // Only the step shapes the engine runs, so a plan that validates clean also starts instead
+        // of failing session creation with a bare invalid-argument code. A hold step writes its
+        // whole slice in RandomBlocks order, so requiring it to declare that order keeps the order
+        // the summary and the analyzer read equal to the order that runs. Undefined values are
+        // already reported above, and one faulty shape gives one violation.
+        if (step.HasHold && Enum.IsDefined(step.Pattern) && Enum.IsDefined(step.Order))
+        {
+            if (step.Pattern is PatternKind.MovingInversionWalking or PatternKind.MovingInversionRandom)
+            {
+                Report(string.Create(CultureInfo.InvariantCulture, $"{label} holds for {Seconds(step.Hold)} with the moving-inversion pattern {step.Pattern}; moving inversion runs its own whole-slice sweeps and takes no hold."));
+            }
+            else if (step.Order != AccessOrder.RandomBlocks)
+            {
+                Report(string.Create(CultureInfo.InvariantCulture, $"{label} holds for {Seconds(step.Hold)} with access order {step.Order}; a hold step writes its whole slice in RandomBlocks order, so its order must be RandomBlocks."));
+            }
+        }
 
         // Int128 keeps 2 × budget and 5 × hold exact for every TimeSpan, so no floating-point
         // rounding decides a budget that sits exactly at 2.5 holds.

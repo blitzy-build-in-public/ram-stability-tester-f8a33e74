@@ -41,12 +41,15 @@ public sealed record SummaryPublishResult(bool Succeeded, string? JsonPath, stri
 /// <b>Line format</b>, parsed by <c>scripts/Summarize-ValidationRuns.ps1</c>: every line is
 /// <c>&lt;yyyy-MM-ddTHH:mm:ss.fffZ&gt; &lt;EVENT&gt; key=value key=value …</c>, UTF-8 without a byte-order mark,
 /// ending in <c>\r\n</c>, in the invariant culture. Free-text values (<c>name</c>, <c>detail</c>,
-/// <c>message</c>, <c>outcome</c>, <c>os</c>, <c>cpu</c>, <c>path</c>, <c>error</c>) are always double-quoted;
-/// any other value is quoted only when it is empty or holds white space, a double quote or a control
-/// character. Inside quotes <c>\"</c> stands for <c>"</c> and <c>\\</c> for <c>\</c>, and control characters
-/// are written as spaces, so an event never spans more lines than it writes. Numbers are plain; percentages
-/// have one decimal, other doubles use the round-trip format. Hex words are <c>0x</c> plus 16 uppercase digits.
-/// A value that was not captured is written <c>unknown</c>. Step and pass numbers are 1-based, as in
+/// <c>message</c>, <c>outcome</c>, <c>os</c>, <c>cpu</c>, <c>path</c>, <c>error</c>, <c>source</c>) are always
+/// double-quoted, with the locations that name the Windows account written as placeholders: the run's data folder
+/// <c>&lt;data&gt;</c>, the user's folders <c>%LOCALAPPDATA%</c>, <c>%APPDATA%</c> and <c>%USERPROFILE%</c>, and the
+/// user name, where it is a path segment, <c>%USERNAME%</c>. Results files are named relative to the data folder,
+/// as <c>logs\&lt;file&gt;</c>. Any other value is quoted only when it is empty or holds white space, a double
+/// quote or a control character. Inside quotes <c>\"</c> stands for <c>"</c> and <c>\\</c> for <c>\</c>, and
+/// control characters are written as spaces, so an event never spans more lines than it writes. Numbers are plain;
+/// percentages have one decimal, other doubles use the round-trip format. Hex words are <c>0x</c> plus 16 uppercase
+/// digits. A value that was not captured is written <c>unknown</c>. Step and pass numbers are 1-based, as in
 /// <c>step=3/6</c>, the folder-wide rule for persisted indices.
 /// </para>
 /// <para>
@@ -54,21 +57,38 @@ public sealed record SummaryPublishResult(bool Succeeded, string? JsonPath, stri
 /// <c>PLAN</c> per step and <c>PLAN_TARGET</c>; <c>PREPARED</c>; per step <c>STEP_START</c>, <c>STEP_END</c>
 /// and, after an overrun, <c>STEP_OVERRUN</c>; a <c>PROGRESS</c> line whenever the elapsed time crosses the
 /// next multiple of 10 s; <c>ERROR</c> lines for the first <see cref="ErrorGrouping.StoredDetailCap"/>
-/// errors and one <c>ERROR_CAP_REACHED</c>; <c>SENSOR</c>, <c>THERMAL_STOP</c>, <c>JOURNAL_FAILURE</c> and
+/// errors and one <c>ERROR_CAP_REACHED</c>; <c>SENSOR</c>, <c>THERMAL_STOP</c>, <c>JOURNAL_FAILURE</c>,
+/// <c>CALLBACK_FAULT</c> (an exception in an engine callback or event handler, the cause of a host-fault stop) and
 /// <c>NOTICE</c> as they occur; <c>STOP_REQUESTED</c>, <c>COMPLETED</c>, <c>VERDICT</c>, <c>RELEASED</c> or
-/// <c>RELEASE_NOT_CONFIRMED</c>; and <c>SUMMARY_PUBLISHED</c> or <c>SUMMARY_FAILED</c>. The stop-to-Completed
-/// latency is the difference of the <c>STOP_REQUESTED</c> and <c>COMPLETED</c> timestamps.
+/// <c>RELEASE_NOT_CONFIRMED</c>; and <c>SUMMARY_PUBLISHED</c> or <c>SUMMARY_FAILED</c>. A run has at most two
+/// <c>STOP_REQUESTED</c> lines. One records the controller's first stop request, user, thermal or host-fault,
+/// stamped when it is made; later requests, which the first-writer-wins engine ignores, add none. The other records
+/// the engine's own first-error stop with Stop on error on, adding <c>time_into_test_ms</c>, the decision's test
+/// time on the engine clock that <c>COMPLETED elapsed_ms</c> uses. It is logged when the controller learns of that
+/// stop, from the error report or at Completed, and only when that stop ended the run; reported before any request,
+/// it is the run's only stop line. <c>scripts/Summarize-ValidationRuns.ps1</c> reads the first
+/// <c>STOP_REQUESTED</c>: the stop-to-Completed latency is the difference of its and <c>COMPLETED</c>'s timestamps.
+/// </para>
+/// <para>
+/// <b>app-errors.log</b>: per exception, an <c>APP_ERROR source="…"</c> header, with <c>run_id=</c> while a run is
+/// in progress, then the exception's full text, every line indented by two spaces and its locations written as in
+/// the <c>.log</c>, then a blank line.
 /// </para>
 /// <para>
 /// <b>Threading.</b> Every <c>Log*</c> method may be called from any thread and never performs I/O: it formats
-/// its lines and enqueues them. One drain loop on the thread pool appends them in order and flushes them to
-/// the device after every drained batch, so a crashed run's <c>.log</c> keeps every event that reached the
-/// drain. A write failure is recorded once in <see cref="WriteFailure"/> and otherwise swallowed: the run
-/// continues without its event log. Events logged after <see cref="Dispose"/> are discarded.
+/// its lines and enqueues them, except <see cref="LogErrors"/>, which enqueues its capped batch of records for
+/// the drain to render, so a large batch costs the caller only a reference copy. One drain loop on the thread
+/// pool appends the events in order and flushes them to the device after every drained batch, so a crashed
+/// run's <c>.log</c> keeps every event that reached the drain. A write failure is recorded once in
+/// <see cref="WriteFailure"/> and otherwise swallowed: the run continues without its event log. Events logged
+/// after <see cref="Dispose"/> are discarded.
 /// </para>
 /// <para>
 /// The run state is never cached here: <see cref="LogVerdict"/> receives the terminal state as a parameter.
-/// Logs hold only memory-test data and hardware descriptors; no user or machine name is written.
+/// The summaries are the files meant for sharing: they hold memory-test data and hardware descriptors. The
+/// <c>.log</c> and <c>app-errors.log</c> are local diagnostic logs: they can also hold exception text and stack
+/// traces, with the account's locations written as placeholders, so they are inspected before they are shared.
+/// No user or machine name is added to any of them, and nothing leaves the PC.
 /// </para>
 /// </remarks>
 public sealed class ResultsLog : IDisposable
@@ -95,6 +115,7 @@ public sealed class ResultsLog : IDisposable
     internal const string ReleasedEvent = "RELEASED";
     internal const string ReleaseNotConfirmedEvent = "RELEASE_NOT_CONFIRMED";
     internal const string NoticeEvent = "NOTICE";
+    internal const string CallbackFaultEvent = "CALLBACK_FAULT";
     internal const string SummaryPublishedEvent = "SUMMARY_PUBLISHED";
     internal const string SummaryFailedEvent = "SUMMARY_FAILED";
     internal const string AppErrorEvent = "APP_ERROR";
@@ -114,11 +135,18 @@ public sealed class ResultsLog : IDisposable
     private const string RecoveredSummaryTextSuffix = "-recovered-summary.txt";
     private const string TempSuffix = ".tmp";
 
+    // Precedes every line of an app-errors.log entry's exception text; the entry's header alone starts at the margin.
+    private const string AppErrorTextIndent = "  ";
+
     // Three retries after the first attempt: four run ids in total before Start is refused.
     private const int MaxReservationRetries = 3;
 
     // Bounds one drained batch, so a steady stream of events cannot postpone the flush that ends it.
     private const int MaxBatchEntries = 256;
+
+    // Bounds the transient text of one write: a batch of 10,000 records is rendered and written this many
+    // ERROR lines at a time, never as one multi-megabyte string.
+    private const int MaxErrorLinesPerWrite = 256;
 
     // No byte-order mark, and invalid UTF-16 never throws: an unpaired surrogate is written as U+FFFD.
     private static readonly UTF8Encoding _utf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
@@ -133,10 +161,12 @@ public sealed class ResultsLog : IDisposable
 
     private readonly FileStream _stream;
     private readonly TimeProvider _timeProvider;
+    private readonly PersonalDataRedactor _redactor;
     private readonly Channel<LogEntry> _channel;
     private readonly Task _drainTask;
 
-    // Guards the formatting state below; held only while lines are formatted and enqueued, never during I/O.
+    // Guards the formatting state below; held only while events are formatted or copied and enqueued, never
+    // during I/O.
     private readonly object _gate = new();
 
     private Exception? _writeFailure;
@@ -158,6 +188,7 @@ public sealed class ResultsLog : IDisposable
         SummaryTextPath = GetSummaryTextPath(dataDirectory, baseName);
         _stream = stream;
         _timeProvider = timeProvider;
+        _redactor = new PersonalDataRedactor(dataDirectory.RootPath);
         _channel = Channel.CreateUnbounded<LogEntry>(new UnboundedChannelOptions
         {
             SingleReader = true,
@@ -376,7 +407,7 @@ public sealed class ResultsLog : IDisposable
         int stepCount = begin.Steps.Count;
         JournalSystemInfo system = begin.System;
         JournalMemoryInfo memory = begin.Memory;
-        EventText text = new EventText()
+        EventText text = new EventText(_redactor)
             .Line(begin.StartRequestedUtc, StartRequestedEvent)
             .Token("run_id", SummaryFormat.RunId(begin.RunId))
             .Token("test_type", begin.TestType)
@@ -438,7 +469,7 @@ public sealed class ResultsLog : IDisposable
     {
         ArgumentNullException.ThrowIfNull(prepared);
 
-        EventText text = new EventText()
+        EventText text = new EventText(_redactor)
             .Line(_timeProvider.GetUtcNow(), PreparedEvent)
             .Number("tested_bytes", prepared.TestedBytes)
             .Number("workers", prepared.Workers)
@@ -470,7 +501,7 @@ public sealed class ResultsLog : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(stepCount);
         ArgumentNullException.ThrowIfNull(stepName);
 
-        Enqueue(new EventText()
+        Enqueue(new EventText(_redactor)
             .Line(_timeProvider.GetUtcNow(), StepStartEvent)
             .StepNumber(stepIndex + 1, stepCount)
             .Text("name", stepName));
@@ -495,7 +526,7 @@ public sealed class ResultsLog : IDisposable
 
         lock (_gate)
         {
-            EventText text = new EventText()
+            EventText text = new EventText(_redactor)
                 .Line(now, StepEndEvent)
                 .StepNumber(stepNumber, stepCount)
                 .Text("name", outcome.Attributes.Name)
@@ -542,7 +573,7 @@ public sealed class ResultsLog : IDisposable
             long intervalsElapsed = progress.Elapsed.Ticks / _progressLineInterval.Ticks;
             _nextProgressLineAt = TimeSpan.FromTicks((intervalsElapsed + 1) * _progressLineInterval.Ticks);
 
-            Enqueue(new EventText()
+            Enqueue(new EventText(_redactor)
                 .Line(_timeProvider.GetUtcNow(), ProgressEvent)
                 .StepNumber(progress.StepIndex + 1, progress.StepCount)
                 .Number("elapsed_ms", JournalValues.WholeMilliseconds(progress.Elapsed))
@@ -560,8 +591,15 @@ public sealed class ResultsLog : IDisposable
     /// <param name="records">The batch's error records; empty once the engine's detail cap is reached.</param>
     /// <param name="totalErrors">The true error total carried by the batch.</param>
     /// <remarks>
+    /// <para>
     /// The address is written with its kind, <c>address_kind=virtual</c> in v1, and the re-read outcome with
     /// its observation and inference, which is never stated as an established fault.
+    /// </para>
+    /// <para>
+    /// The records within the cap are copied by reference and enqueued; the drain renders their lines. The
+    /// caller may therefore reuse <paramref name="records"/> as soon as this returns, and a large batch costs it
+    /// only that copy. Every line still carries the time of this call and the step count known at it.
+    /// </para>
     /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="records"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException"><paramref name="records"/> contains a <see langword="null"/> element.</exception>
@@ -584,25 +622,26 @@ public sealed class ResultsLog : IDisposable
                 return;
             }
 
-            EventText text = new();
-            for (int position = 0; position < records.Count && _loggedErrorRecords < ErrorGrouping.StoredDetailCap; position++)
+            int take = Math.Min(records.Count, ErrorGrouping.StoredDetailCap - _loggedErrorRecords);
+            _loggedErrorRecords += take;
+            bool capReached = _loggedErrorRecords >= ErrorGrouping.StoredDetailCap;
+            if (take == 0 && !capReached)
             {
-                AppendErrorLine(text, now, records[position], _stepCount, totalErrors);
-                _loggedErrorRecords++;
+                return;
             }
 
-            if (_loggedErrorRecords >= ErrorGrouping.StoredDetailCap)
+            _capReported = capReached;
+
+            // Unlike the other events, these lines are rendered by the drain, not here: the run controller calls
+            // this on the UI thread, and a batch of up to 10,000 records of 21 fields each is too much formatting
+            // for it. The private copy lets the caller reuse its list; the time and step count are this call's.
+            var accepted = new ErrorRecord[take];
+            for (int position = 0; position < take; position++)
             {
-                text.Line(now, ErrorCapReachedEvent)
-                    .Number("stored", ErrorGrouping.StoredDetailCap)
-                    .Number("total", totalErrors);
-                _capReported = true;
+                accepted[position] = records[position];
             }
 
-            if (!text.IsEmpty)
-            {
-                Enqueue(text);
-            }
+            Enqueue(new ErrorBatch(now, accepted, _stepCount, totalErrors, capReached));
         }
     }
 
@@ -619,7 +658,7 @@ public sealed class ResultsLog : IDisposable
         ArgumentNullException.ThrowIfNull(status);
         ArgumentNullException.ThrowIfNull(message);
 
-        Enqueue(new EventText()
+        Enqueue(new EventText(_redactor)
             .Line(_timeProvider.GetUtcNow(), SensorEvent)
             .Token("sensor", sensor)
             .Token("status", status)
@@ -638,7 +677,7 @@ public sealed class ResultsLog : IDisposable
     {
         ArgumentNullException.ThrowIfNull(sensor);
 
-        Enqueue(new EventText()
+        Enqueue(new EventText(_redactor)
             .Line(utc, ThermalStopEvent)
             .Token("sensor", sensor)
             .Real("celsius", celsius)
@@ -654,24 +693,43 @@ public sealed class ResultsLog : IDisposable
     {
         ArgumentNullException.ThrowIfNull(message);
 
-        Enqueue(new EventText()
+        Enqueue(new EventText(_redactor)
             .Line(_timeProvider.GetUtcNow(), JournalFailureEvent)
             .Text("message", message));
     }
 
     /// <summary>
-    /// Logs <c>STOP_REQUESTED reason=</c> at <paramref name="utc"/>, the start of the stop-latency interval.
+    /// Logs <c>STOP_REQUESTED reason=</c> at <paramref name="utc"/>, followed by <c>time_into_test_ms=</c> when the
+    /// engine's own time of the stop decision is known.
     /// </summary>
-    /// <param name="utc">The time the stop was requested.</param>
-    /// <param name="reason">The stop reason, for example <c>"UserStop"</c> or <c>"Thermal"</c>.</param>
+    /// <remarks>
+    /// A requested stop's stamp starts its stop-latency interval. A stop the engine decides itself is stamped when
+    /// the controller learns of it, so its <c>time_into_test_ms</c> starts the interval instead. The class remarks
+    /// state which stops are logged.
+    /// </remarks>
+    /// <param name="utc">The time the stop was requested, or the time the controller learned of the decision.</param>
+    /// <param name="reason">
+    /// The stop reason, for example <c>"UserStop"</c>, <c>"Thermal"</c> or <c>"FirstError"</c>.
+    /// </param>
+    /// <param name="timeIntoTest">
+    /// The engine's test time of the decision, for a stop the engine decides itself such as the first confirmed error
+    /// with Stop on error on; on the same clock as <c>COMPLETED elapsed_ms</c>, so the decision-to-Completed interval
+    /// is their difference. <see langword="null"/> for a stop the controller requests, and then no key is written.
+    /// </param>
     /// <exception cref="ArgumentNullException"><paramref name="reason"/> is <see langword="null"/>.</exception>
-    public void LogStopRequested(DateTimeOffset utc, string reason)
+    public void LogStopRequested(DateTimeOffset utc, string reason, TimeSpan? timeIntoTest = null)
     {
         ArgumentNullException.ThrowIfNull(reason);
 
-        Enqueue(new EventText()
+        EventText text = new EventText(_redactor)
             .Line(utc, StopRequestedEvent)
-            .Token("reason", reason));
+            .Token("reason", reason);
+        if (timeIntoTest is { } decided)
+        {
+            text.Number("time_into_test_ms", JournalValues.WholeMilliseconds(decided));
+        }
+
+        Enqueue(text);
     }
 
     /// <summary>
@@ -695,7 +753,7 @@ public sealed class ResultsLog : IDisposable
         TimeSpan elapsed,
         TimeSpan? firstError)
     {
-        Enqueue(new EventText()
+        Enqueue(new EventText(_redactor)
             .Line(utc, CompletedEvent)
             .Token("end_reason", endReason.ToString())
             .Number("total_errors", totalErrors)
@@ -720,7 +778,7 @@ public sealed class ResultsLog : IDisposable
             ?? throw new ArgumentException(
                 $"A verdict needs a terminal state, not {terminalState}.", nameof(terminalState));
 
-        Enqueue(new EventText()
+        Enqueue(new EventText(_redactor)
             .Line(utc, VerdictEvent)
             .Token("verdict", verdict)
             .Token("state", terminalState.ToString())
@@ -737,7 +795,7 @@ public sealed class ResultsLog : IDisposable
     /// <param name="releaseTime">The time the release took.</param>
     public void LogReleased(DateTimeOffset utc, ulong releasedBytes, TimeSpan releaseTime)
     {
-        Enqueue(new EventText()
+        Enqueue(new EventText(_redactor)
             .Line(utc, ReleasedEvent)
             .Number("bytes", releasedBytes)
             .Number("release_ms", JournalValues.WholeMilliseconds(releaseTime)));
@@ -751,7 +809,7 @@ public sealed class ResultsLog : IDisposable
     /// <param name="utc">The time publication gave up waiting.</param>
     public void LogReleaseNotConfirmed(DateTimeOffset utc)
     {
-        Enqueue(new EventText()
+        Enqueue(new EventText(_redactor)
             .Line(utc, ReleaseNotConfirmedEvent)
             .Text("message", ReleaseNotConfirmedMessage));
     }
@@ -766,9 +824,35 @@ public sealed class ResultsLog : IDisposable
     {
         ArgumentNullException.ThrowIfNull(message);
 
-        Enqueue(new EventText()
+        Enqueue(new EventText(_redactor)
             .Line(_timeProvider.GetUtcNow(), NoticeEvent)
             .Text("message", message));
+    }
+
+    /// <summary>
+    /// Logs <c>CALLBACK_FAULT source="…" error="…"</c> at <paramref name="utc"/>: an exception escaped an engine
+    /// callback or an engine-event handler, and the run is stopped as a host fault. The line is that stop's cause;
+    /// the exception's full text is in <c>app-errors.log</c> under the same source and this run's id.
+    /// </summary>
+    /// <param name="utc">The time the exception was caught.</param>
+    /// <param name="source">
+    /// Where it was caught, as its <c>app-errors.log</c> entry names it, for example
+    /// <c>"EngineCallback:on_progress"</c>.
+    /// </param>
+    /// <param name="exception">The exception; <c>error</c> is its type's full name, a colon and its message.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="exception"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="source"/> is <see langword="null"/>, empty or white space.
+    /// </exception>
+    public void LogCallbackFault(DateTimeOffset utc, string source, Exception exception)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
+        ArgumentNullException.ThrowIfNull(exception);
+
+        Enqueue(new EventText(_redactor)
+            .Line(utc, CallbackFaultEvent)
+            .Text("source", source)
+            .Text("error", exception.GetType().FullName + ": " + exception.Message));
     }
 
     /// <summary>
@@ -781,7 +865,7 @@ public sealed class ResultsLog : IDisposable
     public Task FlushAsync()
     {
         var request = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        return _channel.Writer.TryWrite(new LogEntry(null, request)) ? request.Task : _drainTask;
+        return _channel.Writer.TryWrite(new LogEntry(null, null, request)) ? request.Task : _drainTask;
     }
 
     /// <summary>
@@ -857,8 +941,10 @@ public sealed class ResultsLog : IDisposable
     }
 
     /// <summary>
-    /// Appends one block to <see cref="DataDirectory.AppErrorsLogPath"/>: an <c>APP_ERROR source="…"</c> line
-    /// stamped <paramref name="utc"/>, the exception's full text and a blank line, flushed to the device.
+    /// Appends one block to <see cref="DataDirectory.AppErrorsLogPath"/>: an <c>APP_ERROR source="…" run_id=…</c> line
+    /// stamped <paramref name="utc"/>, the exception's full text with every line indented by two spaces, and a blank
+    /// line, flushed to the device. Only a header starts at the margin, so a line break inside an exception message
+    /// can never forge an entry.
     /// </summary>
     /// <param name="dataDirectory">The data folder.</param>
     /// <param name="source">
@@ -867,22 +953,34 @@ public sealed class ResultsLog : IDisposable
     /// </param>
     /// <param name="exception">The exception.</param>
     /// <param name="utc">The time it was caught.</param>
+    /// <param name="runId">
+    /// The run in progress or still publishing when it was caught, written <c>run_id=&lt;32 hex digits&gt;</c> after
+    /// the source so the entry can be tied to that run's <c>.log</c> and summaries; <see langword="null"/>, or
+    /// <see cref="Guid.Empty"/>, when there is none, and then the header has no <c>run_id</c>.
+    /// </param>
     /// <remarks>
     /// Synchronous, for the application's unhandled-exception handlers. It runs inside crash handlers, so it
     /// never throws for a failure to format or write the block: such a failure is swallowed. Only the
-    /// exception's own text is written; no user or machine name is added.
+    /// exception's own text is written, with the data folder and the user's folders and name written as
+    /// <c>&lt;data&gt;</c>, <c>%LOCALAPPDATA%</c>, <c>%APPDATA%</c>, <c>%USERPROFILE%</c> and <c>%USERNAME%</c>, as in
+    /// the <c>.log</c>; no user or machine name is added.
     /// </remarks>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="dataDirectory"/> or <paramref name="exception"/> is <see langword="null"/>.
     /// </exception>
     /// <exception cref="ArgumentException"><paramref name="source"/> is <see langword="null"/>, empty or white space.</exception>
-    public static void AppendAppError(DataDirectory dataDirectory, string source, Exception exception, DateTimeOffset utc)
+    public static void AppendAppError(
+        DataDirectory dataDirectory,
+        string source,
+        Exception exception,
+        DateTimeOffset utc,
+        Guid? runId = null)
     {
         ArgumentNullException.ThrowIfNull(dataDirectory);
         ArgumentException.ThrowIfNullOrWhiteSpace(source);
         ArgumentNullException.ThrowIfNull(exception);
 
-        WriteAppError(dataDirectory.AppErrorsLogPath, source, exception, utc);
+        WriteAppError(dataDirectory.AppErrorsLogPath, dataDirectory.RootPath, source, exception, utc, runId);
     }
 
     /// <summary>
@@ -893,18 +991,28 @@ public sealed class ResultsLog : IDisposable
     /// <param name="source">Where the exception was caught, for example <c>"EngineCallback:on_progress"</c>.</param>
     /// <param name="exception">The exception.</param>
     /// <param name="utc">The time it was caught.</param>
+    /// <param name="runId">
+    /// The run in progress or still publishing when it was caught, or <see langword="null"/> when there is none; see
+    /// <see cref="AppendAppError"/>.
+    /// </param>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="dataDirectory"/> or <paramref name="exception"/> is <see langword="null"/>.
     /// </exception>
     /// <exception cref="ArgumentException"><paramref name="source"/> is <see langword="null"/>, empty or white space.</exception>
-    public static void QueueAppError(DataDirectory dataDirectory, string source, Exception exception, DateTimeOffset utc)
+    public static void QueueAppError(
+        DataDirectory dataDirectory,
+        string source,
+        Exception exception,
+        DateTimeOffset utc,
+        Guid? runId = null)
     {
         ArgumentNullException.ThrowIfNull(dataDirectory);
         ArgumentException.ThrowIfNullOrWhiteSpace(source);
         ArgumentNullException.ThrowIfNull(exception);
 
         string path = dataDirectory.AppErrorsLogPath;
-        _ = Task.Run(() => WriteAppError(path, source, exception, utc)).ContinueWith(
+        string dataRoot = dataDirectory.RootPath;
+        _ = Task.Run(() => WriteAppError(path, dataRoot, source, exception, utc, runId)).ContinueWith(
             static task => _ = task.Exception,
             CancellationToken.None,
             TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
@@ -978,11 +1086,18 @@ public sealed class ResultsLog : IDisposable
         }
     }
 
-    private static void WriteAppError(string path, string source, Exception exception, DateTimeOffset utc)
+    private static void WriteAppError(
+        string path,
+        string dataRoot,
+        string source,
+        Exception exception,
+        DateTimeOffset utc,
+        Guid? runId)
     {
         // Runs inside crash handlers: nothing here may throw, so every failure to format or write is swallowed.
         try
         {
+            var redactor = new PersonalDataRedactor(dataRoot);
             string details;
             try
             {
@@ -994,11 +1109,20 @@ public sealed class ResultsLog : IDisposable
                     + formatFailure.GetType().FullName + ")";
             }
 
-            string block = new EventText()
+            EventText header = new EventText(redactor)
                 .Line(utc, AppErrorEvent)
-                .Text("source", source)
-                .Build()
-                + details + EventText.NewLine + EventText.NewLine;
+                .Text("source", source);
+            if (runId is { } id && id != Guid.Empty)
+            {
+                header.Token("run_id", SummaryFormat.RunId(id));
+            }
+
+            // Every line of the text is indented, so only an entry's own header starts at the margin and a line break
+            // inside an exception message can never forge one. Any Unicode line ending starts a new line.
+            string block = header.Build()
+                + AppErrorTextIndent
+                + redactor.Redact(details).ReplaceLineEndings(EventText.NewLine + AppErrorTextIndent)
+                + EventText.NewLine + EventText.NewLine;
             byte[] bytes = _utf8.GetBytes(block);
 
             lock (_appErrorsGate)
@@ -1073,23 +1197,33 @@ public sealed class ResultsLog : IDisposable
         }
         catch (Exception exception) when (IsUnusableLocation(exception))
         {
-            Enqueue(new EventText()
+            Enqueue(new EventText(_redactor)
                 .Line(_timeProvider.GetUtcNow(), SummaryFailedEvent)
-                .Text("path", finalPath)
+                .Text("path", DataRelativePath(finalPath))
                 .Text("error", exception.Message));
             return exception.Message;
         }
 
-        Enqueue(new EventText()
+        Enqueue(new EventText(_redactor)
             .Line(_timeProvider.GetUtcNow(), SummaryPublishedEvent)
-            .Text("path", finalPath));
+            .Text("path", DataRelativePath(finalPath)));
         return null;
     }
+
+    // The data folder's own location can name the Windows account (%LOCALAPPDATA%\RamQuick), so a results file is
+    // written relative to it, as logs\<file name>.
+    private string DataRelativePath(string path) => Path.GetRelativePath(DataDirectory.RootPath, path);
 
     private void Enqueue(EventText text)
     {
         // Fails only after Dispose, when events are discarded by design.
-        _ = _channel.Writer.TryWrite(new LogEntry(text.Build(), null));
+        _ = _channel.Writer.TryWrite(new LogEntry(text.Build(), null, null));
+    }
+
+    private void Enqueue(ErrorBatch batch)
+    {
+        // Fails only after Dispose, when events are discarded by design.
+        _ = _channel.Writer.TryWrite(new LogEntry(null, batch, null));
     }
 
     private async Task DrainAsync()
@@ -1105,6 +1239,11 @@ public sealed class ResultsLog : IDisposable
                     if (entry.Text is { } text)
                     {
                         Append(text);
+                    }
+
+                    if (entry.Errors is { } errors)
+                    {
+                        AppendErrors(errors);
                     }
 
                     if (entry.FlushRequest is { } request)
@@ -1133,6 +1272,31 @@ public sealed class ResultsLog : IDisposable
         catch (Exception exception) when (IsUnusableLocation(exception))
         {
             RecordWriteFailure(exception);
+        }
+    }
+
+    private void AppendErrors(ErrorBatch batch)
+    {
+        ErrorRecord[] records = batch.Records;
+        for (int start = 0; start < records.Length; start += MaxErrorLinesPerWrite)
+        {
+            int end = Math.Min(records.Length, start + MaxErrorLinesPerWrite);
+            EventText text = new(_redactor);
+            for (int position = start; position < end; position++)
+            {
+                AppendErrorLine(text, batch.Utc, records[position], batch.StepCount, batch.TotalErrors);
+            }
+
+            Append(text.Build());
+        }
+
+        if (batch.CapReached)
+        {
+            Append(new EventText(_redactor)
+                .Line(batch.Utc, ErrorCapReachedEvent)
+                .Number("stored", ErrorGrouping.StoredDetailCap)
+                .Number("total", batch.TotalErrors)
+                .Build());
         }
     }
 
@@ -1174,13 +1338,226 @@ public sealed class ResultsLog : IDisposable
     }
 
     /// <summary>
-    /// One item of the drain queue: the text of one event, a flush request, or both.
+    /// One item of the drain queue: the text of one event, a batch of error records for the drain to render, or
+    /// a flush request.
     /// </summary>
     /// <param name="Text">The event's lines, each ending in <c>\r\n</c>, or <see langword="null"/>.</param>
+    /// <param name="Errors">
+    /// The records whose <c>ERROR</c> lines, and any <c>ERROR_CAP_REACHED</c> line, the drain renders and
+    /// writes, or <see langword="null"/>.
+    /// </param>
     /// <param name="FlushRequest">
     /// Completed once everything queued before it is flushed to the device, or <see langword="null"/>.
     /// </param>
-    private readonly record struct LogEntry(string? Text, TaskCompletionSource? FlushRequest);
+    private readonly record struct LogEntry(string? Text, ErrorBatch? Errors, TaskCompletionSource? FlushRequest);
+
+    /// <summary>
+    /// The part of one <see cref="LogErrors"/> call that reaches the <c>.log</c>, as the drain renders it.
+    /// </summary>
+    /// <param name="Utc">The time of the call, which stamps every line of the batch.</param>
+    /// <param name="Records">
+    /// The log's own copy of the records within the cap, in the caller's order; never modified once enqueued.
+    /// </param>
+    /// <param name="StepCount">The plan's step count at the call, or 0 when no run start had been logged.</param>
+    /// <param name="TotalErrors">The true error total the batch carried.</param>
+    /// <param name="CapReached">Whether the batch reached the cap, so <c>ERROR_CAP_REACHED</c> follows its lines.</param>
+    private sealed record ErrorBatch(DateTimeOffset Utc, ErrorRecord[] Records, int StepCount, ulong TotalErrors, bool CapReached);
+
+    /// <summary>
+    /// Keeps the Windows account out of free text written to the <c>.log</c> and <c>app-errors.log</c>: the run's
+    /// data folder is written <c>&lt;data&gt;</c>, the user's local and roaming application data folders and
+    /// profile folder <c>%LOCALAPPDATA%</c>, <c>%APPDATA%</c> and <c>%USERPROFILE%</c>, and the user name, where it
+    /// is a whole path segment, <c>%USERNAME%</c>.
+    /// </summary>
+    /// <remarks>
+    /// Folders are compared case-insensitively with <c>\</c> and <c>/</c> alike, the longest first, so a data folder
+    /// under the profile is written <c>&lt;data&gt;</c>. A folder or name matches only where its path segment ends,
+    /// at a separator, a quote, white space, punctuation or the end of the text, so <c>C:\Users\ann</c> never
+    /// matches inside <c>C:\Users\anna</c>. A folder Windows reports empty, or as a bare volume root, is skipped.
+    /// Never throws, so it is safe inside the crash handlers' app-error writes.
+    /// </remarks>
+    private sealed class PersonalDataRedactor
+    {
+        private const string DataFolderToken = "<data>";
+        private const string UserNameToken = "%USERNAME%";
+
+        // The account's folders and name are read once: they do not change while the process runs.
+        private static readonly (string Folder, string Token)[] _userFolders = ReadUserFolders();
+        private static readonly string? _userName = ReadUserName();
+
+        private readonly (string Folder, string Token)[] _folders;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="PersonalDataRedactor"/> class for the run whose data folder
+        /// is <paramref name="dataRoot"/>.
+        /// </summary>
+        public PersonalDataRedactor(string? dataRoot)
+        {
+            var folders = new List<(string Folder, string Token)>(_userFolders.Length + 1);
+            if (UsableFolder(dataRoot) is { } root)
+            {
+                folders.Add((root, DataFolderToken));
+            }
+
+            folders.AddRange(_userFolders);
+            _folders = folders.OrderByDescending(entry => entry.Folder.Length).ToArray();
+        }
+
+        /// <summary>
+        /// Returns <paramref name="text"/> with every folder and user-name segment replaced by its placeholder.
+        /// </summary>
+        public string Redact(string text)
+        {
+            // Every folder and every user-name segment holds or follows a directory separator.
+            if (text.AsSpan().IndexOfAny('\\', '/') < 0)
+            {
+                return text;
+            }
+
+            var builder = new StringBuilder(text.Length);
+            int position = 0;
+            while (position < text.Length)
+            {
+                if (MatchFolder(text, position) is { } match)
+                {
+                    builder.Append(match.Token);
+                    position += match.Length;
+                }
+                else if (MatchesUserName(text, position))
+                {
+                    builder.Append(UserNameToken);
+                    position += _userName!.Length;
+                }
+                else
+                {
+                    builder.Append(text[position]);
+                    position++;
+                }
+            }
+
+            return builder.ToString();
+        }
+
+        private (string Token, int Length)? MatchFolder(string text, int position)
+        {
+            if (position > 0 && char.IsLetterOrDigit(text[position - 1]))
+            {
+                return null;
+            }
+
+            foreach ((string folder, string token) in _folders)
+            {
+                if (RegionMatches(text, position, folder) && EndsSegment(text, position + folder.Length))
+                {
+                    return (token, folder.Length);
+                }
+            }
+
+            return null;
+        }
+
+        private static bool MatchesUserName(string text, int position) =>
+            _userName is { } userName
+            && position > 0
+            && IsSeparator(text[position - 1])
+            && RegionMatches(text, position, userName)
+            && EndsSegment(text, position + userName.Length);
+
+        private static bool RegionMatches(string text, int position, string value)
+        {
+            if (text.Length - position < value.Length)
+            {
+                return false;
+            }
+
+            for (int offset = 0; offset < value.Length; offset++)
+            {
+                char actual = text[position + offset];
+                char expected = value[offset];
+                if (IsSeparator(actual) && IsSeparator(expected))
+                {
+                    continue;
+                }
+
+                if (char.ToUpperInvariant(actual) != char.ToUpperInvariant(expected))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool EndsSegment(string text, int end) =>
+            end == text.Length
+            || IsSeparator(text[end])
+            || char.IsWhiteSpace(text[end])
+            || text[end] is '"' or '\'' or '.' or ',' or ';' or ':' or '!' or '?' or ')' or ']' or '}' or '>';
+
+        private static bool IsSeparator(char character) => character is '\\' or '/';
+
+        // A folder is matched without its trailing separator. A volume root such as C:\ names no account, and
+        // replacing it would rewrite every path on that volume, so it is skipped like a folder Windows does not know.
+        private static string? UsableFolder(string? folder)
+        {
+            if (string.IsNullOrWhiteSpace(folder))
+            {
+                return null;
+            }
+
+            string trimmed = Path.TrimEndingDirectorySeparator(folder.Trim());
+            return Path.GetPathRoot(trimmed) is { } volume && volume.Length >= trimmed.Length ? null : trimmed;
+        }
+
+        private static (string Folder, string Token)[] ReadUserFolders()
+        {
+            var folders = new List<(string Folder, string Token)>(3);
+            AddUserFolder(folders, Environment.SpecialFolder.LocalApplicationData, "%LOCALAPPDATA%");
+            AddUserFolder(folders, Environment.SpecialFolder.ApplicationData, "%APPDATA%");
+            AddUserFolder(folders, Environment.SpecialFolder.UserProfile, "%USERPROFILE%");
+            return folders.ToArray();
+        }
+
+        private static void AddUserFolder(
+            List<(string Folder, string Token)> folders,
+            Environment.SpecialFolder folder,
+            string token)
+        {
+            string? path;
+            try
+            {
+                // Windows reports a folder it does not know as an empty string.
+                path = Environment.GetFolderPath(folder, Environment.SpecialFolderOption.DoNotVerify);
+            }
+            catch (PlatformNotSupportedException)
+            {
+                path = null;
+            }
+
+            if (UsableFolder(path) is { } usable)
+            {
+                folders.Add((usable, token));
+            }
+        }
+
+        private static string? ReadUserName()
+        {
+            string userName;
+            try
+            {
+                userName = Environment.UserName;
+            }
+            catch (PlatformNotSupportedException)
+            {
+                return null;
+            }
+
+            // A name holding a separator could never be one path segment.
+            return string.IsNullOrWhiteSpace(userName) || userName.AsSpan().IndexOfAny('\\', '/') >= 0
+                ? null
+                : userName;
+        }
+    }
 
     /// <summary>
     /// Formats the lines of one event in the <c>.log</c> line format described on <see cref="ResultsLog"/>.
@@ -1198,11 +1575,13 @@ public sealed class ResultsLog : IDisposable
         private const string NotCaptured = "unknown";
 
         private readonly StringBuilder _text = new();
+        private readonly PersonalDataRedactor _redactor;
 
         /// <summary>
-        /// Gets a value indicating whether no line has been started.
+        /// Initializes a new instance of the <see cref="EventText"/> class whose free-text values pass through
+        /// <paramref name="redactor"/>.
         /// </summary>
-        public bool IsEmpty => _text.Length == 0;
+        public EventText(PersonalDataRedactor redactor) => _redactor = redactor;
 
         /// <summary>
         /// Ends the current line, if any, and starts <c>&lt;utc&gt; &lt;eventName&gt;</c>.
@@ -1230,11 +1609,12 @@ public sealed class ResultsLog : IDisposable
         }
 
         /// <summary>
-        /// Appends a free-text value, always quoted.
+        /// Appends a free-text value, always quoted, with the locations that name the Windows account replaced
+        /// by their placeholders.
         /// </summary>
         public EventText Text(string key, string? value)
         {
-            AppendValue(Key(key), value, alwaysQuote: true);
+            AppendValue(Key(key), value is null ? null : _redactor.Redact(value), alwaysQuote: true);
             return this;
         }
 

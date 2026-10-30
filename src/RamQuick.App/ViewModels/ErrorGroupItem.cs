@@ -5,8 +5,8 @@ namespace RamQuick.App.ViewModels;
 
 /// <summary>
 /// One line of the grouped error list in the result detail: the stored error records that hit one
-/// 8-byte word, shown as its address, how many stored records hit it, which bits flipped and the
-/// step that first reported it.
+/// 8-byte word, shown as its labelled virtual address, how many stored records hit it, which bits
+/// flipped and the step that first reported it.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -27,7 +27,10 @@ public sealed class ErrorGroupItem
     /// Initializes a new instance of the <see cref="ErrorGroupItem"/> class and formats every
     /// displayed text of the group once.
     /// </summary>
-    /// <param name="group">The error group to display, as built by <see cref="ErrorGrouping.Group"/>.</param>
+    /// <param name="group">
+    /// The error group to display, as built by <see cref="ErrorGrouping.Group"/> or
+    /// <see cref="IncrementalErrorGrouping"/>.
+    /// </param>
     /// <exception cref="ArgumentNullException"><paramref name="group"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentOutOfRangeException">
     /// The group's <see cref="ErrorGroup.Count"/> is less than 1; every group holds at least one record.
@@ -48,11 +51,13 @@ public sealed class ErrorGroupItem
         FirstStepName = group.FirstStepName;
         FirstTimeText = DisplayFormat.Duration(group.FirstTimeIntoTest);
 
-        // The list line carries exactly the template's four parts (address, count, bits, first
-        // step); the first time stays a separate property rather than a fifth, unused argument.
+        // The list line carries exactly the template's parts: the address, labelled as virtual
+        // like every displayed address in v1, then the count, bits and first step. The first time
+        // stays a separate property rather than an extra, unused argument.
         Text = string.Format(
             CultureInfo.InvariantCulture,
             UiText.ErrorGroupFormat,
+            UiText.VirtualAddressLabel,
             AddressText,
             CountText,
             BitsText,
@@ -103,10 +108,10 @@ public sealed class ErrorGroupItem
     public string FirstTimeText { get; }
 
     /// <summary>
-    /// Gets the item's display line, <see cref="UiText.ErrorGroupFormat"/> filled with the address,
-    /// the count, the bits and the first step, such as
-    /// "0x0000023A4F7C1D48 — 3 errors — bits 17 — first in 'Random bank thrash'". The grouped error
-    /// list binds this text.
+    /// Gets the item's display line, <see cref="UiText.ErrorGroupFormat"/> filled with
+    /// <see cref="UiText.VirtualAddressLabel"/>, the address, the count, the bits and the first step,
+    /// such as "virtual address 0x0000023A4F7C1D48 — 3 errors — bits 17 — first in 'Random bank
+    /// thrash'". The grouped error list binds this text.
     /// </summary>
     public string Text { get; }
 

@@ -6,6 +6,7 @@ using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows.Threading;
+using RamQuick.App;
 using RamQuick.App.Services;
 using RamQuick.App.Tests.Fakes;
 using RamQuick.Core;
@@ -45,13 +46,18 @@ internal static class Program
 /// </summary>
 internal static class HostExitCodes
 {
-    /// <summary>The run ended PASS and both summaries were published.</summary>
+    /// <summary>The run ended PASS and the controller published both of the run's own summaries.</summary>
     public const int Passed = 0;
 
-    /// <summary>The run ended FAIL and both summaries were published.</summary>
+    /// <summary>The run ended FAIL and the controller published both of the run's own summaries.</summary>
+    /// <remarks>
+    /// Reached only when the production engine reports memory errors for this host's run, at the first error or in a
+    /// run that completes with errors, which healthy hardware never produces. The host binds only the production
+    /// engine, so it has no fault injection by design, and no process-level test drives this code.
+    /// </remarks>
     public const int Failed = 1;
 
-    /// <summary>The run ended ABORTED and both summaries were published.</summary>
+    /// <summary>The run ended ABORTED and the controller published both of the run's own summaries.</summary>
     public const int Aborted = 2;
 
     /// <summary>
@@ -61,12 +67,18 @@ internal static class HostExitCodes
     public const int Refused = 3;
 
     /// <summary>
-    /// The run's summaries could not be confirmed on disk, its run id was not found, or the run did not finish within
+    /// The run's own summaries could not be confirmed on disk: the controller reported that it could not save them, a
+    /// summary under the run's name is missing or is not the run's own publication (another run id, a summary rebuilt
+    /// from a journal, or another verdict or end reason), the run id was not found, or the run did not finish within
     /// the overall timeout.
     /// </summary>
     public const int NotPublished = 4;
 
     /// <summary>An unhandled exception ended the host.</summary>
+    /// <remarks>
+    /// Reached only through the fatal path, an exception escaping the run, the dispatcher or another thread, which is a
+    /// host or controller defect that no valid command line produces, so no process-level test drives this code.
+    /// </remarks>
     public const int Unhandled = 5;
 }
 
@@ -280,7 +292,7 @@ internal sealed class HostOutput : IDisposable
     /// <param name="reason">The end reason's name, or <c>None</c>.</param>
     public void Verdict(string verdict, string reason) => Event("VERDICT " + verdict + " reason=" + reason);
 
-    /// <summary>Reports that both summaries of the run are on disk and the JSON one parses.</summary>
+    /// <summary>Reports that both of the run's own summaries are on disk and the JSON one parses.</summary>
     /// <param name="jsonPath">The full path of the JSON summary.</param>
     /// <param name="textPath">The full path of the text summary.</param>
     public void Published(string jsonPath, string textPath) => Event("PUBLISHED json=" + jsonPath + " txt=" + textPath);
@@ -391,6 +403,9 @@ internal sealed partial class HostRun
     private static readonly TimeSpan _runIdSearchLimit = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan _runIdRetryDelay = TimeSpan.FromMilliseconds(100);
 
+    // The controller's save-failure notice up to its variable part, taken from UiText so the wording has one owner.
+    private static readonly string _resultsNotSavedPrefix = UiText.ResultsNotSaved(string.Empty);
+
     private readonly HostOptions _options;
     private readonly HostOutput _output;
     private readonly TaskCompletionSource<WaitOutcome> _completion =
@@ -409,6 +424,10 @@ internal sealed partial class HostRun
     private Task<RunIdentity?>? _runIdentity;
     private bool _startAccepted;
     private bool _sawPreparing;
+
+    // The first save failure the controller reported after this run entered Preparing.
+    private string? _saveFailure;
+
     private bool _verdictReported;
     private bool _graphDisposed;
     private int _fatalReported;
@@ -667,13 +686,17 @@ internal sealed partial class HostRun
         }
 
         DataDirectory dataDirectory = prepared.DataDirectory;
-        PublicationCheck publication = await Task.Run(() => CheckPublication(dataDirectory, identity));
-        if (publication.Failure is { } failure)
+        RunStateMachine stateMachine = controller.StateMachine;
+        string? expectedVerdict = stateMachine.State.ToVerdictText();
+        string? expectedEndReason = stateMachine.EndReason?.ToString();
+        PublicationCheck publication = await Task.Run(
+            () => CheckPublication(dataDirectory, identity, expectedVerdict, expectedEndReason));
+
+        // A save failure the controller reported means the run's own publication failed, even where files under the
+        // run's name pass the check.
+        if ((publication.Failure ?? _saveFailure) is { } failure)
         {
-            // The controller's notice (its save failure, when it saw one) is appended rather than used instead of the
-            // check's finding, because the notice can also be an unrelated recovery outcome of this Start.
-            _output.Error("results not published: " + failure
-                + (controller.NoticeMessage is { } notice ? " (" + notice + ")" : string.Empty));
+            _output.Error("results not published: " + WithControllerNotices(failure, controller.NoticeMessage));
             return HostExitCodes.NotPublished;
         }
 
@@ -685,6 +708,25 @@ internal sealed partial class HostRun
             RunState.Aborted => HostExitCodes.Aborted,
             _ => HostExitCodes.NotPublished,
         };
+    }
+
+    // The controller's save failure and current notice are appended rather than used instead of the finding, because
+    // the notice can also be an unrelated recovery outcome of this Start. A notice the text already states is not
+    // repeated.
+    private string WithControllerNotices(string finding, string? currentNotice)
+    {
+        var notices = new List<string>(2);
+        foreach (string? notice in new[] { _saveFailure, currentNotice })
+        {
+            if (notice is not null
+                && !finding.Contains(notice, StringComparison.Ordinal)
+                && !notices.Contains(notice, StringComparer.Ordinal))
+            {
+                notices.Add(notice);
+            }
+        }
+
+        return notices.Count == 0 ? finding : finding + " (" + string.Join("; ", notices) + ")";
     }
 
     private static HashSet<string> ListRunLogs(string logsDirectory)
@@ -740,8 +782,14 @@ internal sealed partial class HostRun
         return new RunLogSearch(identity, Conclusive: true, fileName);
     }
 
-    // Runs on the thread pool: both summaries must exist, and the JSON one must parse and name this run.
-    private static PublicationCheck CheckPublication(DataDirectory dataDirectory, RunIdentity identity)
+    // Runs on the thread pool: both summaries must exist, and the JSON one must parse, name this run and be the run's
+    // own publication. A launch recovery, in this or another process, can publish a summary rebuilt from this run's
+    // journal under the same name and run id; it is never the run's own, whatever its verdict.
+    private static PublicationCheck CheckPublication(
+        DataDirectory dataDirectory,
+        RunIdentity identity,
+        string? expectedVerdict,
+        string? expectedEndReason)
     {
         string jsonPath = ResultsLog.GetSummaryJsonPath(dataDirectory, identity.BaseName);
         string textPath = ResultsLog.GetSummaryTextPath(dataDirectory, identity.BaseName);
@@ -768,6 +816,27 @@ internal sealed partial class HostRun
         if (!string.Equals(summary.Run.Id, identity.RunId, StringComparison.OrdinalIgnoreCase))
         {
             return new PublicationCheck(jsonPath, textPath, $"{jsonPath} names run {summary.Run.Id}, not {identity.RunId}");
+        }
+
+        SummaryRun run = summary.Run;
+        if (run.Recovered || run.Partial)
+        {
+            string kind = (run.Partial ? "a partial summary" : "a summary")
+                + (run.Recovered ? " recovered from a journal" : string.Empty);
+            return new PublicationCheck(
+                jsonPath,
+                textPath,
+                $"{jsonPath} is {kind} (verdict {run.Verdict}, reason {run.EndReason}), not this run's own");
+        }
+
+        if (!string.Equals(run.Verdict, expectedVerdict, StringComparison.Ordinal)
+            || !string.Equals(run.EndReason, expectedEndReason, StringComparison.Ordinal))
+        {
+            return new PublicationCheck(
+                jsonPath,
+                textPath,
+                $"{jsonPath} records verdict {run.Verdict}, reason {run.EndReason}, "
+                    + $"not this run's verdict {expectedVerdict ?? "none"}, reason {expectedEndReason ?? "none"}");
         }
 
         return new PublicationCheck(jsonPath, textPath, null);
@@ -859,6 +928,11 @@ internal sealed partial class HostRun
 
     private void OnControllerPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
+        if (e.PropertyName is nameof(RunController.NoticeMessage) or null or "")
+        {
+            RecordSaveFailure();
+        }
+
         if (e.PropertyName is nameof(RunController.CanStart)
             or nameof(RunController.PostRunActivity)
             or nameof(RunController.NoticeMessage)
@@ -866,6 +940,19 @@ internal sealed partial class HostRun
             or "")
         {
             EvaluateCompletion();
+        }
+    }
+
+    // The accepted Start cleared the notice, and from Preparing on only this run's publication reports a save failure,
+    // so the first one seen is this run's own; a later notice never replaces it.
+    private void RecordSaveFailure()
+    {
+        if (_sawPreparing
+            && _saveFailure is null
+            && _controller?.NoticeMessage is { } notice
+            && notice.StartsWith(_resultsNotSavedPrefix, StringComparison.Ordinal))
+        {
+            _saveFailure = notice;
         }
     }
 

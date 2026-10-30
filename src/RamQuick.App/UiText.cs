@@ -123,6 +123,13 @@ public static class UiText
     public const string ResultAutomationName = "Result";
 
     /// <summary>
+    /// The automation name of the scrolling detail area below the result header: the cause hints and the
+    /// grouped error list, preceded in the compact and minimal layouts by the text the fixed rows shorten
+    /// or omit. The area is a tab stop so the keyboard can scroll it.
+    /// </summary>
+    public const string ResultDetailAutomationName = "Result details";
+
+    /// <summary>
     /// The automation name of the cause hint list.
     /// </summary>
     public const string CauseHintsAutomationName = "Probable causes";
@@ -343,8 +350,9 @@ public static class UiText
     public const string ErrorGroupsTruncatedHeader = "Grouped from the first 10,000 errors";
 
     /// <summary>
-    /// The word placed before every displayed address, filled into <see cref="FirstErrorFormat"/>.
-    /// Addresses are virtual because no documented user-mode API yields physical addresses.
+    /// The word placed before every displayed address, filled into <see cref="FirstErrorFormat"/> and
+    /// <see cref="ErrorGroupFormat"/>. Addresses are virtual because no documented user-mode API
+    /// yields physical addresses.
     /// </summary>
     public const string VirtualAddressLabel = "virtual address";
 
@@ -426,11 +434,12 @@ public static class UiText
     public const string CauseHintFormat = "{0} {1} — {2} — {3}";
 
     /// <summary>
-    /// Composite format of a grouped error item: {0} the word address, {1} the error count (see
-    /// <see cref="ErrorCount"/>), {2} the flipped bit positions, {3} the name of the step that
-    /// first reported the word.
+    /// Composite format of a grouped error item: {0} <see cref="VirtualAddressLabel"/>, {1} the word
+    /// address, {2} the error count (see <see cref="ErrorCount"/>), {3} the flipped bit positions,
+    /// {4} the name of the step that first reported the word. Example: "virtual address
+    /// 0x0000023A4F7C1D48 — 3 errors — bits 5, 17 — first in 'Random bank thrash'".
     /// </summary>
-    public const string ErrorGroupFormat = "{0} — {1} — bits {2} — first in '{3}'";
+    public const string ErrorGroupFormat = "{0} {1} — {2} — bits {3} — first in '{4}'";
 
     /// <summary>
     /// Composite format of the one-line status of the minimal window layout: {0} the current step,
@@ -442,6 +451,27 @@ public static class UiText
     /// <see cref="ErrorCount"/> instead.
     /// </remarks>
     public const string StatusLineFormat = "{0} · {1} · {2} errors · {3}";
+
+    /// <summary>
+    /// Composite format of the automation name of a live reading or memory summary value: {0} the
+    /// field's label, {1} its current value. Example: "RAM temperature: 48 °C".
+    /// </summary>
+    /// <remarks>
+    /// A value is shown in its own text element beside its label, and a text element's automation
+    /// name is its text, so without this name a screen reader would announce a bare "N/A" or "03:12".
+    /// </remarks>
+    public const string LabeledValueAutomationFormat = "{0}: {1}";
+
+    /// <summary>
+    /// Composite format of the result's automation name, which a screen reader announces when a
+    /// verdict appears or its reason changes: {0} the verdict, {1} its reason. Example:
+    /// "ABORTED: Stopped by user".
+    /// </summary>
+    /// <remarks>
+    /// One name carries both, so the verdict and its reason are announced together rather than as
+    /// two announcements that interrupt each other.
+    /// </remarks>
+    public const string ResultAnnouncementFormat = "{0}: {1}";
 
     /// <summary>
     /// The separator placed between notices when several apply at once.

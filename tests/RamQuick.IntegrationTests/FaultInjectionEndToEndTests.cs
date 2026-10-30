@@ -18,7 +18,8 @@ namespace RamQuick.IntegrationTests;
 /// End-to-end fault injection through <c>RamQuick.Interop</c> over <c>ramquick_engine_test.dll</c>: every injected
 /// corruption that had a verification opportunity is reported exactly once with its word, bit, step and pass; the
 /// analyzer ranks the expected cause first and labels it a hint; the stored-detail cap keeps the true total; and Stop on
-/// error halts the run within 2 s of the first injected error.
+/// error halts the run within 2 s of the first injected error, with an end detail that numbers that error's step and
+/// pass as its stored record and its <c>.log</c> line do.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -84,6 +85,13 @@ public sealed class FaultInjectionEndToEndTests
     private const string SummaryErrorsProperty = "errors";
     private const string SummaryRunProperty = "run";
     private const string FailVerdict = "FAIL";
+
+    // A run's files share one base name in the logs folder: <base>.log and <base>-summary.json.
+    private const string SummaryJsonSuffix = "-summary.json";
+    private const string LogExtension = ".log";
+
+    // Every .log line ends in CRLF.
+    private const string LogLineEnd = "\r\n";
 
     private static readonly TimeSpan _releasedTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan _runTimeoutSlack = TimeSpan.FromSeconds(60);
@@ -396,7 +404,7 @@ public sealed class FaultInjectionEndToEndTests
                 string.Create(CultureInfo.InvariantCulture, $"{unlabelled.Length} of {view.CauseHintTexts.Count} displayed hints lack the '{UiText.HintPrefix}' prefix: ")
                 + Listed(unlabelled));
 
-            await AssertFirstErrorSummaryAsync(harness.Root, cancellationToken);
+            await AssertFirstErrorSummaryAsync(harness.Root, ScaledPlans.FaultInjectionStandard.Steps.Count, cancellationToken);
         }
         finally
         {
@@ -697,7 +705,7 @@ public sealed class FaultInjectionEndToEndTests
         return (Path.GetFileName(summaries[0]), JsonDocument.Parse(json));
     }
 
-    private static async Task AssertFirstErrorSummaryAsync(TempDataRoot root, CancellationToken cancellationToken)
+    private async Task AssertFirstErrorSummaryAsync(TempDataRoot root, int stepCount, CancellationToken cancellationToken)
     {
         (string fileName, JsonDocument document) = await ReadPublishedSummaryAsync(root, cancellationToken);
         using (document)
@@ -717,7 +725,53 @@ public sealed class FaultInjectionEndToEndTests
                 string.Create(CultureInfo.InvariantCulture, $"Summary '{fileName}': run.verdict {verdict}, run.endReason {endReason}, ")
                 + string.Create(CultureInfo.InvariantCulture, $"causeHints.label '{label}', {hintCount} hint(s); expected {FailVerdict}, ")
                 + string.Create(CultureInfo.InvariantCulture, $"{nameof(RunEndReason.FirstError)}, '{CauseHints.HintLabel}' and at least one hint."));
+
+            // The end detail, the first stored record and that record's .log ERROR line must number the error's step and
+            // pass alike: the detail and the .log count from 1, the summary's records keep the engine's 0-based indices.
+            // Every pass ends at a barrier of all workers, so whichever worker's error wrote the detail, it was found in
+            // the step and pass of record 0.
+            string? endDetail = run.GetProperty("endDetail").GetString();
+            JsonElement records = document.RootElement.GetProperty(SummaryErrorsProperty).GetProperty("records");
+            Assert.True(records.GetArrayLength() > 0, string.Create(CultureInfo.InvariantCulture, $"Summary '{fileName}' stores no error record."));
+            JsonElement first = records[0];
+            ulong sequence = first.GetProperty("sequence").GetUInt64();
+            int stepNumber = first.GetProperty("stepIndex").GetInt32() + 1;
+            int passNumber = first.GetProperty("passIndex").GetInt32() + 1;
+
+            string logPath = Path.Combine(root.LogsPath, fileName[..^SummaryJsonSuffix.Length] + LogExtension);
+            Assert.True(File.Exists(logPath), string.Create(CultureInfo.InvariantCulture, $"Summary '{fileName}' has no results log '{logPath}'."));
+            string errorPrefix = string.Create(CultureInfo.InvariantCulture, $" ERROR seq={sequence} ");
+            string? errorLine = (await ReadSharedTextAsync(logPath, cancellationToken))
+                .Split(LogLineEnd, StringSplitOptions.RemoveEmptyEntries)
+                .FirstOrDefault(line => line.Contains(errorPrefix, StringComparison.Ordinal));
+            _output.WriteLine("Summary run.endDetail: " + (endDetail ?? "(null)"));
+            _output.WriteLine(string.Create(CultureInfo.InvariantCulture, $".log ERROR line of errors.records[0] (seq {sequence}): {errorLine ?? "(none)"}"));
+
+            string expectedDetail = string.Create(
+                CultureInfo.InvariantCulture,
+                $"First error: step {stepNumber} of {stepCount}, pass {passNumber}, worker ");
+            Assert.True(
+                endDetail is not null && endDetail.StartsWith(expectedDetail, StringComparison.Ordinal),
+                string.Create(CultureInfo.InvariantCulture, $"Summary '{fileName}': run.endDetail '{endDetail}' does not begin '{expectedDetail}', the step and pass ")
+                + string.Create(CultureInfo.InvariantCulture, $"of errors.records[0] (stepIndex {stepNumber - 1}, passIndex {passNumber - 1}) counted from 1."));
+
+            string expectedStep = string.Create(CultureInfo.InvariantCulture, $" step={stepNumber}/{stepCount} ");
+            string expectedPass = string.Create(CultureInfo.InvariantCulture, $" pass={passNumber} ");
+            Assert.True(
+                errorLine is not null
+                    && errorLine.Contains(expectedStep, StringComparison.Ordinal)
+                    && errorLine.Contains(expectedPass, StringComparison.Ordinal),
+                string.Create(CultureInfo.InvariantCulture, $"'{Path.GetFileName(logPath)}': the ERROR line of record {sequence} ('{errorLine}') does not hold ")
+                + string.Create(CultureInfo.InvariantCulture, $"'{expectedStep.Trim()}' and '{expectedPass.Trim()}', the numbering of run.endDetail '{endDetail}'."));
         }
+    }
+
+    // The results log is written with read sharing only, so a reader that may overlap its writer allows write sharing.
+    private static async Task<string> ReadSharedTextAsync(string path, CancellationToken cancellationToken)
+    {
+        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        return await reader.ReadToEndAsync(cancellationToken);
     }
 
     private static async Task AssertTruncatedSummaryAsync(TempDataRoot root, ulong trueTotal, CancellationToken cancellationToken)

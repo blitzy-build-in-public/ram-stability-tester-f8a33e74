@@ -28,9 +28,14 @@ namespace rq::engine {
 
 namespace {
 
-/** Closes a kernel handle; the deleter of unique_handle. */
+/**
+ * Closes a kernel handle; the deleter of unique_handle. A failed close reaches the debugger
+ * through close_handle_checked, the most a deleter can do about it.
+ */
 struct handle_closer {
-    void operator()(HANDLE handle) const noexcept { CloseHandle(handle); }
+    void operator()(HANDLE handle) const noexcept {
+        close_handle_checked(handle, L"process token (lock-pages privilege query)");
+    }
 };
 
 /** Owns a kernel handle (the process token) so it is closed on every path. */

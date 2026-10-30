@@ -15,6 +15,14 @@ namespace RamQuick.Logging;
 /// a verdict, where it stopped.
 /// </para>
 /// <para>
+/// The steps table has one row per started step, with every <see cref="SummaryStep"/> value, its primary
+/// mechanism included. The errors section lists every stored group, with its word address, count, flipped
+/// bits, first step and first and last error times, and every stored record, with every
+/// <see cref="SummaryErrorRecord"/> value. A summary holds at most <see cref="ErrorGrouping.StoredDetailCap"/>
+/// of each, as the engine stores no more; a damaged or foreign document read back can hold more, and its
+/// listing stops at that cap with a line stating how many entries it leaves out.
+/// </para>
+/// <para>
 /// Rendering is pure and deterministic: no clock, environment or current culture is read. Numbers, dates and
 /// times use the invariant culture and every line ends with <c>"\r\n"</c>, so equal summaries give
 /// byte-identical text on every machine. Free text taken from the summary, such as a step name or an end
@@ -23,7 +31,8 @@ namespace RamQuick.Logging;
 /// <para>
 /// The cause hints are always written below <see cref="SummaryCauseHints.HintLabel"/>, as the UI and the JSON
 /// summary label them, and every item starts with <c>"Hint:"</c>; no wording states a cause as certain.
-/// Addresses are named by their kind, <c>"virtual address"</c> in v1.
+/// Addresses are named by their kind, <c>"virtual address"</c> in v1: a record's by its own address kind, and
+/// a group's word address, which the schema gives no kind of its own, by the summary's memory address kind.
 /// </para>
 /// </remarks>
 public static class TextSummaryFormatter
@@ -50,11 +59,12 @@ public static class TextSummaryFormatter
     private const string UpToOneDecimal = "0.#";
     private const string UpToThreeDecimals = "0.0##";
     private const string ThreeDecimals = "0.000";
+
+    // A time since write is measured in microseconds, so it keeps up to six decimals of a second.
+    private const string ThreeToSixDecimals = "0.000###";
     private const string TwoDecimals = "0.00";
     private const string WholeNumber = "0";
     private const string GroupedDigits = "N0";
-    private const int ListedGroupLimit = 100;
-    private const int ListedRecordLimit = 100;
     private const double BytesPerGibibyte = 1024.0 * 1024.0 * 1024.0;
 
     // Bounds the whole-second conversion of a plan target; no plan comes near it.
@@ -69,6 +79,7 @@ public static class TextSummaryFormatter
         ("Order", false),
         ("Threads", false),
         ("Hold s", true),
+        ("Primary mechanism", false),
         ("Planned s", true),
         ("Actual s", true),
         ("Overrun s", true),
@@ -104,7 +115,7 @@ public static class TextSummaryFormatter
         AppendSteps(text, summary.Steps);
         AppendCoverage(text, summary.Coverage);
         AppendTemperatures(text, summary.Temperatures);
-        AppendErrors(text, summary.Errors);
+        AppendErrors(text, summary.Errors, summary.Memory.AddressKind);
         AppendCauseHints(text, summary.CauseHints);
         if (summary.UnfinishedRun is { } unfinished)
         {
@@ -128,8 +139,14 @@ public static class TextSummaryFormatter
     {
         ArgumentNullException.ThrowIfNull(text);
 
-        foreach (ReadOnlySpan<char> line in text.AsSpan().EnumerateLines())
+        // An explicit MoveNext loop rather than foreach: from .NET 9 on, SpanLineEnumerator
+        // implements IEnumerator<T>, and foreach over it then needs C# 13. The repository compiles
+        // as C# 12, so this loop keeps a retarget to a newer .NET a change of the target framework
+        // alone.
+        SpanLineEnumerator lines = text.AsSpan().EnumerateLines();
+        while (lines.MoveNext())
         {
+            ReadOnlySpan<char> line = lines.Current;
             if (line.StartsWith(RunIdLinePrefix, StringComparison.Ordinal))
             {
                 ReadOnlySpan<char> value = line[RunIdLinePrefix.Length..].Trim();
@@ -261,6 +278,7 @@ public static class TextSummaryFormatter
                 TextOrNotCaptured(step.AccessOrder),
                 TextOrNotCaptured(step.ThreadMode),
                 Number(step.HoldSeconds, UpToOneDecimal),
+                TextOrNotCaptured(step.PrimaryMechanism),
                 Number(step.PlannedSeconds, UpToOneDecimal),
                 NumberOrDash(step.ActualSeconds, OneDecimal),
                 NumberOrDash(step.OverrunSeconds, OneDecimal),
@@ -346,7 +364,7 @@ public static class TextSummaryFormatter
         Field(text, "RAM max", Temperature(temperatures.RamMaxC, temperatures.RamStatus));
     }
 
-    private static void AppendErrors(StringBuilder text, SummaryErrors errors)
+    private static void AppendErrors(StringBuilder text, SummaryErrors errors, string? addressKind)
     {
         Heading(text, "Errors");
         Field(text, "Total errors (true count)", Count(errors.Total));
@@ -360,16 +378,11 @@ public static class TextSummaryFormatter
         Line(text, errors.Truncated ? stored + " (truncated: total exceeds stored detail)" : stored);
         Field(text, "Distinct addresses (stored)", Count(errors.StoredDistinctAddresses));
 
-        AppendErrorGroups(text, errors);
+        AppendErrorGroups(text, errors, addressKind);
         AppendErrorRecords(text, errors.Records);
-        if (errors.Groups.Count > 0 || errors.Records.Count > 0)
-        {
-            Line(text, string.Empty);
-            Line(text, "The JSON summary and the .log file hold the full stored detail.");
-        }
     }
 
-    private static void AppendErrorGroups(StringBuilder text, SummaryErrors errors)
+    private static void AppendErrorGroups(StringBuilder text, SummaryErrors errors, string? addressKind)
     {
         IReadOnlyList<SummaryErrorGroup> groups = errors.Groups;
         if (groups.Count == 0)
@@ -381,25 +394,25 @@ public static class TextSummaryFormatter
         // in the UI's words.
         bool capReached = errors.Truncated || (errors.StoredCap > 0 && errors.StoredCount >= errors.StoredCap);
         int cap = errors.StoredCap > 0 ? errors.StoredCap : errors.StoredCount;
+        string addressLabel = GroupAddressLabel(addressKind);
 
         Line(text, string.Empty);
         Line(text, capReached ? "Grouped from the first " + Count(cap) + " errors" : "Errors by address");
-        int shown = Math.Min(groups.Count, ListedGroupLimit);
-        for (int i = 0; i < shown; i++)
+        int listed = Math.Min(groups.Count, ErrorGrouping.StoredDetailCap);
+        for (int i = 0; i < listed; i++)
         {
             SummaryErrorGroup group = groups[i];
             Line(
                 text,
-                "  " + TextOrNotCaptured(group.WordAddress)
+                "  " + addressLabel + " " + TextOrNotCaptured(group.WordAddress)
                     + "  " + ErrorCount(group.Count)
                     + "  bits " + BitsOfMask(group.BitMaskUnion)
-                    + "  first step '" + TextOrNotCaptured(group.FirstStepName) + "'");
+                    + "  first step '" + TextOrNotCaptured(group.FirstStepName) + "'"
+                    + "  first error at " + Number(group.FirstTimeIntoTest, ThreeDecimals) + " s"
+                    + "  last error at " + Number(group.LastTimeIntoTest, ThreeDecimals) + " s");
         }
 
-        if (groups.Count > shown)
-        {
-            Line(text, "  Showing the " + Integer(shown) + " largest of " + Count(groups.Count) + " groups.");
-        }
+        AppendUnlisted(text, groups.Count - listed, "group", "groups");
     }
 
     private static void AppendErrorRecords(StringBuilder text, IReadOnlyList<SummaryErrorRecord> records)
@@ -409,14 +422,10 @@ public static class TextSummaryFormatter
             return;
         }
 
-        int shown = Math.Min(records.Count, ListedRecordLimit);
+        int listed = Math.Min(records.Count, ErrorGrouping.StoredDetailCap);
         Line(text, string.Empty);
-        Line(
-            text,
-            records.Count > shown
-                ? "Stored error records (first " + Integer(shown) + " of " + Count(records.Count) + ")"
-                : "Stored error records (" + Count(records.Count) + ")");
-        for (int i = 0; i < shown; i++)
+        Line(text, "Stored error records (" + Count(records.Count) + ")");
+        for (int i = 0; i < listed; i++)
         {
             SummaryErrorRecord record = records[i];
             Line(
@@ -431,7 +440,43 @@ public static class TextSummaryFormatter
                     + ", actual " + TextOrNotCaptured(record.Actual)
                     + ", re-read " + TextOrNotCaptured(record.Reread)
                     + " (" + RereadText(record.RereadOutcome) + ")");
+
+            // Step and pass indices are the stored 0-based values, named as indices so they read as the same
+            // data as the JSON rather than as the steps table's 1-based numbers.
+            Line(
+                text,
+                "     bit mask " + TextOrNotCaptured(record.BitMask)
+                    + ", sequence " + Integer(record.Sequence)
+                    + ", region offset " + Count(record.RegionOffset) + " bytes"
+                    + ", step index " + Integer(record.StepIndex)
+                    + ", pass index " + Integer(record.PassIndex));
+            Line(
+                text,
+                "     access type " + TextOrNotCaptured(record.AccessType)
+                    + ", time since write " + Number(record.TimeSinceWrite, ThreeToSixDecimals) + " s"
+                    + ", worker index " + Integer(record.WorkerIndex)
+                    + ", processor group " + Integer(record.ProcessorGroup)
+                    + ", logical processor " + Integer(record.LogicalProcessor)
+                    + ", active workers " + Integer(record.ActiveWorkers));
         }
+
+        AppendUnlisted(text, records.Count - listed, "record", "records");
+    }
+
+    // A summary the product writes holds at most the stored-detail cap of groups and of records, as the engine
+    // stores no more; only a damaged or foreign document read back can hold more. Its listing stops at the cap,
+    // and this line says how many entries it leaves out, so nothing is dropped silently.
+    private static void AppendUnlisted(StringBuilder text, int unlisted, string singular, string plural)
+    {
+        if (unlisted <= 0)
+        {
+            return;
+        }
+
+        Line(
+            text,
+            "  " + (unlisted == 1 ? "1 more " + singular + " is" : Count(unlisted) + " more " + plural + " are")
+                + " beyond the stored-detail cap of " + Count(ErrorGrouping.StoredDetailCap) + " and not listed.");
     }
 
     private static void AppendCauseHints(StringBuilder text, SummaryCauseHints causeHints)
@@ -498,6 +543,15 @@ public static class TextSummaryFormatter
     {
         string kind = OneLine(addressKind).Trim();
         return kind.Length == 0 ? "address" : kind.ToLowerInvariant() + " address";
+    }
+
+    // A group's word address is the virtual address of the word its records hit; the schema gives a group no
+    // address kind of its own. It is named by the summary's memory address kind, and as virtual, the only v1
+    // kind, when the document did not capture one.
+    private static string GroupAddressLabel(string? addressKind)
+    {
+        string kind = OneLine(addressKind).Trim();
+        return AddressLabel(kind.Length > 0 ? kind : nameof(AddressKind.Virtual));
     }
 
     private static string Capacity(ulong? bytes) =>
@@ -615,6 +669,8 @@ public static class TextSummaryFormatter
     }
 
     private static string Integer(long value) => value.ToString(Invariant);
+
+    private static string Integer(ulong value) => value.ToString(Invariant);
 
     private static string IntegerOrNotCaptured(int? value) => value is { } number ? Integer(number) : NotCaptured;
 

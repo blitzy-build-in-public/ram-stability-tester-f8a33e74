@@ -18,7 +18,11 @@ namespace RamQuick.Interop;
 /// </para>
 /// <para>
 /// As a by-value P/Invoke argument this handle is reference-counted for the duration of each call, so a concurrent
-/// <see cref="SafeHandle.Dispose()"/> cannot destroy the session under a running <c>rq_session_*</c> call.
+/// <see cref="SafeHandle.Dispose()"/> cannot destroy the session under a running <c>rq_session_*</c> call. The release
+/// then runs when that call drops the last reference, on its thread. When that thread is an engine coordinator inside a
+/// callback, for example a step gate's <c>rq_session_stop</c>, the engine refuses <c>rq_session_destroy</c> there, so
+/// <see cref="ReleaseHandle"/> hands destruction to a dedicated release thread, and <see cref="WaitForRelease"/> lets the
+/// disposer wait for it.
 /// </para>
 /// <para>
 /// Lifecycle: <c>EngineSession</c> constructs the handle around the GCHandle before <c>rq_session_create</c>, passes
@@ -35,9 +39,15 @@ internal sealed class SafeSessionHandle : SafeHandleZeroOrMinusOneIsInvalid
     private const int ResultOk = 0;
     private const int ResultInvalidHandle = -2;
 
+    private const string ReleaseThreadName = "RamQuick session release";
+
     // A normal (not pinned) handle: the engine only stores and returns its value, which stays stable however the
     // CallbackState moves. Not readonly, because Free() mutates the struct in place.
     private GCHandle _callbackHandle;
+
+    // Completed once the release has run to its end, on whichever thread, failures included, so a waiter never hangs.
+    // A TaskCompletionSource needs no disposal, which a handle released by its finalizer could not provide.
+    private readonly TaskCompletionSource _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     /// <summary>
     /// Creates a handle that owns <paramref name="callbackHandle"/> and, as yet, no native session.
@@ -137,59 +147,123 @@ internal sealed class SafeSessionHandle : SafeHandleZeroOrMinusOneIsInvalid
     }
 
     /// <summary>
-    /// Destroys the native session, then disposes the stop event and frees the GCHandle to the callback state.
+    /// Blocks until the release that <see cref="SafeHandle.Dispose()"/> started has finished, on whichever thread
+    /// dropped the last reference: the disposing thread itself, a thread whose <c>rq_session_*</c> call still held the
+    /// handle, or the release thread to which a callback's last release handed destruction. Returns at once when no
+    /// native session was ever attached, because the runtime then never runs <see cref="ReleaseHandle"/>.
+    /// </summary>
+    /// <remarks>
+    /// Call it after <see cref="SafeHandle.Dispose()"/>. Never call it while the calling thread itself holds a
+    /// <see cref="SafeHandle.DangerousAddRef(ref bool)"/> reference, which keeps the release from starting, nor inside an
+    /// engine callback, whose coordinator <c>rq_session_destroy</c> must join: either way the call would never return.
+    /// </remarks>
+    internal void WaitForRelease()
+    {
+        if (IsInvalid)
+        {
+            return;
+        }
+
+        _released.Task.Wait();
+    }
+
+    /// <summary>
+    /// Destroys the native session, then disposes the stop event and frees the GCHandle to the callback state; inside an
+    /// engine callback, starts a release thread that does so.
     /// </summary>
     /// <returns>
-    /// <see langword="true"/> when <c>rq_session_destroy</c> returned <c>RQ_OK</c>; <see langword="false"/> when it
-    /// returned another code or could not be called.
+    /// <see langword="true"/> when <c>rq_session_destroy</c> returned <c>RQ_OK</c>, or when destruction was handed to
+    /// the release thread; <see langword="false"/> when it returned another code, could not be called, or the release
+    /// thread could not be started.
     /// </returns>
     /// <remarks>
     /// <para>
-    /// Runs once, from <see cref="SafeHandle.Dispose()"/> or from the critical finalizer, and must neither throw nor
-    /// touch the <c>EngineSession</c>, which may already have been collected. <c>rq_session_destroy</c> is
-    /// <c>noexcept</c>, but binding its import on first use can raise a managed exception, for example when the
-    /// engine library that created the session lacks the export. The call is therefore guarded. When it throws,
-    /// destruction is unconfirmed, so the callback state is retained as for a failed destroy and
-    /// <see langword="false"/> is returned.
+    /// Runs once, on the thread that drops the last reference: <see cref="SafeHandle.Dispose()"/>, the critical
+    /// finalizer, or a P/Invoke or <see cref="SafeHandle.DangerousRelease"/> whose reference outlived a concurrent
+    /// <see cref="SafeHandle.Dispose()"/>. It must neither throw nor touch the <c>EngineSession</c>, which may already
+    /// have been collected.
     /// </para>
     /// <para>
-    /// It never runs inside an engine callback: <c>EngineSession.Dispose</c> throws while
-    /// <c>CallbackThunks.IsInCallback</c> is set, and the finalizer thread never runs callbacks, which arrive only on
-    /// the coordinator. Destroy called there would return <c>RQ_E_INVALID_STATE</c> with the session still alive.
+    /// That thread can be an engine coordinator inside a callback, whose own <c>rq_session_*</c> call still held the
+    /// handle. <c>rq_session_destroy</c> would have to join that coordinator, so the engine refuses it there with
+    /// <c>RQ_E_INVALID_STATE</c> and leaves the session alive, and a <see cref="SafeHandle"/> releases only once. The
+    /// destruction therefore moves to a new background thread, which the coordinator only starts and never waits for:
+    /// the release thread's <c>rq_session_destroy</c> waits for the callback to return and joins the coordinator, and
+    /// only then frees the callback state.
     /// </para>
     /// </remarks>
     protected override bool ReleaseHandle()
     {
-        int result;
+        if (!CallbackThunks.IsInCallback)
+        {
+            return DestroySession();
+        }
+
         try
         {
-            result = NativeMethods.RqSessionDestroy(handle);
+            var releaser = new Thread(static state => ((SafeSessionHandle)state!).DestroySession())
+            {
+                IsBackground = true,
+                Name = ReleaseThreadName,
+            };
+            releaser.UnsafeStart(this);
         }
         catch (Exception)
         {
-            // Nothing can be reported from a finalizer, and an exception escaping here would terminate the process.
-            // Destruction is unconfirmed, so the native session may still be alive and calling back with user_data:
-            // the callback state stays rooted, as after a failed destroy.
+            // An exception escaping here would unwind into the callback's frames. Destruction is unconfirmed, so the
+            // native session may still be alive and calling back with user_data: the callback state stays rooted, as
+            // after a failed destroy, and a waiting disposer is released rather than left blocked.
+            _released.TrySetResult();
             return false;
         }
 
-        // Any other result may leave a live native session that still calls back with user_data, or a step gate still
-        // waiting on the stop event. The callback state then stays rooted, a small leak, rather than freed under them.
-        if (result is ResultOk or ResultInvalidHandle)
+        return true;
+    }
+
+    // rq_session_destroy is noexcept, but binding its import on first use can raise a managed exception, for example
+    // when the engine library that created the session lacks the export; the call is therefore guarded. Runs on the
+    // thread that dropped the last reference or on the release thread, where an escaping exception would terminate the
+    // process, and completes the release whatever the outcome.
+    private bool DestroySession()
+    {
+        try
         {
+            int result;
             try
             {
-                ReleaseCallbackState();
+                result = NativeMethods.RqSessionDestroy(handle);
             }
             catch (Exception)
             {
-                // Nothing can be reported from a finalizer, and the native session is already destroyed; an
-                // exception escaping here would terminate the process. The worst outcome of ignoring it is that the
-                // callback state stays rooted.
+                // Nothing can be reported from a finalizer or the release thread. Destruction is unconfirmed, so the
+                // native session may still be alive and calling back with user_data: the callback state stays rooted,
+                // as after a failed destroy.
+                return false;
             }
-        }
 
-        return result == ResultOk;
+            // Any other result may leave a live native session that still calls back with user_data, or a step gate
+            // still waiting on the stop event. The callback state then stays rooted, a small leak, rather than freed
+            // under them.
+            if (result is ResultOk or ResultInvalidHandle)
+            {
+                try
+                {
+                    ReleaseCallbackState();
+                }
+                catch (Exception)
+                {
+                    // Nothing can be reported from a finalizer or the release thread, and the native session is
+                    // already destroyed; an exception escaping here would terminate the process. The worst outcome of
+                    // ignoring it is that the callback state stays rooted.
+                }
+            }
+
+            return result == ResultOk;
+        }
+        finally
+        {
+            _released.TrySetResult();
+        }
     }
 
     private void ReleaseCallbackState()

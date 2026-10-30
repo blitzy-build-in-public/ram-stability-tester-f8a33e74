@@ -95,13 +95,15 @@ If neither is writable, Start is refused with "RAMQuick cannot save its progress
 | File | Content |
 |------|---------|
 | `<data>\journal\active-run.jsonl` | Progress journal, written durably throughout a test and deleted once its results are saved |
-| `<data>\logs\RamQuick-<yyyyMMdd-HHmmss>-<TestType>-<runId>.log` | Timestamped event log of one test: configuration, steps, progress every 10 s, errors, temperatures, stop and verdict |
+| `<data>\logs\RamQuick-<yyyyMMdd-HHmmss>-<TestType>-<runId>.log` | Timestamped event log of one test: configuration, steps, progress every 10 s, errors, temperatures, journal and callback failures, stop and verdict |
 | `<data>\logs\RamQuick-<yyyyMMdd-HHmmss>-<TestType>-<runId>-summary.json` | Machine-readable summary (`schemaVersion: 1`): configuration, steps, coverage, temperatures, errors, cause hints and verdict |
 | `<data>\logs\RamQuick-<yyyyMMdd-HHmmss>-<TestType>-<runId>-summary.txt` | The same summary as readable text |
 | `<data>\logs\…-recovered-summary.json`, `…-recovered-summary.txt` | A summary rebuilt from the journal, used when a file under the original name already exists but cannot be read or belongs to another test |
-| `<data>\logs\app-errors.log` | Unexpected application errors, such as exceptions raised while handling engine events |
+| `<data>\logs\app-errors.log` | Unexpected application errors, such as exceptions raised while handling engine events: one `APP_ERROR` header per error, with the test's `run_id` while a test is running, followed by the exception text and stack trace, each line indented by two spaces |
 
-The timestamp is the test's local start time, and `<runId>` is a 32-digit hexadecimal run identifier. Logs hold only memory-test data and hardware descriptors, and they never leave the PC.
+The timestamp is the test's local start time, and `<runId>` is a 32-digit hexadecimal run identifier.
+
+The JSON and text summaries are the files meant for sharing, for example to compare attempts: they hold memory-test data and hardware descriptors. The `.log` and `app-errors.log` are local diagnostic logs that can also hold exception messages and stack traces. In them, the data folder is written `<data>`, your folders `%LOCALAPPDATA%`, `%APPDATA%` and `%USERPROFILE%`, and your Windows user name, where it is part of a path, `%USERNAME%`. Inspect them before you share them. Nothing leaves the PC.
 
 ## Privacy and safety
 
@@ -131,6 +133,8 @@ A CPU without AVX2 runs the SSE2 code path; the notice line reads "Reduced instr
 
 **.NET 8 support ends on 10 November 2026.** To retarget, change `RamQuickTargetFramework` in [Directory.Build.props](Directory.Build.props) to `net10.0-windows` and the SDK in [global.json](global.json) to a .NET 10 SDK. No source change is expected, because only .NET 8 APIs are used.
 
+A .NET 10 SDK also needs a newer toolchain. From the 10.0.2xx feature band on, .NET 10 SDKs require MSBuild 18.0 or later (Visual Studio 2026); the MSBuild of Visual Studio 2022 17.14 refuses to load them ("requires at least version 18.0.0 of MSBuild"), and Microsoft does not support targeting `net10.0` from 17.14 even with a 10.0.1xx SDK ([.NET SDK, MSBuild, and Visual Studio versioning](https://learn.microsoft.com/en-us/dotnet/core/porting/versioning-sdk-msbuild-vs)). The scripts select only a 17.14 installation (`$VisualStudioVersionRange` is `[17.14,18.0)` in [scripts/build.ps1](scripts/build.ps1) and [scripts/publish-portable.ps1](scripts/publish-portable.ps1)), so building the retargeted solution also needs Visual Studio 2026 Build Tools, with the v143 toolset that [src/engine/engine.props](src/engine/engine.props) pins, and that range raised. Visual Studio 2022 17.14 stays the pinned toolchain for .NET 8.
+
 ## Building from source
 
 ### Prerequisites
@@ -159,11 +163,15 @@ One command builds the solution and runs every check:
 - `-Coverage` also collects line coverage and fails below 90 % for `RamQuick.Core`, `RamQuick.Plans` and `RamQuick.Analysis`, and below 80 % for `RamQuick.Logging`, `RamQuick.Interop`, `RamQuick.Sensors` and the app's services and view models.
 - `-Configuration Debug` builds and tests the Debug configuration, and `-IncludeLong` adds the full-length tests. See `Get-Help .\scripts\build.ps1 -Full` for details.
 
+The build step restores NuGet packages in locked mode, so it fails with `NU1004` when a committed `packages.lock.json` is out of date, instead of rewriting it.
+
 To build without the checks, use Visual Studio's MSBuild, for example from a Developer PowerShell for VS 2022:
 
 ```powershell
 msbuild RamQuick.sln -restore -p:Configuration=Release -p:Platform=x64
 ```
+
+This command restores without locked mode and updates the lock files to match the pins. After deliberately changing a version in [Directory.Packages.props](Directory.Packages.props) or a package reference in a project, run it to refresh the lock files and commit them with the change.
 
 `dotnet build` cannot build the C++ projects in the solution, so always build with Visual Studio's MSBuild.
 

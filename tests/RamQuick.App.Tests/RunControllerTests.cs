@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -610,7 +611,8 @@ internal sealed class ControllerHarness : IDisposable
 
 /// <summary>
 /// Tests for <see cref="RunController"/>: initialisation and every refused Start, the elevation offer, the run flow
-/// from Start to published summaries, stops and terminal precedence, the thermal limits, the step gate and journal
+/// from Start to published summaries, the grouping of stored errors (with <see cref="IncrementalErrorGrouping"/>),
+/// stops and terminal precedence, the thermal limits, the step gate and journal
 /// failures, crash recovery at launch, and shutdown. Every displayed message is compared with its
 /// <see cref="UiText"/> member.
 /// </summary>
@@ -619,12 +621,19 @@ public sealed class RunControllerTests
     private const ulong GiB = FakeEngineData.GiB;
     private const ulong MiB = FakeEngineData.MiB;
 
+    // The region-offset distance FakeEngineData.Errors puts between consecutive records by default, so word n of a
+    // test lies at n × WordSpacing and has its own 8-byte word.
+    private const ulong WordSpacing = 4_096;
+
     // Real-time bounds: the step gate's journal wait is real time, and Stop must release it within 2 s.
     private static readonly TimeSpan _stopBound = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan _gateTimeoutWait = TimeSpan.FromSeconds(15);
 
     // The journal-acknowledgment bound measured with a margin below it for scheduling jitter.
     private static readonly TimeSpan _gateTimeoutFloor = ProgressJournal.AcknowledgmentTimeout - TimeSpan.FromMilliseconds(250);
+
+    // Long enough for a gate that ignored the events still queued before it to journal its step and return.
+    private static readonly TimeSpan _undeliveredEventsWindow = TimeSpan.FromMilliseconds(300);
 
     private static readonly IReadOnlyList<StepAttributes> _quickSteps = TestPlans.Quick.ToStepAttributes();
 
@@ -1374,7 +1383,7 @@ public sealed class RunControllerTests
         harness.RunUntil(() => harness.Controller.TotalErrors == (ulong)stored.Count);
         Assert.False(harness.Controller.IsErrorDetailTruncated);
         Assert.Equal(stored[0], harness.Controller.FirstError);
-        Assert.Equal(stored.Count, harness.Controller.ErrorGroups.Count);
+        Assert.Equal(ErrorGrouping.Group(stored).Take(RunController.MaxErrorGroups), harness.Controller.ErrorGroups);
 
         // Past the cap, batches carry no records, and the true total keeps rising through batches and progress.
         session.RaiseErrors(Array.Empty<ErrorRecord>(), 15_000);
@@ -1382,7 +1391,7 @@ public sealed class RunControllerTests
         Assert.True(harness.Controller.IsErrorDetailTruncated);
         session.PublishProgress(progress with { TotalErrors = 16_000 });
         harness.RunUntil(() => harness.Controller.TotalErrors == 16_000);
-        Assert.Equal(stored.Count, harness.Controller.ErrorGroups.Count);
+        Assert.Equal(ErrorGrouping.Group(stored).Take(RunController.MaxErrorGroups), harness.Controller.ErrorGroups);
 
         harness.Complete(RunEndReason.Completed, totalErrors: 16_500);
 
@@ -1398,6 +1407,243 @@ public sealed class RunControllerTests
         Assert.True(errors.GetProperty("truncated").GetBoolean());
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Error grouping
+    // ---------------------------------------------------------------------------------------------
+
+    [Fact]
+    public void ErrorGroups_AcrossBatches_EqualLargestGroupsOfAcceptedRecordsAsRanksChange()
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted(stopOnError: false);
+        harness.Prepare();
+        StepAttributes firstStep = session.Options.Steps[0];
+        StepAttributes laterStep = session.Options.Steps[1];
+        var accepted = new List<ErrorRecord>();
+        ulong nextSequence = 1;
+        ulong total = 0;
+
+        // 150 words hit once each, 1 ms apart: the 100 earliest are listed, ending with word 99.
+        RaiseAndCheck(Spread(150, firstWord: 0, TimeSpan.FromSeconds(1), firstStep));
+        Assert.Equal(Word(99), harness.Controller.ErrorGroups[^1].WordAddress);
+
+        // Five unlisted words gain repeats and overtake every listed group; 30 new words arrive too late to rank.
+        RaiseAndCheck(
+        [
+            .. Enumerable.Range(120, 5).SelectMany(word => Hits(word, 3, TimeSpan.FromSeconds(2), firstStep)),
+            .. Spread(30, firstWord: 200, TimeSpan.FromSeconds(2.1), firstStep),
+        ]);
+        Assert.Equal(Word(120), harness.Controller.ErrorGroups[0].WordAddress);
+        Assert.Equal(4, harness.Controller.ErrorGroups[0].Count);
+        Assert.Equal(Word(94), harness.Controller.ErrorGroups[^1].WordAddress);
+
+        // A later batch gives a listed word and an unlisted word an earlier first error, from a later step.
+        RaiseAndCheck(
+        [
+            .. Hits(140, 1, TimeSpan.FromSeconds(0.5), laterStep),
+            .. Hits(50, 1, TimeSpan.FromSeconds(0.4), laterStep),
+        ]);
+        ErrorGroup earliestPair = harness.Controller.ErrorGroups[5];
+        Assert.Equal(Word(50), earliestPair.WordAddress);
+        Assert.Equal(TimeSpan.FromSeconds(0.4), earliestPair.FirstTimeIntoTest);
+        Assert.Equal(laterStep.Name, earliestPair.FirstStepName);
+        Assert.Equal(Word(140), harness.Controller.ErrorGroups[6].WordAddress);
+
+        // The batch that crosses the detail cap is stored only up to it: word 130's repeats rank first, while word
+        // 131's repeats lie beyond the cap and never count.
+        int room = ErrorGrouping.StoredDetailCap - accepted.Count;
+        RaiseAndCheck(
+        [
+            .. Hits(130, 10, TimeSpan.FromSeconds(3), laterStep),
+            .. Spread(room - 10, firstWord: 1_000, TimeSpan.FromSeconds(3.1), laterStep),
+            .. Hits(131, 50, TimeSpan.FromSeconds(4), laterStep),
+        ]);
+        Assert.Equal(ErrorGrouping.StoredDetailCap, accepted.Count);
+        Assert.True(harness.Controller.IsErrorDetailTruncated);
+        Assert.Equal(Word(130), harness.Controller.ErrorGroups[0].WordAddress);
+        Assert.Equal(11, harness.Controller.ErrorGroups[0].Count);
+        Assert.DoesNotContain(harness.Controller.ErrorGroups, group => group.WordAddress == Word(131));
+
+        void RaiseAndCheck(IReadOnlyList<ErrorRecord> batch)
+        {
+            total += (ulong)batch.Count;
+            session.RaiseErrors(batch, total);
+            harness.RunUntil(() => harness.Controller.TotalErrors == total);
+            accepted.AddRange(batch.Take(ErrorGrouping.StoredDetailCap - accepted.Count));
+            Assert.Equal(ErrorGrouping.Group(accepted).Take(RunController.MaxErrorGroups), harness.Controller.ErrorGroups);
+        }
+
+        IReadOnlyList<ErrorRecord> Spread(int count, int firstWord, TimeSpan firstTime, StepAttributes step)
+        {
+            IReadOnlyList<ErrorRecord> records = FakeEngineData.Errors(
+                count,
+                nextSequence,
+                stepIndex: step.Index,
+                stepName: step.Name,
+                firstRegionOffset: (ulong)firstWord * WordSpacing,
+                strideBytes: WordSpacing,
+                firstTimeIntoTest: firstTime);
+            nextSequence += (ulong)count;
+            return records;
+        }
+
+        IReadOnlyList<ErrorRecord> Hits(int word, int count, TimeSpan time, StepAttributes step)
+        {
+            IReadOnlyList<ErrorRecord> records = FakeEngineData.Errors(
+                count,
+                nextSequence,
+                stepIndex: step.Index,
+                stepName: step.Name,
+                firstRegionOffset: (ulong)word * WordSpacing,
+                strideBytes: 0,
+                firstTimeIntoTest: time,
+                spacing: TimeSpan.Zero);
+            nextSequence += (ulong)count;
+            return records;
+        }
+
+        static ulong Word(int word) => FakeEngineData.AddressAt((ulong)word * WordSpacing);
+    }
+
+    [Theory]
+    [InlineData(120, 1)]
+    [InlineData(300, 2)]
+    public void ErrorGroups_BatchOnlyInUnlistedGroups_KeepsListInstanceAndRaisesNoChange(int word, int hits)
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted(stopOnError: false);
+        harness.Prepare();
+        StepAttributes step = session.Options.Steps[0];
+
+        // Words 0-99 are hit three times each and listed; words 100-149 are hit once each and are not. The batch
+        // then brings a stored unlisted word (120) or a new word (300) to at most two records, still below the list.
+        ErrorRecord[] stored =
+        [
+            .. Enumerable.Range(0, RunController.MaxErrorGroups).SelectMany(listedWord => FakeEngineData.Errors(
+                3,
+                (ulong)(listedWord * 3) + 1,
+                stepIndex: step.Index,
+                stepName: step.Name,
+                firstRegionOffset: (ulong)listedWord * WordSpacing,
+                strideBytes: 0)),
+            .. FakeEngineData.Errors(
+                50,
+                firstSequence: 1_001,
+                stepIndex: step.Index,
+                stepName: step.Name,
+                firstRegionOffset: 100 * WordSpacing,
+                strideBytes: WordSpacing),
+        ];
+        session.RaiseErrors(stored, (ulong)stored.Length);
+        harness.RunUntil(() => harness.Controller.TotalErrors == (ulong)stored.Length);
+        IReadOnlyList<ErrorGroup> listed = harness.Controller.ErrorGroups;
+        Assert.Equal(RunController.MaxErrorGroups, listed.Count);
+
+        var changed = new List<string?>();
+        harness.Controller.PropertyChanged += (_, e) => changed.Add(e.PropertyName);
+        IReadOnlyList<ErrorRecord> batch = FakeEngineData.Errors(
+            hits,
+            firstSequence: 2_001,
+            stepIndex: step.Index,
+            stepName: step.Name,
+            firstRegionOffset: (ulong)word * WordSpacing,
+            strideBytes: 0,
+            firstTimeIntoTest: TimeSpan.FromSeconds(10));
+        ulong total = (ulong)(stored.Length + batch.Count);
+        session.RaiseErrors(batch, total);
+        harness.RunUntil(() => harness.Controller.TotalErrors == total);
+
+        Assert.Same(listed, harness.Controller.ErrorGroups);
+        Assert.Contains(nameof(RunController.TotalErrors), changed);
+        Assert.DoesNotContain(nameof(RunController.ErrorGroups), changed);
+        Assert.Equal(ErrorGrouping.Group([.. stored, .. batch]).Take(RunController.MaxErrorGroups), listed);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(RunController.MaxErrorGroups)]
+    public void IncrementalErrorGrouping_ChurningBatches_MatchesFullGroupingAndKeepsInstanceOnlyWhenUnchanged(int maxGroups)
+    {
+        var grouping = new IncrementalErrorGrouping(maxGroups);
+        var added = new List<ErrorRecord>();
+        IReadOnlyList<ErrorGroup> previous = grouping.Largest;
+        Assert.Empty(previous);
+        ulong sequence = 1;
+
+        // Deterministic churn over 160 words: batch sizes 1-50, repeats, new words, and first errors earlier than
+        // those already stored.
+        for (int batchIndex = 0; batchIndex < 60; batchIndex++)
+        {
+            int size = 1 + ((batchIndex * 37) % 50);
+            var batch = new ErrorRecord[size];
+            StepAttributes step = _quickSteps[batchIndex % _quickSteps.Count];
+            for (int index = 0; index < size; index++)
+            {
+                int word = ((batchIndex * 131) + (index * 17) + ((index * index) % 23)) % 160;
+                batch[index] = FakeEngineData.Error(
+                    sequence++,
+                    FakeEngineData.AddressAt((ulong)word * 8),
+                    bit: (batchIndex + index) % 64,
+                    stepIndex: step.Index,
+                    stepName: step.Name,
+                    timeIntoTest: TimeSpan.FromMilliseconds(((batchIndex * 7_919) + (index * 104_729)) % 5_000));
+            }
+
+            added.AddRange(batch);
+            IReadOnlyList<ErrorGroup> expected = ErrorGrouping.Group(added).Take(maxGroups).ToArray();
+            IReadOnlyList<ErrorGroup> result = grouping.Add(batch);
+
+            Assert.Same(result, grouping.Largest);
+            Assert.Equal(expected, result);
+            if (expected.SequenceEqual(previous))
+            {
+                Assert.Same(previous, result);
+            }
+            else
+            {
+                Assert.NotSame(previous, result);
+            }
+
+            previous = result;
+        }
+
+        Assert.Same(previous, grouping.Add(Array.Empty<ErrorRecord>()));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void IncrementalErrorGrouping_MaxGroupsNotPositive_Throws(int maxGroups) =>
+        Assert.Throws<ArgumentOutOfRangeException>("maxGroups", () => new IncrementalErrorGrouping(maxGroups));
+
+    [Fact]
+    public void IncrementalErrorGrouping_NullBatch_Throws()
+    {
+        var grouping = new IncrementalErrorGrouping(RunController.MaxErrorGroups);
+
+        Assert.Throws<ArgumentNullException>("records", () => grouping.Add(null!));
+    }
+
+    [Fact]
+    public void IncrementalErrorGrouping_BatchWithNullRecord_ThrowsBeforeChangingAnyGroup()
+    {
+        var grouping = new IncrementalErrorGrouping(RunController.MaxErrorGroups);
+        ErrorRecord first = FakeEngineData.Error(1, FakeEngineData.AddressAt(0), bit: 3, stepIndex: 0, stepName: "High-toggle sweep");
+        ErrorRecord second = FakeEngineData.Error(2, FakeEngineData.AddressAt(0), bit: 5, stepIndex: 0, stepName: "High-toggle sweep");
+        IReadOnlyList<ErrorGroup> listed = grouping.Add([first]);
+
+        ArgumentException exception = Assert.Throws<ArgumentException>(() => grouping.Add([second, null!]));
+
+        Assert.Equal("records", exception.ParamName);
+        Assert.Same(listed, grouping.Largest);
+        Assert.Equal(1, Assert.Single(listed).Count);
+
+        // The valid record of the rejected batch was not counted: adding it now makes the group's second record.
+        Assert.Equal(2, Assert.Single(grouping.Add([second])).Count);
+    }
 
     // ---------------------------------------------------------------------------------------------
     // Stops and terminal precedence
@@ -1562,6 +1808,118 @@ public sealed class RunControllerTests
     }
 
     [Fact]
+    public void Stop_SeveralRequests_LogsOnlyTheFirstStopDecision()
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+
+        harness.Controller.RequestStop();
+        harness.Controller.RequestStop();
+        session.InvokeCallbackFault("on_progress", new InvalidOperationException("progress sink failed after the stop"));
+
+        // The engine keeps the first reason, so every later request changes nothing there and adds no line here.
+        Assert.Equal(new[] { StopReason.User, StopReason.User, StopReason.HostFault, StopReason.HostFault }, session.StopRequests);
+        session.CompleteWithFirstRecordedReason();
+        harness.AwaitVerdict();
+        harness.Release(TimeSpan.FromMilliseconds(100));
+
+        Assert.Equal(RunEndReason.UserStop, harness.StateMachine.EndReason);
+        string stop = Assert.Single(RunLogLines(harness), line => EventOf(line) == "STOP_REQUESTED");
+        Assert.EndsWith(" STOP_REQUESTED reason=UserStop", stop, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void FirstErrorStop_LogsOneStopDecisionWithTheEngineTime(bool errorReported)
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted(stopOnError: true);
+        harness.Prepare();
+        StepAttributes step = session.Options.Steps[0];
+        TimeSpan firstErrorTime = TimeSpan.FromSeconds(12.5);
+        if (errorReported)
+        {
+            ErrorRecord error = FakeEngineData.Error(
+                1, FakeEngineData.AddressAt(4 * MiB), 3, step.Index, step.Name, timeIntoTest: firstErrorTime);
+            session.RaiseErrors(new[] { error }, 1);
+            harness.RunUntil(() => harness.Controller.TotalErrors == 1);
+        }
+
+        // The engine stops itself at the first confirmed error; the controller requests nothing. Without an error
+        // report the line comes from the conclusion.
+        session.SimulateEngineStop(RunEndReason.FirstError);
+        session.CompleteWithFirstRecordedReason(totalErrors: 1, firstErrorTime: firstErrorTime);
+        harness.AwaitVerdict();
+        harness.Release(TimeSpan.FromMilliseconds(100));
+
+        Assert.Empty(session.StopRequests);
+        string[] lines = RunLogLines(harness);
+        string stop = Assert.Single(lines, line => EventOf(line) == "STOP_REQUESTED");
+        Assert.EndsWith(" STOP_REQUESTED reason=FirstError time_into_test_ms=12500", stop, StringComparison.Ordinal);
+        Assert.True(
+            Array.IndexOf(lines, stop) < Array.FindIndex(lines, line => EventOf(line) == "COMPLETED"),
+            "STOP_REQUESTED does not precede COMPLETED.");
+        AssertStampsNonDecreasing(lines);
+    }
+
+    // The engine records its first-error stop before reporting the error, so a user Stop can reach the controller
+    // after it. The user's line stays as the record of that request; Completed's end reason decides whether the
+    // first error, which then carries the engine's time, was a stop decision of its own.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void FirstErrorStop_UserStopRacesIt_LogsTheFirstErrorLineOnlyWhenItEndedTheRun(bool engineStoppedFirst)
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted(stopOnError: true);
+        harness.Prepare();
+        StepAttributes step = session.Options.Steps[0];
+        TimeSpan firstErrorTime = TimeSpan.FromSeconds(12);
+        if (engineStoppedFirst)
+        {
+            session.SimulateEngineStop(RunEndReason.FirstError);
+            harness.Controller.RequestStop();
+        }
+        else
+        {
+            harness.Controller.RequestStop();
+            session.SimulateEngineStop(RunEndReason.FirstError);
+        }
+
+        ErrorRecord error = FakeEngineData.Error(
+            1, FakeEngineData.AddressAt(4 * MiB), 3, step.Index, step.Name, timeIntoTest: firstErrorTime);
+        session.RaiseErrors(new[] { error }, 1);
+        harness.RunUntil(() => harness.Controller.TotalErrors == 1);
+        session.CompleteWithFirstRecordedReason(
+            totalErrors: 1, elapsed: TimeSpan.FromMilliseconds(12_300), firstErrorTime: firstErrorTime);
+        harness.AwaitVerdict();
+        harness.Release(TimeSpan.FromMilliseconds(100));
+
+        RunEndReason winner = engineStoppedFirst ? RunEndReason.FirstError : RunEndReason.UserStop;
+        Assert.Equal(winner, harness.StateMachine.EndReason);
+        Assert.Equal(new[] { StopReason.User }, session.StopRequests);
+        string[] lines = RunLogLines(harness);
+        string[] events = lines
+            .Where(line => EventOf(line) is "STOP_REQUESTED" or "COMPLETED")
+            .Select(line => line[(line.IndexOf(' ', StringComparison.Ordinal) + 1)..])
+            .ToArray();
+        string[] expectedStops = engineStoppedFirst
+            ? new[] { "STOP_REQUESTED reason=UserStop", "STOP_REQUESTED reason=FirstError time_into_test_ms=12000" }
+            : new[] { "STOP_REQUESTED reason=UserStop" };
+        Assert.Equal(expectedStops, events[..^1]);
+        Assert.StartsWith(
+            $"COMPLETED end_reason={winner} total_errors=1 verified_bytes=0 elapsed_ms=12300 first_error_ms=12000 ",
+            events[^1],
+            StringComparison.Ordinal);
+        AssertStampsNonDecreasing(lines);
+    }
+
+    [Fact]
     public void Completed_FirstErrorWithStopOnError_FailsWithSingleErrorPriorHint()
     {
         using var harness = new ControllerHarness();
@@ -1717,6 +2075,51 @@ public sealed class RunControllerTests
     }
 
     [Fact]
+    public void StepGate_EarlierEventsNotYetDelivered_JournalsPreparedAndStepEndBeforeTheStep()
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+
+        // The engine raises Prepared before step 1's gate; the UI thread has not delivered it yet.
+        session.RaisePrepared();
+        long firstStartedAt = Stopwatch.GetTimestamp();
+        Task<StepGateDecision> first = session.InvokeStepGateOnBackgroundThread(0);
+        Assert.False(
+            SpinWait.SpinUntil(() => first.IsCompleted, _undeliveredEventsWindow),
+            "Step 1's gate returned while Prepared was still undelivered.");
+        Assert.Empty(harness.ReadJournal().OfType<JournalStepStart>());
+
+        (StepGateDecision firstDecision, _) = harness.AwaitGate(first, firstStartedAt);
+        Assert.Equal(StepGateDecision.Continue, firstDecision);
+        Assert.Collection(
+            harness.ReadJournal(),
+            record => Assert.IsType<JournalBegin>(record),
+            record => Assert.IsType<JournalPrepared>(record),
+            record => Assert.Equal(1, Assert.IsType<JournalStepStart>(record).Index));
+
+        // Likewise step 1's StepFinished before step 2's gate.
+        session.RaiseStepFinished(0);
+        long secondStartedAt = Stopwatch.GetTimestamp();
+        Task<StepGateDecision> second = session.InvokeStepGateOnBackgroundThread(1);
+        Assert.False(
+            SpinWait.SpinUntil(() => second.IsCompleted, _undeliveredEventsWindow),
+            "Step 2's gate returned while step 1's StepFinished was still undelivered.");
+        Assert.DoesNotContain(harness.ReadJournal(), record => record is JournalStepStart { Index: 2 });
+
+        (StepGateDecision secondDecision, _) = harness.AwaitGate(second, secondStartedAt);
+        Assert.Equal(StepGateDecision.Continue, secondDecision);
+        Assert.Collection(
+            harness.ReadJournal(),
+            record => Assert.IsType<JournalBegin>(record),
+            record => Assert.IsType<JournalPrepared>(record),
+            record => Assert.Equal(1, Assert.IsType<JournalStepStart>(record).Index),
+            record => Assert.Equal(1, Assert.IsType<JournalStepEnd>(record).Index),
+            record => Assert.Equal(2, Assert.IsType<JournalStepStart>(record).Index));
+        Assert.Empty(session.StopRequests);
+    }
+
+    [Fact]
     public void StepGate_StopDuringJournalWait_AbortsWithinTwoSecondsWithoutHostFault()
     {
         using var harness = new ControllerHarness();
@@ -1727,7 +2130,9 @@ public sealed class RunControllerTests
         storage.BlockNext("step");
 
         Task<StepGateDecision> gate = session.InvokeStepGateOnBackgroundThread(0);
-        Assert.True(storage.WaitForBlocked(ControllerHarness.DefaultWait), "The step record never reached the journal storage.");
+
+        // Pumped, because the gate journals its step only once the UI context has run its barrier.
+        harness.RunUntil(() => storage.BlockedCount > 0);
         long stoppedAt = Stopwatch.GetTimestamp();
         harness.Controller.RequestStop();
         (StepGateDecision decision, TimeSpan elapsed) = harness.AwaitGate(gate, stoppedAt);
@@ -1765,12 +2170,18 @@ public sealed class RunControllerTests
         Assert.Equal(1, invocation.StopRequestCountAtReturn);
         Assert.Equal(new[] { StopReason.HostFault }, session.StopRequests);
 
+        // Completed arrives a second after the failure, so a failure logged only at the conclusion would show.
+        DateTimeOffset failedAt = harness.Time.GetUtcNow();
+        harness.Time.Advance(TimeSpan.FromSeconds(1));
         storage.Release();
         session.CompleteWithFirstRecordedReason();
         harness.AwaitVerdict();
         Assert.Equal(RunState.Aborted, harness.StateMachine.State);
         Assert.Equal(RunEndReason.HostFault, harness.StateMachine.EndReason);
         Assert.Equal(UiText.JournalWriteFailed(UiText.JournalAcknowledgmentTimedOut), harness.Controller.ResultMessage);
+
+        harness.Release(TimeSpan.FromMilliseconds(100));
+        AssertGateFailureLogged(RunLogLines(harness), UiText.JournalAcknowledgmentTimedOut, failedAt);
     }
 
     [Fact]
@@ -1792,11 +2203,16 @@ public sealed class RunControllerTests
         JournalFailure failure = Assert.IsType<JournalFailure>(Assert.Single(harness.Journals).Failure);
         Assert.Equal("step", failure.RecordType);
 
+        DateTimeOffset failedAt = harness.Time.GetUtcNow();
+        harness.Time.Advance(TimeSpan.FromSeconds(1));
         session.CompleteWithFirstRecordedReason();
         harness.AwaitVerdict();
         Assert.Equal(RunState.Aborted, harness.StateMachine.State);
         Assert.Equal(RunEndReason.HostFault, harness.StateMachine.EndReason);
         Assert.Equal(UiText.JournalWriteFailed(failure.Message), harness.Controller.ResultMessage);
+
+        harness.Release(TimeSpan.FromMilliseconds(100));
+        AssertGateFailureLogged(RunLogLines(harness), failure.Message, failedAt);
     }
 
     [Fact]
@@ -1853,6 +2269,50 @@ public sealed class RunControllerTests
         Assert.Equal(RunState.Aborted, harness.StateMachine.State);
         Assert.Equal(RunEndReason.HostFault, harness.StateMachine.EndReason);
         Assert.Equal(UiText.EngineError(fault.Message), harness.Controller.ResultMessage);
+
+        // The sink's stop and the wrapper's own are one stop decision, logged after its cause; the app-errors.log
+        // entry names the run.
+        harness.Release(TimeSpan.FromMilliseconds(100));
+        AssertFaultLogged(harness, "EngineCallback:on_progress", fault);
+    }
+
+    [Fact]
+    public void HandlerFault_LogsItsCauseAndOneHostFaultStopTiedToTheRun()
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+        var fault = new InvalidOperationException("progress display failed");
+        int thrown = 0;
+        harness.Controller.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(RunController.CurrentProgress) && Interlocked.Exchange(ref thrown, 1) == 0)
+            {
+                throw fault;
+            }
+        };
+
+        StepAttributes step = session.Options.Steps[0];
+        session.PublishProgress(FakeEngineData.Progress(
+            step.Index,
+            session.Options.Steps.Count,
+            step.Name,
+            TimeSpan.FromSeconds(5),
+            TimeSpan.FromSeconds(295),
+            GiB,
+            session.Options.RegionBytes,
+            0));
+        harness.RunUntil(() => session.StopRequests.Count > 0);
+
+        Assert.Equal(new[] { StopReason.HostFault }, session.StopRequests);
+        session.CompleteWithFirstRecordedReason();
+        harness.AwaitVerdict();
+        Assert.Equal(RunEndReason.HostFault, harness.StateMachine.EndReason);
+        Assert.Equal(UiText.EngineError(fault.Message), harness.Controller.ResultMessage);
+
+        harness.Release(TimeSpan.FromMilliseconds(100));
+        AssertFaultLogged(harness, "RunController.OnSessionProgressChanged", fault);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -2068,7 +2528,10 @@ public sealed class RunControllerTests
 
         Assert.Null(thrown);
         string appErrors = harness.AppErrorsLogText();
-        Assert.Contains("UnhandledException", appErrors, StringComparison.Ordinal);
+        Assert.Contains(
+            " APP_ERROR source=\"UnhandledException\" run_id=" + RunIdOf(harness) + "\r\n",
+            appErrors,
+            StringComparison.Ordinal);
         Assert.Contains(crash.Message, appErrors, StringComparison.Ordinal);
         Assert.Equal(1, session.DisposeCount);
         Assert.True(harness.JournalExists);
@@ -2085,6 +2548,75 @@ public sealed class RunControllerTests
 
         Assert.Null(thrown);
         Assert.False(File.Exists(Path.Combine(harness.RootPath, "data", "logs", "app-errors.log")));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Run log readers
+    // ---------------------------------------------------------------------------------------------
+
+    // The run's .log, read after publication: the session's teardown disposes the log, which drains it.
+    private static string[] RunLogLines(ControllerHarness harness) =>
+        harness.LogText().Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
+
+    private static string EventOf(string line) => line.Split(' ')[1];
+
+    private static DateTimeOffset StampOf(string line) => DateTimeOffset.ParseExact(
+        line[..24],
+        "yyyy-MM-dd'T'HH:mm:ss.fff'Z'",
+        CultureInfo.InvariantCulture,
+        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+
+    // A step-gate failure is logged as it happens: JOURNAL_FAILURE, then its single host-fault STOP_REQUESTED, both
+    // stamped at the failure, and only then COMPLETED, stamped later; no stamp in the log decreases.
+    private static void AssertGateFailureLogged(string[] lines, string failure, DateTimeOffset failedAt)
+    {
+        Assert.Equal(
+            new[] { "JOURNAL_FAILURE", "STOP_REQUESTED", "COMPLETED" },
+            lines.Select(EventOf).Where(name => name is "JOURNAL_FAILURE" or "STOP_REQUESTED" or "COMPLETED").Take(3));
+        string journalFailure = lines.First(line => EventOf(line) == "JOURNAL_FAILURE");
+        Assert.EndsWith($" JOURNAL_FAILURE message=\"{failure}\"", journalFailure, StringComparison.Ordinal);
+        Assert.Equal(failedAt, StampOf(journalFailure));
+        string stop = Assert.Single(lines, line => EventOf(line) == "STOP_REQUESTED");
+        Assert.EndsWith(" STOP_REQUESTED reason=HostFault", stop, StringComparison.Ordinal);
+        Assert.Equal(failedAt, StampOf(stop));
+        Assert.True(StampOf(lines.First(line => EventOf(line) == "COMPLETED")) > failedAt, "COMPLETED is stamped at the failure.");
+        AssertStampsNonDecreasing(lines);
+    }
+
+    // The run id that ends the run's .log name, the 32-hex-digit form every artefact of the run uses.
+    private static string RunIdOf(ControllerHarness harness) =>
+        Path.GetFileNameWithoutExtension(Assert.Single(harness.RunLogPaths()))[^32..];
+
+    // A callback or handler fault is logged as CALLBACK_FAULT, then one host-fault STOP_REQUESTED, then COMPLETED,
+    // and its app-errors.log entry carries the source and the run's id.
+    private static void AssertFaultLogged(ControllerHarness harness, string source, Exception fault)
+    {
+        string[] lines = RunLogLines(harness);
+        string cause = Assert.Single(lines, line => EventOf(line) == "CALLBACK_FAULT");
+        Assert.EndsWith(
+            $" CALLBACK_FAULT source=\"{source}\" error=\"{fault.GetType().FullName}: {fault.Message}\"",
+            cause,
+            StringComparison.Ordinal);
+        string stop = Assert.Single(lines, line => EventOf(line) == "STOP_REQUESTED");
+        Assert.EndsWith(" STOP_REQUESTED reason=HostFault", stop, StringComparison.Ordinal);
+        int completed = Array.FindIndex(lines, line => EventOf(line) == "COMPLETED");
+        Assert.True(
+            Array.IndexOf(lines, cause) < Array.IndexOf(lines, stop) && Array.IndexOf(lines, stop) < completed,
+            "The fault, its stop and COMPLETED are out of order.");
+        AssertStampsNonDecreasing(lines);
+
+        string header = $" APP_ERROR source=\"{source}\" run_id={RunIdOf(harness)}\r\n";
+        harness.RunUntil(() => harness.AppErrorsLogText().Contains(header, StringComparison.Ordinal));
+    }
+
+    private static void AssertStampsNonDecreasing(string[] lines)
+    {
+        for (int index = 1; index < lines.Length; index++)
+        {
+            Assert.True(
+                StampOf(lines[index]) >= StampOf(lines[index - 1]),
+                $"Line {index + 1} is stamped before line {index}: '{lines[index]}' after '{lines[index - 1]}'.");
+        }
     }
 
     // ---------------------------------------------------------------------------------------------

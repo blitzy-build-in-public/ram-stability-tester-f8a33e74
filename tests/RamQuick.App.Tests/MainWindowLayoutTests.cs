@@ -1,10 +1,14 @@
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Windows;
 using System.Windows.Automation;
+using System.Windows.Automation.Peers;
+using System.Windows.Automation.Provider;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Data;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
@@ -25,11 +29,12 @@ namespace RamQuick.App.Tests;
 /// Tests for the main window's layout. <see cref="MainWindow"/>, never shown and bound to a real view model filled
 /// with the longest texts it can show, is measured at the preferred 560-DIP width and the narrowest supported 512:
 /// its fixed rows stay within the regular and compact budgets, and the minimal fallback keeps only the control row and
-/// the status line fixed. The window has exactly three accessible input controls, and its Start/Stop toggle binds the
-/// command the run state calls for. Also tests <see cref="WindowSizing.Compute"/>: the window bounds and active
+/// the status line fixed. The window has exactly three accessible input controls, its test type selector's entries and
+/// selection are named by their labels, and its Start/Stop toggle binds the command the run state calls for. Also tests <see cref="WindowSizing.Compute"/>: the window bounds and active
 /// layout for the worked work areas, the layout and supported-range thresholds, and the argument guards; and
 /// <see cref="WorkAreaSizing"/> on a loaded window with a real handle: DPI changes that arrive before the sizing work
-/// they defer has run.
+/// they defer has run, and the non-client height measured once a shown window loads, which a content margin leaves
+/// unchanged.
 /// </summary>
 /// <remarks>
 /// Every <see cref="MainWindow"/> is built and measured on the STA thread of <see cref="WpfStaFixture"/>, which also
@@ -44,6 +49,9 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
 
     // Measured heights are compared to within one DIP: the window rounds layout to whole device pixels.
     private const double LayoutTolerance = 1;
+
+    // The margin the main window's root grid keeps on every side of the client area, in DIPs.
+    private const double RootGridMargin = 12;
 
     // The widest values the first-error message and the error count show: a seven-digit total with two group
     // separators, the highest 8-byte-aligned address, and data words with every hexadecimal digit significant.
@@ -304,33 +312,76 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
     }
 
     /// <summary>
-    /// Walks every element the window declares, its data templates included: the only input controls are the test
-    /// type selector, the Stop on error checkbox and the Start/Stop toggle, each named for assistive technology and
-    /// reached by Tab in that order.
+    /// Walks every element the window declares, its data templates and collapsed elements included: the only input
+    /// controls are the test type selector, the Stop on error checkbox and the Start/Stop toggle, and the only keyboard
+    /// tab stops are those three followed by the scrolling detail area, reached by Tab in that order and each named for
+    /// assistive technology.
     /// </summary>
     /// <returns>A task that completes when the walk has been checked on the STA thread.</returns>
     [Fact]
-    public async Task InputControls_MainWindow_AreExactlyTheThreeAccessibleTabStopsAsync()
+    public async Task TabStops_MainWindow_AreTheThreeInputControlsThenTheDetailAreaEachNamedAsync()
     {
         await _fixture.RunAsync(() =>
         {
             using LongestTextScene scene = LongestTextScene.Create();
             MainWindow window = scene.Window;
-            Control[] expected = [window.TestTypeSelector, window.StopOnErrorCheckBox, window.StartStopButton];
+            Control[] expectedInputControls = [window.TestTypeSelector, window.StopOnErrorCheckBox, window.StartStopButton];
+            DependencyObject[] expectedTabStops = [.. expectedInputControls, window.DetailScroller];
 
-            IReadOnlyList<Control> found = InputControlsIn(window);
+            IReadOnlyList<Control> inputControls = InputControlsIn(window);
+            IReadOnlyList<DependencyObject> tabStops = TabStopsIn(window);
 
-            Assert.Equal(expected.Select(Describe), found.OrderBy(control => control.TabIndex).Select(Describe));
-            Assert.Equal(expected, found.OrderBy(control => control.TabIndex));
-            Assert.Equal(new[] { 0, 1, 2 }, expected.Select(control => control.TabIndex));
-            foreach (Control control in expected)
+            Assert.Equal(expectedInputControls.Select(Describe), inputControls.OrderBy(control => control.TabIndex).Select(Describe));
+            Assert.Equal(expectedInputControls, inputControls.OrderBy(control => control.TabIndex));
+
+            DependencyObject[] tabOrder = tabStops.OrderBy(KeyboardNavigation.GetTabIndex).ToArray();
+            Assert.Equal(expectedTabStops.Select(Describe), tabOrder.Select(Describe));
+            Assert.Equal(expectedTabStops, tabOrder);
+            Assert.Equal(new[] { 0, 1, 2, 3 }, tabOrder.Select(KeyboardNavigation.GetTabIndex));
+            foreach (DependencyObject tabStop in tabOrder)
             {
                 Assert.False(
-                    string.IsNullOrWhiteSpace(AutomationProperties.GetName(control)),
-                    $"{Describe(control)} has no automation name.");
-                Assert.True(control.Focusable, $"{Describe(control)} cannot take keyboard focus.");
-                Assert.True(control.IsTabStop, $"{Describe(control)} is not a tab stop.");
+                    string.IsNullOrWhiteSpace(AutomationProperties.GetName(tabStop)),
+                    $"{Describe(tabStop)} has no automation name.");
             }
+
+            Assert.Equal(UiText.ResultDetailAutomationName, AutomationProperties.GetName(window.DetailScroller));
+        });
+    }
+
+    /// <summary>
+    /// Checks the automation name of each live reading and detected-memory value in the regular layout's fixed rows:
+    /// its label followed by the value the view model currently shows, while idle and again while running with the
+    /// longest texts, so a screen reader hears which reading a value is and follows it as it changes.
+    /// </summary>
+    /// <param name="label">The label shown beside the value.</param>
+    /// <param name="valuePropertyName">The <see cref="MainViewModel"/> property the value shows.</param>
+    /// <returns>A task that completes when the names have been checked on the STA thread.</returns>
+    [Theory]
+    [InlineData(UiText.CurrentStepLabel, nameof(MainViewModel.CurrentStepText))]
+    [InlineData(UiText.RamTemperatureLabel, nameof(MainViewModel.RamTemperatureText))]
+    [InlineData(UiText.CpuTemperatureLabel, nameof(MainViewModel.CpuTemperatureText))]
+    [InlineData(UiText.ElapsedLabel, nameof(MainViewModel.ElapsedText))]
+    [InlineData(UiText.RemainingLabel, nameof(MainViewModel.RemainingText))]
+    [InlineData(UiText.CoverageLabel, nameof(MainViewModel.CoverageText))]
+    [InlineData(UiText.ErrorsLabel, nameof(MainViewModel.ErrorCountText))]
+    [InlineData(UiText.InstalledLabel, nameof(MainViewModel.InstalledText))]
+    [InlineData(UiText.TestedLabel, nameof(MainViewModel.TestedText))]
+    [InlineData(UiText.SpeedLabel, nameof(MainViewModel.SpeedText))]
+    [InlineData(UiText.ChannelsLabel, nameof(MainViewModel.ChannelsText))]
+    [InlineData(UiText.DimmsLabel, nameof(MainViewModel.DimmsText))]
+    public async Task FieldValue_IdleThenRunning_IsNamedByItsLabelAndCurrentValueAsync(string label, string valuePropertyName)
+    {
+        PropertyInfo valueProperty = Assert.IsAssignableFrom<PropertyInfo>(typeof(MainViewModel).GetProperty(valuePropertyName));
+        await _fixture.RunAsync(async () =>
+        {
+            using LongestTextScene scene = LongestTextScene.Create();
+            await scene.MeasureAsync(WindowLayout.Regular, WindowSizing.PreferredWidth);
+            AssertNamedByLabelAndValue(scene, label, valueProperty);
+
+            scene.RunTo(RunState.Running);
+            await scene.MeasureAsync(WindowLayout.Regular, WindowSizing.PreferredWidth);
+            AssertNamedByLabelAndValue(scene, label, valueProperty);
         });
     }
 
@@ -363,6 +414,252 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
             Assert.False(viewModel.IsRunInProgress);
             Assert.True(viewModel.CanStart);
             AssertToggle(toggle, viewModel.StartCommand, UiText.StartLabel, UiText.StartAutomationName);
+        });
+    }
+
+    /// <summary>
+    /// Reads the test type selector through its automation peers, as assistive technology does: one item per test
+    /// type, each named by the label it shows, and the default Quick entry the one selected.
+    /// </summary>
+    /// <returns>A task that completes when the automation peers have been checked on the STA thread.</returns>
+    [Fact]
+    public async Task TestTypeSelector_AutomationPeers_NameEveryEntryAndTheSelectionByItsLabelAsync()
+    {
+        await _fixture.RunAsync(async () =>
+        {
+            using LongestTextScene scene = LongestTextScene.Create();
+            ComboBox selector = scene.Window.TestTypeSelector;
+
+            // The selector's items and selection arrive through bindings the dispatcher resolves.
+            await SettleAsync();
+            Assert.IsType<ComboBoxAutomationPeer>(UIElementAutomationPeer.CreatePeerForElement(selector));
+            var selectorPeer = new TestTypeSelectorPeer(selector);
+
+            ItemAutomationPeer[] itemPeers = selector.Items.Cast<object>().Select(selectorPeer.ItemPeer).ToArray();
+
+            Assert.Equal(Enum.GetValues<TestType>().Select(UiText.TestTypeDisplay), itemPeers.Select(peer => peer.GetName()));
+            ItemAutomationPeer selected = Assert.Single(
+                itemPeers,
+                peer => peer.GetPattern(PatternInterface.SelectionItem) is ISelectionItemProvider { IsSelected: true });
+            Assert.Equal(UiText.TestTypeQuick, selected.GetName());
+        });
+    }
+
+    /// <summary>
+    /// Stops a run that counted errors, so the detail area shows both result sections, and checks that the cause-hint
+    /// and grouped-error headers reach assistive technology as level-1 headings rather than only as bold text, so
+    /// screen-reader heading navigation can find each section.
+    /// </summary>
+    /// <returns>A task that completes when the headers have been checked on the STA thread.</returns>
+    [Fact]
+    public async Task ResultSectionHeaders_AbortedWithErrors_AreLevelOneHeadingsAsync()
+    {
+        await _fixture.RunAsync(async () =>
+        {
+            using LongestTextScene scene = LongestTextScene.Create();
+            scene.RunTo(RunState.Aborted);
+
+            await scene.MeasureAsync(WindowLayout.Regular, WindowSizing.PreferredWidth);
+
+            MainWindow window = scene.Window;
+            MainViewModel viewModel = scene.ViewModel;
+            Assert.True(viewModel.HasCauseHints);
+            Assert.True(viewModel.HasErrorGroups);
+            foreach (string header in new[] { viewModel.CauseHintsHeader, viewModel.ErrorGroupsHeader })
+            {
+                TextBlock headerBlock = Assert.Single(LaidOutTextBlocks(window.DetailScroller, header));
+                AutomationPeer peer = UIElementAutomationPeer.CreatePeerForElement(headerBlock);
+                Assert.Equal(AutomationHeadingLevel.Level1, peer.GetHeadingLevel());
+            }
+        });
+    }
+
+    /// <summary>
+    /// Lays out a run stopped with errors in each layout and reads every text block the window has created: each copy
+    /// of the result, the first error and the notice is a polite live region whose announced text is bound with
+    /// target-update notification, and no other text, the live readings, the status line and the verdict badge
+    /// included, is live.
+    /// </summary>
+    /// <param name="layout">The layout forced on the window.</param>
+    /// <returns>A task that completes when the text blocks have been checked on the STA thread.</returns>
+    [Theory]
+    [InlineData(WindowLayout.Regular)]
+    [InlineData(WindowLayout.Compact)]
+    [InlineData(WindowLayout.Minimal)]
+    public async Task LiveRegions_StoppedRunInEachLayout_OnlyResultFirstErrorAndNoticeCopiesAreLiveAsync(WindowLayout layout)
+    {
+        // The fields that change up to four times a second, and the badge, whose verdict the result announces with
+        // its reason.
+        string[] unannouncedPaths =
+        [
+            nameof(MainViewModel.CurrentStepText),
+            nameof(MainViewModel.RamTemperatureText),
+            nameof(MainViewModel.CpuTemperatureText),
+            nameof(MainViewModel.ElapsedText),
+            nameof(MainViewModel.RemainingText),
+            nameof(MainViewModel.CoverageText),
+            nameof(MainViewModel.ErrorCountText),
+            nameof(MainViewModel.StatusLineText),
+            nameof(MainViewModel.VerdictText),
+        ];
+
+        await _fixture.RunAsync(async () =>
+        {
+            using LongestTextScene scene = LongestTextScene.Create();
+            scene.RunTo(RunState.Aborted);
+            await scene.MeasureAsync(layout, WindowSizing.PreferredWidth);
+
+            var liveRegions = new HashSet<LiveRegion>();
+            var unannouncedFound = new HashSet<string>(StringComparer.Ordinal);
+            foreach (TextBlock textBlock in VisualDescendants(scene.Window.RootGrid).OfType<TextBlock>())
+            {
+                LiveRegion region = App.GetLiveRegion(textBlock);
+                AutomationLiveSetting liveSetting = AutomationProperties.GetLiveSetting(textBlock);
+                string? textPath = BindingOperations.GetBinding(textBlock, TextBlock.TextProperty)?.Path?.Path;
+                string description = FormattableString.Invariant($"The text block bound to '{textPath}' in region {region}");
+                if (region == LiveRegion.None)
+                {
+                    // A live text that no region names would never be announced.
+                    Assert.True(liveSetting == AutomationLiveSetting.Off, description + " is live.");
+                }
+                else
+                {
+                    Assert.True(liveSetting == AutomationLiveSetting.Polite, description + $" is {liveSetting}, not polite.");
+                    DependencyProperty announced = region == LiveRegion.Result ? AutomationProperties.NameProperty : TextBlock.TextProperty;
+                    Binding? binding = BindingOperations.GetBinding(textBlock, announced);
+                    Assert.True(binding?.NotifyOnTargetUpdated == true, description + " does not notify its updates.");
+                    liveRegions.Add(region);
+                }
+
+                if (textPath is not null && unannouncedPaths.Contains(textPath, StringComparer.Ordinal))
+                {
+                    Assert.Equal(LiveRegion.None, region);
+                    unannouncedFound.Add(textPath);
+                }
+            }
+
+            Assert.Equal(new[] { LiveRegion.Result, LiveRegion.FirstError, LiveRegion.Notice }.Order(), liveRegions.Order());
+            Assert.Equal(unannouncedPaths.Order(StringComparer.Ordinal), unannouncedFound.Order(StringComparer.Ordinal));
+        });
+    }
+
+    /// <summary>
+    /// Follows one run in each layout through what a screen reader hears: the sensor notice once at launch and never
+    /// for the unchanged notice every reading re-raises; the first error once when it appears and not as its count
+    /// grows; a different notice once; the verdict and its reason once, together; and nothing more when the other
+    /// layouts show, or create, a second copy of any of them.
+    /// </summary>
+    /// <param name="layout">The layout the run is followed in.</param>
+    /// <returns>A task that completes when the announcements have been checked on the STA thread.</returns>
+    [Theory]
+    [InlineData(WindowLayout.Regular)]
+    [InlineData(WindowLayout.Compact)]
+    [InlineData(WindowLayout.Minimal)]
+    public async Task LiveRegions_RunWithErrorsThenStopped_AnnounceEachChangeOnceAsync(WindowLayout layout)
+    {
+        await _fixture.RunAsync(async () =>
+        {
+            using LongestTextScene scene = LongestTextScene.Create();
+            using var listener = new LiveRegionListener(scene.Window);
+            MainViewModel viewModel = scene.ViewModel;
+            ControllerHarness harness = scene.Harness;
+
+            await scene.MeasureAsync(layout, WindowSizing.PreferredWidth);
+            Assert.Equal(new[] { (LiveRegion.Notice, UiText.SensorsUnavailableNotice) }, listener.TakeAnnouncements());
+
+            harness.NextReading();
+            await SettleAsync();
+            Assert.Empty(listener.TakeAnnouncements());
+
+            scene.RunTo(RunState.Running);
+            await scene.MeasureAsync(layout, WindowSizing.PreferredWidth);
+            string firstError = viewModel.FirstErrorText;
+            Assert.Equal(new[] { (LiveRegion.FirstError, firstError) }, listener.TakeAnnouncements());
+
+            scene.GrowErrorTotal(LongestErrorTotal + 1);
+            await scene.MeasureAsync(layout, WindowSizing.PreferredWidth);
+            Assert.NotEqual(firstError, viewModel.FirstErrorText);
+            Assert.NotEmpty(LaidOutTextBlocks(scene.Window.RootGrid, viewModel.FirstErrorText));
+            Assert.Empty(listener.TakeAnnouncements());
+
+            harness.Sensors.SetRam(40);
+            harness.NextReading();
+            await SettleAsync();
+            Assert.Equal(UiText.CpuSensorUnavailableNotice, viewModel.NoticeText);
+            Assert.Equal(new[] { (LiveRegion.Notice, UiText.CpuSensorUnavailableNotice) }, listener.TakeAnnouncements());
+
+            scene.RunTo(RunState.Aborted);
+            await scene.MeasureAsync(layout, WindowSizing.PreferredWidth);
+            Assert.True(viewModel.HasResult);
+            string result = string.Format(
+                CultureInfo.InvariantCulture,
+                UiText.ResultAnnouncementFormat,
+                viewModel.VerdictText,
+                viewModel.ResultReasonText);
+            Assert.Equal(new[] { (LiveRegion.Result, result) }, listener.TakeAnnouncements());
+
+            foreach (WindowLayout other in Enum.GetValues<WindowLayout>().Where(candidate => candidate != layout).Append(layout))
+            {
+                await scene.MeasureAsync(other, WindowSizing.PreferredWidth);
+            }
+
+            Assert.Empty(listener.TakeAnnouncements());
+
+            // The next run clears the result and the first error, so each is announced again with the same text.
+            scene.RunTo(RunState.Running);
+            await scene.MeasureAsync(layout, WindowSizing.PreferredWidth);
+            Assert.Equal(new[] { (LiveRegion.FirstError, firstError) }, listener.TakeAnnouncements());
+
+            scene.GrowErrorTotal(LongestErrorTotal + 1);
+            scene.RunTo(RunState.Aborted);
+            await scene.MeasureAsync(layout, WindowSizing.PreferredWidth);
+            Assert.Equal(new[] { (LiveRegion.Result, result) }, listener.TakeAnnouncements());
+            Assert.Equal(0, listener.CollapsedCopiesHeard);
+        });
+    }
+
+    /// <summary>
+    /// Holds the screen reader back as at launch, where one that is already running connects to the window only after
+    /// the window has appeared: a change that no listener hears is tried again until its retries run out, then once
+    /// more by the next update of the same text, which announces it once a listener is there; and a result that
+    /// first brings the result header into view is announced, with the first error, once a listener connects within
+    /// the retry period.
+    /// </summary>
+    /// <returns>A task that completes when the announcements have been checked on the STA thread.</returns>
+    [Fact]
+    public async Task LiveRegions_ListenerConnectsAfterTheChange_AnnouncedOnceWhenHeardAsync()
+    {
+        await _fixture.RunAsync(async () =>
+        {
+            using LongestTextScene scene = LongestTextScene.Create();
+            using var listener = new LiveRegionListener(scene.Window) { IsListening = false };
+            MainViewModel viewModel = scene.ViewModel;
+
+            await scene.MeasureAsync(WindowLayout.Regular, WindowSizing.PreferredWidth);
+            await listener.WaitUntilQuietAsync();
+            Assert.True(listener.Attempts > 1, "The unheard notice was not tried again.");
+            Assert.Empty(listener.TakeAnnouncements());
+
+            listener.IsListening = true;
+            scene.Harness.NextReading();
+            await SettleAsync();
+            Assert.Equal(new[] { (LiveRegion.Notice, UiText.SensorsUnavailableNotice) }, listener.TakeAnnouncements());
+
+            listener.IsListening = false;
+            Assert.Equal(Visibility.Collapsed, scene.Window.ResultHeader.Visibility);
+            scene.RunTo(RunState.Aborted);
+            await scene.MeasureAsync(WindowLayout.Regular, WindowSizing.PreferredWidth);
+            Assert.Empty(listener.TakeAnnouncements());
+
+            listener.IsListening = true;
+            await listener.WaitUntilQuietAsync();
+            (LiveRegion, string)[] expected =
+            [
+                (LiveRegion.Result, viewModel.ResultAnnouncementText),
+                (LiveRegion.FirstError, viewModel.FirstErrorText),
+            ];
+            Assert.Equal(expected.Order(), listener.TakeAnnouncements().Order());
+            Assert.Equal(0, listener.CollapsedCopiesHeard);
         });
     }
 
@@ -428,6 +725,70 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
             finally
             {
                 window.Close();
+            }
+        });
+
+    /// <summary>
+    /// Shows two windows that differ only in the margin around their vertically stretching content, none and the main
+    /// window's root margin, and checks that the non-client height the behavior measures once they load is their chrome
+    /// alone: both get the same minimum height and layout, and that minimum height is the layout's fixed-row budget plus
+    /// 40 DIPs of detail plus the chrome, the window's height less the client height its root visual is arranged to.
+    /// </summary>
+    [Fact]
+    public void Loaded_ContentMargin_MeasuresOnlyChromeAsNonClientHeight() =>
+        RunOnStaThread(() =>
+        {
+            var windows = new List<Window>();
+            try
+            {
+                foreach (double margin in new[] { 0, RootGridMargin })
+                {
+                    var window = new Window
+                    {
+                        ShowInTaskbar = false,
+                        ShowActivated = false,
+                        Content = new Grid { Margin = new Thickness(margin) },
+                    };
+                    WorkAreaSizing.SetIsEnabled(window, true);
+                    windows.Add(window);
+                    window.Show();
+                }
+
+                // Loaded, and the sizing it applies, run as dispatcher work after the first layout pass; the second
+                // drain lets the window lay out again at the size that work set.
+                DrainDispatcher();
+                DrainDispatcher();
+
+                foreach (Window window in windows)
+                {
+                    Assert.True(window.IsLoaded, "The shown window did not load.");
+                    var root = (FrameworkElement)VisualTreeHelper.GetChild(window, 0);
+                    double chrome = window.ActualHeight - root.ActualHeight;
+                    double margin = ((FrameworkElement)window.Content).Margin.Top;
+
+                    nint hwnd = new WindowInteropHelper(window).Handle;
+                    MonitorWorkArea monitorWorkArea = Assert.NotNull(Win32Display.GetWorkArea(hwnd));
+                    Size workArea = ToDips(monitorWorkArea, VisualTreeHelper.GetDpi(window));
+                    WindowLayout layout = WorkAreaSizing.GetLayout(window);
+                    double expectedMinHeight = Math.Min(
+                        WindowSizing.FixedRowsBudget(layout) + WindowSizing.MinimumDetailHeight + chrome,
+                        workArea.Height);
+                    string measurement = FormattableString.Invariant(
+                        $"Content margin {margin} DIPs: chrome {chrome:F1}, {layout} MinHeight {window.MinHeight:F1} of H {workArea.Height:F1} DIPs.");
+                    TestContext.Current.TestOutputHelper?.WriteLine(measurement);
+                    Assert.True(chrome > 0, measurement);
+                    Assert.True(Math.Abs(expectedMinHeight - window.MinHeight) <= LayoutTolerance, measurement);
+                }
+
+                Assert.Equal(windows[0].MinHeight, windows[1].MinHeight, Tolerance);
+                Assert.Equal(WorkAreaSizing.GetLayout(windows[0]), WorkAreaSizing.GetLayout(windows[1]));
+            }
+            finally
+            {
+                foreach (Window window in windows)
+                {
+                    window.Close();
+                }
             }
         });
 
@@ -557,6 +918,20 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
         Assert.True(toggle.IsEnabled, $"The '{label}' toggle is disabled.");
     }
 
+    // The value beside the label in the laid-out fixed rows shows the view model's current value, and its automation
+    // peer, what a screen reader reads, is named by the label followed by that value.
+    private static void AssertNamedByLabelAndValue(LongestTextScene scene, string label, PropertyInfo valueProperty)
+    {
+        string value = Assert.IsType<string>(valueProperty.GetValue(scene.ViewModel));
+        TextBlock labelBlock = Assert.Single(LaidOutTextBlocks(scene.Window.FixedArea, label));
+        DockPanel pair = Assert.IsType<DockPanel>(VisualTreeHelper.GetParent(labelBlock));
+        TextBlock valueBlock = Assert.Single(pair.Children.OfType<TextBlock>(), textBlock => !ReferenceEquals(textBlock, labelBlock));
+        Assert.Equal(value, valueBlock.Text);
+
+        AutomationPeer peer = Assert.IsType<TextBlockAutomationPeer>(UIElementAutomationPeer.CreatePeerForElement(valueBlock));
+        Assert.Equal(string.Format(CultureInfo.InvariantCulture, UiText.LabeledValueAutomationFormat, label, value), peer.GetName());
+    }
+
     private static FrameworkElement[] FixedRowsOf(MainWindow window) => [window.FixedArea, window.ResultHeader];
 
     private static double SlotHeight(FrameworkElement element) =>
@@ -619,18 +994,49 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
         }
     }
 
-    // The logical tree holds every element the window declares, collapsed ones included, but not the content of its
-    // data templates, so the template each content or items control presents is loaded and walked as well.
-    private static IReadOnlyList<Control> InputControlsIn(Window window)
+    // The window an element belongs to.
+    private static Window? WindowOf(DependencyObject element)
     {
-        var found = new List<Control>();
+        DependencyObject? current = element;
+        while (current is not null and not Window)
+        {
+            current = ParentOf(current);
+        }
+
+        return current as Window;
+    }
+
+    // The never-shown window applies no template of its own, so its root grid is reached from the window's content only
+    // through the logical tree.
+    private static DependencyObject? ParentOf(DependencyObject element) =>
+        (element is Visual ? VisualTreeHelper.GetParent(element) : null) ?? LogicalTreeHelper.GetParent(element);
+
+    private static IReadOnlyList<Control> InputControlsIn(Window window) =>
+        DeclaredElementsIn(window)
+            .Where(element => element is ButtonBase or Selector or TextBoxBase or RangeBase or PasswordBox)
+            .Cast<Control>()
+            .ToArray();
+
+    // Tab stops on an element that can take keyboard focus and is a tab stop. Whether it is enabled at the moment
+    // depends on the run state, not on the declaration, so it does not decide the order.
+    private static IReadOnlyList<DependencyObject> TabStopsIn(Window window) =>
+        DeclaredElementsIn(window)
+            .Where(element => (element is UIElement { Focusable: true } or ContentElement { Focusable: true })
+                && KeyboardNavigation.GetIsTabStop(element))
+            .ToArray();
+
+    // The logical tree holds every element the window declares, collapsed ones included, but not the content of its
+    // data templates, so the template each content or items control presents is loaded and walked as well. The window
+    // is the root of the walk, not one of its elements: Tab cycles within it and never stops on the window itself.
+    private static IEnumerable<DependencyObject> DeclaredElementsIn(Window window)
+    {
         var pending = new Stack<DependencyObject>();
         pending.Push(window);
         while (pending.TryPop(out DependencyObject? current))
         {
-            if (current is ButtonBase or Selector or TextBoxBase or RangeBase or PasswordBox)
+            if (!ReferenceEquals(current, window))
             {
-                found.Add((Control)current);
+                yield return current;
             }
 
             DataTemplate? template = current switch
@@ -652,11 +1058,120 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
                 }
             }
         }
-
-        return found;
     }
 
-    private static string Describe(Control control) => control.GetType().Name + " '" + control.Name + "'";
+    private static string Describe(DependencyObject element)
+    {
+        string name = element switch
+        {
+            FrameworkElement frameworkElement => frameworkElement.Name,
+            FrameworkContentElement contentElement => contentElement.Name,
+            _ => string.Empty,
+        };
+        return element.GetType().Name + " '" + name + "'";
+    }
+
+    /// <summary>
+    /// The selector's own automation peer type, exposing the item peer it creates for an entry: the peer SelectionPattern
+    /// reports for the selection and a tree walk reports for each entry. A never-shown window realises no item
+    /// containers and has no automation root, so neither public route reaches these peers.
+    /// </summary>
+    private sealed class TestTypeSelectorPeer : ComboBoxAutomationPeer
+    {
+        public TestTypeSelectorPeer(ComboBox owner)
+            : base(owner)
+        {
+        }
+
+        public ItemAutomationPeer ItemPeer(object item) => CreateItemAutomationPeer(item);
+    }
+
+    /// <summary>
+    /// Stands in for a screen reader through <see cref="App.AnnouncementSink"/>, from creation until disposal: hears,
+    /// or while it is not listening refuses, each live-region change the application tries to announce in one window,
+    /// and records the region and text of each one it heard. Changes in other windows are refused and not counted.
+    /// </summary>
+    private sealed class LiveRegionListener : IDisposable
+    {
+        // Longer than the application's interval between retries of an unheard change.
+        private static readonly TimeSpan _quietPeriod = TimeSpan.FromMilliseconds(750);
+        private static readonly TimeSpan _quietTimeout = TimeSpan.FromSeconds(15);
+
+        private readonly Window _window;
+        private readonly List<(LiveRegion Region, string Text)> _heard = [];
+
+        public LiveRegionListener(Window window)
+        {
+            _window = window;
+            App.AnnouncementSink = Hear;
+        }
+
+        public bool IsListening { get; set; } = true;
+
+        // Every change the application tried to announce in the window, heard or not.
+        public int Attempts { get; private set; }
+
+        // Changes heard from a copy that the window's current layout collapses, which only the copy it shows may
+        // announce.
+        public int CollapsedCopiesHeard { get; private set; }
+
+        public (LiveRegion Region, string Text)[] TakeAnnouncements()
+        {
+            (LiveRegion Region, string Text)[] heard = [.. _heard];
+            _heard.Clear();
+            return heard;
+        }
+
+        // Yields to the dispatcher until the application has stopped trying to announce: no attempt for a quiet period.
+        public async Task WaitUntilQuietAsync()
+        {
+            DateTime deadline = DateTime.UtcNow + _quietTimeout;
+            int attempts;
+            do
+            {
+                Assert.True(DateTime.UtcNow < deadline, $"The application kept retrying announcements for {_quietTimeout}.");
+                attempts = Attempts;
+                await Task.Delay(_quietPeriod);
+            }
+            while (Attempts != attempts);
+        }
+
+        public void Dispose() => App.AnnouncementSink = null;
+
+        private bool Hear(TextBlock textBlock, string text)
+        {
+            if (!ReferenceEquals(WindowOf(textBlock), _window))
+            {
+                return false;
+            }
+
+            Attempts++;
+            if (IsListening)
+            {
+                _heard.Add((App.GetLiveRegion(textBlock), text));
+                if (!IsShownByLayout(textBlock))
+                {
+                    CollapsedCopiesHeard++;
+                }
+            }
+
+            return IsListening;
+        }
+
+        // Neither the element nor an ancestor below its window is collapsed or hidden.
+        private static bool IsShownByLayout(DependencyObject element)
+        {
+            for (DependencyObject? current = element; current is not null and not Window; current = ParentOf(current))
+            {
+                if (current is UIElement { Visibility: not Visibility.Visible })
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+    }
 
     /// <summary>The heights of the two fixed rows of the main window's root grid, in DIPs.</summary>
     /// <param name="TopArea">Row 0: the control row, live readings, memory summary and notice.</param>
@@ -757,6 +1272,15 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
                 default:
                     throw new ArgumentOutOfRangeException(nameof(state), state, "A scene runs to Running or Aborted only.");
             }
+        }
+
+        // Raises the running run's error total with a batch that carries no record, as batches past the detail cap do,
+        // so the first-error message's count grows in place.
+        public void GrowErrorTotal(ulong totalErrors)
+        {
+            FakeEngineSession session = _session ?? throw new InvalidOperationException("The scene has not started a run.");
+            session.RaiseErrors([], totalErrors);
+            Harness.RunUntil(() => Harness.Controller.TotalErrors == totalErrors);
         }
 
         // Forces the layout on the window and lays out its root grid at the width with unbounded height, so the Auto

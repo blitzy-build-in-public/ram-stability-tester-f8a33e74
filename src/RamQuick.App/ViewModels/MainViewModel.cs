@@ -16,7 +16,15 @@ namespace RamQuick.App.ViewModels;
 /// </summary>
 /// <param name="Value">The test type the entry selects; the selector's <c>SelectedValuePath</c>.</param>
 /// <param name="Text">The entry's display text, such as "Quick (~5 min)"; the selector's <c>DisplayMemberPath</c>.</param>
-public sealed record TestTypeOption(TestType Value, string Text);
+public sealed record TestTypeOption(TestType Value, string Text)
+{
+    /// <summary>
+    /// Returns <see cref="Text"/>, which also serves as the entry's automation name, the selector's selected-item
+    /// name, and its debugger display.
+    /// </summary>
+    /// <returns>The entry's display text.</returns>
+    public override string ToString() => Text;
+}
 
 /// <summary>
 /// The single view model of the main window and its only <c>DataContext</c>: the three controls (test type
@@ -45,10 +53,10 @@ public sealed record TestTypeOption(TestType Value, string Text);
 public sealed partial class MainViewModel : ObservableObject, IDisposable
 {
     /// <summary>
-    /// The largest number of error groups the result panel lists: the 100 largest, taken from the front of the
-    /// controller's groups, which are ordered largest first.
+    /// The largest number of error groups the result panel lists: the 100 largest, which are exactly the
+    /// controller's groups, since it holds only <see cref="RunController.MaxErrorGroups"/> of them, largest first.
     /// </summary>
-    public const int MaxDisplayedErrorGroups = 100;
+    public const int MaxDisplayedErrorGroups = RunController.MaxErrorGroups;
 
     private static readonly IReadOnlyList<TestTypeOption> _testTypeOptions = Array.AsReadOnly(
         Enum.GetValues<TestType>().Select(type => new TestTypeOption(type, UiText.TestTypeDisplay(type))).ToArray());
@@ -90,6 +98,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         nameof(VerdictText),
         nameof(HasResult),
         nameof(ResultReasonText),
+        nameof(ResultAnnouncementText),
         nameof(HasFirstError),
         nameof(FirstErrorText),
         nameof(HasCauseHints),
@@ -363,6 +372,28 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     public string ResultReasonText => _controller.ResultMessage ?? string.Empty;
 
     /// <summary>
+    /// Gets the verdict and its reason as the one sentence a screen reader announces for the result, such as
+    /// "ABORTED: Stopped by user" (<see cref="UiText.ResultAnnouncementFormat"/>); the verdict alone when it has no
+    /// reason, and empty when there is no verdict.
+    /// </summary>
+    public string ResultAnnouncementText
+    {
+        get
+        {
+            string verdict = VerdictText;
+            if (verdict.Length == 0)
+            {
+                return string.Empty;
+            }
+
+            string reason = ResultReasonText;
+            return reason.Length == 0
+                ? verdict
+                : string.Format(CultureInfo.InvariantCulture, UiText.ResultAnnouncementFormat, verdict, reason);
+        }
+    }
+
+    /// <summary>
     /// Gets the first-error message, such as "Step 'Random bank thrash' at 01:12 — 3 errors — virtual address
     /// 0x0000023A4F7C1D48 — expected 0x…, actual 0x…, re-read 0x… (repeated wrong value: likely write or storage
     /// fault)"; empty when the run found no error.
@@ -570,6 +601,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
 
             case nameof(RunController.ResultMessage):
                 OnPropertyChanged(nameof(ResultReasonText));
+                OnPropertyChanged(nameof(ResultAnnouncementText));
                 break;
 
             case nameof(RunController.NoticeMessage):

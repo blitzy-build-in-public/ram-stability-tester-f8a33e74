@@ -14,6 +14,8 @@
  *   on its own thread, before on_mismatch returns and without any drain or callback; racing
  *   workers record it once, an earlier stop keeps its reason, and Stop on error off requests
  *   nothing.
+ * - ErrorCollectorFirstErrorDetail: the exact text of that stop's end detail, which numbers the
+ *   step and pass from 1, as the results log does, and the worker from 0, and names the word.
  * - ErrorCollectorRecord: every field of a stored rq_error_record.
  * - ErrorCollectorSession: a real 2-worker, 256 MiB session over the fault-injecting ->
  *   counting -> real stack, whose on_errors batches arrive at most every 100 ms, on the
@@ -627,6 +629,59 @@ TEST(ErrorCollectorStopOnError, FirstMismatchRequestsTheStopBeforeOnMismatchRetu
     EXPECT_EQ(later.reason, RQ_END_FIRST_ERROR);
     EXPECT_EQ(std::string(later.detail), std::string(first.detail));
 }
+
+/** A first error's verification context and the end detail Stop on error must record for it. */
+struct first_error_detail_case {
+    const char* name;
+    std::uint32_t step_count;
+    std::uint32_t workers;
+    std::uint32_t worker;
+    std::uint32_t step;
+    std::uint32_t pass;
+    /** The detail up to the word's address: step and pass from 1, the worker from 0. */
+    const char* expected_prefix;
+};
+
+void PrintTo(const first_error_detail_case& detail_case, std::ostream* os) {
+    *os << detail_case.name << " (worker " << detail_case.worker << ", step index "
+        << detail_case.step << ", pass index " << detail_case.pass << ")";
+}
+
+class ErrorCollectorFirstErrorDetail : public ::testing::TestWithParam<first_error_detail_case> {};
+
+TEST_P(ErrorCollectorFirstErrorDetail, NumbersStepAndPassAsTheResultsLogAndNamesTheWord) {
+    const first_error_detail_case& detail_case = GetParam();
+    collector_rig rig(k_detail_cap, true, detail_case.step_count, detail_case.workers);
+    ASSERT_TRUE(rig.region.valid());
+    rig.collector.begin_run(rig.clock.now_ns());
+    rig.collector.begin_step(detail_case.step, detail_case.workers);
+    worker_error_sink& sink =
+        rig.bound_sink(detail_case.worker, detail_case.step, detail_case.pass);
+
+    std::uint64_t* const word = rig.region.word(4'096U);
+    report(sink, word, expected_for(0U), actual_for(0U));
+
+    // The results log writes this error as step=<step + 1>/<count> ... pass=<pass + 1> ...
+    // worker=<worker>; the detail must number it the same way.
+    const stop_signal::end_info info = rig.stop.snapshot();
+    ASSERT_EQ(info.reason, RQ_END_FIRST_ERROR);
+    EXPECT_EQ(std::string(info.detail),
+              std::string(detail_case.expected_prefix) + hex64(address_of(word)));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ErrorCollector, ErrorCollectorFirstErrorDetail,
+    ::testing::Values(
+        first_error_detail_case{"FirstStepFirstPass", 2U, 2U, 1U, 0U, 0U,
+                                "First error: step 1 of 2, pass 1, worker 1, virtual address "},
+        first_error_detail_case{"LaterStepAndPass", 3U, 3U, 2U, 1U, 3U,
+                                "First error: step 2 of 3, pass 4, worker 2, virtual address "},
+        first_error_detail_case{
+            "LastPassIndex", 1U, 1U, 0U, 0U, 0xFFFF'FFFFU,
+            "First error: step 1 of 1, pass 4294967296, worker 0, virtual address "}),
+    [](const ::testing::TestParamInfo<first_error_detail_case>& info) {
+        return std::string(info.param.name);
+    });
 
 TEST(ErrorCollectorStopOnError, RacingWorkersRecordFirstErrorOnce) {
     constexpr std::uint32_t k_per_worker = 500U;

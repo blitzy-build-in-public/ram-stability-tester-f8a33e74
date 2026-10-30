@@ -184,10 +184,12 @@ public sealed record JournalBegin : JournalRecord
     /// <summary>
     /// Gets the plan's target duration in seconds: the sum of the steps' time budgets. Derived from
     /// <see cref="Steps"/> and never serialized; a <see langword="null"/> entry, which a damaged journal line
-    /// can hold, is skipped.
+    /// can hold, is skipped. It never throws: the budgets are summed as <see cref="double"/> values, exact
+    /// for every total below 2^53 ms, so budgets a damaged line made too large cannot overflow the sum.
     /// </summary>
     [JsonIgnore]
-    public double TargetSeconds => Steps.Where(step => step is not null).Sum(step => step.TimeBudgetMs) / 1000.0;
+    public double TargetSeconds =>
+        Steps.Where(step => step is not null).Sum(step => (double)step.TimeBudgetMs) / 1000.0;
 
     /// <summary>
     /// Gets the plan's coverage target as a percentage: the sum of the steps' coverage budgets. Derived from

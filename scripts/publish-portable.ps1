@@ -21,12 +21,12 @@
                      DLL, and the csproj copies it beside RamQuick.exe.
       4. Verify      The folder root must hold RamQuick.exe beside RamQuick.dll (so no single-file
                      bundle), ramquick_engine.dll, the six RamQuick libraries,
-                     LibreHardwareMonitorLib.dll, CommunityToolkit.Mvvm.dll and the self-contained
-                     .NET and WPF runtime (hostfxr.dll, coreclr.dll, PresentationFramework.dll,
-                     wpfgfx_cor3.dll). No test-only item may appear anywhere in the tree: the
-                     fault-injecting ramquick_engine_test.dll, engine.tests.exe,
-                     RamQuick.TestHost, test assemblies, xUnit, the test platform,
-                     FakeTimeProvider or GoogleTest. dumpbin /dependents must show that
+                     LibreHardwareMonitorLib.dll, CommunityToolkit.Mvvm.dll and the
+                     self-contained .NET and WPF runtime (hostfxr.dll, coreclr.dll,
+                     PresentationFramework.dll, wpfgfx_cor3.dll). No test-only item may appear
+                     anywhere in the tree: the fault-injecting ramquick_engine_test.dll,
+                     engine.tests.exe, RamQuick.TestHost, test assemblies, xUnit, the test
+                     platform, FakeTimeProvider or GoogleTest. dumpbin /dependents must show that
                      ramquick_engine.dll needs no Visual C++ or Universal CRT DLL. Every violation
                      is listed before the run fails.
       5. Package     Copies THIRD-PARTY-NOTICES.txt and README.md into the folder, then zips it to

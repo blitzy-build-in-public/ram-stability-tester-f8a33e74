@@ -268,6 +268,10 @@ internal sealed class EngineSession : IEngineSession
         }
 
         _handle.Dispose();
+
+        // A callback's own rq_session_* call that still holds the handle makes its release the last one, which hands
+        // destruction to the release thread; waiting for that keeps Dispose blocking until the session is destroyed.
+        _handle.WaitForRelease();
     }
 
     /// <summary>

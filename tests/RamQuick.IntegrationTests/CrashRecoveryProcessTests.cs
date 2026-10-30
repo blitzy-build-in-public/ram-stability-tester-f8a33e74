@@ -34,6 +34,7 @@ public sealed class CrashRecoveryProcessTests
     private const string ExpectedUnfinishedMessage =
         "The previous test did not finish at step 2 of 3 (Random bank thrash), which likely indicates severe instability.";
 
+    private const string PreparedRecord = "prepared";
     private const string StepRecord = "step";
     private const string StepEndRecord = "stepEnd";
     private const string BeatRecord = "beat";
@@ -150,6 +151,18 @@ public sealed class CrashRecoveryProcessTests
                 $"Step {KilledStepNumber + 1} had started before the kill; the host was not killed in step {KilledStepNumber}.");
             Assert.True(journal.Contains(BeatRecord), "The killed run journalled no heartbeat.");
 
+            // The host died as soon as step 2's record was on disk, so everything raised before step 2 must precede that
+            // record, or the partial summary would lose the preparation or step 1's outcome.
+            int killedStepAt = journal.PositionOf(StepRecord, KilledStepNumber);
+            int preparedAt = journal.PositionOf(PreparedRecord);
+            int previousStepEndAt = journal.PositionOf(StepEndRecord, KilledStepNumber - 1);
+            Assert.True(
+                preparedAt >= 0 && preparedAt < killedStepAt,
+                $"The prepared record (record {preparedAt}) does not precede step {KilledStepNumber}'s record (record {killedStepAt}).");
+            Assert.True(
+                previousStepEndAt >= 0 && previousStepEndAt < killedStepAt,
+                $"Step {KilledStepNumber - 1}'s stepEnd record (record {previousStepEndAt}) does not precede step {KilledStepNumber}'s record (record {killedStepAt}).");
+
             JsonElement step = journal.FindStep(KilledStepNumber)
                 ?? throw new InvalidOperationException($"The step {KilledStepNumber} record disappeared from the journal.");
             JsonElement begin = journal.First(BeginRecord)
@@ -177,10 +190,8 @@ public sealed class CrashRecoveryProcessTests
         }
     }
 
-    // Polls the journal until step 2's record and step 1's stepEnd are both on disk. The step record is written
-    // synchronously by the engine coordinator's step gate, but stepEnd is journalled from the UI thread without an
-    // acknowledgment, so it can land just after the next step's record; killing on the step record alone could drop
-    // step 1's outcome from the partial summary.
+    // Polls the journal until step 2's record is on disk: the earliest moment of step 2, where a crash must still leave
+    // a journal that reports it.
     private static async Task<JournalView> WaitForKillPointAsync(
         TestHostLauncher.RunningHost host,
         string journalPath,
@@ -193,7 +204,7 @@ public sealed class CrashRecoveryProcessTests
             if (await TryReadJournalAsync(journalPath, cancellationToken) is { } view)
             {
                 observe(view);
-                if (view.FindStep(KilledStepNumber) is not null && view.HasStepEnd(KilledStepNumber - 1))
+                if (view.FindStep(KilledStepNumber) is not null)
                 {
                     return view;
                 }
@@ -449,8 +460,11 @@ public sealed class CrashRecoveryProcessTests
                 .Select(static record => (JsonElement?)record)
                 .FirstOrDefault();
 
-        public bool HasStepEnd(int stepNumber) =>
-            _records.Any(record => IsType(record, StepEndRecord) && HasIndex(record, stepNumber));
+        // The position of the first record of the type, and of the step when one is given, or -1 when there is none.
+        public int PositionOf(string recordType, int? stepNumber = null) =>
+            Array.FindIndex(
+                _records,
+                record => IsType(record, recordType) && (stepNumber is not { } number || HasIndex(record, number)));
 
         public string Tail(int lineCount) =>
             string.Join(Environment.NewLine, _lines.Skip(Math.Max(0, _lines.Length - lineCount)).Select(static line => "  " + line));

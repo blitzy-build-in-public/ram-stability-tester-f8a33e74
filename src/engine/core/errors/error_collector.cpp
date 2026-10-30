@@ -269,12 +269,14 @@ void error_collector::record(worker_error_sink& sink, const std::uint64_t* addre
     if (stop_on_error_ && !stop_issued_.exchange(true, std::memory_order_acq_rel)) {
         char detail[RQ_END_DETAIL_SIZE];
         char* const end = detail + sizeof(detail);
+        // Step and pass are numbered from 1, as the results log numbers them, so the detail and
+        // the error's log line agree; widened first, so a UINT32_MAX index cannot wrap to 0.
         char* cursor = append_text(detail, end, "First error: step ");
         cursor = append_decimal(cursor, end, std::uint64_t{ctx.step_index} + 1);
         cursor = append_text(cursor, end, " of ");
         cursor = append_decimal(cursor, end, step_count_);
         cursor = append_text(cursor, end, ", pass ");
-        cursor = append_decimal(cursor, end, ctx.pass_index);
+        cursor = append_decimal(cursor, end, std::uint64_t{ctx.pass_index} + 1);
         cursor = append_text(cursor, end, ", worker ");
         cursor = append_decimal(cursor, end, sink.worker_index_);
         cursor = append_text(cursor, end, ", virtual address ");

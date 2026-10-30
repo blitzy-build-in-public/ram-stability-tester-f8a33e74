@@ -1,4 +1,5 @@
 using System.Windows;
+using System.Windows.Controls.Primitives;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -421,23 +422,27 @@ public static class WorkAreaSizing
         return double.IsFinite(estimate) && estimate >= 0 ? estimate : 0;
     }
 
-    // The fixed-row budgets are measured on the window's content, so everything the content does not receive
-    // counts as non-client height: caption, frame, the window's border and padding, and the content's margin.
-    // Content that does not stretch vertically is only as tall as it asks to be, so the difference would not be
-    // the non-client height and is not used.
+    // The non-client height is the window's chrome alone: caption and frame. A window arranges its first visual
+    // child, the root of its template, in exactly its client area, whatever that child's margin, alignment or size,
+    // so the window's height less that child's layout slot is the non-client height. The window's border and padding
+    // and the content's margin lie inside the client area: they are client height, which the fixed rows and the
+    // 40-DIP detail allowance share. Until element content has been laid out there is nothing to measure, and a
+    // minimized window's client area is empty; the estimate then stays.
     private static bool TryMeasureNonClientHeight(Window window, out double nonClientHeight)
     {
         nonClientHeight = 0;
-        if (window.Content is not FrameworkElement content
-            || content.VerticalAlignment != VerticalAlignment.Stretch
-            || !double.IsNaN(content.Height)
-            || !(content.ActualHeight > 0))
+        if (window.Content is not UIElement content
+            || !(content.RenderSize.Height > 0)
+            || !(window.ActualHeight > 0)
+            || VisualTreeHelper.GetChildrenCount(window) == 0
+            || VisualTreeHelper.GetChild(window, 0) is not FrameworkElement root)
         {
             return false;
         }
 
-        double measured = window.ActualHeight - content.ActualHeight;
-        if (!double.IsFinite(measured) || measured < 0)
+        double clientHeight = LayoutInformation.GetLayoutSlot(root).Height;
+        double measured = window.ActualHeight - clientHeight;
+        if (!(clientHeight > 0) || !double.IsFinite(measured) || measured < 0)
         {
             return false;
         }

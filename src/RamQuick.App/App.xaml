@@ -39,9 +39,15 @@
                 <Setter Property="TextTrimming" Value="CharacterEllipsis" />
             </Style>
 
+            <!--
+                Header of a result detail section. Bold text alone is invisible to assistive technology, so the
+                style also marks each header as a heading for screen-reader heading navigation. Level 1, because
+                these headers are the window's only headings and a lower level would skip one.
+            -->
             <Style x:Key="SectionHeaderStyle" TargetType="TextBlock">
                 <Setter Property="FontWeight" Value="SemiBold" />
                 <Setter Property="Margin" Value="0,8,0,4" />
+                <Setter Property="AutomationProperties.HeadingLevel" Value="Level1" />
             </Style>
 
             <!--

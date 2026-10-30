@@ -1,7 +1,8 @@
 /**
  * @file clock.h
- * @brief The engine's clock seam (IClock and the QPC clock), the session stop signal and the
- *        UTF-8 truncation helper for fixed char[] payload fields.
+ * @brief The engine's clock seam (IClock and the QPC clock), the session stop signal, the
+ *        UTF-8 truncation helper for fixed char[] payload fields and the checked CloseHandle
+ *        that every engine handle owner closes through.
  *
  * Every engine timing reads the session's IClock, and every blocking wait that must honour a
  * stop waits through IClock::wait_for_stop on the session's stop_signal. The signal lives here
@@ -21,6 +22,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <cwchar>
 #include <system_error>
 
 #include "ramquick_engine.h"
@@ -63,6 +65,51 @@ inline void copy_utf8_truncated(char* dst, size_t dst_size, const char* src) noe
         std::memcpy(dst, src, length);
     }
     std::memset(dst + length, 0, dst_size - length);
+}
+
+/**
+ * Closes a kernel handle for an engine RAII owner and reports a failed close.
+ *
+ * Owners close in destructors, deleters and reset(), which must not throw, and the C API has no
+ * warning channel. So a failed close is written as one line to the debugger, where the engine's
+ * other non-fatal cleanup failures go, and returned for a caller that can act on it. The last
+ * error is read straight after CloseHandle, before formatting can overwrite it, and an unset one
+ * is reported as ERROR_GEN_FAILURE so that a failure never reads as success.
+ *
+ * The close is never retried, and the caller gives up the handle either way. A handle whose
+ * close failed may be invalid, already closed or already reused for another object, so closing
+ * the same value again could close a handle that other code owns.
+ *
+ * Never throws and never allocates: the line is formatted into a fixed stack buffer with
+ * _snwprintf_s and _TRUNCATE, which cuts an overlong description instead of raising the CRT
+ * invalid-parameter handler, which would terminate a static-CRT process. A cut line still ends
+ * with its newline.
+ *
+ * @param handle The handle to close; the caller owns it and must not use it afterwards.
+ * @param what Short English description of the handle for the diagnostic, for example
+ *        L"session stop event"; null is reported as L"handle".
+ * @return ERROR_SUCCESS when the handle was closed; otherwise the Windows error of the failed
+ *         close, never 0.
+ */
+inline DWORD close_handle_checked(HANDLE handle, const wchar_t* what) noexcept {
+    if (CloseHandle(handle)) {
+        return ERROR_SUCCESS;
+    }
+    const DWORD last_error = GetLastError();
+    const DWORD error = last_error != ERROR_SUCCESS ? last_error : ERROR_GEN_FAILURE;
+
+    constexpr size_t k_line_capacity = 256;
+    wchar_t line[k_line_capacity];
+    // One element is held back so that the newline still fits after a cut.
+    const int written =
+        _snwprintf_s(line, k_line_capacity - 1, _TRUNCATE,
+                     L"RAMQuick engine: CloseHandle of the %ls failed (Windows error %lu)",
+                     what != nullptr ? what : L"handle", error);
+    const size_t length = written >= 0 ? static_cast<size_t>(written) : std::wcslen(line);
+    line[length] = L'\n';
+    line[length + 1] = L'\0';
+    OutputDebugStringW(line);
+    return error;
 }
 
 /**
@@ -116,8 +163,11 @@ public:
         }
     }
 
-    /** Closes the event. No thread may still be waiting on it. */
-    ~stop_signal() { CloseHandle(event_); }
+    /**
+     * Closes the event. No thread may still be waiting on it. A failed close reaches the
+     * debugger through close_handle_checked; a destructor can do nothing more about it.
+     */
+    ~stop_signal() { close_handle_checked(event_, L"session stop event"); }
 
     stop_signal(const stop_signal&) = delete;
     stop_signal& operator=(const stop_signal&) = delete;

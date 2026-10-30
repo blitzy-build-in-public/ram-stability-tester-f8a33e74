@@ -15,6 +15,11 @@
     Exactly three input controls: the test type selector, Stop on error and the Start/Stop toggle. Lists are
     read-only ItemsControls rather than ListBox or DataGrid, and every ContentControl and ItemsControl is
     Focusable="False" (both default to True), so the tab order is selector, checkbox, toggle, detail area.
+
+    Live regions: the result (verdict with reason), the first-error message and the notice are announced to screen
+    readers when they change, the live readings never. Every copy of their text carries
+    AutomationProperties.LiveSetting, app:App.LiveRegion naming its region, and NotifyOnTargetUpdated on its binding;
+    App.xaml.cs announces each change once, from a copy the current layout shows.
 -->
 <Window x:Class="RamQuick.App.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -27,8 +32,8 @@
         mc:Ignorable="d"
         d:DataContext="{d:DesignInstance Type=viewModels:MainViewModel, IsDesignTimeCreatable=False}"
         Title="{x:Static app:UiText.AppTitle}"
-        Width="560"
-        Height="680"
+        Width="{x:Static behaviors:WindowSizing.PreferredWidth}"
+        Height="{x:Static behaviors:WindowSizing.PreferredHeight}"
         ResizeMode="CanResize"
         WindowStartupLocation="CenterScreen"
         UseLayoutRounding="True"
@@ -195,64 +200,157 @@
             <Setter Property="Margin" Value="12,1,0,0" />
         </Style>
 
-        <!-- Shared by the fixed area and, in the minimal layout, the detail area. -->
+        <!--
+            Shared by the fixed area and, in the minimal layout, the detail area.
+            Each value's automation name is "label: value", bound to the same value as its text, so a screen reader
+            announces the reading and follows it as it changes. A text element is otherwise named by its text alone,
+            and the panels around a label/value pair have no automation peer that could carry the label.
+        -->
         <DataTemplate x:Key="LiveReadingsTemplate">
             <StackPanel>
                 <DockPanel Style="{StaticResource FieldPairStyle}">
                     <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.CurrentStepLabel}" />
-                    <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding CurrentStepText}" />
+                    <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding CurrentStepText}">
+                        <AutomationProperties.Name>
+                            <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
+                                <Binding Source="{x:Static app:UiText.CurrentStepLabel}" />
+                                <Binding Path="CurrentStepText" />
+                            </MultiBinding>
+                        </AutomationProperties.Name>
+                    </TextBlock>
                 </DockPanel>
                 <UniformGrid Style="{StaticResource ReadingsGridStyle}">
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.RamTemperatureLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding RamTemperatureText}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding RamTemperatureText}">
+                            <AutomationProperties.Name>
+                                <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
+                                    <Binding Source="{x:Static app:UiText.RamTemperatureLabel}" />
+                                    <Binding Path="RamTemperatureText" />
+                                </MultiBinding>
+                            </AutomationProperties.Name>
+                        </TextBlock>
                     </DockPanel>
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.CpuTemperatureLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding CpuTemperatureText}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding CpuTemperatureText}">
+                            <AutomationProperties.Name>
+                                <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
+                                    <Binding Source="{x:Static app:UiText.CpuTemperatureLabel}" />
+                                    <Binding Path="CpuTemperatureText" />
+                                </MultiBinding>
+                            </AutomationProperties.Name>
+                        </TextBlock>
                     </DockPanel>
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.ElapsedLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding ElapsedText}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding ElapsedText}">
+                            <AutomationProperties.Name>
+                                <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
+                                    <Binding Source="{x:Static app:UiText.ElapsedLabel}" />
+                                    <Binding Path="ElapsedText" />
+                                </MultiBinding>
+                            </AutomationProperties.Name>
+                        </TextBlock>
                     </DockPanel>
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.RemainingLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding RemainingText}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding RemainingText}">
+                            <AutomationProperties.Name>
+                                <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
+                                    <Binding Source="{x:Static app:UiText.RemainingLabel}" />
+                                    <Binding Path="RemainingText" />
+                                </MultiBinding>
+                            </AutomationProperties.Name>
+                        </TextBlock>
                     </DockPanel>
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.CoverageLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding CoverageText}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding CoverageText}">
+                            <AutomationProperties.Name>
+                                <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
+                                    <Binding Source="{x:Static app:UiText.CoverageLabel}" />
+                                    <Binding Path="CoverageText" />
+                                </MultiBinding>
+                            </AutomationProperties.Name>
+                        </TextBlock>
                     </DockPanel>
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.ErrorsLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding ErrorCountText}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding ErrorCountText}">
+                            <AutomationProperties.Name>
+                                <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
+                                    <Binding Source="{x:Static app:UiText.ErrorsLabel}" />
+                                    <Binding Path="ErrorCountText" />
+                                </MultiBinding>
+                            </AutomationProperties.Name>
+                        </TextBlock>
                     </DockPanel>
                 </UniformGrid>
             </StackPanel>
         </DataTemplate>
 
+        <!--
+            The grid's values are named "label: value" as in LiveReadingsTemplate. The compact one-line summary needs
+            no such name: its own text already carries every label.
+        -->
         <DataTemplate x:Key="MemorySummaryTemplate">
             <StackPanel>
                 <UniformGrid Style="{StaticResource MemoryGridStyle}">
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.InstalledLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding InstalledText}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding InstalledText}">
+                            <AutomationProperties.Name>
+                                <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
+                                    <Binding Source="{x:Static app:UiText.InstalledLabel}" />
+                                    <Binding Path="InstalledText" />
+                                </MultiBinding>
+                            </AutomationProperties.Name>
+                        </TextBlock>
                     </DockPanel>
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.TestedLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding TestedText}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding TestedText}">
+                            <AutomationProperties.Name>
+                                <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
+                                    <Binding Source="{x:Static app:UiText.TestedLabel}" />
+                                    <Binding Path="TestedText" />
+                                </MultiBinding>
+                            </AutomationProperties.Name>
+                        </TextBlock>
                     </DockPanel>
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.SpeedLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding SpeedText}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding SpeedText}">
+                            <AutomationProperties.Name>
+                                <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
+                                    <Binding Source="{x:Static app:UiText.SpeedLabel}" />
+                                    <Binding Path="SpeedText" />
+                                </MultiBinding>
+                            </AutomationProperties.Name>
+                        </TextBlock>
                     </DockPanel>
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.ChannelsLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding ChannelsText}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding ChannelsText}">
+                            <AutomationProperties.Name>
+                                <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
+                                    <Binding Source="{x:Static app:UiText.ChannelsLabel}" />
+                                    <Binding Path="ChannelsText" />
+                                </MultiBinding>
+                            </AutomationProperties.Name>
+                        </TextBlock>
                     </DockPanel>
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.DimmsLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding DimmsText}" />
+                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding DimmsText}">
+                            <AutomationProperties.Name>
+                                <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
+                                    <Binding Source="{x:Static app:UiText.DimmsLabel}" />
+                                    <Binding Path="DimmsText" />
+                                </MultiBinding>
+                            </AutomationProperties.Name>
+                        </TextBlock>
                     </DockPanel>
                 </UniformGrid>
                 <!--
@@ -277,7 +375,11 @@
             </StackPanel>
         </DataTemplate>
 
-        <!-- Verdict badge and reason side by side, so a wrapped reason costs no extra row next to the badge. -->
+        <!--
+            Verdict badge and reason side by side, so a wrapped reason costs no extra row next to the badge.
+            The reason is the result's live region: its automation name is the verdict and the reason in one sentence,
+            so a screen reader announces both together once, while the badge still reads as the verdict alone.
+        -->
         <DataTemplate x:Key="ResultTemplate">
             <Grid Visibility="{Binding HasResult, Converter={StaticResource BoolToVisibility}}">
                 <Grid.ColumnDefinitions>
@@ -293,6 +395,9 @@
                            Margin="8,0,0,0"
                            VerticalAlignment="Center"
                            TextWrapping="Wrap"
+                           AutomationProperties.LiveSetting="Polite"
+                           AutomationProperties.Name="{Binding ResultAnnouncementText, NotifyOnTargetUpdated=True}"
+                           app:App.LiveRegion="Result"
                            Text="{Binding ResultReasonText}" />
             </Grid>
         </DataTemplate>
@@ -369,7 +474,9 @@
             -->
             <TextBlock Style="{StaticResource NoticeLineStyle}"
                        AutomationProperties.HelpText="{x:Static app:UiText.NoticeAutomationName}"
-                       Text="{Binding NoticeText}" />
+                       AutomationProperties.LiveSetting="Polite"
+                       app:App.LiveRegion="Notice"
+                       Text="{Binding NoticeText, NotifyOnTargetUpdated=True}" />
         </StackPanel>
 
         <StackPanel x:Name="ResultHeader"
@@ -379,7 +486,10 @@
             <ContentControl Focusable="False"
                             Content="{Binding}"
                             ContentTemplate="{StaticResource ResultTemplate}" />
-            <TextBlock Style="{StaticResource FirstErrorLineStyle}" Text="{Binding FirstErrorText}" />
+            <TextBlock Style="{StaticResource FirstErrorLineStyle}"
+                       AutomationProperties.LiveSetting="Polite"
+                       app:App.LiveRegion="FirstError"
+                       Text="{Binding FirstErrorText, NotifyOnTargetUpdated=True}" />
         </StackPanel>
 
         <!-- The separator marks where scrolling starts, so scrolled text never reads as part of the fixed rows. -->
@@ -390,7 +500,8 @@
                           HorizontalScrollBarVisibility="Disabled"
                           Focusable="True"
                           IsTabStop="True"
-                          TabIndex="3">
+                          TabIndex="3"
+                          AutomationProperties.Name="{x:Static app:UiText.ResultDetailAutomationName}">
                 <StackPanel>
                     <ContentControl Style="{StaticResource MinimalOnlyStyle}"
                                     Margin="0,4,0,6"
@@ -403,10 +514,14 @@
                         <TextBlock Style="{StaticResource DetailTextStyle}"
                                    Visibility="{Binding HasNotice, Converter={StaticResource BoolToVisibility}}"
                                    AutomationProperties.HelpText="{x:Static app:UiText.NoticeAutomationName}"
-                                   Text="{Binding NoticeText}" />
+                                   AutomationProperties.LiveSetting="Polite"
+                                   app:App.LiveRegion="Notice"
+                                   Text="{Binding NoticeText, NotifyOnTargetUpdated=True}" />
                         <TextBlock Style="{StaticResource DetailTextStyle}"
                                    Visibility="{Binding HasFirstError, Converter={StaticResource BoolToVisibility}}"
-                                   Text="{Binding FirstErrorText}" />
+                                   AutomationProperties.LiveSetting="Polite"
+                                   app:App.LiveRegion="FirstError"
+                                   Text="{Binding FirstErrorText, NotifyOnTargetUpdated=True}" />
                     </StackPanel>
 
                     <StackPanel Style="{StaticResource MinimalOnlyStyle}">

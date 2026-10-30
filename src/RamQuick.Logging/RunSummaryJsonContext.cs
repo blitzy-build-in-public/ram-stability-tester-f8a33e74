@@ -161,13 +161,22 @@ public static class RunSummaryJson
     /// </param>
     /// <returns>
     /// <see langword="true"/> when <paramref name="json"/> parses as a summary whose
-    /// <see cref="RunSummary.SchemaVersion"/> is <see cref="RunSummary.CurrentSchemaVersion"/> and whose
-    /// <c>run.id</c> is present; <see langword="false"/> for blank, malformed or mistyped JSON, another
-    /// schema version, or a missing run or run id. Never throws.
+    /// <see cref="RunSummary.SchemaVersion"/> is <see cref="RunSummary.CurrentSchemaVersion"/>, whose
+    /// <c>run.id</c> is present, and whose <c>steps</c>, <c>errors.groups</c>, <c>errors.records</c> and
+    /// <c>causeHints.items</c> arrays hold no <c>null</c> element; <see langword="false"/> for blank, malformed
+    /// or mistyped JSON, another schema version, a missing run or run id, or a <c>null</c> element in one of
+    /// those arrays. Never throws.
     /// </returns>
     /// <remarks>
+    /// <para>
     /// Crash recovery uses it to decide whether a final summary already on disk parses with the run id of
     /// the journal being recovered; the caller compares <see cref="SummaryRun.Id"/>.
+    /// </para>
+    /// <para>
+    /// Schema version 1 holds objects in those four arrays. Deserialization keeps a <c>null</c> element, so
+    /// a document holding one is refused here, before any reader of the summary, the text formatter among
+    /// them, meets it.
+    /// </para>
     /// </remarks>
     public static bool TryDeserialize(string json, [NotNullWhen(true)] out RunSummary? summary)
     {
@@ -191,7 +200,11 @@ public static class RunSummaryJson
         // so a missing run id reads back as empty text.
         if (parsed is null
             || parsed.SchemaVersion != RunSummary.CurrentSchemaVersion
-            || string.IsNullOrWhiteSpace(parsed.Run.Id))
+            || string.IsNullOrWhiteSpace(parsed.Run.Id)
+            || HasNullElement(parsed.Steps)
+            || HasNullElement(parsed.Errors.Groups)
+            || HasNullElement(parsed.Errors.Records)
+            || HasNullElement(parsed.CauseHints.Items))
         {
             return false;
         }
@@ -199,6 +212,10 @@ public static class RunSummaryJson
         summary = parsed;
         return true;
     }
+
+    private static bool HasNullElement<T>(IReadOnlyList<T> items)
+        where T : class =>
+        items.Any(item => item is null);
 }
 
 /// <summary>

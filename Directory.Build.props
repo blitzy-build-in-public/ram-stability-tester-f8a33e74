@@ -32,6 +32,7 @@
   <!--
     Target frameworks. RamQuickTargetFramework is the single retarget point: moving off .NET 8
     means changing it (for example to net10.0-windows) together with the SDK in global.json.
+    A .NET 10 SDK also needs MSBuild 18 (Visual Studio 2026); README.md states the toolchain.
     RamQuickNeutralTargetFramework is derived from it, so the two never drift apart.
     Each project file sets TargetFramework to one of them:
     - $(RamQuickNeutralTargetFramework): src/RamQuick.Core, src/RamQuick.Plans,

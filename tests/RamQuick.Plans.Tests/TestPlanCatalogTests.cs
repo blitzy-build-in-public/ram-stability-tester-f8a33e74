@@ -781,9 +781,15 @@ public sealed class TestPlanValidatorTests
     // Index 0 of every single-change plan: a valid windowed step whose name no case reuses.
     private static readonly StepDefinition _leadingStep = TestPlans.Quick.Steps[1];
 
-    // The baselines changed at index 1: Q1, a windowed step, and Q5, a step with a 5 s hold.
+    // The baselines changed at index 1: Q1, a windowed step; Q4, a moving-inversion step; and Q5,
+    // a step with a 5 s hold.
     private static readonly StepDefinition _windowedBaseline = TestPlans.Quick.Steps[0];
+    private static readonly StepDefinition _movingInversionBaseline = TestPlans.Quick.Steps[3];
     private static readonly StepDefinition _holdBaseline = TestPlans.Quick.Steps[4];
+
+    // A hold and a budget that meet the hold rule, so a shape case breaks the shape rule alone.
+    private static readonly TimeSpan _shapeCaseHold = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan _shapeCaseBudget = TimeSpan.FromSeconds(10);
 
     // "\u20AC" (euro sign) is 3 UTF-8 bytes and "\u00E9" (e acute) 2, so these names tell a byte
     // limit apart from a character limit.
@@ -802,6 +808,8 @@ public sealed class TestPlanValidatorTests
         "BudgetNativeMaximum",
         "HoldBudgetExactlyMinimumRatio",
         "MechanismsEveryDefinedBit",
+        "MovingInversionWithTurnaroundOrderNoHold",
+        "HoldWithRandomBlocksOnHighTogglePattern",
     };
 
     public static TheoryData<string> InvalidCases { get; } = new()
@@ -835,6 +843,10 @@ public sealed class TestPlanValidatorTests
         "PrimaryNone",
         "PrimaryUndefinedBit",
         "MechanismsUndefinedBit",
+        "HoldWithSequentialAscendingOrder",
+        "HoldWithBankStrideOrder",
+        "HoldWithTurnaroundOrder",
+        "HoldWithMovingInversionPattern",
     };
 
     [Theory]
@@ -850,8 +862,16 @@ public sealed class TestPlanValidatorTests
         Assert.Equal("Random bank thrash", _leadingStep.Name);
         Assert.Equal("High-toggle sweep", _windowedBaseline.Name);
         Assert.False(_windowedBaseline.HasHold);
+        Assert.Equal(PatternKind.HighToggle, _windowedBaseline.Pattern);
+        Assert.Equal(AccessOrder.SequentialAscending, _windowedBaseline.Order);
+        Assert.Equal("Moving inversion, walking bits", _movingInversionBaseline.Name);
+        Assert.Equal(PatternKind.MovingInversionWalking, _movingInversionBaseline.Pattern);
+        Assert.Equal(AccessOrder.SequentialAscending, _movingInversionBaseline.Order);
+        Assert.False(_movingInversionBaseline.HasHold);
         Assert.Equal("Refresh hold", _holdBaseline.Name);
         Assert.Equal(TimeSpan.FromSeconds(5), _holdBaseline.Hold);
+        Assert.Equal(PatternKind.Random, _holdBaseline.Pattern);
+        Assert.Equal(AccessOrder.RandomBlocks, _holdBaseline.Order);
     }
 
     [Fact]
@@ -921,6 +941,22 @@ public sealed class TestPlanValidatorTests
     }
 
     [Fact]
+    public void Validate_MovingInversionHoldOnOtherOrder_ReportsOnlyThePatternRule()
+    {
+        // Q4 declares SequentialAscending, so a hold breaks both halves of the shape rule; the
+        // moving-inversion half alone is reported, so one faulty shape gives one violation.
+        IReadOnlyList<PlanViolation> violations = TestPlanValidator.Validate(
+            SingleChangePlan(_movingInversionBaseline with { Hold = _shapeCaseHold, TimeBudget = _shapeCaseBudget }));
+
+        PlanViolation violation = Assert.Single(violations);
+        Assert.Equal(1, violation.StepIndex);
+        Assert.Equal(_movingInversionBaseline.Name, violation.StepName);
+        Assert.Contains(_movingInversionBaseline.Name, violation.Message, StringComparison.Ordinal);
+        Assert.Contains("moving inversion", violation.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("must be RandomBlocks", violation.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Validate_NameWithControlCharacter_EscapesItInTheMessageAndKeepsTheRawName()
     {
         const string RawName = "Bad\0name";
@@ -955,6 +991,13 @@ public sealed class TestPlanValidatorTests
         // 12.5 s is exactly 2.5 times the 5 s hold; the rule compares in ticks, so equality passes.
         "HoldBudgetExactlyMinimumRatio" => SingleChangePlan(_holdBaseline with { TimeBudget = Milliseconds(12_500) }),
         "MechanismsEveryDefinedBit" => SingleChangePlan(_windowedBaseline with { Mechanisms = AllDefinedMechanisms() }),
+
+        // Moving inversion ignores the order it declares, and a step without a hold has no shape rule
+        // to break; a hold on RandomBlocks with a pattern other than moving inversion is a shape the
+        // engine runs.
+        "MovingInversionWithTurnaroundOrderNoHold" => SingleChangePlan(_movingInversionBaseline with { Order = AccessOrder.Turnaround }),
+        "HoldWithRandomBlocksOnHighTogglePattern" => SingleChangePlan(
+            _windowedBaseline with { Order = AccessOrder.RandomBlocks, Hold = _shapeCaseHold, TimeBudget = _shapeCaseBudget }),
         _ => throw new ArgumentOutOfRangeException(nameof(caseName), caseName, "Unknown boundary case."),
     };
 
@@ -1035,6 +1078,17 @@ public sealed class TestPlanValidatorTests
         "MechanismsUndefinedBit" => StepCase(
             _windowedBaseline,
             _windowedBaseline with { Mechanisms = InstabilityMechanism.SignalIntegrity | UndefinedMechanismBit }),
+
+        // A hold step writes its whole slice in RandomBlocks order, so a hold on any other order is
+        // a shape the engine refuses at session creation.
+        "HoldWithSequentialAscendingOrder" => StepCase(
+            _windowedBaseline,
+            _windowedBaseline with { Hold = _shapeCaseHold, TimeBudget = _shapeCaseBudget }),
+        "HoldWithBankStrideOrder" => StepCase(
+            _windowedBaseline,
+            _windowedBaseline with { Order = AccessOrder.BankStride, Hold = _shapeCaseHold, TimeBudget = _shapeCaseBudget }),
+        "HoldWithTurnaroundOrder" => StepCase(_holdBaseline, _holdBaseline with { Order = AccessOrder.Turnaround }),
+        "HoldWithMovingInversionPattern" => StepCase(_holdBaseline, _holdBaseline with { Pattern = PatternKind.MovingInversionWalking }),
         _ => throw new ArgumentOutOfRangeException(nameof(caseName), caseName, "Unknown invalid case."),
     };
 
