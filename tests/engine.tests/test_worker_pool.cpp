@@ -502,16 +502,40 @@ TEST(WorkerPoolPinning, EveryWorkerRunsOnlyOnItsOwnProcessorAtBelowNormalPriorit
  * WorkerPoolHalfMode
  * ------------------------------------------------------------------------------------------- */
 
-/** Worker count of a Half-mode case; 0 stands for every placement of the machine. */
+/** Fixed Half-mode worker counts: a lone even worker, one pair, a pair plus an unpaired worker. */
+constexpr std::uint32_t k_half_mode_fixed_counts[] = {1U, 2U, 3U};
+
+/**
+ * The Half-mode cases to register: each fixed count the machine has processors for, then 0 for
+ * every placement. A count the machine lacks is not registered, because processor count is no
+ * reason for a worker-pool test to skip. gtest calls this inside InitGoogleTest, so it reads the
+ * non-throwing active-processor count, which WorkerPoolPlacement asserts equals the placements.
+ * If that read fails (0), every fixed count is registered and the case's own check reports it.
+ */
+std::vector<std::uint32_t> half_mode_worker_counts() {
+    const auto active = static_cast<std::uint32_t>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+    std::vector<std::uint32_t> counts;
+    for (const std::uint32_t count : k_half_mode_fixed_counts) {
+        if (active == 0U || count <= active) {
+            counts.push_back(count);
+        }
+    }
+    counts.push_back(0U);
+    return counts;
+}
+
+/**
+ * Worker count of a Half-mode case; 0 stands for every placement of the machine. Only counts the
+ * machine has are registered.
+ */
 class WorkerPoolHalfMode : public ::testing::TestWithParam<std::uint32_t> {};
 
 TEST_P(WorkerPoolHalfMode, EvenPhaseRunsExactlyTheEvenWorkersAndTheOddPartnersRunTheNextPhase) {
     const std::vector<logical_processor> placements = machine_placements();
     const auto available = static_cast<std::uint32_t>(placements.size());
     const std::uint32_t count = GetParam() == 0U ? available : GetParam();
-    if (count > available) {
-        GTEST_SKIP() << "needs " << count << " logical processors; " << available << " are active";
-    }
+    ASSERT_LE(count, available) << "registered for " << count << " workers but only " << available
+                                << " placements exist";
     failing_affinity affinity(count, k_no_failure, 0U);
     stop_signal stop;
     std::vector<std::atomic<std::uint32_t>> even_runs(count);
@@ -564,7 +588,8 @@ TEST_P(WorkerPoolHalfMode, EvenPhaseRunsExactlyTheEvenWorkersAndTheOddPartnersRu
     EXPECT_FALSE(stop.stop_requested());
 }
 
-INSTANTIATE_TEST_SUITE_P(WorkerPoolSizes, WorkerPoolHalfMode, ::testing::Values(1U, 2U, 3U, 0U),
+INSTANTIATE_TEST_SUITE_P(WorkerPoolSizes, WorkerPoolHalfMode,
+                         ::testing::ValuesIn(half_mode_worker_counts()),
                          [](const ::testing::TestParamInfo<std::uint32_t>& info) {
                              return info.param == 0U
                                         ? std::string("EveryPlacement")
@@ -696,7 +721,18 @@ TEST(WorkerPoolStop, RunningPhaseEndsWithinTheStopBoundOnceAStopIsRequested) {
     failing_affinity affinity(count, k_no_failure, 0U);
     stop_signal stop;
     qpc_clock clock;
-    std::atomic<std::uint32_t> entered{0U};
+
+    // Entry is counted under a lock so the last worker in can wake the test thread, which then
+    // requests the stop knowing every task is blocked in its wait. The shared counter is atomic,
+    // yet still changed under the lock so the wait cannot miss the last entrant's notification.
+    // The gate is declared before the pool because the tasks that touch it run until the pool's
+    // destructor joins them.
+    struct entry_gate {
+        std::mutex lock;
+        std::condition_variable all_entered;
+        std::atomic<std::uint32_t> entered{0U};
+    };
+    entry_gate entry;
     std::atomic<std::uint32_t> woken_by_stop{0U};
     worker_pool pool;
     const stop_on_exit release_tasks(stop);
@@ -706,19 +742,28 @@ TEST(WorkerPoolStop, RunningPhaseEndsWithinTheStopBoundOnceAStopIsRequested) {
 
     // Each task blocks as a hold does, on the stop signal rather than in a sleep.
     pool.post_phase(
-        [&stop, &clock, &entered, &woken_by_stop](std::uint32_t) {
-            entered.fetch_add(1U, std::memory_order_relaxed);
+        [&stop, &clock, &entry, count, &woken_by_stop](std::uint32_t) {
+            bool last = false;
+            {
+                const std::lock_guard hold(entry.lock);
+                last = entry.entered.fetch_add(1U, std::memory_order_relaxed) + 1U == count;
+            }
+            if (last) {
+                entry.all_entered.notify_all();
+            }
             if (clock.wait_for_stop(stop, k_task_wait_cap_ms)) {
                 woken_by_stop.fetch_add(1U, std::memory_order_relaxed);
             }
         },
         active_set::all);
-    const auto deadline = std::chrono::steady_clock::now() + k_phase_timeout;
-    while (entered.load(std::memory_order_relaxed) < count &&
-           std::chrono::steady_clock::now() < deadline) {
-        Sleep(1);
+    {
+        std::unique_lock hold(entry.lock);
+        ASSERT_TRUE(entry.all_entered.wait_for(
+            hold, k_phase_timeout,
+            [&entry, count] { return entry.entered.load(std::memory_order_relaxed) == count; }))
+            << entry.entered.load(std::memory_order_relaxed) << " of " << count
+            << " workers began the phase within " << k_phase_timeout.count() << " ms";
     }
-    ASSERT_EQ(entered.load(std::memory_order_relaxed), count) << "workers that began the phase";
     EXPECT_FALSE(pool.wait_phase(0U)) << "the phase must still be outstanding";
 
     const auto requested_at = std::chrono::steady_clock::now();
