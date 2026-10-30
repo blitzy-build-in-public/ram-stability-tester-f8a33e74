@@ -172,6 +172,11 @@ public sealed class HostServiceTests
     private static readonly TimeSpan _contendedTimeout = TimeSpan.FromMilliseconds(100);
     private static readonly TimeSpan _threadJoinTimeout = TimeSpan.FromSeconds(30);
 
+    // Thread.Join can return before Windows has ended the joined OS thread and abandoned the mutexes
+    // it owns, so a successor waits this long for the abandonment instead of testing once. The owner
+    // never releases, so the wait succeeds only through abandonment, never while the owner lives.
+    private static readonly TimeSpan _abandonmentTimeout = TimeSpan.FromSeconds(5);
+
     /// <summary>
     /// Names Windows rejects as malformed, one per Win32 error the guard lets propagate: a namespace
     /// that does not exist (ERROR_PATH_NOT_FOUND), nothing after the namespace prefix
@@ -264,7 +269,7 @@ public sealed class HostServiceTests
         SingleInstanceGuard? successor = null;
         try
         {
-            successor = SingleInstanceGuard.TryAcquire(TimeSpan.Zero, name);
+            successor = SingleInstanceGuard.TryAcquire(_abandonmentTimeout, name);
             Assert.NotNull(successor);
 
             // Disposed off its owning thread, the abandoned guard only closes its handle. It must not

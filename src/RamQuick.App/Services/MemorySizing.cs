@@ -29,6 +29,14 @@ public sealed record MemorySizingResult(ulong PlannedBytes, bool IsSufficient);
 /// refuses Start.
 /// </para>
 /// <para>
+/// Both shares are of the available memory measured when the run is sized. Locking the region then costs Windows
+/// bookkeeping of its own, a page-table entry and a working-set entry of 8 bytes each per 4 KiB page (about 1/256 of
+/// the region), and this process and Windows may grow while the region is held, so free memory during a run can sit
+/// slightly below these shares. The constants deliberately carry no allowance for that: the planned size is exactly the
+/// rule above, and <see cref="AvailableRatio"/> and <see cref="HeadroomBytes"/> are the points to retune if Windows
+/// stops responding during a run on a real machine.
+/// </para>
+/// <para>
 /// Worked examples (GiB = 2^30 bytes, MiB = 2^20 bytes):
 /// </para>
 /// <list type="bullet">

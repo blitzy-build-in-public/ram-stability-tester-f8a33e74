@@ -108,7 +108,7 @@ The timestamp is the test's local start time, and `<runId>` is a 32-digit hexade
 - No telemetry, no update checks and no network activity initiated by RAMQuick.
 - No registry writes and no driver or service installation; privileges are enabled only when the account already holds them.
 - Locked memory is released on every exit path: completion, Stop, errors, thermal stops and engine faults. If the process is terminated, Windows reclaims the memory.
-- At least 10 % of the available memory, and never less than 1 GiB, stays free during a test, and test threads run below normal priority, so Windows stays usable.
+- The test is sized to leave at least 10 % of the available memory free, and never less than 1 GiB. Locking the test memory costs Windows a little memory of its own, so free memory during a test can sit slightly below that share. Test threads run below normal priority, so Windows stays usable.
 - The test is designed to stay within the stress of heavy daily workloads: it changes no voltage, frequency or timing and never loops over a small set of addresses. [docs/METHODOLOGY.md](docs/METHODOLOGY.md) defines that bound and how it is measured.
 
 ## Supported systems
