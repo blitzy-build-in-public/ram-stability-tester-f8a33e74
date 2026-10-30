@@ -29,12 +29,18 @@ namespace RamQuick.IntegrationTests;
 /// grouped-list header and the hint labels are observed where the user reads them.
 /// </para>
 /// <para>
-/// The fault layer applies each corruption after the word's last write and before its verification, and claims its
-/// global cap in time order. Each correctness test caps its expected reports at 2,000. How many verifications the
-/// scaled plan runs depends on memory bandwidth, and one target per verification is the sparsest injection the layer
-/// offers, so on a fast or idle host the cap can end injection before the last step. The steps after it then run
-/// without the fault, and the cause analysis covers only the steps the fault was live in
-/// (<see cref="FaultRun.FaultLiveStepResults"/>).
+/// The fault layer applies each corruption after the word's last write and before its verification. Each correctness
+/// spec sets a per-step pass quota (<see cref="FaultSpec.InjectedPassesPerStep"/>), so only the first passes of every
+/// step inject. How many passes a step runs depends on memory bandwidth, but its injections are then bounded by the
+/// plan alone: each test computes that worst case before it runs (<see cref="ReportBound"/>) and requires it to stay
+/// within 2,000 reports and below the injection cap, which remains a safety net the log must never reach. The fault is
+/// therefore live in every step, the matching covers every injection, and the cause analysis reads every step outcome
+/// of the completed run.
+/// </para>
+/// <para>
+/// The delay-dependent class ages data on the test library's controlled hold clock, which only a begun hold advances,
+/// by the hold's configured 5 s; a windowed verification that a descheduled worker runs late still sees age 0, so the
+/// 2,000 ms threshold separates hold verifications from all others whatever the host load.
 /// </para>
 /// </remarks>
 public sealed class FaultInjectionEndToEndTests
@@ -59,18 +65,26 @@ public sealed class FaultInjectionEndToEndTests
     private const ulong CapExhaustionSeed = 0x0000_0000_CA9E_C5A1UL;
     private const ulong StopOnErrorSeed = 0x0000_0000_F125_7E77UL;
 
-    // Per-(step, pass) counts and caps of the correctness runs. The caps hold the expected reports at 2,000, and one
-    // target per verification is the floor, because the fault layer has no sparser setting. How many verifications
-    // the scaled plan runs depends on memory bandwidth, so on a fast or idle host a spread class can spend its cap
-    // before the last step. The steps after it then run without the fault, and the cause analysis covers only the
-    // steps the fault was live in (FaultRun.FaultLiveStepResults).
+    // Per-(step, pass) counts, per-step pass quotas and safety caps of the correctness runs. Only the first <quota>
+    // passes of each step inject, so the scaled Standard plan's worst case is fixed before the run: 128 passes x 1 word
+    // over ten single-sweep steps and two moving-inversion steps of two sweeps is 1,792 reports for the spread, region
+    // and stuck-bit classes, and 16 passes x 8 words over the two hold steps is 256 for the delay-dependent class. Each
+    // stays within MaxExpectedReports and below its cap, so the cap never binds and no step loses the fault to it.
     private const int SingleBitFlipPerPass = 1;
+    private const uint SingleBitFlipPassesPerStep = 128;
     private const long SingleBitFlipMaxInjections = MaxExpectedReports;
+    private const uint StuckBitPassesPerStep = 128;
     private const long StuckBitMaxInjections = MaxExpectedReports;
     private const int AddressRegionPerPass = 1;
+    private const uint AddressRegionPassesPerStep = 128;
     private const long AddressRegionMaxInjections = MaxExpectedReports;
     private const int DelayDependentPerPass = 8;
+    private const uint DelayDependentPassesPerStep = 16;
     private const long DelayDependentMaxInjections = 1_500;
+
+    // Verifications per pass of one word: moving inversion verifies twice, every other phase once.
+    private const int MovingInversionSweepsPerPass = 2;
+    private const int SingleSweepPerPass = 1;
 
     // Cap exhaustion: more than 15,000 corruptions against the 10,000-record detail cap.
     private const int CapExhaustionPerPass = 64;
@@ -97,9 +111,6 @@ public sealed class FaultInjectionEndToEndTests
     private static readonly TimeSpan _runTimeoutSlack = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan _stopOnErrorBound = TimeSpan.FromSeconds(2);
 
-    // The wall-clock interval includes the engine's batching delay of at most 100 ms and the dispatcher hops.
-    private static readonly TimeSpan _stopOnErrorWallClockBound = TimeSpan.FromSeconds(2.25);
-
     private readonly ITestOutputHelper _output;
 
     public FaultInjectionEndToEndTests(ITestOutputHelper output)
@@ -116,11 +127,16 @@ public sealed class FaultInjectionEndToEndTests
             FlippedBit,
             SingleBitFlipPerPass,
             SingleBitFlipMaxInjections,
-            SingleBitFlipSeed);
+            SingleBitFlipSeed) with
+        {
+            InjectedPassesPerStep = SingleBitFlipPassesPerStep,
+        };
+        AssertReportBoundBeforeRun(spec);
 
         FaultRun run = await RunDirectAsync(spec, TestContext.Current.CancellationToken);
 
         AssertCorrectnessRun(run);
+        AssertEveryCompletedStepInjected(run);
 
         string[] wrongBits = run.Records
             .Where(record => record.BitPositions.Count != 1 || record.BitPositions[0] != FlippedBit)
@@ -156,7 +172,11 @@ public sealed class FaultInjectionEndToEndTests
     {
         ulong regionBytes = PlannedRegionBytes();
         ulong stuckWord = (regionBytes / 3) & WordAlignmentMask;
-        FaultSpec spec = FaultSpec.StuckBit(stuckWord, StuckBitIndex, StuckBitValue, StuckBitMaxInjections);
+        FaultSpec spec = FaultSpec.StuckBit(stuckWord, StuckBitIndex, StuckBitValue, StuckBitMaxInjections) with
+        {
+            InjectedPassesPerStep = StuckBitPassesPerStep,
+        };
+        AssertReportBoundBeforeRun(spec);
 
         FaultRun run = await RunDirectAsync(spec, TestContext.Current.CancellationToken);
 
@@ -181,6 +201,18 @@ public sealed class FaultInjectionEndToEndTests
                 CultureInfo.InvariantCulture,
                 $"word 0x{group.WordAddress:X} x{group.Count}, bits 0x{group.BitMaskUnion:X16}"))));
 
+        // The group is keyed by the reported address, so it must be the stuck word's address as the fault layer stored
+        // through it, which every injection of the one stuck word shares.
+        ulong[] injectedAddresses = run.VerifiedInjections.Select(fault => fault.Address).Distinct().ToArray();
+        Assert.True(
+            injectedAddresses.Length == 1,
+            string.Create(CultureInfo.InvariantCulture, $"The stuck word's {run.VerifiedInjections.Count} injections were stored through {injectedAddresses.Length} addresses: ")
+            + Listed(injectedAddresses.Select(address => string.Create(CultureInfo.InvariantCulture, $"0x{address:X16}")).ToArray()));
+        Assert.True(
+            groups[0].WordAddress == injectedAddresses[0],
+            string.Create(CultureInfo.InvariantCulture, $"The stuck-bit group is at address 0x{groups[0].WordAddress:X16}, but the stuck word's corruptions ")
+            + string.Create(CultureInfo.InvariantCulture, $"were stored through 0x{injectedAddresses[0]:X16}."));
+
         AssertTopCause(run, CauseCategory.RankOrDimm);
     }
 
@@ -195,11 +227,16 @@ public sealed class FaultInjectionEndToEndTests
             length,
             AddressRegionPerPass,
             AddressRegionMaxInjections,
-            AddressRegionSeed);
+            AddressRegionSeed) with
+        {
+            InjectedPassesPerStep = AddressRegionPassesPerStep,
+        };
+        AssertReportBoundBeforeRun(spec);
 
         FaultRun run = await RunDirectAsync(spec, TestContext.Current.CancellationToken);
 
         AssertCorrectnessRun(run);
+        AssertEveryCompletedStepInjected(run);
 
         string[] outside = run.Records
             .Where(record => record.RegionOffset < offset || record.RegionOffset >= offset + length)
@@ -219,14 +256,22 @@ public sealed class FaultInjectionEndToEndTests
         FaultSpec spec = FaultSpec.DelayDependent(
             DelayDependentPerPass,
             DelayDependentMaxInjections,
-            DelayDependentSeed);
+            DelayDependentSeed) with
+        {
+            InjectedPassesPerStep = DelayDependentPassesPerStep,
+        };
         Assert.Equal(TestEngineNative.DefaultDelayThresholdMs, spec.DelayThresholdMs);
+        AssertReportBoundBeforeRun(spec);
 
         FaultRun run = await RunDirectAsync(spec, TestContext.Current.CancellationToken);
 
         AssertCorrectnessRun(run);
 
-        // Hold steps exist in the plan (Q5 and S10), and only their data ages past the 2000 ms threshold.
+        // Hold steps exist in the plan (Q5 and S10), and only their data ages past the 2000 ms threshold: the test
+        // library measures the age on its controlled hold clock, which advances by a hold's configured 5 s once every
+        // worker has written and flushed its slice and the hold has begun, and by nothing else. A windowed
+        // verification that host load delays by seconds therefore still sees age 0, so the assertions below hold
+        // whatever the scheduling, while every hold verification sees 5,000 ms, above the unchanged threshold.
         int holdSteps = run.Plan.Steps.Count(step => step.HasHold);
         Assert.True(
             run.Records.Count >= 1,
@@ -247,7 +292,8 @@ public sealed class FaultInjectionEndToEndTests
             .ToArray();
         Assert.True(
             erroneousWindowedSteps.Length == 0,
-            "Steps without a hold counted errors, although their data never ages past the threshold: "
+            "Steps without a hold counted errors, although no hold begins between their writes and verifications, so the "
+            + "controlled hold clock never ages their data: "
             + Listed(erroneousWindowedSteps));
 
         AssertTopCause(run, CauseCategory.RefreshRetention);
@@ -375,21 +421,50 @@ public sealed class FaultInjectionEndToEndTests
             Assert.True(
                 engineRun.FirstErrorAt is not null && engineRun.CompletedAt is not null,
                 "The first error batch or Completed was not received.");
-            TimeSpan wallLatency = Stopwatch.GetElapsedTime(engineRun.FirstErrorAt.Value, engineRun.CompletedAt.Value);
-            _output.WriteLine(string.Create(
-                CultureInfo.InvariantCulture,
-                $"First error batch to Completed, wall clock: {wallLatency.TotalMilliseconds:0} ms; engine: {engineLatency.TotalMilliseconds:0} ms."));
-            Assert.True(
-                wallLatency <= _stopOnErrorWallClockBound,
-                string.Create(CultureInfo.InvariantCulture, $"Completed arrived {wallLatency.TotalMilliseconds:0} ms after the first error batch ")
-                + string.Create(CultureInfo.InvariantCulture, $"(engine-side {engineLatency.TotalMilliseconds:0} ms); the bound is {_stopOnErrorWallClockBound.TotalSeconds:0.##} s."));
+            long firstBatchAt = engineRun.FirstErrorAt.Value;
+            long completedAt = engineRun.CompletedAt.Value;
 
-            // The reported first error is one of the injected corruptions, at its word, bit, step and pass.
+            // The reported first error is one of the injected corruptions, at its word, address, bit, step and pass.
             Assert.True(view.FirstError is not null, "The controller holds no first error record.");
             var firstKey = MatchKey.Of(view.FirstError);
             Assert.True(
                 engineRun.InjectionLog.Any(fault => MatchKey.Of(fault) == firstKey),
                 string.Create(CultureInfo.InvariantCulture, $"The first error ({Describe(view.FirstError)}) matches no injected corruption."));
+
+            // Every error of this run is an injected corruption, confirmed inside the forwarded verification that follows
+            // its store, and each call's injection time is read before it stores anything. The earliest verified
+            // injection therefore precedes the first confirmed error, so the interval from it to the Completed receipt is
+            // an upper bound on the required one, with no allowance for batching or dispatch.
+            InjectedFault? earliest = engineRun.InjectionLog
+                .Where(fault => fault.VerifiedOpportunity)
+                .MinBy(fault => fault.InjectedNs);
+            Assert.True(
+                earliest is not null,
+                string.Create(CultureInfo.InvariantCulture, $"The run reported {completed.TotalErrors} error(s), but the fault layer logged no verified injection."));
+            long injectedAt = earliest.InjectedAt;
+
+            // The session clock and Stopwatch must both read QueryPerformanceCounter: the earliest injection then follows
+            // the session's creation and precedes the receipt of the first error batch, which it caused.
+            Assert.True(
+                engineRun.CreatedAt <= injectedAt && injectedAt <= firstBatchAt,
+                string.Create(CultureInfo.InvariantCulture, $"The earliest injection's timestamp {injectedAt} lies outside [session created {engineRun.CreatedAt}, ")
+                + string.Create(CultureInfo.InvariantCulture, $"first error batch received {firstBatchAt}]; the session clock and Stopwatch do not share a time base."));
+
+            TimeSpan injectionToCompleted = Stopwatch.GetElapsedTime(injectedAt, completedAt);
+            TimeSpan injectionToBatch = Stopwatch.GetElapsedTime(injectedAt, firstBatchAt);
+            TimeSpan batchToCompleted = Stopwatch.GetElapsedTime(firstBatchAt, completedAt);
+            TimeSpan remainder = injectionToCompleted - engineLatency;
+            _output.WriteLine(string.Create(
+                CultureInfo.InvariantCulture,
+                $"Earliest verified injection to Completed receipt: {injectionToCompleted.TotalMilliseconds:0.0} ms. Injection to first error batch "
+                + $"receipt (confirmation, batching, dispatch): {injectionToBatch.TotalMilliseconds:0.0} ms; first batch receipt to Completed "
+                + $"receipt: {batchToCompleted.TotalMilliseconds:0.0} ms; engine first error to Completed: {engineLatency.TotalMilliseconds:0} ms; "
+                + $"remainder (injection to confirmation, Completed dispatch): {remainder.TotalMilliseconds:0.0} ms."));
+            Assert.True(
+                injectionToCompleted <= _stopOnErrorBound,
+                string.Create(CultureInfo.InvariantCulture, $"Completed was received {injectionToCompleted.TotalMilliseconds:0.0} ms after the earliest verified injection, ")
+                + string.Create(CultureInfo.InvariantCulture, $"which precedes the first confirmed error; the bound is {_stopOnErrorBound.TotalSeconds:0} s (engine-side ")
+                + string.Create(CultureInfo.InvariantCulture, $"{engineLatency.TotalMilliseconds:0} ms, first batch receipt to Completed receipt {batchToCompleted.TotalMilliseconds:0.0} ms)."));
 
             Assert.True(
                 view.CauseHintCount > 0,
@@ -510,10 +585,10 @@ public sealed class FaultInjectionEndToEndTests
         }
     }
 
-    // The checks every correctness run shares: a completed run over the planned region in which every injection with a
-    // verification opportunity is reported exactly once, the true totals agree, and the independent byte count
-    // confirms the reported coverage.
-    private void AssertCorrectnessRun(FaultRun run)
+    // The checks every correctness run shares: a completed run over the planned region whose injections stay within the
+    // plan's bound and below the cap, in which every injection with a verification opportunity is reported exactly
+    // once, the true totals agree, and the independent byte count confirms the reported coverage.
+    private static void AssertCorrectnessRun(FaultRun run)
     {
         Assert.True(
             run.Completed.EndReason == RunEndReason.Completed,
@@ -525,21 +600,16 @@ public sealed class FaultInjectionEndToEndTests
             string.Create(CultureInfo.InvariantCulture, $"Precondition: the engine tested {run.Prepared.TestedBytes} bytes instead of the planned ")
             + string.Create(CultureInfo.InvariantCulture, $"{run.RegionBytes}; locking shrank the region, so the fault offsets no longer describe it."));
 
-        // The layer claims its cap in time order, and its verification count follows memory bandwidth, so the cap can
-        // end injection before the last step. The matching below covers every injection either way; only the cause
-        // analysis narrows to the fault-live steps.
-        if (run.CapReachedBeforeLastStep)
-        {
-            int capStep = run.LastInjectedStep + 1;
-            int stepCount = run.Plan.Steps.Count;
-            string faultFree = capStep + 1 == stepCount
-                ? string.Create(CultureInfo.InvariantCulture, $"step {stepCount} ran")
-                : string.Create(CultureInfo.InvariantCulture, $"steps {capStep + 1} to {stepCount} ran");
-            _output.WriteLine(string.Create(
-                CultureInfo.InvariantCulture,
-                $"Cap: the fault layer reached its cap of {run.Spec.MaxInjections} injections in step {capStep} of {stepCount}, "
-                + $"so {faultFree} without the fault; the cause analysis covers steps 1 to {capStep}."));
-        }
+        // The per-step quota, not the cap, bounds the injections: a log beyond the plan's bound means the quota failed,
+        // and a log at the cap means the cap ended injection early and some steps ran without the fault.
+        Assert.True(
+            run.InjectionLog.Count <= run.ReportBound,
+            string.Create(CultureInfo.InvariantCulture, $"The fault layer logged {run.InjectionLog.Count} injections, more than the {run.ReportBound} ")
+            + string.Create(CultureInfo.InvariantCulture, $"that {run.Spec.InjectedPassesPerStep} injecting passes per step allow on the plan."));
+        Assert.True(
+            (ulong)run.InjectionLog.Count < run.Spec.MaxInjections,
+            string.Create(CultureInfo.InvariantCulture, $"The fault layer reached its safety cap of {run.Spec.MaxInjections} injections, ")
+            + "so the cap, not the per-step quota, ended injection and later steps ran without the fault.");
 
         IReadOnlyList<InjectedFault> verified = run.VerifiedInjections;
         Assert.True(
@@ -558,6 +628,8 @@ public sealed class FaultInjectionEndToEndTests
     }
 
     // Multiset matching: moving inversion verifies twice per pass, so one target can be injected, and reported, twice.
+    // The fault layer logs the address it stored each corruption through, so every record's address is checked against
+    // that ground truth, not merely against the record's own offset.
     private static void AssertEveryInjectionReportedOnce(IReadOnlyList<InjectedFault> verified, IReadOnlyList<ErrorRecord> records)
     {
         MatchKey[] injectedKeys = verified.Select(MatchKey.Of).ToArray();
@@ -567,6 +639,10 @@ public sealed class FaultInjectionEndToEndTests
 
         var unreported = new List<string>();
         int unreportedTotal = 0;
+
+        // The injected addresses still unreported, by the rest of their key: a surplus record with that rest names the
+        // right word by offset, mask, step and pass but reports another address.
+        var unreportedAddresses = new Dictionary<MatchKey, Queue<ulong>>();
         foreach ((MatchKey key, int count) in injected)
         {
             int seen = reported.GetValueOrDefault(key);
@@ -574,11 +650,23 @@ public sealed class FaultInjectionEndToEndTests
             {
                 unreportedTotal += count - seen;
                 unreported.Add(string.Create(CultureInfo.InvariantCulture, $"{key} (injected x{count}, reported x{seen})"));
+                if (!unreportedAddresses.TryGetValue(key.WithoutAddress, out Queue<ulong>? addresses))
+                {
+                    addresses = new Queue<ulong>();
+                    unreportedAddresses.Add(key.WithoutAddress, addresses);
+                }
+
+                for (int missing = count - seen; missing > 0; missing--)
+                {
+                    addresses.Enqueue(key.Address);
+                }
             }
         }
 
         var unexpected = new List<string>();
         int unexpectedTotal = 0;
+        var wrongAddresses = new List<string>();
+        int wrongAddressTotal = 0;
         foreach ((MatchKey key, int count) in reported)
         {
             int expected = injected.GetValueOrDefault(key);
@@ -586,6 +674,17 @@ public sealed class FaultInjectionEndToEndTests
             {
                 unexpectedTotal += count - expected;
                 unexpected.Add(string.Create(CultureInfo.InvariantCulture, $"{key} (reported x{count}, injected x{expected})"));
+                if (unreportedAddresses.TryGetValue(key.WithoutAddress, out Queue<ulong>? addresses))
+                {
+                    for (int surplus = count - expected; surplus > 0 && addresses.TryDequeue(out ulong injectedAddress); surplus--)
+                    {
+                        wrongAddressTotal++;
+                        wrongAddresses.Add(string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"word 0x{key.WordOffset:X} mask 0x{key.BitMask:X16} step {key.StepIndex + 1} pass {key.PassIndex + 1}: "
+                            + $"expected address 0x{injectedAddress:X16}, reported 0x{key.Address:X16}"));
+                    }
+                }
             }
         }
 
@@ -599,9 +698,16 @@ public sealed class FaultInjectionEndToEndTests
         message.Append(CultureInfo.InvariantCulture, $"{unreportedTotal} injection(s) unreported, {unexpectedTotal} record(s) unexpected.");
         message.Append(" Unreported: ").Append(Listed(unreported)).Append(" Unexpected: ").Append(Listed(unexpected));
 
+        if (wrongAddressTotal > 0)
+        {
+            message.Append(CultureInfo.InvariantCulture, $" {wrongAddressTotal} record(s) match an unreported injection's word offset, mask, step and pass ");
+            message.Append("but not the virtual address its corruption was stored through: ").Append(Listed(wrongAddresses));
+            message.Append(" rq_error_record.address must be the mismatching word's own address (src/engine/core/errors/error_collector).");
+        }
+
         if (unexpectedTotal == records.Count && ConstantOffset(injectedKeys, reportedKeys) is { } delta)
         {
-            message.Append(CultureInfo.InvariantCulture, $" Every record misses its injection by the constant offset {delta} bytes: ");
+            message.Append(CultureInfo.InvariantCulture, $" Every record misses its injection by the constant offset {delta} bytes at the right address: ");
             message.Append("rq_error_record.region_offset and rq_injected_fault.word_offset must both be logical region offsets ");
             message.Append("(src/engine/core/errors/error_collector and tests/engine.tests/fakes).");
         }
@@ -609,7 +715,8 @@ public sealed class FaultInjectionEndToEndTests
         Assert.Fail(message.ToString());
     }
 
-    // The offset d, other than 0, for which every record moved by -d matches the injections as a multiset, or null.
+    // The offset d, other than 0, for which every record's logical offset moved by -d matches the injections as a
+    // multiset, its address unchanged, or null.
     private static long? ConstantOffset(MatchKey[] injectedKeys, MatchKey[] reportedKeys)
     {
         if (reportedKeys.Length == 0 || injectedKeys.Length != reportedKeys.Length)
@@ -620,7 +727,8 @@ public sealed class FaultInjectionEndToEndTests
         Dictionary<MatchKey, int> injected = CountKeys(injectedKeys);
         MatchKey first = reportedKeys[0];
         IEnumerable<ulong> candidates = injected.Keys
-            .Where(key => key.BitMask == first.BitMask && key.StepIndex == first.StepIndex && key.PassIndex == first.PassIndex)
+            .Where(key => key.Address == first.Address && key.BitMask == first.BitMask
+                && key.StepIndex == first.StepIndex && key.PassIndex == first.PassIndex)
             .Select(key => key.WordOffset);
 
         foreach (ulong candidate in candidates)
@@ -666,9 +774,71 @@ public sealed class FaultInjectionEndToEndTests
             + string.Create(CultureInfo.InvariantCulture, $"at most {CoverageTolerance:P0} is allowed."));
     }
 
+    // The most reports a correctness spec can cause on the plan, fixed before the run: each step injects only in its
+    // first InjectedPassesPerStep passes, each of which verifies every word once per sweep, moving inversion twice; a
+    // stuck bit corrupts one word per sweep at most, and a delay-dependent fault only in hold steps, the one place the
+    // controlled hold clock ages data. 0 quota means every pass injects, which the plan cannot bound.
+    private static long ReportBound(FaultSpec spec, TestPlan plan)
+    {
+        long bound = 0;
+        foreach (StepDefinition step in InjectingSteps(spec, plan))
+        {
+            int sweeps = step.Pattern is PatternKind.MovingInversionWalking or PatternKind.MovingInversionRandom
+                ? MovingInversionSweepsPerPass
+                : SingleSweepPerPass;
+            bound = checked(bound + (spec.InjectedPassesPerStep * WordsPerSweep(spec) * sweeps));
+        }
+
+        return bound;
+    }
+
+    // The steps in which the spec can inject: every step, except that a delay-dependent fault needs a hold.
+    private static IEnumerable<StepDefinition> InjectingSteps(FaultSpec spec, TestPlan plan) =>
+        plan.Steps.Where(step => spec.Kind != FaultKind.DelayDependent || step.HasHold);
+
+    // The words a spec can corrupt per sweep of a pass: the per-pass count, or the one stuck word.
+    private static long WordsPerSweep(FaultSpec spec) => spec.Kind == FaultKind.StuckBit ? 1 : spec.PerPassCount;
+
+    // The bounded-below-the-cap precondition, asserted before the run: a set quota whose worst case on the plan stays
+    // within MaxExpectedReports and below the injection cap, so the cap can never end injection before the last step.
+    private void AssertReportBoundBeforeRun(FaultSpec spec)
+    {
+        TestPlan plan = ScaledPlans.FaultInjectionStandard;
+        long bound = ReportBound(spec, plan);
+        _output.WriteLine(string.Create(
+            CultureInfo.InvariantCulture,
+            $"Report bound: {spec.InjectedPassesPerStep} injecting passes per step x {WordsPerSweep(spec)} word(s) per sweep over "
+            + $"{InjectingSteps(spec, plan).Count()} of {plan.Steps.Count} steps, moving inversion sweeping twice, allow at most {bound} "
+            + $"reports (limit {MaxExpectedReports}, cap {spec.MaxInjections})."));
+        Assert.True(
+            spec.InjectedPassesPerStep > 0 && bound is > 0 and <= MaxExpectedReports && (ulong)bound < spec.MaxInjections,
+            string.Create(CultureInfo.InvariantCulture, $"Precondition: {spec.Kind} with {spec.InjectedPassesPerStep} injecting passes per step allows ")
+            + string.Create(CultureInfo.InvariantCulture, $"{bound} reports on the plan; a nonzero quota whose bound is at most {MaxExpectedReports} and below ")
+            + string.Create(CultureInfo.InvariantCulture, $"the cap of {spec.MaxInjections} is required."));
+    }
+
+    // A fault spread over its whole target range is verified by every pass, so every step that completed a pass
+    // carries verified injections: the cause analysis then sees the fault in every step, none left clean by the cap.
+    private static void AssertEveryCompletedStepInjected(FaultRun run)
+    {
+        string[] clean = run.Completed.StepResults
+            .Where(outcome => outcome.PassesCompleted >= 1
+                && !run.VerifiedInjections.Any(fault => fault.StepIndex == outcome.Attributes.Index))
+            .Select(outcome => string.Create(
+                CultureInfo.InvariantCulture,
+                $"step {outcome.Attributes.Index + 1} '{outcome.Attributes.Name}' ({outcome.PassesCompleted} passes)"))
+            .ToArray();
+        Assert.True(
+            clean.Length == 0,
+            string.Create(CultureInfo.InvariantCulture, $"{clean.Length} step(s) completed a pass without a verified {run.Spec.Kind} injection: ")
+            + Listed(clean));
+    }
+
+    // The production analysis of the whole completed run: every record and every step outcome, the clean passes after
+    // each step's quota included, as the controller analyses a real run.
     private void AssertTopCause(FaultRun run, CauseCategory expected)
     {
-        IReadOnlyList<StepOutcome> analysedSteps = run.FaultLiveStepResults;
+        IReadOnlyList<StepOutcome> analysedSteps = run.Completed.StepResults;
         CauseHints hints = ErrorAnalyzer.Analyze(new AnalysisInput(
             run.Records,
             analysedSteps,
@@ -678,7 +848,7 @@ public sealed class FaultInjectionEndToEndTests
 
         string scope = string.Create(
             CultureInfo.InvariantCulture,
-            $"{analysedSteps.Count} of {run.Completed.StepResults.Count} steps analysed");
+            $"all {analysedSteps.Count} steps of {run.Plan.Steps.Count} analysed");
         string ranking = hints.IsEmpty
             ? "no hints"
             : string.Join("; ", hints.Items.Select(hint => string.Create(
@@ -851,7 +1021,8 @@ public sealed class FaultInjectionEndToEndTests
             + $"ISA {run.Prepared.InstructionSet}, pages {run.Prepared.PageMode}, prepared in {run.Prepared.PrepareTime.TotalSeconds:0.00} s."));
         _output.WriteLine(string.Create(
             CultureInfo.InvariantCulture,
-            $"Injections: {run.InjectionLog.Count} logged, {verified} with a verification opportunity, cap {run.Spec.MaxInjections}; "
+            $"Injections: {run.InjectionLog.Count} logged, {verified} with a verification opportunity, plan bound {run.ReportBound} "
+            + $"({run.Spec.InjectedPassesPerStep} injecting passes per step), cap {run.Spec.MaxInjections}; "
             + $"records {run.Records.Count}; true total {run.Completed.TotalErrors}; end {run.Completed.EndReason}."));
         _output.WriteLine(string.Create(
             CultureInfo.InvariantCulture,
@@ -878,7 +1049,7 @@ public sealed class FaultInjectionEndToEndTests
 
     private static string Describe(ErrorRecord record) => string.Create(
         CultureInfo.InvariantCulture,
-        $"#{record.Sequence} offset 0x{record.RegionOffset:X} step {record.StepIndex + 1} '{record.StepName}' pass {record.PassIndex + 1} "
+        $"#{record.Sequence} offset 0x{record.RegionOffset:X} address 0x{record.Address:X16} step {record.StepIndex + 1} '{record.StepName}' pass {record.PassIndex + 1} "
         + $"{record.AccessType} mask 0x{record.BitMask:X16} {record.RereadOutcome} {record.TimeSinceWrite.TotalMilliseconds:0} ms since write");
 
     private static string Listed(IReadOnlyCollection<string> items) =>
@@ -1068,32 +1239,9 @@ public sealed class FaultInjectionEndToEndTests
             InjectionLog.Where(fault => fault.VerifiedOpportunity).ToArray();
 
         /// <summary>
-        /// Gets the zero-based index of the last step the fault layer injected into, or -1 when it injected nothing.
+        /// Gets the most injections the spec's per-step pass quota allows on the plan, fixed before the run.
         /// </summary>
-        public int LastInjectedStep { get; } =
-            InjectionLog.Count == 0 ? -1 : InjectionLog.Max(fault => fault.StepIndex);
-
-        /// <summary>
-        /// Gets a value indicating whether the fault layer spent its cap before the plan's last step, so the steps after
-        /// <see cref="LastInjectedStep"/> ran without the fault.
-        /// </summary>
-        public bool CapReachedBeforeLastStep =>
-            (ulong)InjectionLog.Count == Spec.MaxInjections && LastInjectedStep < Plan.Steps.Count - 1;
-
-        /// <summary>
-        /// Gets the outcomes of the steps the fault was live in: every started step, or, when
-        /// <see cref="CapReachedBeforeLastStep"/>, those up to and including <see cref="LastInjectedStep"/>.
-        /// </summary>
-        /// <remarks>
-        /// The steps after the cap are clean only because the cap was spent. The load, bank-switching and turnaround
-        /// rules read a clean step after faulty ones as their contrast, so a clean reduced-load or sequential step there
-        /// would rank SoC/IMC power, row and bank timing or turnaround first: the cap's artefact, not the injected
-        /// signature.
-        /// </remarks>
-        public IReadOnlyList<StepOutcome> FaultLiveStepResults =>
-            CapReachedBeforeLastStep
-                ? Completed.StepResults.Where(outcome => outcome.Attributes.Index <= LastInjectedStep).ToArray()
-                : Completed.StepResults;
+        public long ReportBound { get; } = FaultInjectionEndToEndTests.ReportBound(Spec, Plan);
     }
 
     /// <summary>A started direct session with its recorder.</summary>
@@ -1105,19 +1253,26 @@ public sealed class FaultInjectionEndToEndTests
         long StartedAt);
 
     /// <summary>
-    /// The matching key of the fault-injection criterion: the 8-byte word as a logical region offset, the flipped
-    /// bits, the zero-based step and the zero-based pass.
+    /// The matching key of the fault-injection criterion: the 8-byte word as a logical region offset and as the
+    /// virtual address the corruption was stored through, the flipped bits, the zero-based step and the zero-based pass.
     /// </summary>
-    private readonly record struct MatchKey(ulong WordOffset, ulong BitMask, int StepIndex, int PassIndex)
+    /// <remarks>
+    /// The record's address is compared unmasked: the engine reports the mismatching word's own address, so a record
+    /// that points anywhere else, even inside the same word, is a wrong address.
+    /// </remarks>
+    private readonly record struct MatchKey(ulong WordOffset, ulong Address, ulong BitMask, int StepIndex, int PassIndex)
     {
+        /// <summary>Gets the key without its address, which an address mismatch leaves equal.</summary>
+        public MatchKey WithoutAddress => this with { Address = 0 };
+
         public static MatchKey Of(InjectedFault fault) =>
-            new(fault.WordOffset, fault.BitMask, fault.StepIndex, fault.PassIndex);
+            new(fault.WordOffset, fault.Address, fault.BitMask, fault.StepIndex, fault.PassIndex);
 
         public static MatchKey Of(ErrorRecord record) =>
-            new(record.RegionOffset & WordAlignmentMask, record.BitMask, record.StepIndex, record.PassIndex);
+            new(record.RegionOffset & WordAlignmentMask, record.Address, record.BitMask, record.StepIndex, record.PassIndex);
 
         public override string ToString() => string.Create(
             CultureInfo.InvariantCulture,
-            $"word 0x{WordOffset:X} mask 0x{BitMask:X16} step {StepIndex + 1} pass {PassIndex + 1}");
+            $"word 0x{WordOffset:X} address 0x{Address:X16} mask 0x{BitMask:X16} step {StepIndex + 1} pass {PassIndex + 1}");
     }
 }

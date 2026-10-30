@@ -1409,7 +1409,8 @@ public:
  * The test DLL's stack, fault-injecting -> counting -> real over the host's kernels, driven
  * directly over a committed, unlocked k_layer_region_bytes buffer. The buffer's base serves as
  * access_context::region_base, so a word's logical offset is its distance from the base. The
- * fake clock never moves, which no single-bit flip depends on.
+ * fake clock moves only when a test advances it through clock(), which no single-bit flip
+ * depends on.
  */
 class layer_harness {
 public:
@@ -1425,6 +1426,12 @@ public:
     bool valid() const noexcept { return buffer_ != nullptr; }
 
     const fault_injecting_memory_access& layer() const noexcept { return layer_; }
+
+    /** The buffer's virtual address, which every call also passes as region_base. */
+    std::uintptr_t buffer_address() const noexcept { return base(); }
+
+    /** The clock the layer reads and every call's write_time_ns is stamped from. */
+    fake_clock& clock() noexcept { return clock_; }
 
     /**
      * Streams the buffer with the (step, pass)'s random pattern and fences, then verifies it
@@ -1517,6 +1524,28 @@ logged_targets(const std::vector<rq_injected_fault>& log, std::uint32_t step, st
 }
 
 /**
+ * Checks a layer test's log entry against ground truth the log does not supply: its address is
+ * the buffer word at its logical offset, that word still holds the value `written` put there with
+ * exactly the entry's bit_mask inverted, so the corruption was stored through that address, and
+ * its injected_ns is the fake time of the call that logged it.
+ *
+ * @param written The pattern streamed before the call and not overwritten since.
+ * @param call_ns The harness clock's reading throughout that call.
+ */
+void expect_corrupted_word_at_logged_address(const rq_injected_fault& injection,
+                                             const layer_harness& harness,
+                                             const pattern_spec& written, std::uint64_t call_ns) {
+    SCOPED_TRACE("logged word offset " + hex64(injection.word_offset));
+    ASSERT_LT(injection.word_offset, k_layer_region_bytes);
+    ASSERT_EQ(injection.address, harness.buffer_address() + injection.word_offset);
+    const std::uint64_t stored = *reinterpret_cast<const volatile std::uint64_t*>(
+        static_cast<std::uintptr_t>(injection.address));
+    EXPECT_EQ(stored, expected_value(written, injection.word_offset / sizeof(std::uint64_t)) ^
+                          injection.bit_mask);
+    EXPECT_EQ(injection.injected_ns, call_ns);
+}
+
+/**
  * The strided layer test's visits: the 8 KiB BankStride stride over the 1 MiB buffer, 128 lines
  * per sweep. The layer's visited-line test does not depend on the stride; test_kernels.cpp
  * covers all three.
@@ -1543,6 +1572,12 @@ static_assert((k_strided_stuck_offset % k_strided_layer_stride) / 64U *
 
 /** Targets of the strided test's single-bit flips: enough to land on both calls' lines. */
 constexpr std::uint32_t k_strided_flips_per_pass = 64U;
+
+/**
+ * Fake time the strided test advances before each of its calls, so that every call, and the
+ * harness's construction, reads a distinct time that the call's log entries must carry.
+ */
+constexpr std::uint64_t k_strided_layer_call_gap_ns = 250'000'000U;
 
 rq_fault_spec strided_flip_spec() noexcept {
     return layer_spec(k_random_bit, k_strided_flips_per_pass, k_max_expected_reports);
@@ -1793,10 +1828,14 @@ TEST(FaultInjectionLayer, SpentCapStopsTargetSetBuildsAndTheTableKeepsOnlyTheNew
     EXPECT_EQ(sink.multi_bit_mismatches, 0U);
     const std::vector<rq_injected_fault> log = layer.injection_log();
     ASSERT_EQ(log.size(), k_layer_max_injections);
+    // Plain ranges start inside the buffer, so the address is the range's pointer plus the word's
+    // index; nothing advanced the clock, so every call stamped the same time.
     for (const rq_injected_fault& injection : log) {
         EXPECT_EQ(injection.verified_opportunity, 1U);
         EXPECT_EQ(injection.bit, k_flipped_bit);
         EXPECT_LT(injection.word_offset, k_layer_region_bytes);
+        EXPECT_EQ(injection.address, harness.buffer_address() + injection.word_offset);
+        EXPECT_EQ(injection.injected_ns, harness.clock().now_ns());
     }
 
     // Every target lies in the verified buffer, so each set built before the cap was spent
@@ -1855,6 +1894,7 @@ TEST(FaultInjectionLayer, AReclaimedTargetSetIsRebuiltWithTheSameWordsAndBits) {
 // A BankStride verification reads only the lines it visits, so it injects exactly the targets on
 // those lines, each once, and none elsewhere: split over two calls, as the step runner splits a
 // window into work groups, the pass injects exactly what a plain verification of the buffer does.
+// Each entry's address is the buffer word that holds its corruption, and its time is its call's.
 TEST_P(FaultInjectionLayerStrided, VerifyStridedInjectsExactlyTheTargetsOnItsVisitedLines) {
     const rq_fault_spec spec = GetParam().make_spec();
     const char* reason = nullptr;
@@ -1874,7 +1914,7 @@ TEST_P(FaultInjectionLayerStrided, VerifyStridedInjectsExactlyTheTargetsOnItsVis
     layer_harness harness(spec);
     ASSERT_TRUE(harness.valid()) << "VirtualAlloc failed with Windows error " << GetLastError();
     const fault_injecting_memory_access& layer = harness.layer();
-    harness.stream_pass(0U, 0U);
+    const pattern_spec written = harness.stream_pass(0U, 0U);
     // A slotted worker first, then one the layer looks up in its table.
     const std::pair<std::uint32_t, strided_visits> calls[] = {
         {k_layer_workers[0], strided_visits{k_strided_layer_stride, k_strided_layer_lines_per_sweep,
@@ -1889,8 +1929,15 @@ TEST_P(FaultInjectionLayerStrided, VerifyStridedInjectsExactlyTheTargetsOnItsVis
     for (const auto& [worker, visits] : calls) {
         SCOPED_TRACE("visits [" + std::to_string(visits.first_visit) + ", +" +
                      std::to_string(visits.visit_count) + ")");
+        harness.clock().advance(k_strided_layer_call_gap_ns);
+        const std::uint64_t call_ns = harness.clock().now_ns();
         returned += harness.verify_strided(0U, 0U, worker, visits, sink);
-        const std::vector<target> so_far = logged_targets(layer.injection_log(), 0U, 0U);
+        // Every entry is of (step 0, pass 0), so the log's indices are those of so_far.
+        const std::vector<rq_injected_fault> log = layer.injection_log();
+        for (std::size_t k = logged; k < log.size(); ++k) {
+            expect_corrupted_word_at_logged_address(log[k], harness, written, call_ns);
+        }
+        const std::vector<target> so_far = logged_targets(log, 0U, 0U);
         std::vector<target> injected(so_far.begin() + static_cast<std::ptrdiff_t>(logged),
                                      so_far.end());
         logged = so_far.size();
@@ -1922,6 +1969,78 @@ INSTANTIATE_TEST_SUITE_P(FaultInjectionLayerStridedClasses, FaultInjectionLayerS
                          [](const ::testing::TestParamInfo<strided_layer_case>& info) {
                              return std::string(info.param.name);
                          });
+
+// The test DLL's hold clock over fake_clock: a hold begins only once every slice has issued both
+// pre-hold fences of one (step, pass); the next wait then records it, at the base reading, and
+// signals the caller's event, and the controlled age spans exactly the holds begun after a write.
+TEST(FaultInjectionHoldClock, AllPreHoldFencesArmTheNextWaitWhichRecordsAndSignalsTheHold) {
+    constexpr std::uint32_t k_slices = 3;
+    constexpr std::uint32_t k_hold_step = 1;
+    constexpr std::uint64_t k_fences = std::uint64_t{k_slices} * 2;
+    constexpr std::uint64_t k_hold_ns = std::uint64_t{k_hold_ms} * k_ns_per_ms;
+
+    const hold_event_handle observed(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ASSERT_TRUE(observed != nullptr) << "CreateEventW failed with Windows error " << GetLastError();
+    HANDLE duplicate = nullptr;
+    ASSERT_TRUE(DuplicateHandle(GetCurrentProcess(), observed.get(), GetCurrentProcess(),
+                                &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        << "DuplicateHandle failed with Windows error " << GetLastError();
+    const auto base = std::make_shared<fake_clock>();
+    hold_clock clock(base, k_slices, {0U, k_hold_ms}, hold_event_handle(duplicate));
+    stop_signal stop;
+    const auto signalled = [&] { return WaitForSingleObject(observed.get(), 0) == WAIT_OBJECT_0; };
+
+    const std::uint64_t written_ns = clock.now_ns();
+    EXPECT_EQ(written_ns, base->now_ns());
+    base->advance(k_ns_per_ms);
+
+    // One fence short of pass 0, then a fence of pass 1, which restarts the count: neither arms.
+    for (std::uint64_t i = 0; i + 1 < k_fences; ++i) {
+        clock.note_pre_hold_fence(k_hold_step, 0U);
+    }
+    clock.note_pre_hold_fence(k_hold_step, 1U);
+    EXPECT_FALSE(clock.wait_for_stop(stop, 1U));
+    EXPECT_EQ(clock.hold_entry_count(), 0U);
+    EXPECT_FALSE(signalled());
+    EXPECT_EQ(clock.controlled_age_ns(written_ns, clock.now_ns()), 0U);
+
+    // Pass 1's remaining fences arm the clock; the next wait records the hold and signals.
+    for (std::uint64_t i = 1; i < k_fences; ++i) {
+        clock.note_pre_hold_fence(k_hold_step, 1U);
+    }
+    const std::uint64_t entry_ns = base->now_ns();
+    EXPECT_FALSE(clock.wait_for_stop(stop, 1U));
+    EXPECT_EQ(clock.hold_entry_count(), 1U);
+    EXPECT_TRUE(signalled());
+    const std::uint64_t verified_ns = clock.now_ns();
+    EXPECT_GT(verified_ns, entry_ns);
+    EXPECT_EQ(clock.controlled_age_ns(written_ns, verified_ns), k_hold_ns);
+    EXPECT_EQ(clock.controlled_age_ns(written_ns, entry_ns - 1), 0U)
+        << "a verification before the hold began must not see it";
+    EXPECT_EQ(clock.controlled_age_ns(entry_ns, verified_ns), 0U)
+        << "data written as the hold began did not sit through it";
+
+    // The arming is consumed: later slices of the same hold wait record nothing more.
+    EXPECT_FALSE(clock.wait_for_stop(stop, 1U));
+    EXPECT_EQ(clock.hold_entry_count(), 1U);
+
+    // Real time alone never ages data: a verification 3,406 ms after its write with no hold
+    // begun in between, as a descheduled worker once took, still sees age 0, below 2000 ms.
+    const std::uint64_t late_write_ns = clock.now_ns();
+    base->advance(std::uint64_t{3'406} * k_ns_per_ms);
+    EXPECT_EQ(clock.controlled_age_ns(late_write_ns, clock.now_ns()), 0U);
+
+    // A hold that a stop precedes never begins: armed, but neither recorded nor signalled.
+    ASSERT_TRUE(ResetEvent(observed.get()));
+    for (std::uint64_t i = 0; i < k_fences; ++i) {
+        clock.note_pre_hold_fence(k_hold_step, 2U);
+    }
+    stop.request(RQ_END_USER_STOP);
+    EXPECT_TRUE(clock.wait_for_stop(stop, 1U));
+    EXPECT_EQ(clock.hold_entry_count(), 1U);
+    EXPECT_FALSE(signalled());
+    EXPECT_EQ(clock.controlled_age_ns(written_ns, clock.now_ns()), k_hold_ns);
+}
 
 }  // namespace
 }  // namespace rq::engine::test

@@ -71,8 +71,12 @@ extern "C" {
 #define RQ_FAULT_ADDRESS_REGION 3u
 /**
  * A random bit flipped, just before the verification load, in words whose time since write is
- * at least delay_threshold_ms. Only hold steps let data reach that age, so reports are expected
- * only with RQ_ACCESS_VERIFY_AFTER_HOLD.
+ * at least delay_threshold_ms. In sessions of rq_test_session_create that age is measured on a
+ * controlled hold clock, not on the real clock: it advances only by each hold's configured
+ * duration, once every worker has written and flushed its slice and the hold has begun. Data
+ * verified without an intervening hold therefore has age 0 however the workers are scheduled,
+ * so reports are expected only with RQ_ACCESS_VERIFY_AFTER_HOLD, after a hold at least as long
+ * as the threshold.
  */
 #define RQ_FAULT_DELAY_DEPENDENT 4u
 /** @} */
@@ -99,7 +103,7 @@ extern "C" {
  * the worker slices concatenated in worker order. Target selection is a stateless function of
  * seed, step and pass, so the same (step, pass) always selects the same words for a given seed.
  * Kind RQ_FAULT_NONE ignores every injection field, so a spec may request only an affinity
- * failure.
+ * failure or only hold-entry notification.
  */
 typedef struct rq_fault_spec {
     /** Set by the caller to sizeof(rq_fault_spec). */
@@ -147,13 +151,30 @@ typedef struct rq_fault_spec {
      * whenever affinity_fail_worker names a worker, since a pin returning 0 means success.
      */
     uint32_t affinity_fail_error;
-    /** Reserved; set to 0. It aligns seed to 8 bytes. */
-    uint32_t reserved0;
+    /**
+     * Per-step pass quota of the injecting kinds: only passes whose pass_index is below it
+     * receive injections, and later passes of every step run clean. 0 means every pass. With
+     * per_pass_count it bounds a step's corruptions by the plan alone, whatever the memory
+     * bandwidth, so a test can spread its expected reports over every step instead of having
+     * max_injections spent in time order before the last one. Ignored by RQ_FAULT_NONE.
+     */
+    uint32_t injected_passes_per_step;
     /** Seed of target-word selection and of the random bit choice. */
     uint64_t seed;
+    /**
+     * Win32 event HANDLE, as an integer, signalled with SetEvent each time a hold begins, or 0
+     * for none. A hold begins once every worker has written its slice and issued both fences of
+     * its pre-hold flush, and the coordinator starts waiting the hold; a hold that a stop request
+     * precedes never begins. rq_test_session_create duplicates the handle with the same access,
+     * so the caller keeps ownership of its own handle and may close it on return. It must be an
+     * event with EVENT_MODIFY_STATE access: a handle that cannot be duplicated is rejected, and
+     * a handle of another object type makes the first hold end the run with
+     * RQ_END_INTERNAL_FAULT. Honoured for every kind, RQ_FAULT_NONE included.
+     */
+    uint64_t hold_entered_event;
 } rq_fault_spec;
 
-RQ_STATIC_ASSERT(sizeof(rq_fault_spec) == 72, "rq_fault_spec must be 72 bytes");
+RQ_STATIC_ASSERT(sizeof(rq_fault_spec) == 80, "rq_fault_spec must be 80 bytes");
 RQ_STATIC_ASSERT(offsetof(rq_fault_spec, max_injections) == 16,
                  "rq_fault_spec.max_injections offset");
 RQ_STATIC_ASSERT(offsetof(rq_fault_spec, region_offset) == 24,
@@ -165,8 +186,11 @@ RQ_STATIC_ASSERT(offsetof(rq_fault_spec, delay_threshold_ms) == 48,
                  "rq_fault_spec.delay_threshold_ms offset");
 RQ_STATIC_ASSERT(offsetof(rq_fault_spec, affinity_fail_worker) == 52,
                  "rq_fault_spec.affinity_fail_worker offset");
-RQ_STATIC_ASSERT(offsetof(rq_fault_spec, reserved0) == 60, "rq_fault_spec.reserved0 offset");
+RQ_STATIC_ASSERT(offsetof(rq_fault_spec, injected_passes_per_step) == 60,
+                 "rq_fault_spec.injected_passes_per_step offset");
 RQ_STATIC_ASSERT(offsetof(rq_fault_spec, seed) == 64, "rq_fault_spec.seed offset");
+RQ_STATIC_ASSERT(offsetof(rq_fault_spec, hold_entered_event) == 72,
+                 "rq_fault_spec.hold_entered_event offset");
 
 /**
  * Ground truth of one applied corruption; an element of the array filled by
@@ -196,9 +220,21 @@ typedef struct rq_injected_fault {
     uint32_t verified_opportunity;
     /** Reserved; written as 0. */
     uint32_t reserved0;
+    /**
+     * Virtual address of the corrupted 8-byte word: the pointer the fault layer stored the
+     * corruption through, so the reported rq_error_record.address must equal it exactly.
+     */
+    uint64_t address;
+    /**
+     * Session-clock reading (IClock::now_ns) taken once per verification call, just before that
+     * call's corruptions were stored, so it precedes the error each one causes. In
+     * ramquick_engine_test.dll the session clock reads QueryPerformanceCounter in nanoseconds,
+     * floor(count x 10^9 / frequency): the counter System.Diagnostics.Stopwatch reads.
+     */
+    uint64_t injected_ns;
 } rq_injected_fault;
 
-RQ_STATIC_ASSERT(sizeof(rq_injected_fault) == 40, "rq_injected_fault must be 40 bytes");
+RQ_STATIC_ASSERT(sizeof(rq_injected_fault) == 56, "rq_injected_fault must be 56 bytes");
 RQ_STATIC_ASSERT(offsetof(rq_injected_fault, bit_mask) == 8, "rq_injected_fault.bit_mask offset");
 RQ_STATIC_ASSERT(offsetof(rq_injected_fault, bit) == 16, "rq_injected_fault.bit offset");
 RQ_STATIC_ASSERT(offsetof(rq_injected_fault, access_type) == 28,
@@ -207,6 +243,9 @@ RQ_STATIC_ASSERT(offsetof(rq_injected_fault, verified_opportunity) == 32,
                  "rq_injected_fault.verified_opportunity offset");
 RQ_STATIC_ASSERT(offsetof(rq_injected_fault, reserved0) == 36,
                  "rq_injected_fault.reserved0 offset");
+RQ_STATIC_ASSERT(offsetof(rq_injected_fault, address) == 40, "rq_injected_fault.address offset");
+RQ_STATIC_ASSERT(offsetof(rq_injected_fault, injected_ns) == 48,
+                 "rq_injected_fault.injected_ns offset");
 
 /**
  * The engine's sizeof of every ABI struct, filled by rq_test_struct_sizes. Managed tests
@@ -235,9 +274,9 @@ typedef struct rq_struct_sizes {
     uint32_t error_record;
     /** sizeof(rq_run_result): 192. */
     uint32_t run_result;
-    /** sizeof(rq_fault_spec): 72. */
+    /** sizeof(rq_fault_spec): 80. */
     uint32_t fault_spec;
-    /** sizeof(rq_injected_fault): 40. */
+    /** sizeof(rq_injected_fault): 56. */
     uint32_t injected_fault;
     /** Reserved; written as 0. */
     uint32_t reserved0;
@@ -277,16 +316,22 @@ RQ_STATIC_ASSERT(offsetof(rq_struct_sizes, reserved0) == 52, "rq_struct_sizes.re
  * affinity_fail_error: preparation ends the run with RQ_END_AFFINITY_FAILED, os_error set to
  * that error, and no memory traffic.
  *
+ * The session clock is a controlled hold clock over QueryPerformanceCounter. Every engine
+ * timing, the hold waits included, reads the real counter unchanged; only the fault layer's
+ * delay-dependent age is measured on the controlled timeline, which advances by a hold's
+ * configured hold_ms when the hold begins (see RQ_FAULT_DELAY_DEPENDENT and
+ * rq_fault_spec.hold_entered_event, which is duplicated here before the session is built).
+ *
  * @param config Session configuration; non-null.
  * @param callbacks Callback set; non-null.
  * @param fault Fault specification, or NULL for no fault (the same as RQ_FAULT_NONE).
  * @param out Receives the new handle; non-null. Set to NULL on failure.
  * @return RQ_OK; RQ_E_INVALID_ARGUMENT for everything rq_session_create rejects and for a bad
  *         spec: a wrong struct_size, an unknown kind, a bit above 63 other than
- *         RQ_FAULT_RANDOM_BIT, a nonzero reserved0, a target range outside [0, region_bytes) or
- *         holding no whole word, max_injections 0 or per_pass_count outside 1 to 2^20 where the
- *         kind needs them, or an affinity_fail_worker not below worker_count or paired with
- *         affinity_fail_error 0; RQ_E_INTERNAL.
+ *         RQ_FAULT_RANDOM_BIT, a target range outside [0, region_bytes) or holding no whole
+ *         word, max_injections 0 or per_pass_count outside 1 to 2^20 where the kind needs them,
+ *         an affinity_fail_worker not below worker_count or paired with affinity_fail_error 0,
+ *         or a nonzero hold_entered_event that DuplicateHandle cannot duplicate; RQ_E_INTERNAL.
  */
 RQ_API rq_result RQ_CALL rq_test_session_create(const rq_session_config* config,
                                                 const rq_callbacks* callbacks,

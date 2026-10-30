@@ -19,7 +19,8 @@
  *   range, a 1/32 of the region in the tests (RankOrDimm).
  * - RQ_FAULT_DELAY_DEPENDENT: a random bit flipped just before the verification load in words
  *   whose time since write is at least delay_threshold_ms, which only hold verifications reach
- *   (RefreshRetention).
+ *   (RefreshRetention). The test DLL measures that age on its controlled hold clock
+ *   (fakes/fault_injecting_memory_access.h), the native tests on fake_clock.
  *
  * Injections ride only on the engine's normal verification opportunities, after a word's last
  * write and before its next verification. The fault layer therefore adds one plain store per
@@ -137,9 +138,8 @@ inline const char* fault_spec_failure(const rq_fault_spec& spec, uint64_t region
             return "region holds no whole word";
         }
     }
-    if (spec.reserved0 != 0) {
-        return "reserved0 must be zero";
-    }
+    // injected_passes_per_step takes any value, 0 meaning every pass, and hold_entered_event is
+    // checked by rq_test_session_create, which alone can duplicate the handle.
     return nullptr;
 }
 
@@ -148,7 +148,7 @@ inline const char* fault_spec_failure(const rq_fault_spec& spec, uint64_t region
 /**
  * A spec of the given kind with every field at its neutral value: struct_size set,
  * delay_threshold_ms 2000, no failing worker, a random bit per injection, and every other field
- * 0.
+ * 0, so injected_passes_per_step lets every pass inject and no hold-entered event is set.
  *
  * max_injections stays 0, which means "inject nothing". Callers must set it for every kind other
  * than RQ_FAULT_NONE: validate_fault_spec rejects a zero cap for those kinds, so a forgotten cap
@@ -199,7 +199,8 @@ inline rq_fault_spec normalized(const rq_fault_spec& spec, uint64_t region_bytes
  * Checks spec against region_bytes, stopping at the first rule broken, in this order:
  * struct_size; kind; bit; the affinity pair; for every kind but RQ_FAULT_NONE the target range
  * and max_injections; for the target-range kinds per_pass_count and a whole word in the range
- * (for RQ_FAULT_STUCK_BIT, the stuck word inside the region); reserved0.
+ * (for RQ_FAULT_STUCK_BIT, the stuck word inside the region). Every injected_passes_per_step is
+ * valid, and hold_entered_event is left to rq_test_session_create, which duplicates it.
  *
  * Valid on a raw spec, as rq_test_session_create calls it before normalized(), and on a
  * normalized one. affinity_fail_worker is not compared with the worker count, which this

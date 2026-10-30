@@ -151,8 +151,8 @@ public sealed class InteropMarshallingTests
             new("rq_progress", nameof(RqProgress), Unsafe.SizeOf<RqProgress>(), RqProgress.Size, native.Progress, 72),
             new("rq_error_record", nameof(RqErrorRecord), Unsafe.SizeOf<RqErrorRecord>(), RqErrorRecord.Size, native.ErrorRecord, 112),
             new("rq_run_result", nameof(RqRunResult), Unsafe.SizeOf<RqRunResult>(), RqRunResult.Size, native.RunResult, 192),
-            new("rq_fault_spec", nameof(RqFaultSpec), Unsafe.SizeOf<RqFaultSpec>(), ExpectedSizes.FaultSpec, native.FaultSpec, 72),
-            new("rq_injected_fault", nameof(RqInjectedFault), Unsafe.SizeOf<RqInjectedFault>(), ExpectedSizes.InjectedFault, native.InjectedFault, 40),
+            new("rq_fault_spec", nameof(RqFaultSpec), Unsafe.SizeOf<RqFaultSpec>(), ExpectedSizes.FaultSpec, native.FaultSpec, 80),
+            new("rq_injected_fault", nameof(RqInjectedFault), Unsafe.SizeOf<RqInjectedFault>(), ExpectedSizes.InjectedFault, native.InjectedFault, 56),
         };
 
         foreach (StructSizeRow row in rows)

@@ -21,9 +21,10 @@ namespace RamQuick.IntegrationTests;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Every bound is the acceptance bound itself: coverage within 1 % of the independent count; time remaining within
-/// ±10 % of the actual remaining time on every per-second sample whose actual remaining time is at least 10 s (shorter
-/// samples are measured and reported but not gated, the open deviation recorded for the final seconds); run duration,
+/// Every bound is the acceptance bound itself: coverage within 1 % of the independent count; time remaining sampled at
+/// every scheduled second after step 1 finishes, each sample the estimate on display at that instant, received at most
+/// 1 s before it, and within ±10 % of the time actually left at that instant where at least 10 s (shorter samples are
+/// measured and reported but not gated, the open deviation recorded for the final seconds); run duration,
 /// Running → Completed, within ±15 % of the plan's target; progress at most 1 s apart on the UI thread; a 100 ms
 /// dispatcher probe, whose work commits and touches fresh memory as UI work does, serviced within 250 ms from post to
 /// the end of that work, Preparing included; and Completed within 2 s of a stop request. Each assertion message carries
@@ -60,7 +61,6 @@ public sealed class CoverageAndTimingTests
 
     // Scenario timing.
     private static readonly TimeSpan _midPassStopDelay = TimeSpan.FromMilliseconds(1500);
-    private static readonly TimeSpan _holdStopDelay = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan _holdStepBudget = TimeSpan.FromMilliseconds(12_500);
     private static readonly TimeSpan _shortStepBudget = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan _beatStall = TimeSpan.FromSeconds(2);
@@ -96,8 +96,34 @@ public sealed class CoverageAndTimingTests
         /// <summary>After the third progress snapshot of the first step, while its passes run.</summary>
         MidStep,
 
-        /// <summary>One second into a step with a 5 s hold, while the hold waits on the stop event.</summary>
+        /// <summary>
+        /// Inside the 5 s hold of a hold step, once the engine has signalled that every worker wrote its slice and
+        /// fenced its pre-hold flush and the hold wait on the stop event has begun.
+        /// </summary>
         Hold,
+    }
+
+    /// <summary>
+    /// The synthetic progress trace that <see cref="RemainingSampling_SyntheticTrace_JudgedAtScheduledInstant"/>
+    /// samples. Step 1 finishes at 0 s, Completed is received at 22 s, and progress is received 0.25 s before each
+    /// scheduled second unless the trace omits it.
+    /// </summary>
+    public enum RemainingTrace
+    {
+        /// <summary>Every progress received, each estimate the time actually left at its receipt.</summary>
+        Accurate,
+
+        /// <summary>
+        /// Every progress received, each estimate 9.9 % above the time left at its receipt, and so more than 10 % above
+        /// the time left at the next scheduled second, while it is still on display.
+        /// </summary>
+        HighAtInstant,
+
+        /// <summary>The accurate trace without the progress due at 6.75 s, a 2 s gap in receipts.</summary>
+        Gap,
+
+        /// <summary>The accurate trace without the progress due at 0.75 s and 1.75 s.</summary>
+        LateFirstProgress,
     }
 
     // Criterion 5: the engine's coverage counter against the counting layer's independent count, on a clean run.
@@ -212,7 +238,7 @@ public sealed class CoverageAndTimingTests
 
             IReadOnlyList<RemainingSample> samples = SampleRemaining(progress, firstStepFinishedAt, completedAt);
             WriteRemainingTable(type, samples);
-            AssertRemainingWithinTolerance(samples);
+            AssertRemainingWithinTolerance(samples, firstStepFinishedAt, completedAt);
 
             TimeSpan duration = Stopwatch.GetElapsedTime(preparedAt, completedAt);
             double deviation = (duration - plan.TargetDuration) / plan.TargetDuration;
@@ -224,6 +250,80 @@ public sealed class CoverageAndTimingTests
         }
 
         await AssertNoLiveSessionsAsync(cancellationToken);
+    }
+
+    // Criterion 6's sampling rule on synthetic receipts, without an engine: the estimate on display at each scheduled
+    // second is judged against the time actually left at that second, and a stale or missing estimate fails, each
+    // failure naming its second.
+    [Theory]
+    [InlineData(RemainingTrace.Accurate, null)]
+    [InlineData(RemainingTrace.HighAtInstant, "second 12: remaining 11.265 s against 10.000 s actual (+12.65%)")]
+    [InlineData(
+        RemainingTrace.Gap,
+        "1 of 21 scheduled samples had no estimate received within the 1 s sample interval: second 7: STALE")]
+    [InlineData(
+        RemainingTrace.LateFirstProgress,
+        "2 of 21 scheduled samples had no estimate received within the 1 s sample interval: second 1: MISSING")]
+    public void RemainingSampling_SyntheticTrace_JudgedAtScheduledInstant(RemainingTrace trace, string? expectedFailure)
+    {
+        const double StepOneSeconds = 8;
+        const double CompletedSeconds = 22;
+        const double ReceiptLead = 0.25;
+        const double HighEstimateFactor = 1.099;
+        long firstStepFinishedAt = Stopwatch.GetTimestamp();
+        long At(double seconds) => firstStepFinishedAt + (long)Math.Round(seconds * Stopwatch.Frequency);
+        static RunProgress Snapshot(int stepIndex, int passIndex, double receipt, TimeSpan? remaining) => new()
+        {
+            StepIndex = stepIndex,
+            StepCount = 2,
+            StepName = Invariant($"Synthetic step {stepIndex + 1}"),
+            PassIndex = passIndex,
+            PassesPlanned = passIndex + 1,
+            Elapsed = TimeSpan.FromSeconds(StepOneSeconds + receipt),
+            Remaining = remaining,
+            VerifiedBytes = 0,
+            RegionBytes = 0,
+            CoveragePercent = 0,
+            TotalErrors = 0,
+        };
+
+        // Step 1's "calculating…" snapshot was received before it finished, so it is never on display afterwards.
+        var progress = new List<Timestamped<RunProgress>>
+        {
+            new(At(-ReceiptLead), Snapshot(stepIndex: 0, passIndex: 0, -ReceiptLead, remaining: null)),
+        };
+        for (int second = 1; second < CompletedSeconds; second++)
+        {
+            bool omitted = trace switch
+            {
+                RemainingTrace.Gap => second == 7,
+                RemainingTrace.LateFirstProgress => second <= 2,
+                _ => false,
+            };
+            if (omitted)
+            {
+                continue;
+            }
+
+            // The engine's remaining_ms has millisecond resolution.
+            double receipt = second - ReceiptLead;
+            double factor = trace == RemainingTrace.HighAtInstant ? HighEstimateFactor : 1.0;
+            TimeSpan estimate = TimeSpan.FromMilliseconds(Math.Round(factor * (CompletedSeconds - receipt) * 1000));
+            progress.Add(new(At(receipt), Snapshot(stepIndex: 1, passIndex: second - 1, receipt, estimate)));
+        }
+
+        long completedAt = At(CompletedSeconds);
+        IReadOnlyList<RemainingSample> samples = SampleRemaining(progress, firstStepFinishedAt, completedAt);
+        void Assess() => AssertRemainingWithinTolerance(samples, firstStepFinishedAt, completedAt);
+        if (expectedFailure is null)
+        {
+            Assess();
+            return;
+        }
+
+        Xunit.Sdk.XunitException failure = Assert.ThrowsAny<Xunit.Sdk.XunitException>(Assess);
+        _output.WriteLine(failure.Message);
+        Assert.Contains(expectedFailure, failure.Message, StringComparison.Ordinal);
     }
 
     // Criterion 7: progress reaches the UI thread at least once a second and the dispatcher stays responsive, through
@@ -327,7 +427,14 @@ public sealed class CoverageAndTimingTests
     public async Task StopRequest_DirectSession_CompletesWithinTwoSecondsAsync(StopPoint point)
     {
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
-        NativeEngine engine = TestEngines.Create(FaultSpec.None);
+
+        // The hold stop point waits for the engine's hold-entry signal, which the session raises on its own duplicate
+        // of this event. The event stays open for the whole test, so the wait in StopInsideHoldAsync always has a
+        // live handle; the other stop points pass no event.
+        using var holdEntered = new ManualResetEvent(initialState: false);
+        NativeEngine engine = TestEngines.Create(point == StopPoint.Hold
+            ? FaultSpec.None with { HoldEnteredEvent = holdEntered.SafeWaitHandle.DangerousGetHandle() }
+            : FaultSpec.None);
         SystemSnapshot system = engine.QuerySystem();
         ulong regionBytes = TestRegions.Bytes(system, TestRegions.Gib1);
         TestPlan plan = point == StopPoint.Hold
@@ -348,7 +455,7 @@ public sealed class CoverageAndTimingTests
             {
                 StopPoint.Preparing => RequestUserStop(run),
                 StopPoint.MidStep => await StopAfterProgressAsync(run, cancellationToken),
-                StopPoint.Hold => await StopInsideHoldAsync(run, cancellationToken),
+                StopPoint.Hold => await StopInsideHoldAsync(run, holdEntered, cancellationToken),
                 _ => throw new ArgumentOutOfRangeException(nameof(point), point, "Undefined stop point."),
             };
 
@@ -376,11 +483,17 @@ public sealed class CoverageAndTimingTests
 
             if (point == StopPoint.Hold)
             {
-                // The first pass writes the slice, holds 5 s and only then verifies, so a stop 1 s after the step
-                // started lands before that pass completes.
+                // The stop followed the engine's signal that every worker had written and flushed its slice and the
+                // hold had begun, and the first pass verifies only after its 5 s hold: a stop inside the hold leaves
+                // no pass completed and no byte verified. Read while the native session is alive: the counting layer
+                // is destroyed with it.
+                ulong verifiedBytes = SessionProbe.GetIndependentVerifiedBytes(run.Session);
                 Assert.True(
                     completed.StepResults[0].PassesCompleted == 0,
                     Invariant($"The hold stop must land inside the first pass's 5 s hold, but {completed.StepResults[0].PassesCompleted} pass(es) completed."));
+                Assert.True(
+                    verifiedBytes == 0,
+                    Invariant($"The hold stop must land before the hold's verification, but the counting layer saw {verifiedBytes} verified bytes."));
             }
         }
 
@@ -658,25 +771,50 @@ public sealed class CoverageAndTimingTests
         }
     }
 
-    // One sample per wall-clock second after step 1's StepFinished: the latest progress received in that second, with
-    // the actual remaining time measured to the Completed receipt.
+    // One sample at every scheduled instant, each a whole number of sample intervals after step 1's StepFinished
+    // receipt and before the Completed receipt: the latest progress received after step 1 finished and at or before the
+    // instant, which is the estimate the display shows then, with its age at the instant and the actual remaining time
+    // from the instant to the Completed receipt. An instant that no such progress precedes is kept as a missing sample,
+    // so that it fails instead of vanishing.
     private static IReadOnlyList<RemainingSample> SampleRemaining(
         IReadOnlyList<Timestamped<RunProgress>> progress,
         long firstStepFinishedAt,
         long completedAt)
     {
-        var samples = new List<RemainingSample>();
-        foreach (IGrouping<long, Timestamped<RunProgress>> second in progress
+        Timestamped<RunProgress>[] received = progress
             .Where(sample => sample.Timestamp > firstStepFinishedAt && sample.Timestamp < completedAt)
-            .GroupBy(sample => sample.Since(firstStepFinishedAt).Ticks / _sampleInterval.Ticks))
+            .OrderBy(sample => sample.Timestamp)
+            .ToArray();
+        TimeSpan untilCompleted = Stopwatch.GetElapsedTime(firstStepFinishedAt, completedAt);
+
+        var samples = new List<RemainingSample>();
+        Timestamped<RunProgress>? shown = null;
+        int next = 0;
+        for (int second = 1; _sampleInterval * second < untilCompleted; second++)
         {
-            Timestamped<RunProgress> latest = second.Last();
+            TimeSpan instant = _sampleInterval * second;
+            while (next < received.Length && received[next].Since(firstStepFinishedAt) <= instant)
+            {
+                shown = received[next];
+                next++;
+            }
+
+            if (shown is not { } latest)
+            {
+                samples.Add(new RemainingSample(second, Reading: null));
+                continue;
+            }
+
             RunProgress value = latest.Value;
             TimeSpan remaining = value.Remaining
                 ?? throw new InvalidOperationException(Invariant(
                     $"Remaining was null in step {value.StepIndex + 1} after step 1 finished; it must be non-null once step 1's first pass has completed."));
-            TimeSpan actual = Stopwatch.GetElapsedTime(latest.Timestamp, completedAt);
-            samples.Add(new RemainingSample(second.Key + 1, value.StepIndex, value.PassIndex, remaining, actual));
+
+            // The display keeps showing this estimate until the next progress arrives, so it is judged against the time
+            // actually left at the instant it is shown, not at its receipt.
+            TimeSpan actual = untilCompleted - instant;
+            TimeSpan age = instant - latest.Since(firstStepFinishedAt);
+            samples.Add(new RemainingSample(second, new RemainingReading(value.StepIndex, value.PassIndex, remaining, actual, age)));
         }
 
         return samples;
@@ -685,29 +823,70 @@ public sealed class CoverageAndTimingTests
     private void WriteRemainingTable(TestType type, IReadOnlyList<RemainingSample> samples)
     {
         _output.WriteLine(Invariant(
-            $"Time remaining, scaled {type}: one sample per second after step 1 finished; gated (±{RemainingTolerance:0%}) where the actual remaining time is at least {_remainingGateFloor.TotalSeconds:0} s, reported only below that."));
-        _output.WriteLine("  second  step  pass  remaining s    actual s     error s    error %  gated  result");
+            $"Time remaining, scaled {type}: the estimate on display at every scheduled second after step 1 finished, the latest progress received by then, with its age; MISSING (no progress since step 1 finished) and STALE (older than {_sampleInterval.TotalSeconds:0} s) fail; gated (±{RemainingTolerance:0%}) where the actual remaining time, from the instant to the Completed receipt, is at least {_remainingGateFloor.TotalSeconds:0} s, reported only below that."));
+        _output.WriteLine("  second  step  pass  remaining s    actual s     error s    error %    age s  gated  result");
         foreach (RemainingSample sample in samples)
         {
-            string result = !sample.IsGated ? "reported" : sample.IsWithinTolerance ? "ok" : "OUT OF BOUND";
+            if (sample.Reading is not { } reading)
+            {
+                _output.WriteLine(Invariant(
+                    $"  {sample.Second,6}  {"-",4}  {"-",4}  {"-",11}  {"-",10}  {"-",10}  {"-",9}  {"-",7}  {"-",5}  MISSING"));
+                continue;
+            }
+
+            string accuracy = !reading.IsGated ? "reported" : reading.IsWithinTolerance ? "ok" : "OUT OF BOUND";
             _output.WriteLine(Invariant(
-                $"  {sample.Second,6}  {sample.StepIndex + 1,4}  {sample.PassIndex + 1,4}  {sample.Remaining.TotalSeconds,11:0.000}  {sample.Actual.TotalSeconds,10:0.000}  {sample.Error.TotalSeconds,10:+0.000;-0.000}  {sample.RelativeError,9:+0.00%;-0.00%}  {(sample.IsGated ? "yes" : "no"),5}  {result}"));
+                $"  {sample.Second,6}  {reading.StepIndex + 1,4}  {reading.PassIndex + 1,4}  {reading.Remaining.TotalSeconds,11:0.000}  {reading.Actual.TotalSeconds,10:0.000}  {reading.Error.TotalSeconds,10:+0.000;-0.000}  {reading.RelativeError,9:+0.00%;-0.00%}  {reading.Age.TotalSeconds,7:0.000}  {(reading.IsGated ? "yes" : "no"),5}  {(reading.IsStale ? "STALE, " + accuracy : accuracy)}"));
         }
     }
 
-    private static void AssertRemainingWithinTolerance(IReadOnlyList<RemainingSample> samples)
+    // Every scheduled instant must yield a sample, and each sample must show an estimate received within one sample
+    // interval of its instant: a missing or stale estimate fails, listed by instant, instead of dropping out of the
+    // accuracy check.
+    private static void AssertRemainingWithinTolerance(
+        IReadOnlyList<RemainingSample> samples,
+        long firstStepFinishedAt,
+        long completedAt)
     {
-        RemainingSample[] gated = samples.Where(sample => sample.IsGated).ToArray();
+        TimeSpan untilCompleted = Stopwatch.GetElapsedTime(firstStepFinishedAt, completedAt);
+        long scheduled = untilCompleted > TimeSpan.Zero ? (untilCompleted.Ticks - 1) / _sampleInterval.Ticks : 0;
         Assert.True(
-            gated.Length > 0,
+            scheduled >= 1,
+            Invariant($"Completed was received {untilCompleted.TotalSeconds:0.000} s after step 1 finished, so no time-remaining sample was scheduled after step 1."));
+        Assert.True(
+            samples.Count == scheduled && samples.Select((sample, index) => sample.Second == index + 1).All(inSequence => inSequence),
+            Invariant($"Time remaining was sampled at seconds [{string.Join(", ", samples.Select(sample => sample.Second))}], but one sample is scheduled every {_sampleInterval.TotalSeconds:0} s from step 1's StepFinished receipt to the Completed receipt {untilCompleted.TotalSeconds:0.000} s later, seconds 1 to {scheduled}."));
+
+        string[] unavailable = samples
+            .Where(sample => sample.Reading is null or { IsStale: true })
+            .Select(sample => sample.Reading is { } reading
+                ? Invariant($"second {sample.Second}: STALE, showing the progress of step {reading.StepIndex + 1}, pass {reading.PassIndex + 1} received {reading.Age.TotalSeconds:0.000} s earlier")
+                : Invariant($"second {sample.Second}: MISSING, no progress received since step 1 finished"))
+            .ToArray();
+        Assert.True(
+            unavailable.Length == 0,
+            Invariant($"{unavailable.Length} of {samples.Count} scheduled samples had no estimate received within the {_sampleInterval.TotalSeconds:0} s sample interval: ")
+                + string.Join("; ", unavailable));
+
+        var gated = new List<(int Second, RemainingReading Reading)>();
+        foreach (RemainingSample sample in samples)
+        {
+            if (sample.Reading is { IsGated: true } reading)
+            {
+                gated.Add((sample.Second, reading));
+            }
+        }
+
+        Assert.True(
+            gated.Count > 0,
             Invariant($"None of the {samples.Count} per-second samples after step 1 had at least {_remainingGateFloor.TotalSeconds:0} s actually remaining, so the ±{RemainingTolerance:0%} bound was never checked."));
 
-        RemainingSample[] outOfBound = gated.Where(sample => !sample.IsWithinTolerance).ToArray();
+        (int Second, RemainingReading Reading)[] outOfBound = gated.Where(sample => !sample.Reading.IsWithinTolerance).ToArray();
         Assert.True(
             outOfBound.Length == 0,
-            Invariant($"{outOfBound.Length} of {gated.Length} gated samples deviated beyond ±{RemainingTolerance:0%}: ")
+            Invariant($"{outOfBound.Length} of {gated.Count} gated samples deviated beyond ±{RemainingTolerance:0%}: ")
                 + string.Join("; ", outOfBound.Select(sample => Invariant(
-                    $"second {sample.Second}: remaining {sample.Remaining.TotalSeconds:0.000} s against {sample.Actual.TotalSeconds:0.000} s actual ({sample.RelativeError:+0.00%;-0.00%})"))));
+                    $"second {sample.Second}: remaining {sample.Reading.Remaining.TotalSeconds:0.000} s against {sample.Reading.Actual.TotalSeconds:0.000} s actual ({sample.Reading.RelativeError:+0.00%;-0.00%})"))));
     }
 
     private void WriteStepTable(TestPlan plan, EngineCompleted completed)
@@ -881,7 +1060,11 @@ public sealed class CoverageAndTimingTests
         return RequestUserStop(run);
     }
 
-    private static async Task<long> StopInsideHoldAsync(DirectRun run, CancellationToken cancellationToken)
+    // Requests the stop only once the engine has signalled the hold's start: every worker has written its slice and
+    // fenced its pre-hold flush, and the coordinator waits the hold on the stop event. A stop that waited a fixed time
+    // instead could land in the slow write or flush before the hold. The wait polls, bounded, and fails fast when the
+    // run completes first.
+    private async Task<long> StopInsideHoldAsync(DirectRun run, WaitHandle holdEntered, CancellationToken cancellationToken)
     {
         RecordedEngineEvent started = await WaitForEventAsync(
             run.Recorder,
@@ -889,8 +1072,30 @@ public sealed class CoverageAndTimingTests
             occurrence: 1,
             "the StepStarted event of the hold step",
             cancellationToken);
-        await DelayUntilAsync(started.Timestamp, _holdStopDelay, cancellationToken);
-        return RequestUserStop(run);
+
+        var stopwatch = Stopwatch.StartNew();
+        while (!holdEntered.WaitOne(0))
+        {
+            if (run.Recorder.Completed is { } completed)
+            {
+                throw new InvalidOperationException(Invariant(
+                    $"The run completed ({completed.EndReason}, detail '{completed.EndDetail}') before the engine signalled that the hold began."));
+            }
+
+            if (stopwatch.Elapsed >= _eventTimeout)
+            {
+                throw new TimeoutException(Invariant(
+                    $"The engine did not signal the start of the hold within {_eventTimeout.TotalSeconds:0} s of the hold step's start."));
+            }
+
+            await Task.Delay(_pollInterval, cancellationToken);
+        }
+
+        long observedAt = Stopwatch.GetTimestamp();
+        long requestedAt = RequestUserStop(run);
+        _output.WriteLine(Invariant(
+            $"Hold entry observed {Stopwatch.GetElapsedTime(started.Timestamp, observedAt).TotalMilliseconds:0} ms after StepStarted; stop requested {Stopwatch.GetElapsedTime(observedAt, requestedAt).TotalMilliseconds:0.000} ms after the observation."));
+        return requestedAt;
     }
 
     // Polls the recorder for the occurrence-th event that matches; fails fast when the run completes first.
@@ -951,13 +1156,21 @@ public sealed class CoverageAndTimingTests
             Invariant($"{live} engine session(s) were still alive {_liveSessionSettleTimeout.TotalSeconds:0} s after the test released its sessions."));
     }
 
-    /// <summary>One per-second time-remaining sample.</summary>
-    /// <param name="Second">The 1-based wall-clock second after step 1 finished in which the sample was received.</param>
+    /// <summary>The time-remaining estimate on display at one scheduled instant after step 1 finished.</summary>
+    /// <param name="Second">The instant, in whole sample intervals after step 1's StepFinished receipt.</param>
+    /// <param name="Reading">
+    /// The latest progress received after step 1 finished and at or before the instant; null when none was, which makes
+    /// the sample missing.
+    /// </param>
+    private sealed record RemainingSample(int Second, RemainingReading? Reading);
+
+    /// <summary>The progress on display at a sampling instant, measured against the run's actual end.</summary>
     /// <param name="StepIndex">The zero-based step of the snapshot.</param>
     /// <param name="PassIndex">The zero-based pass of the snapshot.</param>
     /// <param name="Remaining">The engine's estimate.</param>
-    /// <param name="Actual">The time from the snapshot's receipt to the Completed receipt.</param>
-    private sealed record RemainingSample(long Second, int StepIndex, int PassIndex, TimeSpan Remaining, TimeSpan Actual)
+    /// <param name="Actual">The time from the sampling instant to the Completed receipt.</param>
+    /// <param name="Age">The time from the snapshot's receipt to the sampling instant.</param>
+    private sealed record RemainingReading(int StepIndex, int PassIndex, TimeSpan Remaining, TimeSpan Actual, TimeSpan Age)
     {
         public TimeSpan Error => Remaining - Actual;
 
@@ -966,6 +1179,9 @@ public sealed class CoverageAndTimingTests
         public bool IsGated => Actual >= _remainingGateFloor;
 
         public bool IsWithinTolerance => Math.Abs(Error.Ticks) <= RemainingTolerance * Actual.Ticks;
+
+        // Live fields update at least once a second, so an estimate older than one sample interval is out of date.
+        public bool IsStale => Age > _sampleInterval;
     }
 
     /// <summary>The largest interval between consecutive UI-thread receipts of a run.</summary>

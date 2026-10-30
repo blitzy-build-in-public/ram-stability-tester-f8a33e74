@@ -146,9 +146,11 @@ struct access_context {
      * to the time the rest of the group took to stream. A prefetch fill after the flush can also
      * precede the verification load, so the figure can overstate the data's age when it was
      * fetched (see rq_error_record.time_since_write_us). The fault-injecting layer applies a
-     * delay-dependent fault only where now - write_time_ns reaches the fault's threshold,
-     * 2000 ms by default, which only hold verifications reach. Consumers read it only on verify,
-     * verify_strided, verify_and_stream and reread_word.
+     * delay-dependent fault only where the data's age since write_time_ns reaches the fault's
+     * threshold, 2000 ms by default. In the test DLL that age is measured on a controlled hold
+     * clock, which only the holds begun after the write advance, so only hold verifications
+     * reach it whatever the scheduling. Consumers read it only on verify, verify_strided,
+     * verify_and_stream and reread_word.
      */
     std::uint64_t write_time_ns;
 };

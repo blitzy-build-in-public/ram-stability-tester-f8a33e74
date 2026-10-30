@@ -159,11 +159,11 @@ internal enum FaultKind : uint
 /// </summary>
 internal static class ExpectedSizes
 {
-    /// <summary><c>sizeof(rq_fault_spec)</c>.</summary>
-    public const int FaultSpec = 72;
+    /// <summary><c>sizeof(rq_fault_spec)</c>: 80, with the per-step pass quota and the hold-entered event.</summary>
+    public const int FaultSpec = 80;
 
-    /// <summary><c>sizeof(rq_injected_fault)</c>.</summary>
-    public const int InjectedFault = 40;
+    /// <summary><c>sizeof(rq_injected_fault)</c>, with the corrupted word's address and the injection time.</summary>
+    public const int InjectedFault = 56;
 
     /// <summary><c>sizeof(rq_struct_sizes)</c>.</summary>
     public const int StructSizes = 56;
@@ -192,8 +192,8 @@ internal static class ExpectedSizes
 }
 
 /// <summary>
-/// Mirror of <c>rq_fault_spec</c> (72 bytes): natural alignment, fields in native order. <c>reserved0</c> aligns
-/// <see cref="Seed"/> to 8 bytes.
+/// Mirror of <c>rq_fault_spec</c> (80 bytes): natural alignment, fields in native order.
+/// <see cref="InjectedPassesPerStep"/> aligns <see cref="Seed"/> to 8 bytes.
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 internal struct RqFaultSpec
@@ -231,14 +231,17 @@ internal struct RqFaultSpec
     /// <summary><c>affinity_fail_error</c>: the Windows error the failing pin reports; nonzero with a named worker.</summary>
     public uint AffinityFailError;
 
-    /// <summary><c>reserved0</c>: 0.</summary>
-    public uint Reserved0;
+    /// <summary><c>injected_passes_per_step</c>: passes of each step that inject, from pass 0; 0 means every pass.</summary>
+    public uint InjectedPassesPerStep;
 
     /// <summary><c>seed</c>: seed of target-word selection and of the random bit choice.</summary>
     public ulong Seed;
+
+    /// <summary><c>hold_entered_event</c>: a Win32 event handle signalled each time a hold begins, or 0 for none.</summary>
+    public ulong HoldEnteredEvent;
 }
 
-/// <summary>Mirror of <c>rq_injected_fault</c> (40 bytes), the ground truth of one applied corruption.</summary>
+/// <summary>Mirror of <c>rq_injected_fault</c> (56 bytes), the ground truth of one applied corruption.</summary>
 [StructLayout(LayoutKind.Sequential)]
 internal struct RqInjectedFault
 {
@@ -265,6 +268,12 @@ internal struct RqInjectedFault
 
     /// <summary><c>reserved0</c>: written as 0.</summary>
     public uint Reserved0;
+
+    /// <summary><c>address</c>: virtual address of the corrupted 8-byte word, the pointer the corruption was stored through.</summary>
+    public ulong Address;
+
+    /// <summary><c>injected_ns</c>: session-clock nanoseconds read just before the call's corruptions were stored.</summary>
+    public ulong InjectedNs;
 }
 
 /// <summary>Mirror of <c>rq_struct_sizes</c> (56 bytes): the engine's <c>sizeof</c> of every ABI struct.</summary>
@@ -304,10 +313,10 @@ internal struct RqStructSizes
     /// <summary><c>sizeof(rq_run_result)</c>: 192.</summary>
     public uint RunResult;
 
-    /// <summary><c>sizeof(rq_fault_spec)</c>: 72.</summary>
+    /// <summary><c>sizeof(rq_fault_spec)</c>: 80.</summary>
     public uint FaultSpec;
 
-    /// <summary><c>sizeof(rq_injected_fault)</c>: 40.</summary>
+    /// <summary><c>sizeof(rq_injected_fault)</c>: 56.</summary>
     public uint InjectedFault;
 
     /// <summary><c>reserved0</c>: written as 0.</summary>
@@ -372,6 +381,28 @@ internal sealed record FaultSpec
 
     /// <summary>Gets the seed of target-word selection and of the random bit choice.</summary>
     public ulong Seed { get; init; }
+
+    /// <summary>
+    /// Gets the per-step pass quota: only passes whose index is below it inject, so later passes of every step run
+    /// clean. 0, the default, means every pass.
+    /// </summary>
+    /// <remarks>
+    /// With <see cref="PerPassCount"/> it bounds each step's corruptions by the plan alone, so a correctness test can
+    /// spread its expected reports over every step and keep <see cref="MaxInjections"/> out of reach, instead of having
+    /// the cap spent, in time order, before the last step.
+    /// </remarks>
+    public uint InjectedPassesPerStep { get; init; }
+
+    /// <summary>
+    /// Gets the Win32 event handle the engine signals each time a hold begins: once every worker has written its slice
+    /// and fenced its pre-hold flush, and the coordinator starts waiting the hold. 0, the default, means none.
+    /// </summary>
+    /// <remarks>
+    /// Session creation duplicates the handle, so the caller keeps ownership of its event, which must stay open until
+    /// the session has been created; a handle that cannot be duplicated fails creation with <c>RQ_E_INVALID_ARGUMENT</c>.
+    /// Honoured for <see cref="FaultKind.None"/> too, so a test that injects nothing can wait for the hold.
+    /// </remarks>
+    public nint HoldEnteredEvent { get; init; }
 
     /// <summary>
     /// Flips bit <paramref name="bit"/> in <paramref name="perPass"/> words per (step, pass), at seeded offsets spread
@@ -462,8 +493,14 @@ internal sealed record FaultSpec
     /// <summary>
     /// Flips a seeded random bit, just before the verification load, in up to <paramref name="perPass"/> words per
     /// (step, pass) whose time since write is at least <see cref="DelayThresholdMs"/> (2000 ms unless changed with
-    /// <see langword="with"/>). Only hold steps let data reach that age.
+    /// <see langword="with"/>).
     /// </summary>
+    /// <remarks>
+    /// The test library measures that age on its controlled hold clock, not on the real clock: the age advances only by
+    /// each hold's configured duration, once every worker has written and flushed its slice and the hold has begun.
+    /// Only verifications after a hold therefore see data at or above the threshold, whatever the scheduling of the
+    /// workers in real time, and a windowed verification that a descheduled worker runs seconds late still sees age 0.
+    /// </remarks>
     /// <param name="perPass">Words corrupted per (step, pass), 1 to 2^20.</param>
     /// <param name="max">The cap on logged corruptions, at least 1.</param>
     /// <param name="seed">The target-selection and bit seed.</param>
@@ -497,7 +534,7 @@ internal sealed record FaultSpec
         };
     }
 
-    /// <summary>Converts the specification to the native struct, with <c>struct_size</c> 72 and <c>reserved0</c> 0.</summary>
+    /// <summary>Converts the specification to the native struct, with <c>struct_size</c> <see cref="ExpectedSizes.FaultSpec"/>.</summary>
     /// <returns>The native specification.</returns>
     public RqFaultSpec ToNative() => new()
     {
@@ -512,8 +549,11 @@ internal sealed record FaultSpec
         DelayThresholdMs = DelayThresholdMs,
         AffinityFailWorker = AffinityFailWorker,
         AffinityFailError = AffinityFailError,
-        Reserved0 = 0,
+        InjectedPassesPerStep = InjectedPassesPerStep,
         Seed = Seed,
+
+        // The handle's bits unchanged: a HANDLE is pointer-sized, and the native field carries it as an integer.
+        HoldEnteredEvent = unchecked((ulong)HoldEnteredEvent),
     };
 
     private static uint CheckBit(int bit, [CallerArgumentExpression(nameof(bit))] string? name = null)
@@ -566,6 +606,15 @@ internal sealed record FaultSpec
 /// Whether the verification that follows the injection ran; <see langword="false"/> only when a stop or the end of the
 /// run intervened, and such entries are excluded from matching.
 /// </param>
+/// <param name="Address">
+/// The virtual address of the corrupted 8-byte word: the pointer the fault layer stored the corruption through, which the
+/// reported <see cref="ErrorRecord.Address"/> must equal exactly.
+/// </param>
+/// <param name="InjectedNs">
+/// The session clock's reading in nanoseconds, taken once per verification call just before that call's corruptions were
+/// stored, so it precedes the error each one causes; <see cref="InjectedAt"/> is the same instant as a
+/// <see cref="Stopwatch"/> timestamp.
+/// </param>
 internal sealed record InjectedFault(
     ulong WordOffset,
     ulong BitMask,
@@ -573,8 +622,42 @@ internal sealed record InjectedFault(
     int StepIndex,
     int PassIndex,
     RamQuick.Core.AccessType AccessType,
-    bool VerifiedOpportunity)
+    bool VerifiedOpportunity,
+    ulong Address,
+    ulong InjectedNs)
 {
+    private const ulong NanosecondsPerSecond = 1_000_000_000;
+
+    /// <summary>
+    /// Gets <see cref="InjectedNs"/> as a <see cref="Stopwatch.GetTimestamp"/> value, comparable with the receipt
+    /// timestamps <see cref="InstrumentedRun"/> records.
+    /// </summary>
+    /// <remarks>
+    /// The test engine's session clock reads <c>QueryPerformanceCounter</c> as floor(count × 10^9 / frequency), and a
+    /// high-resolution <see cref="Stopwatch"/> reads the same counter at the same frequency. The timestamp is therefore
+    /// floor(ns × frequency / 10^9), computed as (ns / 10^9) × frequency + (ns mod 10^9) × frequency / 10^9 in 128-bit
+    /// arithmetic so no intermediate product overflows. Both floors round down, so the timestamp is at or before the
+    /// counter value the engine read, and a latency measured from it is an upper bound on the true latency.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException"><see cref="Stopwatch"/> does not read the high-resolution counter.</exception>
+    /// <exception cref="OverflowException">The timestamp exceeds <see cref="long.MaxValue"/>.</exception>
+    public long InjectedAt
+    {
+        get
+        {
+            if (!Stopwatch.IsHighResolution)
+            {
+                throw new InvalidOperationException(
+                    "Stopwatch does not read QueryPerformanceCounter, so the engine's session-clock times have no Stopwatch equivalent.");
+            }
+
+            ulong frequency = (ulong)Stopwatch.Frequency;
+            UInt128 wholeSecondTicks = (UInt128)(InjectedNs / NanosecondsPerSecond) * frequency;
+            UInt128 fractionTicks = (UInt128)(InjectedNs % NanosecondsPerSecond) * frequency / NanosecondsPerSecond;
+            return checked((long)(wholeSecondTicks + fractionTicks));
+        }
+    }
+
     /// <summary>Copies a native log entry.</summary>
     /// <param name="native">The entry.</param>
     /// <returns>The managed entry.</returns>
@@ -596,7 +679,9 @@ internal sealed record InjectedFault(
             checked((int)native.StepIndex),
             checked((int)native.PassIndex),
             accessType,
-            native.VerifiedOpportunity != 0);
+            native.VerifiedOpportunity != 0,
+            native.Address,
+            native.InjectedNs);
     }
 }
 
@@ -1943,15 +2028,17 @@ internal static class ScaledPlans
         }));
 
     /// <summary>
-    /// Gets Quick with every budget divided by 10 (30 s), and each hold shortened where needed to at most budget Ã· 2.5,
-    /// so pass scheduling can meet the duration bound. Validated.
+    /// Gets Quick with every time budget and every hold divided by 10 (30 s in all), so each hold step keeps its shipped
+    /// budget-to-hold ratio: Q5 holds 0.5 s on its 5 s budget, 10 to 1 as shipped. Each hold is capped at budget / 2.5.
+    /// Validated.
     /// </summary>
     /// <exception cref="InvalidOperationException">The scaled plan breaks a plan rule.</exception>
     public static TestPlan TimingQuick => Validated(Timing(TestPlans.Quick), nameof(TimingQuick));
 
     /// <summary>
-    /// Gets Standard with every budget divided by 10 (120 s), and each hold shortened where needed to at most
-    /// budget Ã· 2.5. Validated.
+    /// Gets Standard with every time budget and every hold divided by 10 (120 s in all), so each hold step keeps its
+    /// shipped budget-to-hold ratio: Q5 holds 0.5 s on its 5 s budget and S10 3 s on its 15 s, 10 to 1 and 5 to 1 as
+    /// shipped. Each hold is capped at budget / 2.5. Validated.
     /// </summary>
     /// <exception cref="InvalidOperationException">The scaled plan breaks a plan rule.</exception>
     public static TestPlan TimingStandard => Validated(Timing(TestPlans.Standard), nameof(TimingStandard));
@@ -2015,12 +2102,22 @@ internal static class ScaledPlans
         return plan.ToStepAttributes();
     }
 
+    // Holds are divided by 10 like the budgets, so every hold step keeps its shipped budget-to-hold ratio and pass count
+    // and ends as near its budget as at full scale. A full-length hold on a tenth of the budget leaves the step a few
+    // long passes that end most of a pass early, and every time-remaining estimate made before the step runs high by
+    // that shortfall. A hold step keeps at least 1 ms, so it stays a hold step, and FitHold caps it at budget / 2.5.
     private static TestPlan Timing(TestPlan source) => new(
         source.Type,
         source.Steps.Select(step =>
         {
             TimeSpan budget = ScaleDown(step.TimeBudget);
-            return step with { TimeBudget = budget, Hold = FitHold(step.Hold, budget) };
+            TimeSpan hold = ScaleDown(step.Hold);
+            if (step.HasHold && hold < _oneMillisecond)
+            {
+                hold = _oneMillisecond;
+            }
+
+            return step with { TimeBudget = budget, Hold = FitHold(hold, budget) };
         }));
 
     // Budget Ã· 10 in whole milliseconds, the engine's resolution; the shipped budgets are whole seconds, so it is exact.

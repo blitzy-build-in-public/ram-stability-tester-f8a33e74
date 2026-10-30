@@ -37,6 +37,7 @@
 #include <new>
 #include <shared_mutex>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 
 namespace rq::engine::test {
@@ -62,7 +63,7 @@ constexpr std::uint64_t k_target_index_salt = 0x632BE59BD9B4E019ull;
 constexpr std::uint64_t k_target_bit_salt = 0xD1B54A32D192ED03ull;
 /** Workers with a lock-free target-set cache slot; higher indices use the locked lookup. */
 constexpr std::uint32_t k_worker_slots = 1024;
-/** Log entries preallocated at most: 40 MiB, enough for every cap the tests use. */
+/** Log entries preallocated at most: 56 MiB, enough for every cap the tests use. */
 constexpr std::uint64_t k_max_preallocated_log_entries = std::uint64_t{1} << 20;
 constexpr std::uint64_t k_ns_per_ms = 1'000'000;
 
@@ -92,6 +93,30 @@ std::unique_ptr<IMemoryAccess> require_inner(std::unique_ptr<IMemoryAccess> inne
         throw std::invalid_argument("fault_injecting_memory_access requires an inner layer");
     }
     return inner;
+}
+
+/**
+ * Fences of one slice's pre-hold flush: fence_flush_fence (core/runner/step_runner.cpp) fences
+ * before and after flushing the slice, and issues both even when a stop cuts the flush short.
+ */
+constexpr std::uint64_t k_pre_hold_fences_per_slice = 2;
+/** Hold entries reserved up front: far more hold passes than any shipped or scaled plan runs. */
+constexpr std::size_t k_reserved_hold_entries = 256;
+
+/** Rejects a null base clock before any other member is built. */
+std::shared_ptr<IClock> require_base_clock(std::shared_ptr<IClock> base) {
+    if (base == nullptr) {
+        throw std::invalid_argument("hold_clock requires a base clock");
+    }
+    return base;
+}
+
+/** Rejects a slice count of 0, which no session has and which would arm on no fence. */
+std::uint32_t require_slices(std::uint32_t slice_count) {
+    if (slice_count == 0) {
+        throw std::invalid_argument("hold_clock requires at least one slice");
+    }
+    return slice_count;
 }
 
 /** Reserves room for n elements; false, with v unchanged, when the allocation fails. */
@@ -213,7 +238,8 @@ struct fault_injecting_memory_access::impl {
 
     explicit impl(const rq_fault_spec& spec)
         : kind(spec.kind), seed(spec.seed), max_injections(spec.max_injections),
-          stuck_offset(spec.region_offset), stuck_value_bit(spec.stuck_value & 1) {
+          injected_passes_per_step(spec.injected_passes_per_step), stuck_offset(spec.region_offset),
+          stuck_value_bit(spec.stuck_value & 1) {
         // The target range holds only whole words: its first word starts at or after
         // region_offset and its last ends at or before region_offset + region_length.
         first_word = spec.region_offset / detail::k_word_bytes +
@@ -412,7 +438,9 @@ struct fault_injecting_memory_access::impl {
     /**
      * Claims the candidates against the cap and logs the claimed ones, all under one lock, so
      * this call's entries are contiguous from *first_entry. A claim whose entries cannot be
-     * allocated is returned, so no corruption is ever stored unless it is logged.
+     * allocated is returned, so no corruption is ever stored unless it is logged. Every entry
+     * of the call carries one session-clock reading, taken before any of its corruptions is
+     * stored, and the address each corruption will be stored through.
      *
      * @return The number of leading candidates claimed and logged; only those may be stored.
      */
@@ -424,6 +452,8 @@ struct fault_injecting_memory_access::impl {
             return 0;
         }
         const auto count = static_cast<std::size_t>(granted);
+        // Read outside the lock: the stores follow this call, so the reading precedes each one.
+        const std::uint64_t injected_ns = layer.clock_.now_ns();
         {
             const std::lock_guard<std::mutex> lock(log_mutex);
             // Geometric growth keeps appends amortised once the preallocation is used up;
@@ -444,6 +474,9 @@ struct fault_injecting_memory_access::impl {
                 entry.access_type = ctx.access_type;
                 entry.verified_opportunity = 0;
                 entry.reserved0 = 0;
+                entry.address = static_cast<std::uint64_t>(
+                    reinterpret_cast<std::uintptr_t>(candidates[k].word));
+                entry.injected_ns = injected_ns;
                 log.push_back(entry);
             }
         }
@@ -493,6 +526,12 @@ struct fault_injecting_memory_access::impl {
         if (!enabled || word_count == 0 || (visits != nullptr && visits->visit_count == 0)) {
             return forward();
         }
+        // A pass beyond the per-step quota runs clean, before the cap is consulted: no clock
+        // read, no target lookup and no allocation. The quota bounds each step's corruptions by
+        // the plan, so a test can keep the run-wide cap out of reach and inject into every step.
+        if (injected_passes_per_step != 0 && ctx.pass_index >= injected_passes_per_step) {
+            return forward();
+        }
         // Once the run-wide cap is spent no candidate can be claimed, so the call forwards at
         // once: no clock read, no target lookup, no allocation, and no set built for a
         // (step, pass) that could inject nothing. The load is only a snapshot, because
@@ -510,9 +549,13 @@ struct fault_injecting_memory_access::impl {
         if (kind == RQ_FAULT_DELAY_DEPENDENT) {
             // Time-based only, deliberately not filtered on access_type: the tests' assertion
             // that every report follows a hold therefore also checks the runner's
-            // write_time_ns stamps.
+            // write_time_ns stamps. On a hold clock the age is controlled time, which only the
+            // holds that began after the write advance, so a worker descheduled between a
+            // window's write and its verification never ages that window's data.
             const std::uint64_t now = layer.clock_.now_ns();
-            const std::uint64_t age = now > ctx.write_time_ns ? now - ctx.write_time_ns : 0;
+            const std::uint64_t age = layer.holds_ != nullptr
+                                          ? layer.holds_->controlled_age_ns(ctx.write_time_ns, now)
+                                          : (now > ctx.write_time_ns ? now - ctx.write_time_ns : 0);
             if (age < delay_threshold_ns) {
                 return forward();
             }
@@ -554,6 +597,8 @@ struct fault_injecting_memory_access::impl {
     const std::uint32_t kind;
     const std::uint64_t seed;
     const std::uint64_t max_injections;
+    /** Passes of each step that inject, from pass 0; 0 means every pass. */
+    const std::uint32_t injected_passes_per_step;
     /** RQ_FAULT_STUCK_BIT: logical offset of the stuck word, aligned to its 8-byte word. */
     const std::uint64_t stuck_offset;
     /** RQ_FAULT_STUCK_BIT: the value the stuck bit is forced to, 0 or 1. */
@@ -593,11 +638,97 @@ struct fault_injecting_memory_access::impl {
     std::array<worker_slot, k_worker_slots> slots{};
 };
 
+hold_clock::hold_clock(std::shared_ptr<IClock> base, std::uint32_t slice_count,
+                       std::vector<std::uint32_t> hold_ms_by_step, hold_event_handle hold_entered)
+    : base_(require_base_clock(std::move(base))),
+      fences_per_hold_(std::uint64_t{require_slices(slice_count)} * k_pre_hold_fences_per_slice),
+      hold_ms_by_step_(std::move(hold_ms_by_step)), hold_entered_(std::move(hold_entered)) {
+    // Appends happen on the coordinator once per hold pass; reserving the usual run's worth
+    // keeps them from reallocating under the exclusive lock in all but very long plans.
+    timeline_.reserve(k_reserved_hold_entries);
+}
+
+hold_clock::~hold_clock() = default;
+
+std::uint64_t hold_clock::now_ns() const noexcept {
+    return base_->now_ns();
+}
+
+bool hold_clock::wait_for_stop(const stop_signal& signal, std::uint64_t timeout_ms) {
+    bool entering = false;
+    std::uint32_t step = 0;
+    {
+        const std::lock_guard<std::mutex> lock(arm_mutex_);
+        if (armed_) {
+            armed_ = false;
+            entering = true;
+            step = armed_step_;
+        }
+    }
+    // A stop requested by now ends the step before its hold, so no hold begins: the base wait
+    // returns at once and nothing is recorded or signalled.
+    if (entering && !signal.stop_requested()) {
+        const std::uint64_t entry_ns = base_->now_ns();
+        const std::uint64_t hold_ms = step < hold_ms_by_step_.size() ? hold_ms_by_step_[step] : 0;
+        {
+            const std::unique_lock<std::shared_mutex> lock(timeline_mutex_);
+            timeline_.push_back(hold_entry{entry_ns, hold_ms * k_ns_per_ms});
+            if (entry_ns > latest_entry_ns_.load(std::memory_order_relaxed)) {
+                latest_entry_ns_.store(entry_ns, std::memory_order_release);
+            }
+            entries_.store(timeline_.size(), std::memory_order_release);
+        }
+        // Signalled after the entry is recorded, so a test woken by the event finds it counted.
+        if (hold_entered_ != nullptr && !SetEvent(hold_entered_.get())) {
+            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                                    "SetEvent on the hold-entered event failed");
+        }
+    }
+    return base_->wait_for_stop(signal, timeout_ms);
+}
+
+void hold_clock::note_pre_hold_fence(std::uint32_t step_index, std::uint32_t pass_index) {
+    const std::uint64_t key = set_key(step_index, pass_index);
+    const std::lock_guard<std::mutex> lock(arm_mutex_);
+    if (!counting_ || counting_key_ != key) {
+        counting_ = true;
+        counting_key_ = key;
+        fence_count_ = 0;
+    }
+    ++fence_count_;
+    // Equality, not >=, so the hold arms once even if a caller fences the same key again.
+    if (fence_count_ == fences_per_hold_) {
+        armed_ = true;
+        armed_step_ = step_index;
+    }
+}
+
+std::uint64_t hold_clock::controlled_age_ns(std::uint64_t write_ns, std::uint64_t now_ns) const {
+    // Every entry lies at or before latest_entry_ns_, so none can fall in (write_ns, now_ns]
+    // when the write is that recent: windowed, turnaround and moving-inversion data, written
+    // and verified within one pass, take this path without touching the lock.
+    if (write_ns >= now_ns || write_ns >= latest_entry_ns_.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    const std::shared_lock<std::shared_mutex> lock(timeline_mutex_);
+    std::uint64_t age = 0;
+    for (const hold_entry& entry : timeline_) {
+        if (entry.entry_ns > write_ns && entry.entry_ns <= now_ns) {
+            age = entry.advance_ns > UINT64_MAX - age ? UINT64_MAX : age + entry.advance_ns;
+        }
+    }
+    return age;
+}
+
+std::uint64_t hold_clock::hold_entry_count() const noexcept {
+    return entries_.load(std::memory_order_acquire);
+}
+
 fault_injecting_memory_access::fault_injecting_memory_access(std::unique_ptr<IMemoryAccess> inner,
                                                              const rq_fault_spec& spec,
-                                                             const IClock& clock)
+                                                             const IClock& clock, hold_clock* holds)
     : inner_(require_inner(std::move(inner))), spec_(with_layer_defaults(spec)), clock_(clock),
-      impl_(std::make_unique<impl>(spec_)) {}
+      holds_(holds), impl_(std::make_unique<impl>(spec_)) {}
 
 fault_injecting_memory_access::~fault_injecting_memory_access() = default;
 
@@ -608,6 +739,11 @@ void fault_injecting_memory_access::stream_fill(const access_context& ctx, std::
 }
 
 void fault_injecting_memory_access::fence(const access_context& ctx) {
+    // Counted for every kind, RQ_FAULT_NONE included, so a test that injects nothing can still
+    // be told when every worker has flushed its slice and the hold begins.
+    if (holds_ != nullptr && ctx.phase == phase_kind::pre_hold_flush) {
+        holds_->note_pre_hold_fence(ctx.step_index, ctx.pass_index);
+    }
     inner_->fence(ctx);
 }
 

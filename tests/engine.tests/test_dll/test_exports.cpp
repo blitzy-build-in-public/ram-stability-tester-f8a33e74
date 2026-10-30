@@ -34,6 +34,7 @@
 #include <memory>
 #include <algorithm>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -118,8 +119,8 @@ extern "C" RQ_API rq_result RQ_CALL rq_test_session_create(const rq_session_conf
         if (fault != nullptr) {
             // validate_fault_spec checks struct_size before any other field and stops at the
             // first rule broken, so an undersized spec is never read beyond it; the spec is
-            // copied only once it is known to be whole. It also requires reserved0 == 0 and a
-            // nonzero affinity_fail_error whenever affinity_fail_worker names a worker.
+            // copied only once it is known to be whole. It also requires a nonzero
+            // affinity_fail_error whenever affinity_fail_worker names a worker.
             const char* reason = nullptr;
             if (!rq::engine::test::validate_fault_spec(*fault, config->region_bytes, &reason)) {
                 report_rejected_spec(reason);
@@ -136,24 +137,53 @@ extern "C" RQ_API rq_result RQ_CALL rq_test_session_create(const rq_session_conf
         }
         const rq_fault_spec spec = rq::engine::test::normalized(requested, config->region_bytes);
 
+        // Duplicated before anything is built, so a handle the caller closes on return stays
+        // valid for the session, and a bad one is rejected before any allocation. The owner
+        // closes the duplicate on every failure path below.
+        rq::engine::test::hold_event_handle hold_entered;
+        if (spec.hold_entered_event != 0) {
+            const HANDLE process = GetCurrentProcess();
+            const auto caller_event =
+                reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(spec.hold_entered_event));
+            HANDLE duplicate = nullptr;
+            if (!DuplicateHandle(process, caller_event, process, &duplicate, 0, FALSE,
+                                 DUPLICATE_SAME_ACCESS)) {
+                report_rejected_spec("hold_entered_event is not a handle this process can "
+                                     "duplicate");
+                return RQ_E_INVALID_ARGUMENT;
+            }
+            hold_entered.reset(duplicate);
+        }
+        // validate_config has checked step_count and that steps holds step_count elements.
+        std::vector<std::uint32_t> hold_ms_by_step(config->step_count);
+        for (std::uint32_t i = 0; i < config->step_count; ++i) {
+            hold_ms_by_step[i] = config->steps[i].hold_ms;
+        }
+
         rq::engine::session_dependencies dependencies;
         // One clock instance serves both the session and the fault layer: delay-dependent
-        // injection compares clock.now_ns() with access_context::write_time_ns, which the runner
-        // stamps from the session clock, so two clocks would not share a time base. The session
-        // owns it for its lifetime and destroys its memory-access stack first.
-        auto clock = std::make_shared<rq::engine::qpc_clock>();
+        // injection measures access_context::write_time_ns, which the runner stamps from the
+        // session clock, against that clock's readings, so two clocks would not share a time
+        // base. The hold clock reads QueryPerformanceCounter for every engine timing and the hold
+        // waits, and measures the delay-dependent age on its controlled timeline instead, which
+        // only hold entries advance. The session owns it for its lifetime and destroys its
+        // memory-access stack first.
+        auto clock = std::make_shared<rq::engine::test::hold_clock>(
+            std::make_shared<rq::engine::qpc_clock>(), config->worker_count,
+            std::move(hold_ms_by_step), std::move(hold_entered));
         dependencies.clock = clock;
-        // The full stack is built for RQ_FAULT_NONE too, where the fault layer is a pure
-        // pass-through, so the layer queries below find the same stack on every test session.
-        // The counting layer keeps its default options: no primitive log and no clock, so DLL
-        // sessions carry no logging memory.
+        // The full stack is built for RQ_FAULT_NONE too, where the fault layer only passes
+        // accesses through and counts pre-hold fences, so the layer queries below find the same
+        // stack on every test session. The counting layer keeps its default options: no
+        // primitive log and no clock, so DLL sessions carry no logging memory.
         using rq::engine::IMemoryAccess;
         using rq::engine::test::counting_memory_access;
         using rq::engine::test::fault_injecting_memory_access;
         dependencies.wrap_memory_access =
             [spec, clock](std::unique_ptr<IMemoryAccess> real) -> std::unique_ptr<IMemoryAccess> {
             return std::make_unique<fault_injecting_memory_access>(
-                std::make_unique<counting_memory_access>(std::move(real)), spec, *clock);
+                std::make_unique<counting_memory_access>(std::move(real)), spec, *clock,
+                clock.get());
         };
         // Left null otherwise, which selects the production Win32 affinity.
         if (spec.affinity_fail_worker != RQ_FAULT_NO_WORKER) {
