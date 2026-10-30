@@ -6,6 +6,9 @@
  *   out-of-line expected_value, over every pattern kind, pass, complement flag, direction, start
  *   offset within a cache line and range length the kernels split differently; the shape of the
  *   three raw tables; and the baseline flush and re-read helpers.
+ * - kernels_traced*: the instructions the built full_fence, flush_range and reread helpers
+ *   execute, called directly and through real_memory_access's fence, flush and reread_word,
+ *   recorded by an in-process single-step trace.
  * - KernelsStrided*: the BankStride entries of every set against expected_value and, for the
  *   AVX sets, against SSE2, over every kind, the three strides, 2 MiB, 6 MiB and 64 MiB spans
  *   and calls that start or end mid-sweep; and the identity of their visit sequence with
@@ -26,12 +29,23 @@
  * handful of lines once: no flush-and-reload loop over a small address set, the access style the
  * product's stress bound excludes.
  *
+ * The flush and re-read value checks cannot tell a working flush from none: write-back memory
+ * returns the same data either way, and a re-read that loads before it fences still returns the
+ * stored word. The kernels_traced tests therefore run each helper with the trap flag set, so a
+ * vectored exception handler sees every instruction it executes, and compare the fences, the
+ * flushes with the lines they name and the loads of the test page with the helper's contract.
+ * A debugger receives every single-step exception before any vectored handler, so under one
+ * those tests report SKIPPED.
+ *
  * Every kernel assertion names the ISA, pattern, pass, complement flag, direction, first word
  * index, word count and start offset, so a failure identifies the exact case.
  */
 #include <gtest/gtest.h>
 #include <windows.h>
+#include <intrin.h>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -47,6 +61,8 @@
 #include "core/patterns/access_order.h"
 #include "core/kernels/kernels.h"
 #include "core/kernels/isa_dispatch.h"
+#include "core/memory/memory_access.h"
+#include "core/memory/real_memory_access.h"
 
 namespace rq::engine::test {
 namespace {
@@ -1481,6 +1497,645 @@ TEST_P(KernelsFlushHelpers, FlushRangeLeavesDataIntactForUnalignedStartAndLength
 
 INSTANTIATE_TEST_SUITE_P(KernelsBaselineHelpers, KernelsFlushHelpers,
                          ::testing::ValuesIn(k_flush_helpers), param_name<flush_helpers>);
+
+/* ---------------------------------------------------------------------------------------------
+ * Flush and re-read helpers: the instructions their built bodies execute
+ * ------------------------------------------------------------------------------------------- */
+
+// The value tests above pass for a flush_range that flushes nothing and for a re-read that loads
+// before it fences, because write-back memory returns the stored data either way. These tests
+// observe the instructions instead. With the trap flag (EFLAGS.TF) set, the CPU raises a
+// single-step exception after every instruction, and its context holds the address of the next
+// one; a vectored handler decodes that instruction before it executes and records the fences,
+// the flushes with the line each one names, and the loads of the test page. A trace of the
+// running code holds in both configurations, where a scan of its bytes would not: Release
+// inlines the line loop into each flush_range, while Debug calls it out of line and reloads
+// every local from the stack. Only a trace sees which lines a flush loop actually names.
+
+namespace {
+
+/** EFLAGS.TF: while set, the CPU raises a single-step trap after every instruction. */
+constexpr DWORD k_trap_flag = 0x100U;
+
+/** The longest x64 instruction, in bytes. */
+constexpr std::size_t k_max_instruction_bytes = 15U;
+
+/**
+ * Instructions one traced call may execute before the trace is abandoned as runaway. Every
+ * traced call executes far fewer, Debug's /JMC and /RTC checks included.
+ */
+constexpr std::size_t k_trace_step_limit = 100000U;
+
+/** Events one traced call may record; the longest expected trace holds four. */
+constexpr std::size_t k_trace_event_capacity = 64U;
+
+/**
+ * A debugger receives every single-step exception first-chance, before any vectored handler,
+ * and consumes it, so the trace cannot run under one.
+ */
+constexpr char k_debugger_skip[] =
+    "a debugger receives every single-step exception first, so no instruction trace can run";
+
+/** First line of the traced region: lines on both sides stay inside the test page. */
+constexpr std::size_t k_traced_first_line = 4U;
+
+/** The instructions a trace records. */
+enum class traced_op : std::uint8_t {
+    mfence,
+    sfence,
+    lfence,
+    clflush,
+    clflushopt,
+    /** CLWB writes a line back but may leave it cached, so it never serves as the flush. */
+    clwb,
+    /** MOV r, m (opcode 8B) reading the watched page. */
+    load,
+};
+
+const char* op_name(traced_op op) noexcept {
+    switch (op) {
+    case traced_op::mfence:
+        return "MFENCE";
+    case traced_op::sfence:
+        return "SFENCE";
+    case traced_op::lfence:
+        return "LFENCE";
+    case traced_op::clflush:
+        return "CLFLUSH";
+    case traced_op::clflushopt:
+        return "CLFLUSHOPT";
+    case traced_op::clwb:
+        return "CLWB";
+    case traced_op::load:
+        return "LOAD";
+    default:
+        return "OutOfRange";
+    }
+}
+
+/** One recorded instruction. */
+struct traced_event {
+    traced_op op;
+    /**
+     * For a flush, the 64-byte line its operand lies in, which is the line the CPU flushes; for
+     * a load, its exact effective address; 0 for a fence.
+     */
+    std::uintptr_t address;
+    /** Bytes a load reads; 0 for a fence or flush. */
+    std::uint32_t width;
+
+    bool operator==(const traced_event&) const = default;
+};
+
+void PrintTo(const traced_event& event, std::ostream* os) {
+    *os << op_name(event.op);
+    if (event.op == traced_op::load) {
+        *os << " of " << event.width << " bytes at " << hex64(event.address);
+    } else if (event.address != 0U) {
+        *os << " of line " << hex64(event.address);
+    }
+}
+
+/**
+ * Line address recorded for an FS- or GS-relative flush. The segment base is not in CONTEXT,
+ * so the line cannot be resolved, and this value matches no line a test expects.
+ */
+constexpr std::uintptr_t k_unresolved_line = ~std::uintptr_t{k_cache_line_bytes - 1U};
+
+/** The 64-byte line an address lies in. */
+constexpr std::uintptr_t line_of(std::uintptr_t address) noexcept {
+    return address & ~std::uintptr_t{k_cache_line_bytes - 1U};
+}
+
+/**
+ * State the vectored handler records into, global because a vectored handler takes no context
+ * argument. Only the thread named here is traced, and only while `active` holds; the handler
+ * runs on that thread, so the other fields need no synchronisation. The event storage is fixed,
+ * so the handler never allocates.
+ */
+struct trace_record {
+    std::atomic<bool> active{false};
+    DWORD thread_id = 0;
+    /** RIP at which the trace ends: trace_end_marker's entry. */
+    std::uintptr_t stop_at = 0;
+    /** Loads are recorded only inside [watch_begin, watch_end), the test page. */
+    std::uintptr_t watch_begin = 0;
+    std::uintptr_t watch_end = 0;
+    std::array<traced_event, k_trace_event_capacity> events{};
+    std::size_t event_count = 0;
+    std::size_t steps = 0;
+    bool events_overflowed = false;
+    bool step_limit_reached = false;
+    bool reached_stop = false;
+};
+
+constinit trace_record current_trace{};
+
+/** Calls of trace_end_marker, the counter that gives the marker a body of its own. */
+std::atomic<std::uint64_t> trace_end_marker_calls{0U};
+
+/**
+ * Where every traced call ends: the handler stops tracing at this function's entry. Its body
+ * is unique, so /OPT:ICF cannot fold it into a function the traced call runs, which would end
+ * the trace early.
+ */
+__declspec(noinline) void trace_end_marker() noexcept {
+    trace_end_marker_calls.fetch_add(1U, std::memory_order_relaxed);
+}
+
+/** The general-purpose register a ModRM, SIB or REX-extended register number names. */
+std::uint64_t register_value(const CONTEXT& context, unsigned number) noexcept {
+    switch (number) {
+    case 0U:
+        return context.Rax;
+    case 1U:
+        return context.Rcx;
+    case 2U:
+        return context.Rdx;
+    case 3U:
+        return context.Rbx;
+    case 4U:
+        return context.Rsp;
+    case 5U:
+        return context.Rbp;
+    case 6U:
+        return context.Rsi;
+    case 7U:
+        return context.Rdi;
+    case 8U:
+        return context.R8;
+    case 9U:
+        return context.R9;
+    case 10U:
+        return context.R10;
+    case 11U:
+        return context.R11;
+    case 12U:
+        return context.R12;
+    case 13U:
+        return context.R13;
+    case 14U:
+        return context.R14;
+    default:
+        return context.R15;
+    }
+}
+
+/**
+ * Effective address of the memory operand whose ModRM byte (mod != 11) is code[modrm_at], in
+ * an instruction with no immediate, so a RIP-relative operand is relative to the end of its
+ * displacement.
+ */
+std::uintptr_t memory_operand_address(const CONTEXT& context, const std::uint8_t* code,
+                                      std::size_t modrm_at, std::uint8_t rex,
+                                      bool address_size_override) noexcept {
+    const std::uint8_t modrm = code[modrm_at];
+    const unsigned mod = modrm >> 6U;
+    const unsigned rm = modrm & 7U;
+    const unsigned rex_x = (rex & 0x2U) != 0U ? 8U : 0U;
+    const unsigned rex_b = (rex & 0x1U) != 0U ? 8U : 0U;
+    std::size_t next = modrm_at + 1U;
+    std::uint64_t address = 0U;
+    bool disp32 = mod == 2U;
+    bool rip_relative = false;
+    if (rm == 4U) {
+        const std::uint8_t sib = code[next++];
+        const unsigned index = ((sib >> 3U) & 7U) | rex_x;
+        const unsigned base = sib & 7U;
+        // Index 100 without REX.X means no index, since RSP cannot be one.
+        if (index != 4U) {
+            address += register_value(context, index) << (sib >> 6U);
+        }
+        // Base 101 with mod 00 means a 32-bit displacement and no base, whatever REX.B holds.
+        if (base == 5U && mod == 0U) {
+            disp32 = true;
+        } else {
+            address += register_value(context, base | rex_b);
+        }
+    } else if (rm == 5U && mod == 0U) {
+        rip_relative = true;
+        disp32 = true;
+    } else {
+        address += register_value(context, rm | rex_b);
+    }
+    if (mod == 1U) {
+        address += static_cast<std::uint64_t>(static_cast<std::int8_t>(code[next]));
+        next += 1U;
+    } else if (disp32) {
+        std::int32_t displacement = 0;
+        std::memcpy(&displacement, code + next, sizeof(displacement));
+        address += static_cast<std::uint64_t>(static_cast<std::int64_t>(displacement));
+        next += sizeof(displacement);
+    }
+    if (rip_relative) {
+        address += context.Rip + next;
+    }
+    return address_size_override ? address & 0xFFFFFFFFU : address;
+}
+
+/** Appends one event; past the capacity it only flags the overflow. */
+void record_event(traced_op op, std::uintptr_t address, std::uint32_t width) noexcept {
+    if (current_trace.event_count == current_trace.events.size()) {
+        current_trace.events_overflowed = true;
+        return;
+    }
+    current_trace.events[current_trace.event_count++] = traced_event{op, address, width};
+}
+
+/**
+ * Records the instruction at context.Rip when it is a fence, a flush or a MOV load of the
+ * watched page. Only the encodings of those instructions are decoded: the CPU reports the next
+ * instruction's address itself, so no general length decoder is needed.
+ */
+void record_instruction(const CONTEXT& context) noexcept {
+    const auto* const code = reinterpret_cast<const std::uint8_t*>(context.Rip);
+    bool operand_size_override = false;
+    bool repeat_prefix = false;
+    bool address_size_override = false;
+    bool fs_gs_override = false;
+    std::uint8_t rex = 0U;
+    std::size_t at = 0U;
+    // Legacy prefixes in any order, then REX. A REX prefix counts only immediately before the
+    // opcode; the CPU ignores one that another prefix follows, and so does this loop.
+    for (; at < k_max_instruction_bytes; ++at) {
+        const std::uint8_t byte = code[at];
+        if ((byte & 0xF0U) == 0x40U) {
+            rex = byte;
+            continue;
+        }
+        if (byte == 0x66U) {
+            operand_size_override = true;
+        } else if (byte == 0xF2U || byte == 0xF3U) {
+            repeat_prefix = true;
+        } else if (byte == 0x67U) {
+            address_size_override = true;
+        } else if (byte == 0x64U || byte == 0x65U) {
+            fs_gs_override = true;
+        } else if (byte != 0xF0U && byte != 0x26U && byte != 0x2EU && byte != 0x36U &&
+                   byte != 0x3EU) {
+            // Any byte but LOCK or an ES, CS, SS or DS override, which x64 addressing ignores,
+            // is the opcode.
+            break;
+        }
+        rex = 0U;
+    }
+    if (at == k_max_instruction_bytes) {
+        return;
+    }
+    if (code[at] == 0x0FU && code[at + 1U] == 0xAEU) {
+        const std::size_t modrm_at = at + 2U;
+        const std::uint8_t modrm = code[modrm_at];
+        const unsigned reg = (modrm >> 3U) & 7U;
+        if ((modrm >> 6U) == 3U) {
+            // The fences carry no 66, F2 or F3 prefix; with one, the same ModRM encodes another
+            // instruction (TPAUSE, UMWAIT, INCSSP, RDFSBASE and others).
+            if (operand_size_override || repeat_prefix) {
+                return;
+            }
+            if (reg == 5U) {
+                record_event(traced_op::lfence, 0U, 0U);
+            } else if (reg == 6U) {
+                record_event(traced_op::mfence, 0U, 0U);
+            } else if (reg == 7U) {
+                record_event(traced_op::sfence, 0U, 0U);
+            }
+            return;
+        }
+        // Memory forms: /7 is CLFLUSH, and CLFLUSHOPT with 66; /6 with 66 is CLWB. The other
+        // forms (FXSAVE, XSAVE, LDMXCSR and the like) and the F2 and F3 forms flush nothing.
+        if (repeat_prefix || (reg != 7U && !(reg == 6U && operand_size_override))) {
+            return;
+        }
+        const traced_op flush = reg == 6U               ? traced_op::clwb
+                                : operand_size_override ? traced_op::clflushopt
+                                                        : traced_op::clflush;
+        const std::uintptr_t line =
+            fs_gs_override ? k_unresolved_line
+                           : line_of(memory_operand_address(context, code, modrm_at, rex,
+                                                            address_size_override));
+        record_event(flush, line, 0U);
+        return;
+    }
+    // MOV r, m. On x64 Windows an FS- or GS-relative load reads the TEB, never the test page.
+    if (code[at] == 0x8BU && (code[at + 1U] >> 6U) != 3U && !fs_gs_override) {
+        const std::uintptr_t address =
+            memory_operand_address(context, code, at + 1U, rex, address_size_override);
+        const std::uint32_t width = (rex & 0x8U) != 0U ? 8U : operand_size_override ? 2U : 4U;
+        if (address < current_trace.watch_end && address + width > current_trace.watch_begin) {
+            record_event(traced_op::load, address, width);
+        }
+    }
+}
+
+/**
+ * The vectored handler. It claims only single-step exceptions on the tracing thread while a
+ * trace is active. It records into the fixed trace_record, re-arms the trap flag for the next
+ * instruction, and clears it at trace_end_marker or at the step limit.
+ */
+LONG NTAPI record_single_step(EXCEPTION_POINTERS* info) noexcept {
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP ||
+        !current_trace.active.load(std::memory_order_acquire) ||
+        GetCurrentThreadId() != current_trace.thread_id) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    CONTEXT& context = *info->ContextRecord;
+    const bool at_stop = context.Rip == current_trace.stop_at;
+    if (at_stop || current_trace.steps == k_trace_step_limit) {
+        current_trace.reached_stop = at_stop;
+        current_trace.step_limit_reached = !at_stop;
+        context.EFlags &= ~k_trap_flag;
+        current_trace.active.store(false, std::memory_order_release);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    ++current_trace.steps;
+    record_instruction(context);
+    context.EFlags |= k_trap_flag;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+/**
+ * Runs body(context) with the trap flag set, then calls trace_end_marker, where the handler
+ * ends the trace. The CPU raises no trap after the instruction that sets TF, only after the one
+ * following it, so the single instruction that runs untraced is this trampoline's, at the
+ * latest its call of body. Not inlined, so nothing of the caller runs while TF is set.
+ */
+__declspec(noinline) void run_traced(void (*body)(void*), void* context) noexcept {
+    // Sequentially consistent: the store must not sink below the flag write.
+    current_trace.active.store(true);
+    __writeeflags(__readeflags() | k_trap_flag);
+    body(context);
+    trace_end_marker();
+}
+
+/** Calls a traced call object through the type-erased pointer run_traced takes. */
+template <class Call>
+void invoke_call(void* call) noexcept {
+    (*static_cast<Call*>(call))();
+}
+
+/** Removes a vectored exception handler. */
+struct vectored_handler_remover {
+    void operator()(void* handler) const noexcept { RemoveVectoredExceptionHandler(handler); }
+};
+
+/**
+ * One test's tracer: installs record_single_step first in the vectored handler chain on
+ * construction and removes it on destruction. Loads are recorded only inside the watched page,
+ * which keeps the traced code's own stack traffic (every local in Debug) out of the record;
+ * fences and flushes are recorded wherever they point.
+ */
+class instruction_trace {
+public:
+    instruction_trace(const void* watched, std::size_t watched_bytes) noexcept
+        : handler_(AddVectoredExceptionHandler(1U, &record_single_step)),
+          watch_begin_(reinterpret_cast<std::uintptr_t>(watched)),
+          watch_end_(watch_begin_ + watched_bytes) {}
+
+    bool installed() const noexcept { return handler_ != nullptr; }
+
+    /**
+     * Executes call() with every instruction traced and keeps the events for events().
+     *
+     * @return Failure when the trace did not run to trace_end_marker or lost events.
+     */
+    template <class Call>
+    ::testing::AssertionResult run(Call call) {
+        if (!installed()) {
+            return ::testing::AssertionFailure() << "no vectored exception handler is installed";
+        }
+        current_trace.thread_id = GetCurrentThreadId();
+        current_trace.stop_at = reinterpret_cast<std::uintptr_t>(&trace_end_marker);
+        current_trace.watch_begin = watch_begin_;
+        current_trace.watch_end = watch_end_;
+        current_trace.event_count = 0U;
+        current_trace.steps = 0U;
+        current_trace.events_overflowed = false;
+        current_trace.step_limit_reached = false;
+        current_trace.reached_stop = false;
+        run_traced(&invoke_call<Call>, &call);
+        current_trace.active.store(false, std::memory_order_release);
+        events_.assign(current_trace.events.begin(),
+                       current_trace.events.begin() +
+                           static_cast<std::ptrdiff_t>(current_trace.event_count));
+        if (current_trace.step_limit_reached) {
+            return ::testing::AssertionFailure()
+                   << "the traced call ran past " << k_trace_step_limit << " instructions";
+        }
+        if (!current_trace.reached_stop) {
+            return ::testing::AssertionFailure()
+                   << "the trace never reached its end marker: no single-step exception arrived";
+        }
+        if (current_trace.events_overflowed) {
+            return ::testing::AssertionFailure()
+                   << "the traced call executed more than " << k_trace_event_capacity
+                   << " recorded instructions";
+        }
+        return ::testing::AssertionSuccess() << current_trace.steps << " instructions traced";
+    }
+
+    /** The recorded instructions of the last run, in execution order. */
+    const std::vector<traced_event>& events() const noexcept { return events_; }
+
+private:
+    std::unique_ptr<void, vectored_handler_remover> handler_;
+    std::uintptr_t watch_begin_;
+    std::uintptr_t watch_end_;
+    std::vector<traced_event> events_;
+};
+
+traced_event fence_event(traced_op fence) noexcept {
+    return traced_event{fence, 0U, 0U};
+}
+
+traced_event flush_event(traced_op flush, const void* address) noexcept {
+    return traced_event{flush, line_of(reinterpret_cast<std::uintptr_t>(address)), 0U};
+}
+
+/** The flush instruction a helper pair executes. */
+traced_op flush_kind(const flush_helpers& helpers) noexcept {
+    return helpers.needs_clflushopt ? traced_op::clflushopt : traced_op::clflush;
+}
+
+/** The flush instruction of the helpers tables_for(selection) installs. */
+traced_op flush_kind(const isa_selection& selection) noexcept {
+    return selection.clflushopt ? traced_op::clflushopt : traced_op::clflush;
+}
+
+/**
+ * The re-read rule, instruction by instruction: MFENCE, a flush of the word's line, MFENCE,
+ * then the one 64-bit load of the word.
+ */
+std::vector<traced_event> reread_sequence(traced_op flush, const std::uint64_t* word) {
+    return {fence_event(traced_op::mfence), flush_event(flush, word),
+            fence_event(traced_op::mfence),
+            traced_event{traced_op::load, reinterpret_cast<std::uintptr_t>(word),
+                         static_cast<std::uint32_t>(sizeof(std::uint64_t))}};
+}
+
+/** One flush_range call, positioned within the traced lines, and the lines it overlaps. */
+struct flush_range_case {
+    const char* name;
+    /** Bytes from the first traced line's start to the range's first byte. */
+    std::size_t offset;
+    std::size_t bytes;
+    /** Index of the first line the range overlaps, from the first traced line. */
+    std::size_t first_line;
+    std::size_t line_count;
+};
+
+void PrintTo(const flush_range_case& c, std::ostream* os) {
+    *os << c.name;
+}
+
+constexpr flush_range_case k_flush_range_cases[] = {
+    // 13 bytes into line 0 through 7 bytes into line 3, the value test's range: both ends fall
+    // inside a line, so both partial lines must be flushed.
+    {"UnalignedStartAndEnd", 13U, 3U * k_cache_line_bytes - 6U, 0U, 4U},
+    {"ZeroBytes", 13U, 0U, 0U, 0U},
+    {"LastByteOfALine", 2U * k_cache_line_bytes - 1U, 1U, 1U, 1U},
+    // The end is line 2's first byte, which lies outside the range.
+    {"TwoWholeLines", 0U, 2U * k_cache_line_bytes, 0U, 2U},
+    {"TwoBytesAcrossALineBoundary", k_cache_line_bytes - 1U, 2U, 0U, 2U},
+};
+
+using flush_range_param = std::tuple<flush_helpers, flush_range_case>;
+
+std::string flush_range_param_name(const ::testing::TestParamInfo<flush_range_param>& info) {
+    return std::string(std::get<0>(info.param).name) + "_" + std::get<1>(info.param).name;
+}
+
+/**
+ * Fixture of the trace tests. Skips under a debugger and, for a CLFLUSHOPT pair, on a CPU
+ * without CLFLUSHOPT; commits the page the traced calls address and installs the tracer over
+ * it.
+ */
+template <class Base>
+class trace_fixture : public Base {
+protected:
+    /** Called from SetUp, so a skip or failure here keeps the test body from running. */
+    void set_up(bool needs_clflushopt) {
+        if (IsDebuggerPresent()) {
+            GTEST_SKIP() << k_debugger_skip;
+        }
+        if (needs_clflushopt && !host_selection().clflushopt) {
+            GTEST_SKIP() << "CPU lacks CLFLUSHOPT";
+        }
+        ASSERT_TRUE(page_.valid()) << "VirtualAlloc failed with Windows error " << GetLastError();
+        ASSERT_TRUE(trace_.installed()) << "AddVectoredExceptionHandler failed";
+    }
+
+    /** The first traced line, k_traced_first_line lines into the page. */
+    std::uint64_t* traced_lines() noexcept {
+        return page_.data() + k_traced_first_line * k_line_words;
+    }
+
+    test_buffer page_{k_page_words};
+    instruction_trace trace_{page_.data(), k_page_words * sizeof(std::uint64_t)};
+};
+
+/** The fence helper and real_memory_access over the host's tables. */
+class kernels_traced : public trace_fixture<::testing::Test> {
+protected:
+    void SetUp() override { set_up(false); }
+};
+
+/** One flush and re-read pair. */
+class kernels_traced_helpers : public trace_fixture<::testing::TestWithParam<flush_helpers>> {
+protected:
+    void SetUp() override { set_up(GetParam().needs_clflushopt); }
+};
+
+/** One flush and re-read pair's flush_range over one range case. */
+class kernels_traced_flush_range
+    : public trace_fixture<::testing::TestWithParam<flush_range_param>> {
+protected:
+    void SetUp() override { set_up(std::get<0>(GetParam()).needs_clflushopt); }
+};
+
+}  // namespace
+
+TEST_P(kernels_traced_flush_range, FlushesEachOverlappingLineOnceInAscendingOrderWithoutAFence) {
+    const auto& [helpers, range] = GetParam();
+    const auto* const lines = reinterpret_cast<const unsigned char*>(traced_lines());
+    std::vector<traced_event> expected;
+    for (std::size_t line = range.first_line; line < range.first_line + range.line_count; ++line) {
+        expected.push_back(flush_event(flush_kind(helpers), lines + line * k_cache_line_bytes));
+    }
+    const flush_range_fn flush_range = helpers.flush_range;
+    const unsigned char* const start = lines + range.offset;
+    const std::size_t bytes = range.bytes;
+    ASSERT_TRUE(trace_.run([flush_range, start, bytes] { flush_range(start, bytes); }));
+    EXPECT_EQ(trace_.events(), expected) << helpers.name << ", " << range.name;
+}
+
+INSTANTIATE_TEST_SUITE_P(KernelsBaselineHelpers, kernels_traced_flush_range,
+                         ::testing::Combine(::testing::ValuesIn(k_flush_helpers),
+                                            ::testing::ValuesIn(k_flush_range_cases)),
+                         flush_range_param_name);
+
+TEST_P(kernels_traced_helpers, RereadFencesFlushesTheWordsLineFencesThenLoadsItOnce) {
+    // Word 3 of its line, so the flush must name the word's line from an address inside it.
+    constexpr std::uint64_t value = 0x96E15A3C7EC3F00FULL;
+    std::uint64_t* const word = traced_lines() + 3U;
+    *static_cast<volatile std::uint64_t*>(word) = value;
+    const reread_fn reread = GetParam().reread;
+    std::uint64_t returned = 0U;
+    ASSERT_TRUE(trace_.run([reread, word, &returned] { returned = reread(word); }));
+    EXPECT_EQ(trace_.events(), reread_sequence(flush_kind(GetParam()), word)) << GetParam().name;
+    EXPECT_EQ(returned, value) << GetParam().name;
+}
+
+INSTANTIATE_TEST_SUITE_P(KernelsBaselineHelpers, kernels_traced_helpers,
+                         ::testing::ValuesIn(k_flush_helpers), param_name<flush_helpers>);
+
+TEST_F(kernels_traced, FullFenceExecutesOneMfenceAndNothingElse) {
+    const full_fence_fn full_fence = &full_fence_mfence;
+    ASSERT_TRUE(trace_.run([full_fence] { full_fence(); }));
+    EXPECT_EQ(trace_.events(), std::vector<traced_event>{fence_event(traced_op::mfence)});
+}
+
+// The runner's primitives over the table a session uses: counting_memory_access logs these
+// calls, and test_step_runner.cpp asserts the flush-before-verification rule on that log, so
+// these traces tie each logged fence, flush and re-read to the instructions it executes.
+TEST_F(kernels_traced, RealAccessFenceExecutesOneMfence) {
+    real_memory_access access{tables_for(host_selection())};
+    IMemoryAccess& layer = access;
+    const access_context ctx{};
+    ASSERT_TRUE(trace_.run([&layer, &ctx] { layer.fence(ctx); }));
+    EXPECT_EQ(trace_.events(), std::vector<traced_event>{fence_event(traced_op::mfence)});
+}
+
+TEST_F(kernels_traced, RealAccessFlushFlushesEveryLineOfItsWords) {
+    const isa_selection selection = host_selection();
+    real_memory_access access{tables_for(selection)};
+    IMemoryAccess& layer = access;
+    const access_context ctx{};
+    // 26 words from word 3 of line 0 are bytes 24 to 231, lines 0 to 3. Passing the word count
+    // as a byte count would flush line 0 alone.
+    std::uint64_t* const lines = traced_lines();
+    std::uint64_t* const words = lines + 3U;
+    std::vector<traced_event> expected;
+    for (std::size_t line = 0U; line < 4U; ++line) {
+        expected.push_back(flush_event(flush_kind(selection), lines + line * k_line_words));
+    }
+    ASSERT_TRUE(trace_.run([&layer, &ctx, words] { layer.flush(ctx, words, 26U); }));
+    EXPECT_EQ(trace_.events(), expected);
+}
+
+TEST_F(kernels_traced, RealAccessRereadWordFencesFlushesTheLineFencesThenLoadsOnce) {
+    const isa_selection selection = host_selection();
+    real_memory_access access{tables_for(selection)};
+    IMemoryAccess& layer = access;
+    const access_context ctx{};
+    constexpr std::uint64_t value = 0x0FF0C3A5965A3CE1ULL;
+    std::uint64_t* const word = traced_lines() + 5U;
+    *static_cast<volatile std::uint64_t*>(word) = value;
+    std::uint64_t returned = 0U;
+    ASSERT_TRUE(
+        trace_.run([&layer, &ctx, word, &returned] { returned = layer.reread_word(ctx, word); }));
+    EXPECT_EQ(trace_.events(), reread_sequence(flush_kind(selection), word));
+    EXPECT_EQ(returned, value);
+}
 
 /* ---------------------------------------------------------------------------------------------
  * tables_for: the selected set, with CLFLUSH patched in where CLFLUSHOPT is absent

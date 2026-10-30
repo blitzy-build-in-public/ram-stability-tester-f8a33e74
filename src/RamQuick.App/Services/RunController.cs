@@ -246,6 +246,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
     private ErrorRecord? _firstError;
     private IReadOnlyList<ErrorGroup> _errorGroups = Array.Empty<ErrorGroup>();
     private bool _isErrorDetailTruncated;
+    private bool _isStoredDetailCapReached;
     private CauseHints _causeHints = CauseHints.Empty;
     private string? _resultMessage;
     private string? _noticeMessage;
@@ -338,7 +339,8 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
     /// <summary>
     /// Gets the latest progress snapshot of the current or last run, or <see langword="null"/> before its first
-    /// progress report. On Completed it is replaced by a final snapshot carrying the run's verified bytes.
+    /// progress report. On Completed it becomes a final snapshot carrying the run's verified bytes, even when no
+    /// progress report arrived.
     /// </summary>
     /// <remarks>
     /// Raises <see cref="ObservableObject.PropertyChanged"/> on every assignment, even of a value-equal snapshot,
@@ -409,13 +411,29 @@ public sealed partial class RunController : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Gets a value indicating whether the stored-detail cap (10,000 records) was reached while more errors were
-    /// counted, so that <see cref="ErrorGroups"/> describe the stored records only.
+    /// Gets a value indicating whether errors were dropped from the stored detail: the stored records reached
+    /// <see cref="ErrorGrouping.StoredDetailCap"/> and <see cref="TotalErrors"/> exceeds their count. This is the
+    /// condition the summary records as <c>errors.truncated</c>.
     /// </summary>
+    /// <remarks>
+    /// It stays <see langword="false"/> at exactly the cap with no further error, where
+    /// <see cref="IsStoredDetailCapReached"/> is already <see langword="true"/>.
+    /// </remarks>
     public bool IsErrorDetailTruncated
     {
         get => _isErrorDetailTruncated;
         private set => SetProperty(ref _isErrorDetailTruncated, value);
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether the stored records of the current or last run reached
+    /// <see cref="ErrorGrouping.StoredDetailCap"/>, whatever <see cref="TotalErrors"/> is. From then on later errors
+    /// are counted but not stored, so <see cref="ErrorGroups"/> are labelled as derived from the stored records only.
+    /// </summary>
+    public bool IsStoredDetailCapReached
+    {
+        get => _isStoredDetailCapReached;
+        private set => SetProperty(ref _isStoredDetailCapReached, value);
     }
 
     /// <summary>
@@ -547,7 +565,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
     /// and <see cref="CanStart"/> left <see langword="false"/>.
     /// </para>
     /// <para>
-    /// An unfinished journal moves the state Idle â†’ Failed with the "did not finish" reason, shown without a dialog.
+    /// An unfinished journal moves the state Idle → Failed with the "did not finish" reason, shown without a dialog.
     /// A run whose verdict was journalled but whose summaries were missing stays Idle with the recovery notice. A
     /// failed probe or recovery is written to the application error log and does not stop initialisation.
     /// </para>
@@ -1195,6 +1213,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         FirstError = null;
         ErrorGroups = Array.Empty<ErrorGroup>();
         IsErrorDetailTruncated = false;
+        IsStoredDetailCapReached = false;
         CauseHints = CauseHints.Empty;
         ResultMessage = null;
         TestedBytes = null;
@@ -1650,9 +1669,11 @@ public sealed partial class RunController : ObservableObject, IDisposable
         }
     }
 
-    private void UpdateTruncation(RunContext run) =>
-        IsErrorDetailTruncated = run.Stored.Count >= ErrorGrouping.StoredDetailCap
-            && TotalErrors > (ulong)run.Stored.Count;
+    private void UpdateTruncation(RunContext run)
+    {
+        IsStoredDetailCapReached = run.Stored.Count >= ErrorGrouping.StoredDetailCap;
+        IsErrorDetailTruncated = IsStoredDetailCapReached && TotalErrors > (ulong)run.Stored.Count;
+    }
 
     private void OnReadingsChanged(object? sender, SensorReadings readings)
     {
@@ -1866,18 +1887,20 @@ public sealed partial class RunController : ObservableObject, IDisposable
         }
 
         UpdateTruncation(run);
-        if (CurrentProgress is { } progress)
+
+        // A run can end before its first progress tick, as when a stop interrupts step 1's first pass, and the engine
+        // sends no final tick. The final snapshot is assigned either way, so the coverage shown is the one the summary
+        // records from Completed's verified bytes.
+        RunProgress progress = CurrentProgress ?? ProgressBeforeFirstTick(run, TestedBytes ?? 0);
+        CurrentProgress = progress with
         {
-            CurrentProgress = progress with
-            {
-                VerifiedBytes = conclusion.VerifiedBytes,
-                CoveragePercent = RunProgress.CoveragePercentOf(
-                    conclusion.VerifiedBytes,
-                    TestedBytes ?? progress.RegionBytes),
-                Elapsed = conclusion.Elapsed > progress.Elapsed ? conclusion.Elapsed : progress.Elapsed,
-                TotalErrors = TotalErrors,
-            };
-        }
+            VerifiedBytes = conclusion.VerifiedBytes,
+            CoveragePercent = RunProgress.CoveragePercentOf(
+                conclusion.VerifiedBytes,
+                TestedBytes ?? progress.RegionBytes),
+            Elapsed = conclusion.Elapsed > progress.Elapsed ? conclusion.Elapsed : progress.Elapsed,
+            TotalErrors = TotalErrors,
+        };
 
         IReadOnlyList<StepOutcome> outcomes = DistinctSteps(
             conclusion.StepResults.Count > 0 ? conclusion.StepResults : run.OutcomesSnapshot());
@@ -1963,6 +1986,30 @@ public sealed partial class RunController : ObservableObject, IDisposable
         }
 
         PostRunActivity = run.ReleaseExpected ? PostRunActivity.ReleasingMemory : PostRunActivity.SavingResults;
+    }
+
+    // The snapshot of a run no progress tick reached: at the step the gate last let start, or else before step 1, with
+    // nothing measured yet. Passes planned is 0, the engine's value until a step's first pass ends, and remaining is
+    // null, "calculating…", because no estimate ever arrived. A plan without steps never got a session, so its step
+    // name stays empty.
+    private static RunProgress ProgressBeforeFirstTick(RunContext run, ulong regionBytes)
+    {
+        IReadOnlyList<StepAttributes> steps = run.Request.Steps;
+        EngineStepStarted? started = run.LastStartedStep;
+        return new RunProgress
+        {
+            StepIndex = started?.Index ?? 0,
+            StepCount = started?.Count ?? steps.Count,
+            StepName = started?.Name ?? (steps.Count > 0 ? steps[0].Name : string.Empty),
+            PassIndex = 0,
+            PassesPlanned = 0,
+            Elapsed = TimeSpan.Zero,
+            Remaining = null,
+            VerifiedBytes = 0,
+            RegionBytes = regionBytes,
+            CoveragePercent = 0,
+            TotalErrors = 0,
+        };
     }
 
     private string ResultReason(RunContext run, Conclusion conclusion) => conclusion.EndReason switch
@@ -2447,4 +2494,3 @@ public sealed partial class RunController : ObservableObject, IDisposable
         }
     }
 }
-

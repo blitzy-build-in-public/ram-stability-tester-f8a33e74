@@ -17,17 +17,23 @@
  * - ErrorCollectorFirstErrorDetail: the exact text of that stop's end detail, which numbers the
  *   step and pass from 1, as the results log does, and the worker from 0, and names the word.
  * - ErrorCollectorRecord: every field of a stored rq_error_record.
- * - ErrorCollectorSession: a real 2-worker, 256 MiB session over the fault-injecting ->
- *   counting -> real stack, whose on_errors batches arrive at most every 100 ms, on the
- *   coordinator only, with an exact, non-decreasing total and at most the capped detail. A host
- *   stop mid-step may bring in early only the run's final batch, which still precedes
- *   Completed with every stored record and the true total, within 2 s of the stop.
+ * - ErrorCollectorSession: a real 256 MiB session of two workers, or one on a single-processor
+ *   host, over the fault-injecting -> counting -> real stack, whose on_errors batches arrive at
+ *   most every 100 ms, on the coordinator only, with an exact, non-decreasing total and at most
+ *   the capped detail. A host stop mid-step may bring in early only the run's final batch, which
+ *   still precedes Completed with every stored record and the true total, within 2 s of the stop.
+ * - ErrorCollectorSessionCap: cap exhaustion apart from that real-clock cadence, at one worker on
+ *   every host and two where the host has them. An address-region injector at 32,768 targets per
+ *   pass, Stop on error off, spends its whole 20,000-injection cap in pass 0, past 15,000
+ *   corruptions at any host speed: exactly the first 10,000 records arrive, once each, the true
+ *   total passes them, and every total equals the verified-opportunity injections.
  *
  * The collector tests drive worker_error_sink directly from plain std::threads over one
  * committed, unlocked 64 MiB VirtualAlloc region, so each re-read loads real memory through
  * real_memory_access. Each reported word is written once and re-read once: no
  * flush-and-reload loop over a small address set, the access style the stress bound excludes.
- * The session test locks 256 MiB, which needs no elevation, and pins two workers.
+ * The session tests lock 256 MiB, which needs no elevation, and pin at most two workers, one per
+ * logical processor the host has.
  */
 #include <gtest/gtest.h>
 #include <windows.h>
@@ -39,7 +45,6 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
-#include <latch>
 #include <memory>
 #include <mutex>
 #include <ostream>
@@ -277,6 +282,77 @@ struct drained_records {
     std::uint64_t wrong_news_flags = 0;
 };
 
+/**
+ * The race tests' worker threads and the gate that starts them together. Each thread waits in
+ * arrive_and_wait() until all `count` threads have arrived, so the race begins with all of
+ * them at once, as a latch would begin it. Unlike a latch, the gate can be aborted: when fewer
+ * than `count` threads could be started its count can never be reached, so join() aborts it
+ * first, and the threads waiting at it return instead of waiting forever. Every started thread
+ * is joined, by join() or, on any other exit from the test, by the destructor, so a thread that
+ * cannot be created or an exception on the test thread fails that test instead of terminating
+ * the suite. Declare it after everything its threads use, so they are joined first.
+ */
+class racing_workers {
+public:
+    explicit racing_workers(std::uint32_t count) : count_(count) { threads_.reserve(count); }
+
+    racing_workers(const racing_workers&) = delete;
+    racing_workers& operator=(const racing_workers&) = delete;
+
+    ~racing_workers() { join(); }
+
+    /** Starts a thread running body, or throws what std::thread throws when it cannot. */
+    template <typename Body>
+    void start(Body&& body) {
+        threads_.emplace_back(std::forward<Body>(body));
+    }
+
+    /**
+     * The start gate. True once all `count` threads have arrived: race. False when the gate was
+     * aborted because not every thread could be started: return without reporting anything.
+     */
+    bool arrive_and_wait() noexcept {
+        if (arrived_.fetch_add(1U, std::memory_order_acq_rel) + 1U == count_) {
+            settle(gate_state::open);
+        }
+        gate_.wait(gate_state::waiting, std::memory_order_acquire);
+        return gate_.load(std::memory_order_acquire) == gate_state::open;
+    }
+
+    /**
+     * Joins every started thread; a later call finds nothing left to join. When fewer than
+     * `count` threads were started, the gate is aborted before the first join. noexcept because
+     * a thread that cannot be joined still uses the test's frame, so ending the process is the
+     * only safe outcome.
+     */
+    void join() noexcept {
+        if (threads_.size() < count_) {
+            settle(gate_state::aborted);
+        }
+        for (std::thread& thread : threads_) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    }
+
+private:
+    enum class gate_state : std::uint32_t { waiting, open, aborted };
+
+    /** Opens or aborts a waiting gate and wakes every thread at it; a settled gate stays so. */
+    void settle(gate_state outcome) noexcept {
+        gate_state expected = gate_state::waiting;
+        if (gate_.compare_exchange_strong(expected, outcome, std::memory_order_acq_rel)) {
+            gate_.notify_all();
+        }
+    }
+
+    const std::uint32_t count_;
+    std::atomic<std::uint32_t> arrived_{0};
+    std::atomic<gate_state> gate_{gate_state::waiting};
+    std::vector<std::thread> threads_;
+};
+
 /* ---------------------------------------------------------------------------------------------
  * Construction
  * ------------------------------------------------------------------------------------------- */
@@ -343,14 +419,14 @@ TEST(ErrorCollectorCap, RacingWorkersKeepTheExactTotalAndStoreTheFirstCapRecords
 
     // Worker w reports words w * 2000 + i, each k_race_stride_words apart, so every word is
     // distinct and its index gives back the expected and actual values it was reported with.
-    std::latch start(k_race_workers);
     std::atomic<std::uint32_t> finished{0};
-    std::vector<std::thread> workers;
-    workers.reserve(k_race_workers);
+    racing_workers workers(k_race_workers);
     for (std::uint32_t w = 0; w < k_race_workers; ++w) {
-        workers.emplace_back([&rig, &start, &finished, w] {
+        workers.start([&rig, &workers, &finished, w] {
             worker_error_sink& sink = rig.bound_sink(w, 0U, 0U);
-            start.arrive_and_wait();
+            if (!workers.arrive_and_wait()) {
+                return;
+            }
             for (std::uint32_t i = 0; i < k_errors_per_worker; ++i) {
                 const std::uint64_t n = std::uint64_t{w} * k_errors_per_worker + i;
                 report(sink, rig.region.word(n * k_race_stride_words), expected_for(n),
@@ -367,9 +443,7 @@ TEST(ErrorCollectorCap, RacingWorkersKeepTheExactTotalAndStoreTheFirstCapRecords
         drained.drain_from(rig.collector);
         std::this_thread::yield();
     }
-    for (std::thread& worker : workers) {
-        worker.join();
-    }
+    workers.join();
     drained.drain_from(rig.collector);
 
     EXPECT_EQ(rig.collector.true_total(), k_race_total);
@@ -693,13 +767,13 @@ TEST(ErrorCollectorStopOnError, RacingWorkersRecordFirstErrorOnce) {
     rig.collector.begin_run(rig.clock.now_ns());
     rig.collector.begin_step(0U, k_race_workers);
 
-    std::latch start(k_race_workers);
-    std::vector<std::thread> workers;
-    workers.reserve(k_race_workers);
+    racing_workers workers(k_race_workers);
     for (std::uint32_t w = 0; w < k_race_workers; ++w) {
-        workers.emplace_back([&rig, &start, w] {
+        workers.start([&rig, &workers, w] {
             worker_error_sink& sink = rig.bound_sink(w, 0U, 0U);
-            start.arrive_and_wait();
+            if (!workers.arrive_and_wait()) {
+                return;
+            }
             for (std::uint32_t i = 0; i < k_per_worker; ++i) {
                 const std::uint64_t n = std::uint64_t{w} * k_per_worker + i;
                 report(sink, rig.region.word(n * k_race_stride_words), expected_for(n),
@@ -707,9 +781,7 @@ TEST(ErrorCollectorStopOnError, RacingWorkersRecordFirstErrorOnce) {
             }
         });
     }
-    for (std::thread& worker : workers) {
-        worker.join();
-    }
+    workers.join();
 
     constexpr std::uint64_t k_total = std::uint64_t{k_race_workers} * k_per_worker;
     EXPECT_EQ(rig.collector.true_total(), k_total) << "errors after the request still count";
@@ -885,11 +957,16 @@ TEST(ErrorCollectorRecord, FieldsComeFromTheContextTheSinkItsPlacementAndTheStep
  * Batching through a session
  * ------------------------------------------------------------------------------------------- */
 
-/** Planned region of the session test: 128 MiB per worker. */
+/** Planned region of the session tests: 128 MiB per worker at two workers. */
 constexpr std::uint64_t k_session_region_bytes = std::uint64_t{256} << 20U;
 /** Floor a lock shortfall may shrink the region to. */
 constexpr std::uint64_t k_session_min_region_bytes = std::uint64_t{64} << 20U;
-constexpr std::uint32_t k_session_workers = 2U;
+/**
+ * Most workers a session test runs: two, so the multi-worker path runs wherever the host has two
+ * logical processors. session_create rejects more workers than the host has, so a run takes
+ * session_worker_count() of them.
+ */
+constexpr std::uint32_t k_session_max_workers = 2U;
 constexpr std::uint32_t k_session_step_ms = 3'000U;
 
 /**
@@ -900,10 +977,11 @@ constexpr std::uint64_t k_session_fault_offset = std::uint64_t{8} << 20U;
 constexpr std::uint64_t k_session_fault_length = k_session_region_bytes / 32U;
 
 /**
- * Corruptions per pass and in the whole run. Three passes pass the 10,000-record cap, which even
- * a Debug build on a loaded host completes well within the step, and the 20,000 injections
- * spread over five passes, so errors keep arriving across several drain intervals rather than
- * in one burst.
+ * Corruptions per pass and in the whole run of the cadence test. The 20,000 injections spread
+ * over five passes, so errors keep arriving across several drain intervals rather than in one
+ * burst. How many passes the real-clock step runs depends on the host and the build, so the
+ * cadence test holds stored detail to min(total, cap) at any speed; ErrorCollectorSessionCap,
+ * whose total does not depend on the pass count, is the cap-exhaustion test.
  */
 constexpr std::uint32_t k_session_per_pass = 4'000U;
 constexpr std::uint64_t k_session_max_injections = 20'000U;
@@ -916,12 +994,25 @@ constexpr double k_max_batches_per_second = 11.0;
 constexpr std::chrono::seconds k_run_timeout{120};
 constexpr std::chrono::seconds k_stop_timeout{30};
 
+// The most workers give the smallest slices, so a range inside worker 0's slice at
+// k_session_max_workers stays inside it at every worker count a run takes.
 static_assert(k_session_fault_offset + k_session_fault_length <=
-                  k_session_min_region_bytes / k_session_workers,
+                  k_session_min_region_bytes / k_session_max_workers,
               "the injected range must stay inside worker 0's slice at the region floor");
 static_assert(k_session_max_injections > k_detail_cap &&
                   k_session_max_injections > k_session_per_pass,
-              "the session test must exceed the detail cap over several passes");
+              "the cadence test's errors must span several passes and be able to pass the cap");
+
+/**
+ * Workers of a session test on this host: one per logical processor, up to
+ * k_session_max_workers, so a single-processor host runs the one-worker session path rather
+ * than a configuration session_create rejects.
+ */
+std::uint32_t session_worker_count() {
+    const std::size_t processors = enumerate_logical_processors().size();
+    return processors < k_session_max_workers ? static_cast<std::uint32_t>(processors)
+                                              : k_session_max_workers;
+}
 
 /**
  * Budget of the stop test's step: far longer than the test lets it run, so the host's stop
@@ -952,6 +1043,57 @@ constexpr std::uint64_t k_stop_bound_ns = 2'000U * k_ns_per_ms;
 
 static_assert(k_stop_max_injections > k_detail_cap,
               "the stop test's errors must be able to pass the detail cap");
+
+/**
+ * Verified corruptions a cap-exhaustion run must exceed: half as many again as the 10,000-record
+ * cap, so the stored detail truncates well before the true total stops counting.
+ */
+constexpr std::uint64_t k_cap_min_corruptions = 15'000U;
+
+/** The cap-exhaustion run's whole injection cap, every injection of it spent in pass 0. */
+constexpr std::uint64_t k_cap_injections = 20'000U;
+
+/**
+ * Targets the cap-exhaustion run draws per pass, all in the injected range. The layer keeps one
+ * target per word, so a draw of n over the range's N words loses about n^2 / 2N duplicates, some
+ * 500 here. Pass 0, which every step runs in full, then holds more targets than
+ * k_cap_injections and spends the whole cap, so the run's totals do not depend on host speed,
+ * build or how many passes the real-clock step fits.
+ */
+constexpr std::uint32_t k_cap_per_pass = 32'768U;
+
+/** Budget of the cap-exhaustion step: short, since its pass 0 alone spends the cap. */
+constexpr std::uint32_t k_cap_step_ms = 250U;
+
+/** Words of the injected range, the N the per-pass draw spreads over. */
+constexpr std::uint64_t k_session_fault_words = k_session_fault_length / sizeof(std::uint64_t);
+
+static_assert(k_cap_injections > k_cap_min_corruptions && k_cap_min_corruptions > k_detail_cap,
+              "the cap-exhaustion run must pass 15,000 corruptions, past the detail cap");
+static_assert(k_cap_per_pass - 4U * (std::uint64_t{k_cap_per_pass} * k_cap_per_pass /
+                                     (2U * k_session_fault_words)) >
+                  k_cap_injections,
+              "pass 0 must keep more targets than the cap after four times the expected "
+              "duplicates");
+
+/**
+ * Worker counts of the cap-exhaustion test: one on every host, so the one-worker session path
+ * always runs, and each count up to session_worker_count() beyond it. A host whose processors
+ * cannot be enumerated gets the one-worker case alone, whose session_create then fails on the
+ * same enumeration and reports it, rather than an exception escaping test registration.
+ */
+std::vector<std::uint32_t> cap_worker_counts() {
+    std::vector<std::uint32_t> counts{1U};
+    try {
+        const std::uint32_t available = session_worker_count();
+        for (std::uint32_t workers = 2U; workers <= available; ++workers) {
+            counts.push_back(workers);
+        }
+    } catch (const std::exception&) {
+        counts.resize(1U);
+    }
+    return counts;
+}
 
 /** One on_errors call as the session raised it. */
 struct error_call {
@@ -1086,8 +1228,11 @@ bool wait_for_release(session_log& log, std::chrono::seconds timeout) {
  * on every call, the re-reads included. Lock-free and allocation-free, as an observer must be.
  */
 struct worker_thread_probe {
+    /** A probe of a session with `workers` workers, at most k_session_max_workers. */
+    explicit worker_thread_probe(std::uint32_t workers) noexcept : worker_count(workers) {}
+
     void observe(std::uint32_t worker) noexcept {
-        if (worker >= threads.size()) {
+        if (worker >= worker_count || worker >= threads.size()) {
             foreign_worker.store(true, std::memory_order_relaxed);
             return;
         }
@@ -1099,7 +1244,10 @@ struct worker_thread_probe {
         }
     }
 
-    std::array<std::atomic<DWORD>, k_session_workers> threads{};
+    /** The session's workers; a primitive of any higher index is foreign. */
+    const std::uint32_t worker_count;
+    /** Sized for the most workers a session test runs; entries from worker_count stay 0. */
+    std::array<std::atomic<DWORD>, k_session_max_workers> threads{};
     /** A primitive carried a worker index outside the session's workers. */
     std::atomic<bool> foreign_worker{false};
     /** One worker's primitives came from more than one thread. */
@@ -1141,9 +1289,11 @@ private:
 };
 
 TEST(ErrorCollectorSession, BatchesAtMostTenTimesASecondOnTheCoordinatorWithExactTotals) {
+    const std::uint32_t workers = session_worker_count();
+    RecordProperty("workers", std::to_string(workers));
     const auto clock = std::make_shared<qpc_clock>();
     session_log log(*clock);
-    worker_thread_probe probe;
+    worker_thread_probe probe(workers);
     counting_memory_access* counting = nullptr;
     fault_injecting_memory_access* faults = nullptr;
 
@@ -1186,7 +1336,7 @@ TEST(ErrorCollectorSession, BatchesAtMostTenTimesASecondOnTheCoordinatorWithExac
     config.region_bytes = k_session_region_bytes;
     config.min_region_bytes = k_session_min_region_bytes;
     config.seed = 0x5A3C96E1F00F7EC3ULL;
-    config.worker_count = k_session_workers;
+    config.worker_count = workers;
     config.stop_on_error = 0U;
     config.error_detail_cap = k_detail_cap;
     config.progress_interval_ms = 250U;
@@ -1242,10 +1392,13 @@ TEST(ErrorCollectorSession, BatchesAtMostTenTimesASecondOnTheCoordinatorWithExac
     EXPECT_EQ(result.total_errors, verified_opportunities)
         << "run total " << result.total_errors << ", verified-opportunity injections "
         << verified_opportunities;
-    EXPECT_GT(result.total_errors, std::uint64_t{k_detail_cap})
-        << "the cap must be exercised; " << step_result.passes << " passes of "
-        << k_session_per_pass << " injections ran";
+    // Pass 0, which every step runs in full, verifies its targets at any host speed; how far the
+    // total goes, past the cap or not, depends on the passes the real-clock step fits.
+    EXPECT_GT(result.total_errors, 0U)
+        << step_result.passes << " passes of " << k_session_per_pass << " injections ran";
     EXPECT_EQ(step_result.errors, result.total_errors);
+    const std::uint64_t stored =
+        result.total_errors < k_detail_cap ? result.total_errors : std::uint64_t{k_detail_cap};
 
     const std::vector<error_call>& calls = log.error_calls;
     ASSERT_FALSE(calls.empty()) << "errors were confirmed but no batch was raised";
@@ -1278,8 +1431,7 @@ TEST(ErrorCollectorSession, BatchesAtMostTenTimesASecondOnTheCoordinatorWithExac
         delivered += call.count;
         EXPECT_GE(call.total_errors, delivered) << "call " << i;
     }
-    EXPECT_EQ(delivered, std::uint64_t{k_detail_cap})
-        << "stored records delivered over " << calls.size() << " batches";
+    EXPECT_EQ(delivered, stored) << "stored records delivered over " << calls.size() << " batches";
     // Reported in the XML results, so a run's batch cadence can be read without a failure.
     RecordProperty("error_batches", std::to_string(calls.size()));
     RecordProperty("min_batch_spacing_ms", calls.size() >= 2U
@@ -1299,7 +1451,7 @@ TEST(ErrorCollectorSession, BatchesAtMostTenTimesASecondOnTheCoordinatorWithExac
             << calls.size() << " batches over " << span_seconds << " s";
     }
 
-    ASSERT_EQ(log.records.size(), std::size_t{k_detail_cap});
+    ASSERT_EQ(log.records.size(), delivered);
     for (std::size_t i = 0; i < log.records.size(); ++i) {
         const rq_error_record& r = log.records[i];
         ASSERT_EQ(r.sequence, i) << "records must arrive once each, in sequence order";
@@ -1317,7 +1469,7 @@ TEST(ErrorCollectorSession, BatchesAtMostTenTimesASecondOnTheCoordinatorWithExac
         << "callbacks come from the coordinator, never the host thread";
     EXPECT_FALSE(probe.foreign_worker.load(std::memory_order_relaxed));
     EXPECT_FALSE(probe.changed_thread.load(std::memory_order_relaxed));
-    for (std::uint32_t w = 0; w < k_session_workers; ++w) {
+    for (std::uint32_t w = 0; w < workers; ++w) {
         const DWORD worker_thread = probe.threads[w].load(std::memory_order_relaxed);
         EXPECT_NE(worker_thread, 0U) << "worker " << w << " issued no traffic";
         EXPECT_EQ(log.callback_threads.count(worker_thread), 0U)
@@ -1329,11 +1481,13 @@ TEST(ErrorCollectorSession, BatchesAtMostTenTimesASecondOnTheCoordinatorWithExac
 // batch in early; it must be the only early one, and it must still carry every stored record
 // and the true total ahead of Completed.
 TEST(ErrorCollectorSession, HostStopMidStepLeavesOnlyTheFinalBatchEarlyAndAheadOfCompleted) {
+    const std::uint32_t workers = session_worker_count();
+    RecordProperty("workers", std::to_string(workers));
     const auto clock = std::make_shared<qpc_clock>();
     session_log log(*clock);
     fault_injecting_memory_access* faults = nullptr;
 
-    // Flips spread over the whole region, so both workers confirm errors through every
+    // Flips spread over the whole region, so every worker confirms errors through every
     // verification and the stop finds some still undelivered.
     rq_fault_spec spec = make_fault_spec(RQ_FAULT_SINGLE_BIT_FLIP);
     spec.bit = k_stop_flip_bit;
@@ -1370,7 +1524,7 @@ TEST(ErrorCollectorSession, HostStopMidStepLeavesOnlyTheFinalBatchEarlyAndAheadO
     config.region_bytes = k_session_region_bytes;
     config.min_region_bytes = k_session_min_region_bytes;
     config.seed = 0x2D4B6F8091A3C5E7ULL;
-    config.worker_count = k_session_workers;
+    config.worker_count = workers;
     config.stop_on_error = 0U;
     config.error_detail_cap = k_detail_cap;
     // Every observer tick raises progress, so the stop finds its window promptly.
@@ -1481,7 +1635,190 @@ TEST(ErrorCollectorSession, HostStopMidStepLeavesOnlyTheFinalBatchEarlyAndAheadO
     RecordProperty("final_batch_spacing_ms", std::to_string(final_spacing_ns / k_ns_per_ms));
     RecordProperty("stop_latency_ms", std::to_string(latency_ns / k_ns_per_ms));
     RecordProperty("total_errors", std::to_string(result.total_errors));
+    RecordProperty("passes", std::to_string(step_result.passes));
 }
+
+/* ---------------------------------------------------------------------------------------------
+ * Cap exhaustion through a session
+ * ------------------------------------------------------------------------------------------- */
+
+/** Parameter: the session's worker count, from cap_worker_counts(). */
+class ErrorCollectorSessionCap : public ::testing::TestWithParam<std::uint32_t> {};
+
+// Cap exhaustion apart from the real-clock cadence test: pass 0, which every step runs in full,
+// spends the whole injection cap, so every total below is exact at any host speed and build.
+TEST_P(ErrorCollectorSessionCap, PassesFifteenThousandCorruptionsAndStoresExactlyTheCap) {
+    const std::uint32_t workers = GetParam();
+    RecordProperty("workers", std::to_string(workers));
+    const auto clock = std::make_shared<qpc_clock>();
+    session_log log(*clock);
+    fault_injecting_memory_access* faults = nullptr;
+
+    rq_fault_spec spec = make_fault_spec(RQ_FAULT_ADDRESS_REGION);
+    spec.per_pass_count = k_cap_per_pass;
+    spec.max_injections = k_cap_injections;
+    spec.region_offset = k_session_fault_offset;
+    spec.region_length = k_session_fault_length;
+    spec.seed = 0x6A09E667F3BCC908ULL;
+    const char* invalid = nullptr;
+    ASSERT_TRUE(validate_fault_spec(spec, k_session_region_bytes, &invalid)) << invalid;
+
+    // fault-injecting -> counting -> real, the test DLL's stack, with the session's own clock.
+    session_dependencies dependencies;
+    dependencies.clock = clock;
+    dependencies.wrap_memory_access =
+        [&](std::unique_ptr<IMemoryAccess> real) -> std::unique_ptr<IMemoryAccess> {
+        auto faulted = std::make_unique<fault_injecting_memory_access>(
+            std::make_unique<counting_memory_access>(std::move(real)),
+            normalized(spec, k_session_region_bytes), *clock);
+        faults = faulted.get();
+        return faulted;
+    };
+
+    rq_step_def step{};
+    copy_utf8_truncated(step.name, sizeof(step.name), "Random sequential sweep");
+    step.pattern = RQ_PATTERN_RANDOM;
+    step.access_order = RQ_ORDER_SEQUENTIAL_ASCENDING;
+    step.thread_mode = RQ_THREADS_ALL;
+    step.hold_ms = 0U;
+    step.time_budget_ms = k_cap_step_ms;
+    step.coverage_budget_bp = 10'000U;
+
+    rq_session_config config{};
+    config.struct_size = sizeof(rq_session_config);
+    config.step_def_size = sizeof(rq_step_def);
+    config.region_bytes = k_session_region_bytes;
+    config.min_region_bytes = k_session_min_region_bytes;
+    config.seed = 0xBB67AE8584CAA73BULL;
+    config.worker_count = workers;
+    config.stop_on_error = 0U;
+    config.error_detail_cap = k_detail_cap;
+    config.progress_interval_ms = 250U;
+    config.isa_override = RQ_ISA_AUTO;
+    config.step_count = 1U;
+    config.steps = &step;
+
+    rq_callbacks callbacks{};
+    callbacks.struct_size = sizeof(rq_callbacks);
+    callbacks.user_data = &log;
+    callbacks.on_prepared = &log_prepared;
+    callbacks.on_step_starting = &log_step_starting;
+    callbacks.on_step_finished = &log_step_finished;
+    callbacks.on_progress = &log_progress;
+    callbacks.on_errors = &log_errors;
+    callbacks.on_completed = &log_completed;
+    callbacks.on_released = &log_released;
+
+    session_handle_guard handle;
+    ASSERT_EQ(session_create(&config, &callbacks, std::move(dependencies), handle.out()), RQ_OK);
+    ASSERT_NE(faults, nullptr);
+    ASSERT_EQ(session_start(handle.get()), RQ_OK);
+    bool released = wait_for_release(log, k_run_timeout);
+    if (!released) {
+        EXPECT_EQ(session_stop(handle.get(), RQ_STOP_USER), RQ_OK);
+        released = wait_for_release(log, k_stop_timeout);
+    }
+    ASSERT_TRUE(released) << "the session never raised on_released";
+
+    // The run has quiesced: read the layer and the session-owned step results before destroy.
+    rq_run_result result{};
+    result.struct_size = sizeof(rq_run_result);
+    ASSERT_EQ(session_get_result(handle.get(), &result), RQ_OK);
+    ASSERT_EQ(result.step_result_count, 1U);
+    const rq_step_result step_result = result.step_results[0];
+    const std::uint64_t injected = faults->injection_count();
+    const std::uint64_t verified_opportunities = faults->verified_opportunity_count();
+    const std::vector<rq_injected_fault> injections = faults->injection_log();
+    ASSERT_EQ(handle.reset(), RQ_OK);
+
+    // No callback runs after destroy, so the log is stable from here.
+    std::lock_guard<std::mutex> lock(log.mutex);
+    const std::vector<error_call>& calls = log.error_calls;
+    // Reported in the XML results, so a run's totals can be read without a failure.
+    RecordProperty("total_errors", std::to_string(result.total_errors));
+    RecordProperty("injections", std::to_string(injected));
+    RecordProperty("passes", std::to_string(step_result.passes));
+    RecordProperty("error_batches", std::to_string(calls.size()));
+
+    EXPECT_FALSE(log.callback_failed.load(std::memory_order_relaxed));
+    ASSERT_TRUE(log.completed);
+    EXPECT_EQ(result.end_reason, RQ_END_COMPLETED) << result.end_detail;
+    EXPECT_EQ(step_result.completed, 1U);
+
+    // Ground truth: pass 0 spent the whole cap, every logged corruption had its verification,
+    // and each is exactly one error in every total the run reports.
+    EXPECT_EQ(injected, k_cap_injections) << "pass 0 alone must spend the whole injection cap";
+    EXPECT_EQ(injections.size(), injected);
+    for (std::size_t i = 0; i < injections.size(); ++i) {
+        EXPECT_EQ(injections[i].pass_index, 0U) << "injection " << i;
+        EXPECT_EQ(injections[i].verified_opportunity, 1U) << "injection " << i;
+    }
+    EXPECT_EQ(verified_opportunities, injected);
+    EXPECT_GT(verified_opportunities, k_cap_min_corruptions);
+    EXPECT_EQ(result.total_errors, verified_opportunities)
+        << "run total " << result.total_errors << ", verified-opportunity injections "
+        << verified_opportunities;
+    EXPECT_EQ(step_result.errors, result.total_errors);
+    EXPECT_EQ(log.result.total_errors, result.total_errors) << "on_completed carries the total";
+
+    // Truncation as the boundary shows it: the first cap records arrive, then batches carry
+    // only a rising true total, and the last one the final total.
+    ASSERT_FALSE(calls.empty()) << "errors were confirmed but no batch was raised";
+    EXPECT_EQ(calls.back().total_errors, result.total_errors)
+        << "the last batch must carry the final true total";
+    std::uint64_t delivered = 0;
+    std::uint64_t previous_total = 0;
+    for (std::size_t i = 0; i < calls.size(); ++i) {
+        const error_call& call = calls[i];
+        EXPECT_EQ(call.count == 0U, !call.has_records) << "call " << i;
+        EXPECT_FALSE(call.after_completed) << "on_errors call " << i << " followed Completed";
+        if (delivered >= k_detail_cap) {
+            EXPECT_EQ(call.count, 0U) << "call " << i << " carries records past the cap";
+        }
+        EXPECT_GE(call.total_errors, previous_total) << "the total fell at call " << i;
+        if (call.count == 0U) {
+            EXPECT_GT(call.total_errors, previous_total)
+                << "call " << i << " has no records, so only a rising total justifies it";
+        }
+        delivered += call.count;
+        EXPECT_GE(call.total_errors, delivered) << "call " << i;
+        previous_total = call.total_errors;
+    }
+    EXPECT_EQ(delivered, std::uint64_t{k_detail_cap});
+    EXPECT_LT(delivered, result.total_errors) << "the true total must pass the stored detail";
+
+    // Each stored record is one logged corruption, reported once, inside the injected range.
+    std::set<std::pair<std::uint64_t, std::uint64_t>> injected_words;
+    for (const rq_injected_fault& injection : injections) {
+        injected_words.emplace(injection.word_offset, injection.bit_mask);
+    }
+    std::set<std::uint64_t> reported_words;
+    ASSERT_EQ(log.records.size(), std::size_t{k_detail_cap});
+    for (std::size_t i = 0; i < log.records.size(); ++i) {
+        const rq_error_record& r = log.records[i];
+        ASSERT_EQ(r.sequence, i) << "records must arrive once each, in sequence order";
+        EXPECT_GE(r.region_offset, k_session_fault_offset) << "record " << i;
+        EXPECT_LT(r.region_offset, k_session_fault_offset + k_session_fault_length)
+            << "record " << i << " at offset " << hex64(r.region_offset);
+        const std::uint64_t word_offset = r.region_offset & ~std::uint64_t{7};
+        EXPECT_EQ(injected_words.count({word_offset, r.bit_mask}), 1U)
+            << "record " << i << " at offset " << hex64(r.region_offset) << " bit mask "
+            << hex64(r.bit_mask) << " matches no logged injection";
+        EXPECT_TRUE(reported_words.insert(word_offset).second)
+            << "record " << i << " reports word " << hex64(word_offset) << " a second time";
+        EXPECT_EQ(r.step_index, 0U) << "record " << i;
+        EXPECT_EQ(r.pass_index, 0U) << "record " << i;
+        EXPECT_EQ(r.reread_outcome, RQ_REREAD_REPEATS_ACTUAL) << "record " << i;
+        EXPECT_EQ(r.worker_index, 0U) << "the injected range lies in worker 0's slice";
+        EXPECT_EQ(r.active_workers, workers) << "record " << i;
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(ErrorCollector, ErrorCollectorSessionCap,
+                         ::testing::ValuesIn(cap_worker_counts()),
+                         [](const ::testing::TestParamInfo<std::uint32_t>& info) {
+                             return "Workers" + std::to_string(info.param);
+                         });
 
 }  // namespace
 }  // namespace rq::engine::test

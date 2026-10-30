@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Globalization;
 using System.Reflection;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -26,9 +27,9 @@ namespace RamQuick.App.Tests;
 /// <remarks>
 /// Each test builds its own <see cref="ControllerHarness"/>, so the view model reads a real
 /// <see cref="Services.RunController"/> over fakes. Expected wording always comes from <see cref="UiText"/> and
-/// numbers from <see cref="DisplayFormat"/>; the only literals are invariant number formats and the
-/// "virtual address" label the first-error message must carry. Tests follow the harness's threading rule: no
-/// <c>await</c> and no blocking on a task, only its pumping helpers.
+/// numbers from <see cref="DisplayFormat"/>; the only literals are invariant number formats, summary JSON property
+/// names, and the "virtual address" label the first-error message must carry. Tests follow the harness's threading
+/// rule: no <c>await</c> and no blocking on a task, only its pumping helpers.
 /// </remarks>
 public sealed class MainViewModelTests
 {
@@ -502,6 +503,38 @@ public sealed class MainViewModelTests
         Assert.Equal(DisplayFormat.Capacity(regionBytes), viewModel.TestedText);
     }
 
+    [Fact]
+    public void CoverageText_RunEndsBeforeFirstProgress_ShowsTheSummarysFinalCoverage()
+    {
+        // A stop inside step 1's first pass ends the run before any progress tick, so the terminal coverage is the one
+        // Completed carries and the summary records, not the 0 shown before the run measured anything.
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        using MainViewModel viewModel = CreateViewModel(harness);
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+        (StepGateDecision decision, _) = harness.RunGate(0);
+        Assert.Equal(StepGateDecision.Continue, decision);
+        session.RaiseStepStarted(0);
+        ulong verifiedBytes = session.Options.RegionBytes / 8 * 3;
+        TimeSpan elapsed = TimeSpan.FromMilliseconds(200);
+        session.RaiseStepFinished(0, actualDuration: elapsed, passes: 0, verifiedBytes: verifiedBytes, completed: false);
+        harness.Pump();
+        int target = TestPlans.Quick.TargetCoveragePercent;
+        string notMeasured = DisplayFormat.Coverage(0, target);
+        Assert.Equal(notMeasured, viewModel.CoverageText);
+
+        session.RaiseCompleted(RunEndReason.UserStop, verifiedBytes: verifiedBytes, elapsed: elapsed);
+        harness.AwaitVerdict();
+        harness.Release(_releaseTime);
+
+        using JsonDocument summary = harness.ReadSummary();
+        double summaryPercent = summary.RootElement.GetProperty("coverage").GetProperty("percent").GetDouble();
+        Assert.Equal(RunState.Aborted, viewModel.State);
+        Assert.NotEqual(notMeasured, viewModel.CoverageText);
+        Assert.Equal(DisplayFormat.Coverage(summaryPercent, target), viewModel.CoverageText);
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Errors, detail cap and cause hints
     // ---------------------------------------------------------------------------------------------
@@ -539,9 +572,9 @@ public sealed class MainViewModelTests
         session.RaiseErrors(secondBatch, ErrorGrouping.StoredDetailCap);
         harness.RunUntil(() => harness.Controller.TotalErrors == ErrorGrouping.StoredDetailCap);
 
-        // At the cap every error is still stored, so the header is the ordinary one.
+        // Reaching the cap labels the groups stored-only, since any later error is counted but not stored.
         Assert.Equal(DisplayFormat.ErrorTotal(ErrorGrouping.StoredDetailCap), viewModel.ErrorCountText);
-        Assert.Equal(UiText.ErrorGroupsHeader, viewModel.ErrorGroupsHeader);
+        Assert.Equal(UiText.ErrorGroupsTruncatedHeader, viewModel.ErrorGroupsHeader);
         Assert.True(viewModel.HasErrorGroups);
         Assert.True(viewModel.HasFirstError);
         IReadOnlyList<ErrorGroupItem> groups = viewModel.ErrorGroups;
@@ -593,6 +626,53 @@ public sealed class MainViewModelTests
         Assert.True(viewModel.HasErrorGroups);
     }
 
+    // The header turns stored-only as the stored records reach the cap, at exactly the cap included, while the
+    // controller reports truncation only once the true total exceeds what is stored; the next run starts unlabelled.
+    [Theory]
+    [InlineData(ErrorGrouping.StoredDetailCap - 1, false, false)]
+    [InlineData(ErrorGrouping.StoredDetailCap, true, false)]
+    [InlineData(ErrorGrouping.StoredDetailCap + 1, true, true)]
+    public void ErrorGroupsHeader_AtDetailCapBoundary_IsStoredOnlyOnceStoredRecordsReachTheCap(
+        int totalErrors, bool capReached, bool truncated)
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        using MainViewModel viewModel = CreateViewModel(harness);
+        FakeEngineSession session = harness.StartAccepted(stopOnError: false);
+        harness.Prepare();
+        StepAttributes step = session.Options.Steps[0];
+        using var recorder = new PropertyChangeRecorder(viewModel, harness.Time);
+        string expectedHeader = capReached ? UiText.ErrorGroupsTruncatedHeader : UiText.ErrorGroupsHeader;
+
+        // The engine passes records only up to the cap, and every batch carries the true total.
+        IReadOnlyList<ErrorRecord> stored = FakeEngineData.Errors(
+            Math.Min(totalErrors, ErrorGrouping.StoredDetailCap), stepIndex: step.Index, stepName: step.Name);
+        session.RaiseErrors(stored, (ulong)totalErrors);
+        harness.RunUntil(() => harness.Controller.TotalErrors == (ulong)totalErrors);
+
+        Assert.Equal((ulong)totalErrors, harness.Controller.TotalErrors);
+        Assert.Equal(DisplayFormat.ErrorTotal((ulong)totalErrors), viewModel.ErrorCountText);
+        Assert.Equal(capReached, harness.Controller.IsStoredDetailCapReached);
+        Assert.Equal(truncated, harness.Controller.IsErrorDetailTruncated);
+        Assert.Equal(expectedHeader, viewModel.ErrorGroupsHeader);
+        Assert.Equal(
+            capReached ? new[] { UiText.ErrorGroupsTruncatedHeader } : Array.Empty<string>(),
+            recorder.ValuesOf(nameof(MainViewModel.ErrorGroupsHeader)).OfType<string>());
+
+        harness.Complete(RunEndReason.Completed, totalErrors: (ulong)totalErrors);
+        Assert.Equal(RunState.Failed, viewModel.State);
+        Assert.Equal((ulong)totalErrors, harness.Controller.TotalErrors);
+        Assert.Equal(capReached, harness.Controller.IsStoredDetailCapReached);
+        Assert.Equal(truncated, harness.Controller.IsErrorDetailTruncated);
+        Assert.Equal(expectedHeader, viewModel.ErrorGroupsHeader);
+
+        harness.Release(_releaseTime);
+        harness.StartAccepted(stopOnError: false);
+        Assert.False(harness.Controller.IsStoredDetailCapReached);
+        Assert.False(harness.Controller.IsErrorDetailTruncated);
+        Assert.Equal(UiText.ErrorGroupsHeader, viewModel.ErrorGroupsHeader);
+    }
+
     [Theory]
     [InlineData(RunEndReason.Completed, 0UL, RunState.Passed)]
     [InlineData(RunEndReason.Completed, 3UL, RunState.Failed)]
@@ -625,7 +705,7 @@ public sealed class MainViewModelTests
         // No verdict yet: the status line names the state instead.
         Assert.False(viewModel.HasResult);
         Assert.Equal(string.Empty, viewModel.VerdictText);
-        Assert.Equal(StatusLine(viewModel, RunState.Running.ToString()), viewModel.StatusLineText);
+        Assert.Equal(StatusLine(viewModel, UiText.ErrorCount(errors), RunState.Running.ToString()), viewModel.StatusLineText);
 
         session.RaiseStepFinished(step.Index, errors: errors, completed: endReason == RunEndReason.Completed);
         harness.Complete(endReason, errors);
@@ -635,7 +715,7 @@ public sealed class MainViewModelTests
         Assert.Equal(expectedState.ToVerdictText(), viewModel.VerdictText);
         Assert.False(string.IsNullOrEmpty(viewModel.ResultReasonText));
         Assert.Equal(harness.Controller.ResultMessage, viewModel.ResultReasonText);
-        Assert.Equal(StatusLine(viewModel, viewModel.VerdictText), viewModel.StatusLineText);
+        Assert.Equal(StatusLine(viewModel, UiText.ErrorCount(errors), viewModel.VerdictText), viewModel.StatusLineText);
         Assert.Equal(DisplayFormat.ErrorTotal(errors), viewModel.ErrorCountText);
         Assert.Equal(UiText.CauseHintsHeader, viewModel.CauseHintsHeader);
         Assert.Equal(withErrors, viewModel.HasFirstError);
@@ -653,6 +733,59 @@ public sealed class MainViewModelTests
             Assert.Empty(viewModel.ErrorGroups);
             Assert.Equal(string.Empty, viewModel.FirstErrorText);
         }
+    }
+
+    [Theory]
+    [InlineData(0UL, RunState.Passed)]
+    [InlineData(1UL, RunState.Failed)]
+    [InlineData(10_001UL, RunState.Failed)]
+    public void StatusLineText_BeforeDuringAndAfterRun_ErrorPartCountsErrorsWithTheirNoun(ulong errors, RunState expectedState)
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        using MainViewModel viewModel = CreateViewModel(harness);
+
+        // Before a run, and while memory is prepared, there is no error total to count.
+        Assert.Equal(
+            Format(UiText.StatusLineFormat, UiText.NotYetKnown, UiText.NotYetKnown, UiText.NotYetKnown, RunState.Idle.ToString()),
+            viewModel.StatusLineText);
+        FakeEngineSession session = harness.StartAccepted(stopOnError: false);
+        Assert.Equal(
+            Format(UiText.StatusLineFormat, UiText.PreparingMemory, UiText.NotYetKnown, UiText.NotYetKnown, RunState.Preparing.ToString()),
+            viewModel.StatusLineText);
+
+        // While running and with the verdict, the true total carries its noun, past the detail cap included.
+        harness.Prepare();
+        StepAttributes step = session.Options.Steps[0];
+        if (errors > 0)
+        {
+            session.RaiseErrors(FakeEngineData.Errors(1, stepIndex: step.Index, stepName: step.Name), errors);
+            harness.RunUntil(() => harness.Controller.TotalErrors == errors);
+        }
+
+        Assert.Equal(StatusLine(viewModel, UiText.ErrorCount(errors), RunState.Running.ToString()), viewModel.StatusLineText);
+
+        session.RaiseStepFinished(step.Index, errors: errors, completed: true);
+        harness.Complete(RunEndReason.Completed, errors);
+
+        Assert.Equal(expectedState, viewModel.State);
+        Assert.Equal(expectedState.ToVerdictText(), viewModel.VerdictText);
+        Assert.Equal(StatusLine(viewModel, UiText.ErrorCount(errors), viewModel.VerdictText), viewModel.StatusLineText);
+    }
+
+    [Fact]
+    public void StatusLineFormat_FieldsJoinedByOneSeparator_ErrorPartCarriesNoLabelOfItsOwn()
+    {
+        // The error part arrives worded by UiText.ErrorCount, so the template adds nothing around any field but the
+        // one separator that joins them all; a label beside the error part would read "1 error errors".
+        string[] literals = UiText.StatusLineFormat.Split(new[] { "{0}", "{1}", "{2}", "{3}" }, StringSplitOptions.None);
+
+        Assert.Equal(5, literals.Length);
+        Assert.Equal(string.Empty, literals[0]);
+        Assert.Equal(string.Empty, literals[4]);
+        Assert.False(string.IsNullOrWhiteSpace(literals[1]), "The status line's fields have no separator.");
+        Assert.Equal(literals[1], literals[2]);
+        Assert.Equal(literals[1], literals[3]);
     }
 
     [Fact]
@@ -1158,8 +1291,8 @@ public sealed class MainViewModelTests
         Assert.Equal(canChangeSettings, viewModel.CanChangeSettings);
     }
 
-    private static string StatusLine(MainViewModel viewModel, string verdictOrState) =>
-        Format(UiText.StatusLineFormat, viewModel.CurrentStepText, viewModel.RemainingText, viewModel.ErrorCountText, verdictOrState);
+    private static string StatusLine(MainViewModel viewModel, string errorPart, string verdictOrState) =>
+        Format(UiText.StatusLineFormat, viewModel.CurrentStepText, viewModel.RemainingText, errorPart, verdictOrState);
 
     private static string Temperature(string degrees) => Format(UiText.TemperatureFormat, degrees);
 
@@ -1243,4 +1376,3 @@ public sealed class MainViewModelTests
         }
     }
 }
-

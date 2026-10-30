@@ -511,6 +511,7 @@ struct session::state {
     std::shared_ptr<IClock> clock_;
     std::shared_ptr<IThreadAffinity> affinity_;
     free_function free_override_;
+    lock_function lock_override_;
 
     // ISA dispatch, run once at creation and fixed for the session.
     isa_selection isa_;
@@ -581,6 +582,7 @@ session::state::state(const rq_session_config& config, const rq_callbacks& callb
       clock_(clock_or_default(std::move(dependencies.clock))),
       affinity_(affinity_or_default(std::move(dependencies.affinity))),
       free_override_(std::move(dependencies.free_override)),
+      lock_override_(std::move(dependencies.lock_override)),
       isa_(select_isa(read_cpu_features(), config.isa_override)), kernels_(tables_for(isa_)) {
     // validate_config has already checked the override against this machine; a rejection here
     // means the configuration was never validated.
@@ -749,7 +751,10 @@ bool session::state::prepare(run_resources& run) {
     request.region_bytes = config_.region_bytes;
     request.min_region_bytes = config_.min_region_bytes;
     request.worker_count = config_.worker_count;
-    request.lock_privilege_held = lock_memory_privilege_held();
+    // A scripted lock must see every chunk, and large-page chunks are never locked, so while
+    // one is set the region stays on 4 KiB pages whatever the token holds.
+    request.lock_privilege_held = !lock_override_ && lock_memory_privilege_held();
+    request.lock_override = lock_override_;
     request.free_override = free_override_;
     const allocation_outcome allocated = region_.allocate(request, stop_);
     switch (allocated.status) {

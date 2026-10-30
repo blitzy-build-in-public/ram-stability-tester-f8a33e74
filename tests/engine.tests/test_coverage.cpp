@@ -3,18 +3,22 @@
  * @brief Coverage accounting: the verified bytes the engine reports, held against the
  *        independent count of counting_memory_access (success criterion 5: within 1 %).
  *
- * A verified byte is one whose 8-byte word a verification primitive (verify or
- * verify_and_stream) read and compared within the current step. Moving inversion verifies twice
- * per pass, re-reads never count, and data written but not yet verified when a stop arrives never
+ * A verified byte is one whose 8-byte word a verification primitive (verify, verify_and_stream or
+ * verify_strided) read and compared within the current step. Moving inversion verifies twice per
+ * pass, re-reads never count, and data written but not yet verified when a stop arrives never
  * counts. The engine counts through coverage_counter; counting_memory_access sums the same
- * primitives' word counts on its own, so agreement between the two is evidence, not a count
- * agreeing with itself.
+ * primitives on its own, word_count x 8 for verify and verify_and_stream and visit_count x 64 for
+ * verify_strided, whose call compares only the lines it visits, not its whole span. Agreement
+ * between the two is therefore evidence, not a count agreeing with itself.
  *
- * - CoverageMatrix: one step of every pattern and access order, both moving-inversion patterns
- *   and a 5 s hold, in All and Half thread mode, on every instruction set the CPU offers
- *   (SKIPPED where it lacks one). The reported totals lie within 99-101 % of the independent
- *   count, and are in fact exact; every byte of every slice is verified once per pass (twice for
- *   moving inversion), whichever worker covers it.
+ * - CoverageMatrix: one step of every pattern in every access order, both moving-inversion
+ *   patterns included, and a 5 s hold, in All and Half thread mode, on every instruction set the
+ *   CPU offers (SKIPPED where it lacks one). The reported totals lie within 99-101 % of the
+ *   independent count, and are in fact exact; every byte of every slice is verified once per pass
+ *   (twice for moving inversion), whichever worker covers it. The runner ignores a
+ *   moving-inversion step's order, so for each of the five the primitive log must show every
+ *   worker writing the base ascending, then sweeping each group it covers once ascending and once
+ *   descending.
  * - CoverageReread: mismatches injected before verification are each re-read once, and the
  *   re-reads change neither total.
  * - CoverageStop: a stop in mid-pass ends the step incomplete; what the cut pass verified is
@@ -185,11 +189,12 @@ bool is_moving_inversion(std::uint32_t pattern) noexcept {
            pattern == RQ_PATTERN_MOVING_INVERSION_RANDOM;
 }
 
-/** "Random_BankStride", "Random_RandomBlocks_Hold5s" or, ignoring the order, "MovingInversion*". */
+/**
+ * "Random_BankStride", "Random_RandomBlocks_Hold5s" or "MovingInversionRandom_Turnaround". The
+ * order is named for moving inversion too, although the runner ignores it, because the matrix
+ * runs each inversion pattern in every order and every case needs a distinct name.
+ */
 std::string shape_label(const step_shape& shape) {
-    if (is_moving_inversion(shape.pattern)) {
-        return pattern_label(shape.pattern);
-    }
     std::string label = std::string(pattern_label(shape.pattern)) + "_" + order_label(shape.order);
     if (shape.hold_ms > 0U) {
         label += "_Hold" + std::to_string(shape.hold_ms / 1'000U) + "s";
@@ -224,10 +229,23 @@ std::vector<step_shape> pattern_order_shapes() {
     return shapes;
 }
 
-/** Both moving-inversion patterns; the order is ignored, as the runner ignores it. */
+/**
+ * Both moving-inversion patterns in every access order. The runner must ignore the configured
+ * order, because a moving-inversion pass always writes the base ascending and then sweeps
+ * ascending and descending. Configuring each order, rather than one, is what lets CoverageMatrix
+ * prove that every accepted value is ignored, not just one of them.
+ */
 std::vector<step_shape> moving_inversion_shapes() {
-    return {step_shape{RQ_PATTERN_MOVING_INVERSION_WALKING, RQ_ORDER_SEQUENTIAL_ASCENDING, 0U},
-            step_shape{RQ_PATTERN_MOVING_INVERSION_RANDOM, RQ_ORDER_SEQUENTIAL_ASCENDING, 0U}};
+    std::vector<step_shape> shapes;
+    for (const std::uint32_t pattern :
+         {RQ_PATTERN_MOVING_INVERSION_WALKING, RQ_PATTERN_MOVING_INVERSION_RANDOM}) {
+        for (const std::uint32_t order :
+             {RQ_ORDER_SEQUENTIAL_ASCENDING, RQ_ORDER_SEQUENTIAL_DESCENDING, RQ_ORDER_BANK_STRIDE,
+              RQ_ORDER_RANDOM_BLOCKS, RQ_ORDER_TURNAROUND}) {
+            shapes.push_back(step_shape{pattern, order, 0U});
+        }
+    }
+    return shapes;
 }
 
 /** The hold step as Q5 defines it: random data in RandomBlocks order, held 5 s. */
@@ -340,6 +358,20 @@ static_assert(sizeof(lane_tally) == k_cache_line_bytes &&
                   sizeof(padded_counter) == k_cache_line_bytes,
               "every tally must fill exactly one cache line");
 
+/**
+ * Records the primitive log keeps per worker in a moving-inversion step. Each pass has three
+ * whole-slice phases (base write and two sweeps); each issues one data call and one flush per
+ * 1 MiB group it covers, plus two fences per covered slice, and a worker covers at most the whole
+ * region in at most two slices. The cap holds that for every pass, where the layer's default of
+ * 1 << 20 would make each logging worker reserve about 7.5 MiB up front.
+ */
+constexpr std::size_t k_inversion_log_records_per_worker = std::size_t{1} << 12U;
+
+static_assert(std::uint64_t{k_planned_passes} * 3U *
+                      (2U * (k_region_bytes / k_work_group_bytes) + 2U * 2U) <=
+                  k_inversion_log_records_per_worker,
+              "the inversion log must hold every pass of a worker that covers the whole region");
+
 /** The step observer: keeps the last schedule run_step reported and how often it ticked. */
 class status_recorder final : public step_observer {
 public:
@@ -401,7 +433,12 @@ public:
     ::testing::AssertionResult prepare(std::uint32_t isa,
                                        traffic_action action = traffic_action::none);
 
-    /** Runs step as step 0 of a one-step plan and returns what run_step reported. */
+    /**
+     * Runs step as step 0 of a one-step plan and returns what run_step reported. A
+     * moving-inversion step runs with the counting layer's primitive log on, capped at
+     * k_inversion_log_records_per_worker, so that its sweeps can be checked call by call
+     * (inversion_sweeps_match); every other step kind leaves the log off.
+     */
     step_outcome run(const rq_step_def& step);
 
     std::uint64_t tested_bytes() const noexcept { return region_.tested_bytes(); }
@@ -552,6 +589,11 @@ private:
 step_outcome step_harness::run(const rq_step_def& step) {
     stop_threshold_bytes_ =
         tested_bytes() * verifications_per_pass(step) * k_stop_at_percent / 100U;
+    if (is_moving_inversion(step.pattern)) {
+        // Enabled while the workers are idle, as the layer requires, and only here: the sweep
+        // order is what this log proves, and the other kinds' checks need no record of calls.
+        memory_->enable_log(k_inversion_log_records_per_worker);
+    }
     return runner_->run_step(step, 0U, status_);
 }
 
@@ -664,21 +706,182 @@ std::size_t step_harness::slice_holding(std::uintptr_t address) const noexcept {
     return k_no_slice;
 }
 
-/** Bytes of the slices a worker covers in one pass: its own, and its partner's in Half mode. */
-std::uint64_t covered_bytes(const step_harness& harness, std::uint32_t worker,
-                            std::uint32_t thread_mode) noexcept {
+/** Slice indices [first, last) that one worker covers in a pass. */
+struct covered_range {
+    std::uint32_t first = 0;
+    std::uint32_t last = 0;
+};
+
+/** The slices a worker covers in one pass: its own, and its partner's in Half mode. */
+covered_range covered_slices(const step_harness& harness, std::uint32_t worker,
+                             std::uint32_t thread_mode) noexcept {
     if (thread_mode != RQ_THREADS_HALF) {
-        return harness.slice(worker).bytes;
+        return covered_range{worker, worker + 1U};
     }
     if (worker % 2U != 0U) {
         // The idle partner: its even neighbour covers its slice.
-        return 0U;
+        return covered_range{worker, worker};
     }
-    std::uint64_t bytes = harness.slice(worker).bytes;
-    if (worker + 1U < harness.worker_count()) {
-        bytes += harness.slice(worker + 1U).bytes;
+    return covered_range{worker, std::min(worker + 2U, harness.worker_count())};
+}
+
+/** Bytes of the slices a worker covers in one pass. */
+std::uint64_t covered_bytes(const step_harness& harness, std::uint32_t worker,
+                            std::uint32_t thread_mode) noexcept {
+    const covered_range covered = covered_slices(harness, worker, thread_mode);
+    std::uint64_t bytes = 0;
+    for (std::uint32_t s = covered.first; s < covered.last; ++s) {
+        bytes += harness.slice(s).bytes;
     }
     return bytes;
+}
+
+const char* primitive_label(primitive_kind kind) noexcept {
+    switch (kind) {
+    case primitive_kind::stream_fill:
+        return "stream_fill";
+    case primitive_kind::fence:
+        return "fence";
+    case primitive_kind::flush:
+        return "flush";
+    case primitive_kind::verify:
+        return "verify";
+    case primitive_kind::verify_and_stream:
+        return "verify_and_stream";
+    case primitive_kind::reread_word:
+        return "reread_word";
+    case primitive_kind::stream_fill_strided:
+        return "stream_fill_strided";
+    case primitive_kind::verify_strided:
+        return "verify_strided";
+    }
+    return "unknown primitive";
+}
+
+/** "slice 1 + 3 MiB": where an address lies in the region, for failure messages. */
+std::string region_label(const step_harness& harness, std::uintptr_t address) {
+    for (std::uint32_t s = 0; s < harness.worker_count(); ++s) {
+        const slice_view& slice = harness.slice(s);
+        for (const chunk_view& chunk : slice.chunks) {
+            const auto base = reinterpret_cast<std::uintptr_t>(chunk.base);
+            if (address >= base && address - base < chunk.bytes) {
+                const std::uint64_t offset =
+                    chunk.logical_offset - slice.logical_offset + (address - base);
+                return "slice " + std::to_string(s) + " + " +
+                       (offset % k_mib == 0U ? std::to_string(offset / k_mib) + " MiB"
+                                             : std::to_string(offset) + " B");
+            }
+        }
+    }
+    return "an address outside the region";
+}
+
+/** One data call of a moving-inversion pass: its primitive and the 1 MiB group it starts at. */
+struct inversion_call {
+    primitive_kind kind{};
+    std::uintptr_t begin = 0;
+
+    friend bool operator==(const inversion_call&, const inversion_call&) = default;
+};
+
+/**
+ * The data calls one moving-inversion pass must issue on a worker, derived from the slices it
+ * covers and their chunks alone, never from the step's configured order, which the runner
+ * ignores. The base write streams every covered 1 MiB group ascending; the first sweep then
+ * verifies and streams each group once ascending, and the second once descending. As
+ * step_runner.h defines a whole-slice sweep, every phase takes the covered slices in index order,
+ * and the descending sweep reverses the chunks and groups within each slice.
+ */
+std::vector<inversion_call> expected_inversion_pass(const step_harness& harness,
+                                                    std::uint32_t worker,
+                                                    std::uint32_t thread_mode) {
+    std::vector<std::uintptr_t> ascending;
+    std::vector<std::uintptr_t> descending;
+    const covered_range covered = covered_slices(harness, worker, thread_mode);
+    for (std::uint32_t s = covered.first; s < covered.last; ++s) {
+        std::vector<std::uintptr_t> groups;
+        for (const chunk_view& chunk : harness.slice(s).chunks) {
+            const auto base = reinterpret_cast<std::uintptr_t>(chunk.base);
+            for (std::uint64_t offset = 0; offset < chunk.bytes; offset += k_work_group_bytes) {
+                groups.push_back(base + offset);
+            }
+        }
+        ascending.insert(ascending.end(), groups.begin(), groups.end());
+        descending.insert(descending.end(), groups.rbegin(), groups.rend());
+    }
+    std::vector<inversion_call> calls;
+    calls.reserve(3U * ascending.size());
+    for (const std::uintptr_t group : ascending) {
+        calls.push_back(inversion_call{primitive_kind::stream_fill, group});
+    }
+    for (const std::uintptr_t group : ascending) {
+        calls.push_back(inversion_call{primitive_kind::verify_and_stream, group});
+    }
+    for (const std::uintptr_t group : descending) {
+        calls.push_back(inversion_call{primitive_kind::verify_and_stream, group});
+    }
+    return calls;
+}
+
+/**
+ * Holds one worker's logged moving-inversion traffic to expected_inversion_pass, pass by pass
+ * and call by call. Fences and flushes are passed over, because test_step_runner.cpp checks
+ * their placement. Every other call must be a base-write stream_fill (phase_kind::write) or a
+ * sweep verify_and_stream (phase_kind::sweep, RQ_ACCESS_READ_MODIFY_WRITE) of one whole 1 MiB
+ * group, in step 0 and in one of the passes the step completed.
+ */
+::testing::AssertionResult inversion_sweeps_match(const step_harness& harness, std::uint32_t worker,
+                                                  std::uint32_t thread_mode, std::uint32_t passes) {
+    const std::vector<inversion_call> expected =
+        expected_inversion_pass(harness, worker, thread_mode);
+    const std::size_t groups = expected.size() / 3U;
+    std::vector<std::vector<inversion_call>> actual(passes);
+    for (const primitive_record& record : harness.memory().log_for_worker(worker)) {
+        if (record.kind == primitive_kind::fence || record.kind == primitive_kind::flush) {
+            continue;
+        }
+        const access_context& ctx = record.ctx;
+        const bool base_write =
+            record.kind == primitive_kind::stream_fill && ctx.phase == phase_kind::write;
+        const bool sweep = record.kind == primitive_kind::verify_and_stream &&
+                           ctx.phase == phase_kind::sweep &&
+                           ctx.access_type == RQ_ACCESS_READ_MODIFY_WRITE;
+        if (!(base_write || sweep) || record.bytes != k_work_group_bytes || ctx.step_index != 0U ||
+            ctx.pass_index >= passes) {
+            return ::testing::AssertionFailure()
+                   << "worker " << worker << " issued an unexpected "
+                   << primitive_label(record.kind) << " (phase "
+                   << static_cast<std::uint32_t>(ctx.phase) << ", access type " << ctx.access_type
+                   << ", step " << ctx.step_index << ", pass " << ctx.pass_index << ", "
+                   << record.bytes << " bytes) at " << region_label(harness, record.begin);
+        }
+        actual[ctx.pass_index].push_back(inversion_call{record.kind, record.begin});
+    }
+    for (std::uint32_t pass = 0; pass < passes; ++pass) {
+        const std::vector<inversion_call>& calls = actual[pass];
+        const std::size_t common = std::min(calls.size(), expected.size());
+        for (std::size_t i = 0; i < common; ++i) {
+            if (calls[i] == expected[i]) {
+                continue;
+            }
+            const char* part = i < groups        ? "base write"
+                               : i < 2U * groups ? "ascending sweep"
+                                                 : "descending sweep";
+            return ::testing::AssertionFailure()
+                   << "worker " << worker << " pass " << pass << ": data call " << i << " (" << part
+                   << ") is " << primitive_label(calls[i].kind) << " at "
+                   << region_label(harness, calls[i].begin) << ", expected "
+                   << primitive_label(expected[i].kind) << " at "
+                   << region_label(harness, expected[i].begin);
+        }
+        if (calls.size() != expected.size()) {
+            return ::testing::AssertionFailure()
+                   << "worker " << worker << " pass " << pass << ": " << calls.size()
+                   << " data calls, expected " << expected.size() << " (" << groups
+                   << " covered groups, each in the base write and both sweeps)";
+        }
+    }
+    return ::testing::AssertionSuccess();
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -746,6 +949,16 @@ TEST_P(CoverageMatrix, ReportedTotalsMatchIndependentCount) {
     // A clean run: nothing to confirm, so nothing re-read.
     EXPECT_EQ(harness.errors().true_total(), 0U) << label;
     EXPECT_EQ(harness.rereads(), 0U) << label;
+
+    // Moving inversion ignores the configured order: whichever of the five the step names, each
+    // worker writes the base ascending and then sweeps every group it covers once ascending and
+    // once descending, in every pass.
+    if (is_moving_inversion(shape.pattern)) {
+        ASSERT_FALSE(harness.memory().log_overflowed()) << label << ": the primitive log is cut";
+        for (std::uint32_t w = 0; w < harness.worker_count(); ++w) {
+            EXPECT_TRUE(inversion_sweeps_match(harness, w, thread_mode, outcome.passes)) << label;
+        }
+    }
 }
 
 std::string matrix_case_name(const ::testing::TestParamInfo<matrix_param>& info) {
@@ -945,8 +1158,31 @@ TEST(CoverageCounter, PublishesWholeBlocksAndPendingBytesOnPublish) {
  * CoverageSession: a whole session against the independent count
  * ------------------------------------------------------------------------------------------- */
 
-constexpr std::uint32_t k_session_workers = 2U;
+/**
+ * Workers the session prefers, so its region is covered by more than one pinned worker, and the
+ * most it requests. session_create accepts at most one worker per active logical processor, so a
+ * supported host with a single processor runs the session on one worker: this coverage check
+ * runs on every host rather than skipping.
+ */
+constexpr std::uint32_t k_session_max_workers = 2U;
 constexpr std::uint64_t k_session_region_bytes = 128U * k_mib;
+
+/**
+ * Bytes a session over workers (at least 1) tests, derived here rather than by the engine's
+ * plan_region: each worker's slice is its share of the region rounded down to the 2 MiB slice
+ * granularity.
+ */
+constexpr std::uint64_t session_tested_bytes(std::uint32_t workers) noexcept {
+    const std::uint64_t share = k_session_region_bytes / workers;
+    return std::uint64_t{workers} * (share - share % k_slice_granularity_bytes);
+}
+
+// Slices only shrink as workers are added, so the preferred count passing the engine's
+// smallest-slice rule means every count down to one passes it too.
+static_assert(session_tested_bytes(k_session_max_workers) / k_session_max_workers >=
+                  k_min_slice_bytes,
+              "every session worker count must give each worker a slice the engine accepts");
+
 constexpr std::uint32_t k_session_step_ms = 1'000U;
 constexpr std::uint32_t k_session_step_count = 3U;
 // Every tick may report progress, so the last report follows the last pass closely.
@@ -959,6 +1195,7 @@ struct session_events {
     std::condition_variable released_changed;
     bool released = false;
     bool completed = false;
+    std::uint32_t prepared_workers = 0;
     std::uint64_t tested_bytes = 0;
     std::uint32_t steps_started = 0;
     std::uint32_t steps_finished = 0;
@@ -977,6 +1214,7 @@ session_events& events_of(void* user_data) noexcept {
 void RQ_CALL record_prepared(void* user_data, const rq_prepared* info) noexcept {
     session_events& events = events_of(user_data);
     const std::lock_guard<std::mutex> lock(events.mutex);
+    events.prepared_workers = info->worker_count;
     events.tested_bytes = info->tested_bytes;
 }
 
@@ -1060,9 +1298,14 @@ private:
 };
 
 TEST(CoverageSession, RunStepAndProgressTotalsMatchIndependentCount) {
-    if (enumerate_logical_processors().size() < k_session_workers) {
-        GTEST_SKIP() << "needs " << k_session_workers << " logical processors";
-    }
+    // Two workers where the host has them, one on a single-processor host; the expected worker
+    // count and layout follow the count actually requested.
+    const std::vector<logical_processor> processors = enumerate_logical_processors();
+    ASSERT_FALSE(processors.empty()) << "no active logical processor was enumerated";
+    const auto workers =
+        static_cast<std::uint32_t>(std::min<std::size_t>(k_session_max_workers, processors.size()));
+    const std::uint64_t expected_tested_bytes = session_tested_bytes(workers);
+
     // Shaped like Quick's Q1, Q2 and Q4: one windowed sequential step, one bank-stride step and
     // one moving-inversion step, each on its 1 s budget of the real QPC clock.
     const std::array<rq_step_def, k_session_step_count> steps = {
@@ -1079,9 +1322,11 @@ TEST(CoverageSession, RunStepAndProgressTotalsMatchIndependentCount) {
     config.struct_size = sizeof(rq_session_config);
     config.step_def_size = sizeof(rq_step_def);
     config.region_bytes = k_session_region_bytes;
-    config.min_region_bytes = k_session_region_bytes;
+    // The rounded layout itself, so the engine accepts it for this worker count and refuses to
+    // shrink below it: tested_bytes must come out exactly as derived.
+    config.min_region_bytes = expected_tested_bytes;
     config.seed = k_seed;
-    config.worker_count = k_session_workers;
+    config.worker_count = workers;
     config.stop_on_error = 0U;
     config.error_detail_cap = k_detail_cap;
     config.progress_interval_ms = k_session_progress_interval_ms;
@@ -1149,7 +1394,8 @@ TEST(CoverageSession, RunStepAndProgressTotalsMatchIndependentCount) {
 
     const std::lock_guard<std::mutex> lock(events.mutex);
     EXPECT_TRUE(events.completed);
-    EXPECT_EQ(events.tested_bytes, k_session_region_bytes);
+    EXPECT_EQ(events.prepared_workers, workers);
+    EXPECT_EQ(events.tested_bytes, expected_tested_bytes);
     EXPECT_EQ(events.steps_started, k_session_step_count);
     ASSERT_EQ(events.steps_finished, k_session_step_count);
     for (std::uint32_t i = 0; i < k_session_step_count; ++i) {

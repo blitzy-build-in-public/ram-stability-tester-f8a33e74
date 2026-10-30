@@ -16,12 +16,18 @@
  * - MemoryRegionLargePages: large-page chunks, skipped when the token lacks
  *   SeLockMemoryPrivilege, which nobody holds by default.
  * - MemoryRegionRelease: whole sessions ending in each of completed, user stop, first error,
- *   thermal stop, affinity failure, host fault and engine fault. Released reports the tested (or
- *   planned) bytes, and every chunk base the run touched is MEM_FREE when Released is raised.
- *   That check runs inside on_released itself, before anything else in the process can reuse
- *   the freed address range. The two end reasons that fail before any traffic touch no chunk, so
- *   their release is shown by the commit charge instead: it is sampled inside the failing pin,
- *   after the region was committed, and again inside on_released. A scripted free override
+ *   thermal stop, insufficient memory, affinity failure, host fault and engine fault. Each raises
+ *   Completed and then Released, once each and last. Released reports the tested (or planned)
+ *   bytes, and every chunk base the run touched is MEM_FREE when Released is raised. That check
+ *   runs inside on_released itself, before anything else in the process can reuse the freed
+ *   address range. The two end reasons that fail at the pin, before any traffic, touch no chunk,
+ *   so their release is shown by the commit charge instead: it is sampled inside the failing
+ *   pin, after the region was committed, and again inside on_released. Insufficient memory comes
+ *   from a scripted session lock override that locks every chunk of each attempt but the last,
+ *   down to the minimum. allocate() frees each partial attempt itself, so Released reports no
+ *   bytes; its release is shown by every chunk base the override saw being MEM_FREE inside
+ *   on_released, by the commit charge there, and by the working-set limits being back to their
+ *   values before start. A scripted free override
  *   refuses chunks: a refused chunk stays owned and committed, Released is withheld, and a chunk
  *   still refused when its region or session is destroyed passes to the process-wide owner
  *   until a later retry frees it and restores the working-set limits.
@@ -89,7 +95,7 @@ constexpr std::uint64_t k_session_region_bytes = 64 * k_mib;
 constexpr std::uint64_t k_session_min_region_bytes = 32 * k_mib;
 
 /**
- * Region of the two runs that fail before any traffic. It is four times the commit-charge
+ * Region of the two runs whose pin fails before any traffic. It is four times the commit-charge
  * slack, so a region that stayed committed could not hide inside it.
  */
 constexpr std::uint64_t k_no_traffic_region_bytes = 128 * k_mib;
@@ -390,7 +396,8 @@ void expect_unallocated(const memory_region& region, const std::string& context)
 
 /**
  * Collects the allocation base of every range the run's primitives touched, through
- * counting_memory_access's observer, which runs on every worker concurrently.
+ * counting_memory_access's observer, which runs on every worker concurrently, and of every chunk
+ * a scripted lock override was asked to lock.
  */
 class address_capture {
 public:
@@ -409,6 +416,15 @@ public:
         bases_.insert(address_of(info.AllocationBase));
     }
 
+    /**
+     * Adds a chunk's allocation base directly: a lock override receives the base VirtualAlloc
+     * returned, so it needs no query. noexcept, as the lock override's contract requires.
+     */
+    void record(const void* allocation_base) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        bases_.insert(address_of(allocation_base));
+    }
+
     std::vector<std::uintptr_t> bases() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return {bases_.begin(), bases_.end()};
@@ -424,8 +440,43 @@ private:
     std::atomic<std::uint64_t> query_failures_{0};
 };
 
+/**
+ * The callbacks that order a run. Progress and error batches interleave freely, so they are left
+ * out.
+ */
+enum class engine_event {
+    prepared,
+    step_starting,
+    step_finished,
+    completed,
+    released,
+};
+
+void PrintTo(engine_event event, std::ostream* os) {
+    switch (event) {
+    case engine_event::prepared:
+        *os << "prepared";
+        return;
+    case engine_event::step_starting:
+        *os << "step_starting";
+        return;
+    case engine_event::step_finished:
+        *os << "step_finished";
+        return;
+    case engine_event::completed:
+        *os << "completed";
+        return;
+    case engine_event::released:
+        *os << "released";
+        return;
+    }
+    *os << "unknown event";
+}
+
 /** What run_recorder saw, copied under its lock. */
 struct recorded_run {
+    /** The ordering callbacks in the order they were raised. */
+    std::vector<engine_event> events;
     bool prepared = false;
     rq_prepared prepared_info{};
     std::uint32_t gate_calls = 0;
@@ -524,6 +575,7 @@ private:
 
     static void RQ_CALL on_prepared(void* user_data, const rq_prepared* info) noexcept {
         self(user_data).update([info](recorded_run& run) {
+            run.events.push_back(engine_event::prepared);
             run.prepared = true;
             run.prepared_info = *info;
         });
@@ -532,7 +584,10 @@ private:
     static std::uint32_t RQ_CALL on_step_starting(void* user_data,
                                                   const rq_step_start* info) noexcept {
         run_recorder& recorder = self(user_data);
-        recorder.update([](recorded_run& run) { ++run.gate_calls; });
+        recorder.update([](recorded_run& run) {
+            run.events.push_back(engine_event::step_starting);
+            ++run.gate_calls;
+        });
         if (recorder.partner_ != nullptr) {
             run_recorder& partner = *recorder.partner_;
             partner.wait_until(
@@ -542,7 +597,10 @@ private:
     }
 
     static void RQ_CALL on_step_finished(void* user_data, const rq_step_result*) noexcept {
-        self(user_data).update([](recorded_run& run) { ++run.steps_finished; });
+        self(user_data).update([](recorded_run& run) {
+            run.events.push_back(engine_event::step_finished);
+            ++run.steps_finished;
+        });
     }
 
     static void RQ_CALL on_progress(void* user_data, const rq_progress*) noexcept {
@@ -558,6 +616,7 @@ private:
 
     static void RQ_CALL on_completed(void* user_data, const rq_run_result* result) noexcept {
         self(user_data).update([result](recorded_run& run) {
+            run.events.push_back(engine_event::completed);
             run.completed = true;
             run.result = *result;
             run.result.step_results = nullptr;
@@ -580,6 +639,7 @@ private:
             }
         }
         recorder.update([&](recorded_run& run) {
+            run.events.push_back(engine_event::released);
             run.released = true;
             run.released_bytes = released_bytes;
             run.release_ms = release_ms;
@@ -1888,12 +1948,81 @@ TEST(MemoryRegionLargePages, AllocatesLargePageChunksWhenThePrivilegeIsHeld) {
  * Release on every end reason
  * ------------------------------------------------------------------------------------------- */
 
+/**
+ * Stands in for VirtualLock through session_dependencies::lock_override, so that a whole
+ * session exhausts its shrink-and-retry sequence deterministically.
+ *
+ * Constructed with the chunk count of every attempt allocate() makes, in order. Within each
+ * attempt it locks every chunk for real except the attempt's last, which fails with
+ * ERROR_WORKING_SET_QUOTA as the last error, exactly as a failed VirtualLock reports it. Every
+ * failed attempt therefore holds locked chunks (with two workers or more) that allocate() must
+ * free before it retries. A call past the listed attempts fails too, so an unexpected retry
+ * still ends in exhaustion and shows in the call count. Every chunk base joins the capture,
+ * whose bases on_released checks for MEM_FREE. Runs on the coordinator only, inside allocate(),
+ * and the test reads the counts after the session is destroyed, so it needs no lock of its own.
+ * It must outlive the session that calls it.
+ */
+class exhausting_lock_script {
+public:
+    exhausting_lock_script(std::vector<std::uint32_t> attempt_chunks, address_capture& capture)
+        : attempt_chunks_(std::move(attempt_chunks)), capture_(capture) {}
+
+    exhausting_lock_script(const exhausting_lock_script&) = delete;
+    exhausting_lock_script& operator=(const exhausting_lock_script&) = delete;
+
+    lock_function bind() {
+        return [this](void* address, std::size_t bytes) { return lock(address, bytes); };
+    }
+
+    std::uint32_t calls() const noexcept { return calls_; }
+
+    /** Chunks VirtualLock locked for real. */
+    std::uint32_t real_locks() const noexcept { return real_locks_; }
+
+private:
+    bool lock(void* address, std::size_t bytes) noexcept {
+        capture_.record(address);
+        ++calls_;
+        bool fail = true;
+        if (attempt_ < attempt_chunks_.size()) {
+            ++chunk_in_attempt_;
+            fail = chunk_in_attempt_ == attempt_chunks_[attempt_];
+            if (fail) {
+                ++attempt_;
+                chunk_in_attempt_ = 0;
+            }
+        }
+        if (!fail) {
+            if (VirtualLock(address, bytes) != FALSE) {
+                ++real_locks_;
+                return true;
+            }
+            // A real failure ends the attempt as well, so the next call starts the next one;
+            // VirtualLock's own last error stands, and the counts expose the failure.
+            ++attempt_;
+            chunk_in_attempt_ = 0;
+            return false;
+        }
+        // The last action, so nothing overwrites the error before allocate() reads it.
+        SetLastError(k_error_working_set_quota);
+        return false;
+    }
+
+    const std::vector<std::uint32_t> attempt_chunks_;
+    address_capture& capture_;
+    std::size_t attempt_ = 0;
+    std::uint32_t chunk_in_attempt_ = 0;
+    std::uint32_t calls_ = 0;
+    std::uint32_t real_locks_ = 0;
+};
+
 /** The ways a session can end. */
 enum class end_scenario {
     completed,
     user_stop,
     first_error,
     thermal,
+    insufficient_memory,
     affinity_failure,
     host_fault,
     engine_fault,
@@ -1920,6 +2049,8 @@ struct scenario_spec {
     std::uint32_t abort_gate_at = k_no_step;
     bool inject_bit_flips = false;
     pin_failure pin = pin_failure::none;
+    /** Whether exhausting_lock_script fails a lock in every attempt down to the minimum. */
+    bool exhaust_locks = false;
 };
 
 scenario_spec spec_for(end_scenario scenario) {
@@ -1950,6 +2081,15 @@ scenario_spec spec_for(end_scenario scenario) {
         spec.detail = "Stop requested by host: thermal limit";
         spec.step_budget_ms = k_long_step_ms;
         spec.host_stop = RQ_STOP_THERMAL;
+        break;
+    case end_scenario::insufficient_memory:
+        // The exact detail, naming the last size and the minimum, is checked in the test body.
+        spec.name = "InsufficientMemory";
+        spec.end_reason = RQ_END_INSUFFICIENT_MEMORY;
+        spec.detail = "VirtualLock failed";
+        spec.os_error = k_error_working_set_quota;
+        spec.prepared = false;
+        spec.exhaust_locks = true;
         break;
     case end_scenario::affinity_failure:
         spec.name = "AffinityFailure";
@@ -2013,25 +2153,49 @@ TEST_P(MemoryRegionEndReason, ReleasesEveryChunkBeforeReleasedIsRaised) {
         affinity = std::make_shared<scripted_affinity>(spec.pin);
     }
 
+    // The chunk count of every attempt allocate() makes before the sequence is exhausted: the
+    // first size, then each retry down to the minimum. The last size and the minimum name the
+    // failure in end_detail.
+    std::vector<std::uint32_t> attempt_chunks;
+    std::uint64_t last_attempt_bytes = 0;
+    std::optional<exhausting_lock_script> locks;
+    if (spec.exhaust_locks) {
+        for (std::uint64_t size = config.region_bytes; size != 0;
+             size = next_retry_bytes(size, config.min_region_bytes, workers)) {
+            attempt_chunks.push_back(workers * plan_region(size, workers).chunks_per_slice);
+            last_attempt_bytes = size;
+        }
+        ASSERT_GE(attempt_chunks.size(), 2u) << reason << ": the scenario must shrink and retry";
+        ASSERT_EQ(last_attempt_bytes, config.min_region_bytes)
+            << reason << ": the retries must end at the minimum";
+        locks.emplace(attempt_chunks, capture);
+    }
+
     layer_handles layers;
+    session_dependencies dependencies =
+        make_dependencies(capture, layers, fault, std::make_shared<qpc_clock>(), affinity);
+    if (locks) {
+        dependencies.lock_override = locks->bind();
+    }
     session_guard session;
-    ASSERT_EQ(session_create(&config, &callbacks,
-                             make_dependencies(capture, layers, fault,
-                                               std::make_shared<qpc_clock>(), affinity),
-                             session.out()),
-              RQ_OK);
+    ASSERT_EQ(session_create(&config, &callbacks, std::move(dependencies), session.out()), RQ_OK);
     ASSERT_NE(layers.counting, nullptr);
     ASSERT_EQ(layers.fault != nullptr, spec.inject_bit_flips);
     EXPECT_EQ(live_session_count(), live_before + 1);
 
     const std::uint64_t private_before = current_private_usage();
     ASSERT_GT(private_before, 0u);
+    const working_set_limits limits_before = current_working_set_limits();
     ASSERT_EQ(session_start(session.get()), RQ_OK);
     if (spec.host_stop != 0) {
         ASSERT_TRUE(recorder.wait_for_progress()) << reason << ": no progress within 30 s";
         ASSERT_EQ(session_stop(session.get(), spec.host_stop), RQ_OK);
     }
     ASSERT_TRUE(recorder.wait_for_released()) << reason << ": Released not raised within 30 s";
+    if (spec.exhaust_locks) {
+        // Checked before destroy, whose release would withdraw a raise the coordinator left.
+        expect_limits_restored(limits_before, reason + ": after Released");
+    }
     const recorded_run run = recorder.snapshot();
 
     rq_run_result fetched{};
@@ -2045,6 +2209,21 @@ TEST_P(MemoryRegionEndReason, ReleasesEveryChunkBeforeReleasedIsRaised) {
 
     // The run ended the way the scenario drives it.
     ASSERT_TRUE(run.completed) << reason << ": Released without Completed";
+    // Completed, then Released, once each and last; a preparation failure raises nothing else.
+    const std::string trace = ::testing::PrintToString(run.events);
+    EXPECT_EQ(std::count(run.events.begin(), run.events.end(), engine_event::completed), 1)
+        << reason << ": " << trace;
+    EXPECT_EQ(std::count(run.events.begin(), run.events.end(), engine_event::released), 1)
+        << reason << ": " << trace;
+    ASSERT_GE(run.events.size(), 2u) << reason << ": " << trace;
+    EXPECT_EQ(run.events[run.events.size() - 2], engine_event::completed)
+        << reason << ": " << trace;
+    EXPECT_EQ(run.events.back(), engine_event::released) << reason << ": " << trace;
+    if (!spec.prepared) {
+        EXPECT_EQ(run.events,
+                  (std::vector<engine_event>{engine_event::completed, engine_event::released}))
+            << reason;
+    }
     ASSERT_EQ(run.result.end_reason, spec.end_reason)
         << "expected " << reason << ", got " << end_reason_name(run.result.end_reason) << ": "
         << run.result.end_detail;
@@ -2060,14 +2239,20 @@ TEST_P(MemoryRegionEndReason, ReleasesEveryChunkBeforeReleasedIsRaised) {
     EXPECT_EQ(run.prepared, spec.prepared) << reason;
 
     // Released reports every byte that was allocated: the tested bytes once prepared, otherwise
-    // the planned bytes that were allocated and locked before preparation failed.
-    if (run.prepared) {
-        EXPECT_EQ(run.prepared_info.tested_bytes, planned.tested_bytes) << reason;
-        EXPECT_EQ(run.released_bytes, run.prepared_info.tested_bytes) << reason;
+    // the planned bytes that were allocated and locked before preparation failed. Exhausted
+    // locking leaves nothing: allocate() freed every failed attempt itself.
+    if (spec.exhaust_locks) {
+        EXPECT_EQ(run.released_bytes, 0u) << reason;
+        EXPECT_EQ(run.release_ms, 0u) << reason;
     } else {
-        EXPECT_EQ(run.released_bytes, planned.tested_bytes) << reason;
+        if (run.prepared) {
+            EXPECT_EQ(run.prepared_info.tested_bytes, planned.tested_bytes) << reason;
+            EXPECT_EQ(run.released_bytes, run.prepared_info.tested_bytes) << reason;
+        } else {
+            EXPECT_EQ(run.released_bytes, planned.tested_bytes) << reason;
+        }
+        EXPECT_GT(run.released_bytes, 0u) << reason;
     }
-    EXPECT_GT(run.released_bytes, 0u) << reason;
 
     // Every chunk base the run touched was MEM_FREE inside on_released.
     for (const std::string& unfreed : run.unfreed) {
@@ -2079,6 +2264,46 @@ TEST_P(MemoryRegionEndReason, ReleasesEveryChunkBeforeReleasedIsRaised) {
     if (spec.prepared) {
         EXPECT_FALSE(bases.empty()) << reason << ": the run touched no chunk";
         EXPECT_GT(primitives, 0u) << reason;
+    } else if (spec.exhaust_locks) {
+        // No size down to the minimum locked, so no slice reached a worker: no gate, step,
+        // progress or traffic, and a result with nothing measured.
+        EXPECT_EQ(primitives, 0u) << reason << ": traffic ran without a locked region";
+        EXPECT_EQ(run.gate_calls, 0u) << reason;
+        EXPECT_EQ(run.steps_finished, 0u) << reason;
+        EXPECT_EQ(run.progress_calls, 0u) << reason;
+        EXPECT_EQ(run.result.step_result_count, 0u) << reason;
+        EXPECT_EQ(run.result.steps_completed, 0u) << reason;
+        EXPECT_EQ(run.result.total_errors, 0u) << reason;
+        EXPECT_EQ(run.result.verified_bytes, 0u) << reason;
+        EXPECT_EQ(run.result.elapsed_ms, 0u) << reason;
+        EXPECT_EQ(run.result.first_error_ms, RQ_NO_FIRST_ERROR) << reason;
+
+        // The detail names the last size and the minimum. The Windows error is os_error's
+        // alone, because the host prefixes "Windows error n: " to the detail.
+        char expected_detail[RQ_END_DETAIL_SIZE];
+        std::snprintf(expected_detail, sizeof(expected_detail),
+                      "VirtualLock failed at %llu MiB; %llu MiB minimum not lockable",
+                      last_attempt_bytes / k_mib, config.min_region_bytes / k_mib);
+        EXPECT_EQ(detail, expected_detail) << reason;
+        EXPECT_EQ(detail.find("Windows error"), std::string::npos) << reason << ": " << detail;
+
+        // Every attempt asked for each of its chunks and locked all but the last for real, so
+        // with two workers each failed attempt held a locked partial region that allocate()
+        // freed before retrying; every one of those bases was MEM_FREE inside on_released.
+        ASSERT_TRUE(locks.has_value());
+        std::uint32_t expected_calls = 0;
+        std::uint32_t expected_real_locks = 0;
+        for (const std::uint32_t chunks : attempt_chunks) {
+            expected_calls += chunks;
+            expected_real_locks += chunks - 1;
+        }
+        EXPECT_EQ(locks->calls(), expected_calls)
+            << reason << ": the attempts did not follow next_retry_bytes";
+        EXPECT_EQ(locks->real_locks(), expected_real_locks) << reason;
+        EXPECT_FALSE(bases.empty()) << reason << ": the lock override saw no chunk";
+        EXPECT_LE(run.private_usage_at_release, private_before + k_private_usage_slack_bytes)
+            << reason << ": the commit charge did not return after release (before "
+            << private_before << ", at release " << run.private_usage_at_release << ")";
     } else {
         // Preparation failed after the region was locked and before any traffic, so no chunk
         // base was captured; the commit charge shows the release instead.
@@ -2118,6 +2343,7 @@ TEST_P(MemoryRegionEndReason, ReleasesEveryChunkBeforeReleasedIsRaised) {
 INSTANTIATE_TEST_SUITE_P(MemoryRegionEndReasons, MemoryRegionEndReason,
                          ::testing::Values(end_scenario::completed, end_scenario::user_stop,
                                            end_scenario::first_error, end_scenario::thermal,
+                                           end_scenario::insufficient_memory,
                                            end_scenario::affinity_failure, end_scenario::host_fault,
                                            end_scenario::engine_fault),
                          [](const ::testing::TestParamInfo<end_scenario>& info) {

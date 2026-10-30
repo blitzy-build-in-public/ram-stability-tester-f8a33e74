@@ -1,7 +1,8 @@
 /**
  * @file test_stop.cpp
- * @brief Stop latency: on_completed within 2 s of a user stop in every phase kind, on a locked
- *        region of at least 1 GiB, with the release time after it measured and logged.
+ * @brief Stop latency: on_completed within 2 s of a user stop in every phase kind, and of the
+ *        first confirmed error with Stop on error on, on a locked region of at least 1 GiB,
+ *        with the release time after it measured and logged.
  *
  * StopAtRandomPoints/StopLatency runs one production session per case through core/session.h
  * (qpc_clock, the real memory-access layer under counting_memory_access, win32 thread affinity)
@@ -14,21 +15,30 @@
  * - moving inversion: MOVING_INVERSION_WALKING sweeps;
  * - turnaround: RANDOM, TURNAROUND.
  *
- * StopLatencyLargeRegion repeats the preparing case on an 8 GiB region, where releasing the
- * memory already locked takes far longer than one chunk's commit-and-lock. It polls the process
- * working set and stops once at least half the region is locked, so the stop always meets
- * preparation with gigabytes held. Completed must still arrive within 2 s, and the chunks locked
- * before the stop are released only after it: Released reports at least the bytes locked at
- * the stop, less one chunk and a small slack, and at most the region. It skips when less than
- * twice the region is available, since the 1 GiB suite already gates the bound itself.
+ * StopLatencyPreparationRelease stops the same 1 GiB run inside preparation with the whole region
+ * locked, deterministically, and makes releasing it take longer than the bound. Its affinity seam
+ * holds the first worker's pin, which the pool waits for only once allocation has locked every
+ * chunk, until the stop has been requested; its free seam frees each chunk with VirtualFree after
+ * a fixed delay, so the release takes at least 3 s. Completed must still arrive within 2 s of the
+ * stop, every chunk must be freed after Completed and before Released, and Released must report
+ * the whole region: the chunks a stop during preparation leaves locked are released only after
+ * Completed, so a release that grows with the region never delays it. Its release_ms must reach
+ * the delay the seam forces, which shows the release outlasted the bound; like every release
+ * time here, it is never bounded.
  *
- * A counting_memory_access observer detects the phases. It only raises an atomic flag and sets
- * an auto-reset event, on a worker thread; the test thread waits on that event, so every stop
- * is requested, and its QueryPerformanceCounter instant taken, on the test thread. For traffic
- * phases the test first waits for the phase, sleeps a random 0-200 ms, then re-arms the
- * observer and stops at once on the next primitive of that phase, so the stop lands inside it
- * rather than wherever the sleep happened to end. The hold is detected when every worker has
- * issued both fences of its pre-hold flush, just before the coordinator enters the hold.
+ * A counting_memory_access observer detects the phases. It runs on a worker thread, inside the
+ * counting layer's primitive call, and sets an auto-reset event; the test thread waits on that
+ * event, so every stop is requested, and its QueryPerformanceCounter instant taken, on the test
+ * thread. For traffic phases the test first waits for the phase, sleeps a random 0-200 ms, then
+ * arms a handshake: the worker issuing the next primitive of that phase signals and then waits
+ * inside that call, unable to leave the phase, until the test thread has requested the stop and
+ * released it. Its pause and resume instants bracket the stop instant, which proves the stop
+ * landed inside the phase rather than wherever the sleep or the test thread's wake-up ended.
+ * The wait is bounded by the 30 s phase timeout, and the session's owner releases it on every
+ * exit path before joining the workers, so a failed assertion never leaves a worker held. The
+ * 2 s bound is still measured once, from the stop request to on_completed. The hold is detected
+ * when every worker has issued both fences of its pre-hold flush, just before the coordinator
+ * enters the hold.
  *
  * The gate is the 2 s bound from the stop request to on_completed, which ramquick_engine.h
  * places on the engine. Release time grows with the region size and is reported, not bounded,
@@ -36,6 +46,23 @@
  * recorded too, and checked only as an amount: the tested bytes once Prepared was raised, and
  * the chunks locked before the stop, at most the region, after a stop during preparation.
  * TearDownTestSuite records the largest stop latency of the run.
+ *
+ * StopOnFirstError/FirstErrorLatency gates the other bound ramquick_engine.h places on the
+ * engine: with Stop on error on, on_completed within 2 s of the first confirmed error. Each run
+ * is a production session over fault_injecting_memory_access -> counting_memory_access -> the
+ * real layer, the fault layer and the session sharing one qpc_clock, with the region and worker
+ * count of StopLatency and a single 60 s step. No host stop is ever requested, so only the
+ * confirming worker's own RQ_END_FIRST_ERROR request can end the step early. The fault layer
+ * flips bit 17 in a few seeded words of every pass, which the first pass's verification meets in
+ * the phase kind under test, three runs each: windowed verify, verification after a 1 s hold,
+ * moving-inversion sweeps and turnaround. The error collector re-reads every mismatch once
+ * through the outermost layer and only then requests the stop, so a counting-layer observer
+ * stamps the QPC instant of the earliest re-read, with atomics only, on the worker. That instant
+ * precedes the stop request by no more than the error's classification and recording, so the
+ * measured interval is never shorter than the true one. Each run also checks the end reason and
+ * detail, that every error is a logged injection re-read once in the phase kind under test, and
+ * the release after Completed, whose time is reported, not bounded. Its engine and fault seeds
+ * come from its own suite seed, which RAMQUICK_STOP_TEST_SEED replays as well.
  *
  * Random points come from a std::mt19937_64 per case, seeded from a suite seed recorded as an
  * XML property; setting RAMQUICK_STOP_TEST_SEED to that value replays the same delays and engine
@@ -48,11 +75,12 @@
  * CloseHandleChecked and CloseHandleCheckedFailure cover close_handle_checked, through which the
  * stop signal and the engine's other handle owners close their handles: a failed close is
  * reported once, to the caller and to the debugger, and never retried. They need neither memory
- * nor elevation, so the 2 GiB precondition does not apply to them.
+ * nor elevation, so the 2 GiB precondition does not apply to them. Their events are held by
+ * test_event_owner, which lifts close protection and closes on every exit, so a failing case
+ * leaves no protected handle open in the process the rest of the suite runs in.
  */
 #include <gtest/gtest.h>
 #include <windows.h>
-#include <psapi.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -62,6 +90,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -80,7 +109,10 @@
 #include "core/memory/memory_access.h"
 #include "core/memory/memory_region.h"
 #include "core/session.h"
+#include "core/runner/worker_pool.h"
 #include "fakes/counting_memory_access.h"
+#include "fakes/fault_spec.h"
+#include "fakes/fault_injecting_memory_access.h"
 
 namespace rq::engine::test {
 namespace {
@@ -133,25 +165,16 @@ constexpr std::uint64_t k_points_per_kind_u64 = static_cast<std::uint64_t>(k_poi
 constexpr std::uint32_t k_prepare_attempts = 8U;
 
 /**
- * The large-region preparing case: a region of several GiB, so that releasing what was locked
- * before the stop would take far longer than the chunk a stop may wait for.
+ * Least time the preparation-release case's free seam makes releasing the region take, spread
+ * evenly over its chunks. Longer than the bound, so a Completed that waited for the release, as
+ * it would if the chunks locked before a stop were freed first, could not meet it on any machine.
  */
-constexpr std::uint64_t k_large_target_region_bytes = 8 * k_gib;
+constexpr std::uint64_t k_slow_release_ms = 3'000U;
+static_assert(k_slow_release_ms * k_ns_per_ms > k_stop_bound_ns,
+              "the forced release must outlast the stop bound");
 
-/**
- * Attempts of the large-region case. The first stops once half the region is locked; each
- * attempt that finds on_prepared already raised halves that threshold.
- */
-constexpr std::uint32_t k_large_attempts = 4U;
-
-/**
- * Working-set growth since start that the large-region case does not attribute to the region:
- * error-detail storage, thread stacks and heap pages preparation touches.
- */
-constexpr std::uint64_t k_large_working_set_slack_bytes = 64 * k_mib;
-
-/** Engine seed of the large-region case; it runs no traffic, so any value serves. */
-constexpr std::uint64_t k_large_engine_seed = 0x51A4CE5E0F8B1D27ULL;
+/** Engine seed of the preparation-release case; it runs no traffic, so any value serves. */
+constexpr std::uint64_t k_preparation_release_seed = 0x51A4CE5E0F8B1D27ULL;
 
 /** Environment variable that replays a recorded suite seed. */
 constexpr char k_seed_variable[] = "RAMQUICK_STOP_TEST_SEED";
@@ -284,8 +307,29 @@ std::uint32_t random_delay_ms(std::mt19937_64& rng, std::uint32_t max_ms) {
 }
 
 /**
+ * A suite seed: the value of RAMQUICK_STOP_TEST_SEED, so a recorded run replays, or a fresh one
+ * from std::random_device. A value that is not an unsigned integer fails the suite rather than
+ * being silently replaced, since the run would not replay what its reader asked for.
+ */
+std::uint64_t resolve_suite_seed() {
+    char text[32] = {};
+    const DWORD length = GetEnvironmentVariableA(k_seed_variable, text, sizeof(text));
+    if (length > 0U && length < sizeof(text)) {
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(text, &end, 0);
+        if (end != text && *end == '\0') {
+            return static_cast<std::uint64_t>(parsed);
+        }
+        ADD_FAILURE() << k_seed_variable << "='" << text
+                      << "' is not an unsigned integer; set it to a recorded suite_seed";
+    }
+    std::random_device device;
+    return (std::uint64_t{device()} << 32U) ^ device();
+}
+
+/**
  * Bytes of the region under test for the given worker count: whole 2 MiB slices reaching at
- * least target, 1 GiB unless the large-region case asks for more.
+ * least k_target_region_bytes, 1 GiB.
  *
  * The engine rounds each slice down to k_min_slice_bytes and ends a run whose rounded slices
  * test fewer than min_region_bytes with RQ_END_INSUFFICIENT_MEMORY before locking anything. A
@@ -293,9 +337,8 @@ std::uint32_t random_delay_ms(std::mt19937_64& rng, std::uint32_t max_ms) {
  * divide 512; rounding the slice up keeps one worker per logical processor and at least 1 GiB
  * locked, and equals 1 GiB exactly on power-of-two counts.
  */
-constexpr std::uint64_t region_bytes_for(std::uint32_t workers,
-                                         std::uint64_t target = k_target_region_bytes) noexcept {
-    const std::uint64_t per_worker = (target + workers - 1U) / workers;
+constexpr std::uint64_t region_bytes_for(std::uint32_t workers) noexcept {
+    const std::uint64_t per_worker = (k_target_region_bytes + workers - 1U) / workers;
     const std::uint64_t slice =
         (per_worker + k_min_slice_bytes - 1U) / k_min_slice_bytes * k_min_slice_bytes;
     return slice * workers;
@@ -304,24 +347,6 @@ static_assert(region_bytes_for(128U) == k_gib, "power-of-two worker counts test 
 static_assert(region_bytes_for(12U) >= k_gib &&
                   region_bytes_for(12U) % (12U * k_min_slice_bytes) == 0,
               "other counts round each slice up to whole 2 MiB");
-static_assert(region_bytes_for(128U, k_large_target_region_bytes) == 8 * k_gib,
-              "the large region is exactly 8 GiB on power-of-two counts");
-
-/**
- * The process working set (PROCESS_MEMORY_COUNTERS.WorkingSetSize). During preparation it grows
- * by the pages VirtualLock has faulted in, which is how the large-region case tells how much of
- * the region is locked. False, with the Windows error in error, when the query fails.
- */
-bool query_working_set(std::uint64_t& bytes, DWORD& error) noexcept {
-    PROCESS_MEMORY_COUNTERS counters{};
-    counters.cb = sizeof(counters);
-    if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
-        error = GetLastError();
-        return false;
-    }
-    bytes = counters.WorkingSetSize;
-    return true;
-}
 
 std::string end_reason_name(std::uint32_t reason) {
     switch (reason) {
@@ -508,11 +533,21 @@ private:
  * Phase trigger
  * ------------------------------------------------------------------------------------------- */
 
+/** How a Win32 event resets once a wait has seen it signalled. */
+enum class event_reset : std::uint32_t {
+    /** One satisfied wait resets it: each SetEvent wakes exactly one wait. */
+    automatic,
+    /** It stays signalled until reset, so every later wait returns at once. */
+    manual,
+};
+
 /** Owns a Win32 event handle. */
 class event_handle {
 public:
-    /** An unsignalled auto-reset event. @throws std::system_error when it cannot be created. */
-    event_handle() : handle_(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {
+    /** An unsignalled event. @throws std::system_error when it cannot be created. */
+    explicit event_handle(event_reset reset = event_reset::automatic)
+        : handle_(
+              CreateEventW(nullptr, reset == event_reset::manual ? TRUE : FALSE, FALSE, nullptr)) {
         if (handle_ == nullptr) {
             throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
                                     "CreateEventW failed");
@@ -528,17 +563,39 @@ private:
     HANDLE handle_;
 };
 
+/** What the handshake of phase_trigger::arm_handshake() saw of the one worker it held. */
+struct worker_pause {
+    /** A worker was held: the handshake met a primitive of the target phase. */
+    bool paused = false;
+    /** Its wait ended on release(), not on the k_phase_timeout_ms bound. */
+    bool released_by_test = false;
+    /** QPC instant the held worker signalled the test thread, after its primitive's access. */
+    std::uint64_t begin_ns = 0;
+    /** QPC instant its wait returned, before it went back to the runner. */
+    std::uint64_t resume_ns = 0;
+};
+
 /**
  * The counting layer's observer: signals the test thread when the target phase is reached.
  *
- * observe() runs on worker threads, after each primitive has been forwarded. It never calls a
- * session function and never blocks: it reads and swaps atomics and sets an auto-reset event.
+ * observe() runs on worker threads, inside the counting layer's primitive call: after the access
+ * has been forwarded and before the call returns to the runner. The layer calls it under
+ * noexcept with no lock held, so it never calls a session function and never throws.
  * - Traffic phases: while armed, the first primitive of the target phase disarms the trigger
  *   and sets the event. arm() rearms it for the next primitive of that phase.
+ *   arm_handshake() rearms it so that the worker issuing that primitive also waits, inside the
+ *   call, until release(). A held worker cannot leave the phase, so a stop the test thread
+ *   requests while it waits lands inside that phase however late the test thread is scheduled.
+ *   The wait is bounded by k_phase_timeout_ms, so a test that never releases cannot hang the
+ *   run, and worker_pause records both instants and whether release() ended it, which is how a
+ *   test proves its stop fell inside the pause. Only the worker that disarms the trigger waits,
+ *   and the resume event stays signalled once released, so nothing waits after release().
  * - Hold (hold_entry_fences != 0): every worker's pre-hold flush is a fence, its flushes and a
  *   fence, so the event is set when pass 0 has issued hold_entry_fences pre_hold_flush fences,
  *   two per worker: the moment the coordinator crosses the barrier into the hold. Verify-phase
- *   primitives are counted too, because a stop inside the hold must leave none.
+ *   primitives are counted too, because a stop inside the hold must leave none. No worker is
+ *   held: holding the one that issues the last pre-hold fence would keep the coordinator out of
+ *   the hold the stop must meet.
  */
 class phase_trigger {
 public:
@@ -559,15 +616,42 @@ public:
             }
             return;
         }
-        // The plain load keeps the shared flag read-mostly while disarmed.
+        // The plain load keeps the shared flag read-mostly while disarmed. The exchange lets
+        // exactly one worker disarm, so at most one is held per arming.
         if (phase == target_ && armed_.load(std::memory_order_relaxed) &&
             armed_.exchange(false, std::memory_order_acq_rel)) {
-            fire();
+            if (handshake_.exchange(false, std::memory_order_acq_rel)) {
+                pause_worker();
+            } else {
+                fire();
+            }
         }
     }
 
     /** Rearms a traffic-phase trigger after its event has been consumed. */
     void arm() noexcept { armed_.store(true, std::memory_order_release); }
+
+    /**
+     * Rearms a traffic-phase trigger so that the worker issuing the next target-phase primitive
+     * is held inside that call until release(). A no-op once release() has run.
+     */
+    void arm_handshake() noexcept {
+        if (released_.load(std::memory_order_acquire)) {
+            return;
+        }
+        // Published by arm()'s release store, which the disarming exchange acquires.
+        handshake_.store(true, std::memory_order_relaxed);
+        arm();
+    }
+
+    /**
+     * Lets the held worker go, and any later one at once: the manual-reset resume event is never
+     * reset. Every exit path calls it before the session joins its workers.
+     */
+    void release() noexcept {
+        released_.store(true, std::memory_order_release);
+        SetEvent(resume_.get());
+    }
 
     /** Waits for the event; true when it was set within the timeout. */
     bool wait(DWORD timeout_ms) const noexcept {
@@ -576,6 +660,16 @@ public:
 
     /** QPC instant of the last firing; 0 before the first. */
     std::uint64_t fired_ns() const noexcept { return fired_ns_.load(std::memory_order_acquire); }
+
+    /** The handshake's pause; complete once the held worker has returned to the runner. */
+    worker_pause pause() const noexcept {
+        worker_pause result;
+        result.paused = paused_.load(std::memory_order_acquire);
+        result.released_by_test = released_by_test_.load(std::memory_order_acquire);
+        result.begin_ns = pause_begin_ns_.load(std::memory_order_acquire);
+        result.resume_ns = resume_ns_.load(std::memory_order_acquire);
+        return result;
+    }
 
     /** Hold mode only: verify-phase primitives seen so far. */
     std::uint64_t verify_primitives() const noexcept {
@@ -588,13 +682,33 @@ private:
         SetEvent(event_.get());
     }
 
+    void pause_worker() noexcept {
+        // Stamped before the event, so the test thread's stop instant cannot precede it.
+        const std::uint64_t begin_ns = qpc_now_ns();
+        pause_begin_ns_.store(begin_ns, std::memory_order_release);
+        fired_ns_.store(begin_ns, std::memory_order_release);
+        paused_.store(true, std::memory_order_release);
+        SetEvent(event_.get());
+        const DWORD outcome = WaitForSingleObject(resume_.get(), k_phase_timeout_ms);
+        // Stamped after the wait, so a release issued after the stop orders it after the stop.
+        resume_ns_.store(qpc_now_ns(), std::memory_order_release);
+        released_by_test_.store(outcome == WAIT_OBJECT_0, std::memory_order_release);
+    }
+
     const phase_kind target_;
     const std::uint32_t hold_entry_fences_;
     event_handle event_;
+    event_handle resume_{event_reset::manual};
     std::atomic<bool> armed_{true};
+    std::atomic<bool> handshake_{false};
+    std::atomic<bool> released_{false};
     std::atomic<std::uint32_t> hold_fences_{0};
     std::atomic<std::uint64_t> verify_primitives_{0};
     std::atomic<std::uint64_t> fired_ns_{0};
+    std::atomic<bool> paused_{false};
+    std::atomic<bool> released_by_test_{false};
+    std::atomic<std::uint64_t> pause_begin_ns_{0};
+    std::atomic<std::uint64_t> resume_ns_{0};
 };
 
 /* ---------------------------------------------------------------------------------------------
@@ -603,9 +717,9 @@ private:
 
 /**
  * One production session over a counting layer: its single-step plan, its recorder and its
- * phase trigger. The destructor destroys the session first, which joins the coordinator and
- * guarantees no callback or observer call runs after it, so the recorder and the trigger
- * outlive every engine reference to them on every exit path.
+ * phase trigger. The destructor releases the trigger's handshake, then destroys the session,
+ * which joins the coordinator and guarantees no callback or observer call runs after it, so the
+ * recorder and the trigger outlive every engine reference to them on every exit path.
  */
 class stop_session {
 public:
@@ -639,6 +753,9 @@ public:
     }
 
     ~stop_session() {
+        // A worker the handshake still holds would keep session_destroy's join waiting out its
+        // bound, so a failed assertion's early return releases it here first.
+        trigger_.release();
         if (handle_ != nullptr) {
             session_destroy(handle_);
         }
@@ -647,9 +764,21 @@ public:
     stop_session(const stop_session&) = delete;
     stop_session& operator=(const stop_session&) = delete;
 
-    /** session_create with the production clock and affinity and a counting layer. */
-    rq_result create() {
+    /**
+     * Production seams a case replaces. A null affinity pins through win32_thread_affinity and
+     * an empty free_override frees with VirtualFree; both are shared with the session, which
+     * keeps them as long as session_dependencies requires.
+     */
+    struct seams {
+        std::shared_ptr<IThreadAffinity> affinity;
+        std::function<bool(void* address)> free_override;
+    };
+
+    /** session_create with the production clock, the given seams and a counting layer. */
+    rq_result create(seams overrides = {}) {
         session_dependencies dependencies;
+        dependencies.affinity = std::move(overrides.affinity);
+        dependencies.free_override = std::move(overrides.free_override);
         dependencies.wrap_memory_access =
             [this](std::unique_ptr<IMemoryAccess> real) -> std::unique_ptr<IMemoryAccess> {
             auto counting = std::make_unique<counting_memory_access>(std::move(real));
@@ -706,24 +835,7 @@ class StopLatency : public ::testing::TestWithParam<stop_param> {
 protected:
     /** Resolves and records the suite seed once for every case. */
     static void SetUpTestSuite() {
-        bool replayed = false;
-        char text[32] = {};
-        const DWORD length = GetEnvironmentVariableA(k_seed_variable, text, sizeof(text));
-        if (length > 0U && length < sizeof(text)) {
-            char* end = nullptr;
-            const unsigned long long parsed = std::strtoull(text, &end, 0);
-            replayed = end != text && *end == '\0';
-            if (replayed) {
-                suite_seed_ = static_cast<std::uint64_t>(parsed);
-            } else {
-                ADD_FAILURE() << k_seed_variable << "='" << text
-                              << "' is not an unsigned integer; set it to a recorded suite_seed";
-            }
-        }
-        if (!replayed) {
-            std::random_device device;
-            suite_seed_ = (std::uint64_t{device()} << 32U) ^ device();
-        }
+        suite_seed_ = resolve_suite_seed();
         max_latency_ns_ = 0;
         max_latency_label_.clear();
         measurements_ = 0;
@@ -889,15 +1001,20 @@ void StopLatency::run_traffic_case(const case_spec& spec, const std::string& lab
     const std::uint32_t delay_ms = random_delay_ms(rng, spec.max_delay_ms);
     Sleep(delay_ms);
     if (!hold) {
-        // The sleep ends anywhere in the pass; the next primitive of the target phase puts the
-        // stop back inside that phase.
-        run.trigger().arm();
+        // The sleep ends anywhere in the pass. The worker issuing the next primitive of the
+        // target phase is held inside that call until the stop has been requested, so the stop
+        // lands inside the phase however late this thread wakes.
+        run.trigger().arm_handshake();
         ASSERT_TRUE(run.trigger().wait(k_phase_timeout_ms))
             << label << ": phase " << phase_name(spec.target) << " did not recur; "
             << run.recorder().snapshot().describe();
     }
     std::uint64_t stop_ns = 0;
-    ASSERT_EQ(run.stop_now(stop_ns), RQ_OK) << label;
+    const rq_result stop_result = run.stop_now(stop_ns);
+    // Only after the request, so the held worker resumes into a stopping session; at once, so
+    // the stop -> Completed interval spends no more than this call on the handshake.
+    run.trigger().release();
+    ASSERT_EQ(stop_result, RQ_OK) << label;
 
     ASSERT_TRUE(run.recorder().wait_completed(k_completed_timeout))
         << label << ": no Completed within 10 s of the stop; "
@@ -908,6 +1025,9 @@ void StopLatency::run_traffic_case(const case_spec& spec, const std::string& lab
     const std::uint64_t primitives = run.primitive_count();
     const std::uint64_t post_hold_verifies = run.trigger().verify_primitives();
     const std::uint64_t phase_to_stop_ns = since(stop_ns, run.trigger().fired_ns());
+    // Complete: the held worker resumed before the workers joined, and they joined before
+    // Completed.
+    const worker_pause pause = run.trigger().pause();
     ASSERT_EQ(run.destroy(), RQ_OK) << label;
 
     expect_stopped_within_bound(record, stop_ns, label);
@@ -923,6 +1043,21 @@ void StopLatency::run_traffic_case(const case_spec& spec, const std::string& lab
     if (hold) {
         // A stop inside the 30 s hold ends the pass before its verification.
         EXPECT_EQ(post_hold_verifies, 0U) << label << ": the stop landed after the hold";
+    } else {
+        // The request fell between the held worker's pause and its resumption, so a worker was
+        // inside a primitive of the target phase when the stop was requested.
+        EXPECT_TRUE(pause.paused) << label << ": no worker was held in phase "
+                                  << phase_name(spec.target);
+        EXPECT_TRUE(pause.released_by_test)
+            << label << ": the held worker resumed on its " << k_phase_timeout_ms
+            << " ms bound, not on the release after the stop";
+        EXPECT_LE(pause.begin_ns, stop_ns)
+            << label << ": the stop was requested before a worker was held in phase "
+            << phase_name(spec.target);
+        EXPECT_LE(stop_ns, pause.resume_ns)
+            << label << ": the held worker resumed before the stop was requested";
+        RecordProperty("phase_pause_ms_" + label,
+                       format_ms(since(pause.resume_ns, pause.begin_ns)));
     }
     RecordProperty("phase_to_stop_ms_" + label, format_ms(phase_to_stop_ns));
     report(label, delay_ms, stop_ns, record);
@@ -963,147 +1098,724 @@ INSTANTIATE_TEST_SUITE_P(StopAtRandomPoints, StopLatency,
                          ::testing::Combine(k_all_cases, ::testing::Range(0, k_points_per_kind)),
                          case_name);
 
+/* ---------------------------------------------------------------------------------------------
+ * Stop on the first confirmed error
+ * ------------------------------------------------------------------------------------------- */
+
+/** Where the first injected error is confirmed: each phase kind that verifies. */
+enum class first_error_phase : std::uint32_t {
+    windowed_verify,
+    hold_verify,
+    moving_inversion,
+    turnaround,
+};
+
+/** One verifying phase kind: the single step that runs it and the access type it verifies with. */
+struct first_error_spec {
+    first_error_phase phase;
+    /** Test-name fragment and XML property suffix. */
+    const char* label;
+    const char* step_name;
+    std::uint32_t pattern;
+    /** Moving inversion ignores the order, but validation still requires a valid one. */
+    std::uint32_t access_order;
+    std::uint32_t hold_ms;
+    /** RQ_ACCESS_* value of the phase's verifications, which the confirming re-read keeps. */
+    std::uint32_t access_type;
+};
+
+/** Hold of the hold case: a real hold before the verification, short enough to keep runs quick. */
+constexpr std::uint32_t k_first_error_hold_ms = 1'000U;
+
+constexpr std::array<first_error_spec, 4> k_first_error_specs{{
+    {first_error_phase::windowed_verify, "windowed_verify", "First error in windowed verify",
+     RQ_PATTERN_RANDOM, RQ_ORDER_SEQUENTIAL_ASCENDING, 0U, RQ_ACCESS_VERIFY_AFTER_WRITE},
+    {first_error_phase::hold_verify, "hold_verify", "First error after a refresh hold",
+     RQ_PATTERN_RANDOM, RQ_ORDER_RANDOM_BLOCKS, k_first_error_hold_ms, RQ_ACCESS_VERIFY_AFTER_HOLD},
+    {first_error_phase::moving_inversion, "moving_inversion", "First error in moving inversion",
+     RQ_PATTERN_MOVING_INVERSION_WALKING, RQ_ORDER_SEQUENTIAL_ASCENDING, 0U,
+     RQ_ACCESS_READ_MODIFY_WRITE},
+    {first_error_phase::turnaround, "turnaround", "First error in turnaround", RQ_PATTERN_RANDOM,
+     RQ_ORDER_TURNAROUND, 0U, RQ_ACCESS_TURNAROUND_READ},
+}};
+
+constexpr bool first_error_specs_in_enum_order() noexcept {
+    for (std::size_t i = 0; i < k_first_error_specs.size(); ++i) {
+        if (static_cast<std::size_t>(k_first_error_specs[i].phase) != i) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(first_error_specs_in_enum_order(),
+              "k_first_error_specs is indexed by first_error_phase");
+
+const first_error_spec& first_error_spec_for(first_error_phase phase) noexcept {
+    return k_first_error_specs[static_cast<std::size_t>(phase)];
+}
+
+/** gtest prints parameters through this, so failures name the case instead of raw bytes. */
+void PrintTo(first_error_phase phase, std::ostream* os) {
+    *os << first_error_spec_for(phase).label;
+}
+
+/** Runs per phase kind, each with its own seeds; an int because ::testing::Range generates them. */
+constexpr int k_first_error_runs_per_kind = 3;
+constexpr std::uint64_t k_first_error_runs_per_kind_u64 =
+    static_cast<std::uint64_t>(k_first_error_runs_per_kind);
+
 /**
- * A stop during preparation of a multi-GiB region. Its own suite, because gtest does not let
- * TEST_F share the parameterised StopLatency fixture.
+ * The injected fault: the single-bit-flip class of the verification plan, bit 17 in a few seeded
+ * words of every pass, so the first pass's verification meets a corrupted word. The first one met
+ * ends the run; the cap only bounds the further flips workers still verify before they see the
+ * stop.
  */
-class StopLatencyLargeRegion : public ::testing::Test {
-protected:
+constexpr std::uint32_t k_first_error_bit = 17U;
+constexpr std::uint32_t k_first_error_flips_per_pass = 4U;
+constexpr std::uint64_t k_first_error_max_injections = 8U;
+
+/** How error_collector's detail begins for an error in the first pass of a one-step plan. */
+constexpr char k_first_error_detail_prefix[] = "First error: step 1 of 1, pass 1, ";
+
+/**
+ * Start to on_completed: the phase wait, for preparation and the first pass to reach the error,
+ * then the Completed wait. It only keeps a broken engine from hanging the suite; the gate is the
+ * measured interval.
+ */
+constexpr std::chrono::milliseconds k_first_error_completed_timeout =
+    std::chrono::milliseconds{k_phase_timeout_ms} + k_completed_timeout;
+
+/** The bit an RQ_ACCESS_* value sets in confirmation_probe::access_types(); 31 from 31 up. */
+constexpr std::uint32_t access_type_bit(std::uint32_t access_type) noexcept {
+    return std::uint32_t{1} << (access_type < 31U ? access_type : 31U);
+}
+
+/**
+ * The counting layer's observer of a first-error run. error_collector re-reads every mismatch
+ * once through the outermost layer, then classifies it and, for the first one, requests
+ * RQ_END_FIRST_ERROR, so the earliest re-read comes no later than the confirmation that stops.
+ *
+ * observe() runs on worker threads after each primitive has been forwarded, so a re-read's stamp
+ * follows its flushed load and precedes the stop request that may follow it. It never calls a
+ * session function, never blocks and never throws: it reads the clock and updates atomics. The
+ * test thread reads them after on_completed, which every worker's join precedes, so relaxed
+ * ordering suffices.
+ */
+class confirmation_probe {
+public:
+    confirmation_probe() = default;
+    confirmation_probe(const confirmation_probe&) = delete;
+    confirmation_probe& operator=(const confirmation_probe&) = delete;
+
+    void observe(const primitive_record& record) noexcept {
+        if (record.kind != primitive_kind::reread_word || record.ctx.phase != phase_kind::reread) {
+            return;
+        }
+        const std::uint64_t now = qpc_now_ns();
+        rereads_.fetch_add(1U, std::memory_order_relaxed);
+        access_types_.fetch_or(access_type_bit(record.ctx.access_type), std::memory_order_relaxed);
+        // Workers re-read concurrently, so the earliest instant is kept, not the first stored.
+        std::uint64_t earliest = earliest_ns_.load(std::memory_order_relaxed);
+        while ((earliest == 0U || now < earliest) &&
+               !earliest_ns_.compare_exchange_weak(earliest, now, std::memory_order_relaxed)) {
+            // A failed exchange reloaded earliest; retry only while this re-read is earlier.
+        }
+    }
+
+    /** QPC instant of the earliest re-read; 0 before the first. */
+    std::uint64_t earliest_confirmation_ns() const noexcept {
+        return earliest_ns_.load(std::memory_order_relaxed);
+    }
+
+    /** Re-reads issued so far. */
+    std::uint64_t rereads() const noexcept { return rereads_.load(std::memory_order_relaxed); }
+
+    /** access_type_bit of every re-read's access type, or-ed together. */
+    std::uint32_t access_types() const noexcept {
+        return access_types_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<std::uint64_t> earliest_ns_{0};
+    std::atomic<std::uint64_t> rereads_{0};
+    std::atomic<std::uint32_t> access_types_{0};
+};
+
+/**
+ * One production session with Stop on error on over fault-injecting -> counting -> real: its
+ * single-step plan, its fault spec, its recorder and its probe. It offers no stop, so only the
+ * confirming worker can end the run early. The destructor destroys the session first, which
+ * joins the coordinator and guarantees no callback or primitive runs after it, so the recorder,
+ * the probe and the clock outlive every engine reference to them on every exit path.
+ */
+class first_error_session {
+public:
+    first_error_session(const first_error_spec& spec, std::uint32_t workers,
+                        std::uint64_t engine_seed, std::uint64_t fault_seed)
+        : clock_(std::make_shared<qpc_clock>()) {
+        copy_utf8_truncated(step_.name, sizeof(step_.name), spec.step_name);
+        step_.pattern = spec.pattern;
+        step_.access_order = spec.access_order;
+        step_.thread_mode = RQ_THREADS_ALL;
+        step_.hold_ms = spec.hold_ms;
+        // Far beyond the first pass, so only the first confirmed error can end the step.
+        step_.time_budget_ms = k_step_budget_ms;
+        step_.coverage_budget_bp = k_coverage_budget_bp;
+
+        config_.struct_size = sizeof(rq_session_config);
+        config_.step_def_size = sizeof(rq_step_def);
+        config_.region_bytes = region_bytes_for(workers);
+        config_.min_region_bytes = config_.region_bytes;
+        config_.seed = engine_seed;
+        config_.worker_count = workers;
+        config_.stop_on_error = 1U;
+        config_.error_detail_cap = k_error_detail_cap;
+        config_.progress_interval_ms = k_progress_interval_ms;
+        config_.isa_override = RQ_ISA_AUTO;
+        config_.step_count = 1U;
+        config_.steps = &step_;
+
+        rq_fault_spec fault = make_fault_spec(RQ_FAULT_SINGLE_BIT_FLIP);
+        fault.bit = k_first_error_bit;
+        fault.per_pass_count = k_first_error_flips_per_pass;
+        fault.max_injections = k_first_error_max_injections;
+        fault.seed = fault_seed;
+        fault_ = normalized(fault, config_.region_bytes);
+    }
+
+    ~first_error_session() {
+        if (handle_ != nullptr) {
+            session_destroy(handle_);
+        }
+    }
+
+    first_error_session(const first_error_session&) = delete;
+    first_error_session& operator=(const first_error_session&) = delete;
+
     /**
-     * Skips, rather than fails, when the large region would not leave the machine as much
-     * memory again: StopLatency already gates the bound on its 1 GiB region, and this case only
-     * adds the size at which releasing the locked chunks before Completed would show.
+     * session_create with the production affinity, fault-injecting -> counting -> real, and one
+     * qpc_clock for the session and the fault layer, as rq_test_session_create builds them.
      */
+    rq_result create() {
+        session_dependencies dependencies;
+        dependencies.clock = clock_;
+        dependencies.wrap_memory_access =
+            [this](std::unique_ptr<IMemoryAccess> real) -> std::unique_ptr<IMemoryAccess> {
+            auto counting = std::make_unique<counting_memory_access>(std::move(real));
+            confirmation_probe* const probe = &probe_;
+            counting->set_observer(
+                [probe](const primitive_record& record) noexcept { probe->observe(record); });
+            auto injecting = std::make_unique<fault_injecting_memory_access>(std::move(counting),
+                                                                             fault_, *clock_);
+            fault_layer_ = injecting.get();
+            return std::unique_ptr<IMemoryAccess>(std::move(injecting));
+        };
+        const rq_callbacks callbacks = recorder_.callbacks();
+        return session_create(&config_, &callbacks, std::move(dependencies), &handle_);
+    }
+
+    rq_result start() { return session_start(handle_); }
+
+    rq_result destroy() {
+        const rq_result result = session_destroy(handle_);
+        handle_ = nullptr;
+        return result;
+    }
+
+    const rq_session_config& config() const noexcept { return config_; }
+    const rq_fault_spec& fault_spec() const noexcept { return fault_; }
+    run_recorder& recorder() noexcept { return recorder_; }
+    const confirmation_probe& probe() const noexcept { return probe_; }
+
+    /** Logged injections whose verification ran; exact once Completed has been raised. */
+    std::uint64_t verified_injections() const noexcept {
+        return fault_layer_ != nullptr ? fault_layer_->verified_opportunity_count() : 0U;
+    }
+
+private:
+    std::shared_ptr<IClock> clock_;
+    rq_step_def step_{};
+    rq_session_config config_{};
+    rq_fault_spec fault_{};
+    run_recorder recorder_;
+    confirmation_probe probe_;
+    // Owned by the session; valid until the session is destroyed.
+    fault_injecting_memory_access* fault_layer_ = nullptr;
+    rq_session_handle handle_ = nullptr;
+};
+
+using first_error_param = std::tuple<first_error_phase, int>;
+
+class FirstErrorLatency : public ::testing::TestWithParam<first_error_param> {
+protected:
+    /** Resolves and records this suite's seed once for every run, as StopLatency does its own. */
+    static void SetUpTestSuite() {
+        suite_seed_ = resolve_suite_seed();
+        max_latency_ns_ = 0;
+        max_latency_label_.clear();
+        measurements_ = 0;
+        RecordProperty("suite_seed", hex64(suite_seed_));
+        std::printf("[ stop     ] first-error suite seed %s (replay with %s)\n",
+                    hex64(suite_seed_).c_str(), k_seed_variable);
+        std::fflush(stdout);
+    }
+
+    /** The largest first-error-to-Completed latency of the run, as a suite property and a line. */
+    static void TearDownTestSuite() {
+        if (measurements_ == 0U) {
+            return;
+        }
+        RecordProperty("max_first_error_latency_ms", format_ms(max_latency_ns_));
+        RecordProperty("max_first_error_latency_case", max_latency_label_);
+        std::printf(
+            "[ stop     ] max first confirmed error -> Completed latency %s ms (%s) over %u "
+            "runs; bound %s ms\n",
+            format_ms(max_latency_ns_).c_str(), max_latency_label_.c_str(), measurements_,
+            format_ms(k_stop_bound_ns).c_str());
+        std::fflush(stdout);
+    }
+
+    /** StopLatency's precondition, for the same 1 GiB region: fails rather than skips. */
     void SetUp() override {
         rq_system_info info{};
         info.struct_size = sizeof(rq_system_info);
         ASSERT_EQ(query_system(&info), RQ_OK);
+        ASSERT_GE(info.avail_phys_bytes, k_min_available_bytes)
+            << "Precondition failed: the first-error latency tests lock a 1 GiB region and need "
+               "at least 2 GiB of available physical memory, but only "
+            << info.avail_phys_bytes / k_mib << " MiB is available. Close other applications.";
         const std::size_t processors = enumerate_logical_processors().size();
         workers_ = static_cast<std::uint32_t>(std::min<std::size_t>(processors, k_max_workers));
         ASSERT_GT(workers_, 0U);
-        region_bytes_ = region_bytes_for(workers_, k_large_target_region_bytes);
-        if (info.avail_phys_bytes / 2U < region_bytes_) {
-            GTEST_SKIP() << "the large-region stop locks " << region_bytes_ / k_mib
-                         << " MiB and needs twice that available, but only "
-                         << info.avail_phys_bytes / k_mib << " MiB is available";
+    }
+
+    /** Records one run's latency, errors and release time as XML properties and a log line. */
+    static void report(const std::string& label, std::uint64_t confirmed_ns,
+                       const run_record& record);
+
+    static inline std::uint64_t suite_seed_ = 0;
+    static inline std::uint64_t max_latency_ns_ = 0;
+    static inline std::string max_latency_label_;
+    static inline std::uint32_t measurements_ = 0;
+
+    std::uint32_t workers_ = 0;
+};
+
+void FirstErrorLatency::report(const std::string& label, std::uint64_t confirmed_ns,
+                               const run_record& record) {
+    const std::uint64_t latency_ns = since(record.completed_ns, confirmed_ns);
+    // Release time is measured and logged only: it grows with the region, and the 2 s bound
+    // ends at Completed.
+    RecordProperty("first_error_latency_ms_" + label, format_ms(latency_ns));
+    RecordProperty("total_errors_" + label, record.result.total_errors);
+    RecordProperty("release_ms_" + label, record.release_ms);
+    RecordProperty("released_bytes_" + label, record.released_bytes);
+    std::printf("[ stop     ] %s: first confirmed error -> Completed %s ms, %llu errors, release "
+                "%llu ms (%llu MiB)\n",
+                label.c_str(), format_ms(latency_ns).c_str(),
+                static_cast<unsigned long long>(record.result.total_errors),
+                static_cast<unsigned long long>(record.release_ms),
+                static_cast<unsigned long long>(record.released_bytes / k_mib));
+    std::fflush(stdout);
+
+    ++measurements_;
+    if (latency_ns >= max_latency_ns_) {
+        max_latency_ns_ = latency_ns;
+        max_latency_label_ = label;
+    }
+}
+
+TEST_P(FirstErrorLatency, CompletedWithinTwoSecondsOfTheFirstConfirmedError) {
+    const auto& [phase, run_index] = GetParam();
+    const first_error_spec& spec = first_error_spec_for(phase);
+    const std::string label = std::string(spec.label) + "_" + std::to_string(run_index);
+    const std::uint64_t salt = static_cast<std::uint64_t>(phase) * k_first_error_runs_per_kind_u64 +
+                               static_cast<std::uint64_t>(run_index);
+    const std::uint64_t case_seed = mix_seed(suite_seed_, salt);
+    RecordProperty("case_seed", hex64(case_seed));
+    std::mt19937_64 rng(case_seed);
+    const std::uint64_t engine_seed = rng();
+    const std::uint64_t fault_seed = rng();
+
+    first_error_session run(spec, workers_, engine_seed, fault_seed);
+    const char* invalid = nullptr;
+    ASSERT_TRUE(validate_fault_spec(run.fault_spec(), run.config().region_bytes, &invalid))
+        << label << ": " << invalid;
+    ASSERT_EQ(run.create(), RQ_OK) << label;
+    ASSERT_EQ(run.start(), RQ_OK) << label;
+
+    ASSERT_TRUE(run.recorder().wait_completed(k_first_error_completed_timeout))
+        << label << ": no Completed within " << k_first_error_completed_timeout.count()
+        << " ms of the start, so no confirmed error cut the " << k_step_budget_ms
+        << " ms step short; re-reads=" << run.probe().rereads() << " "
+        << run.recorder().snapshot().describe();
+    ASSERT_TRUE(run.recorder().wait_released(k_released_timeout))
+        << label << ": no Released; " << run.recorder().snapshot().describe();
+    const run_record record = run.recorder().snapshot();
+    const std::uint64_t confirmed_ns = run.probe().earliest_confirmation_ns();
+    const std::uint64_t rereads = run.probe().rereads();
+    const std::uint32_t access_types = run.probe().access_types();
+    const std::uint64_t verified_injections = run.verified_injections();
+    ASSERT_EQ(run.destroy(), RQ_OK) << label;
+
+    // The confirming worker ended the run. No host stop was requested, and the first reason
+    // recorded decides the end, so any earlier stop would show here instead.
+    EXPECT_EQ(record.result.end_reason, RQ_END_FIRST_ERROR) << label << ": " << record.describe();
+    EXPECT_EQ(record.end_detail().rfind(k_first_error_detail_prefix, 0), 0U)
+        << label << ": end_detail '" << record.end_detail() << "' does not begin '"
+        << k_first_error_detail_prefix << "'";
+    EXPECT_GE(record.result.total_errors, 1U) << label;
+    EXPECT_NE(record.result.first_error_ms, RQ_NO_FIRST_ERROR) << label;
+    EXPECT_EQ(record.result.steps_completed, 0U) << label;
+
+    // The error met the step: it was prepared on the whole region, its gate continued, and its
+    // single result is cut short and carries every error.
+    EXPECT_TRUE(record.prepared()) << label;
+    EXPECT_EQ(record.prepared_info.tested_bytes, run.config().region_bytes) << label;
+    EXPECT_EQ(record.gates, 1U) << label;
+    ASSERT_TRUE(record.has_step_result) << label << ": " << record.describe();
+    EXPECT_EQ(record.step_result.index, 0U) << label;
+    EXPECT_EQ(record.step_result.completed, 0U) << label << ": the step ran to its schedule";
+    EXPECT_EQ(record.step_result.errors, record.result.total_errors) << label;
+
+    // Every error is an injected flip whose verification ran, re-read once in the phase kind
+    // under test, so the earliest re-read is no later than the confirmation that stopped the run.
+    EXPECT_GE(verified_injections, 1U) << label << ": the fault layer logged no verified injection";
+    EXPECT_EQ(record.result.total_errors, verified_injections) << label;
+    EXPECT_EQ(rereads, record.result.total_errors) << label;
+    EXPECT_EQ(access_types, access_type_bit(spec.access_type))
+        << label << ": the re-reads carried access-type mask " << access_types;
+
+    // The bound under test: the earliest confirmed error to on_completed.
+    ASSERT_NE(confirmed_ns, 0U) << label << ": no re-read confirmed an error";
+    const std::uint64_t latency_ns = since(record.completed_ns, confirmed_ns);
+    EXPECT_GE(record.completed_ns, confirmed_ns)
+        << label << ": Completed preceded the first confirmed error";
+    EXPECT_LE(latency_ns, k_stop_bound_ns)
+        << label << ": Completed arrived " << format_ms(latency_ns)
+        << " ms after the first confirmed error; the bound is 2 s";
+
+    // Completed and Released once each, in that order, and every locked byte released.
+    EXPECT_EQ(record.completed_calls, 1U) << label;
+    EXPECT_EQ(record.released_calls, 1U) << label;
+    EXPECT_GE(record.released_ns, record.completed_ns) << label << ": Released preceded Completed";
+    EXPECT_EQ(record.released_bytes, record.prepared_info.tested_bytes) << label;
+    report(label, confirmed_ns, record);
+}
+
+/** Test-name suffix: the phase kind and the run, for example turnaround_2. */
+std::string first_error_case_name(const ::testing::TestParamInfo<first_error_param>& info) {
+    return std::string(first_error_spec_for(std::get<0>(info.param)).label) + "_" +
+           std::to_string(std::get<1>(info.param));
+}
+
+const auto k_first_error_phases =
+    ::testing::Values(first_error_phase::windowed_verify, first_error_phase::hold_verify,
+                      first_error_phase::moving_inversion, first_error_phase::turnaround);
+
+INSTANTIATE_TEST_SUITE_P(StopOnFirstError, FirstErrorLatency,
+                         ::testing::Combine(k_first_error_phases,
+                                            ::testing::Range(0, k_first_error_runs_per_kind)),
+                         first_error_case_name);
+
+/**
+ * The preparation-release case's affinity seam. The worker pool starts only once allocation has
+ * locked the whole region, and its start waits for every worker's pin, so holding one pin holds
+ * preparation where every chunk is locked and no traffic can have run.
+ *
+ * The first pin(), on whichever worker calls first, stamps the QPC instant, signals the test
+ * thread and waits, bounded by k_phase_timeout_ms, until open(). Every pin, the held one included
+ * once it is let go, then pins through win32_thread_affinity, so the workers really are pinned and
+ * the run ends as a production one would. Workers call pin() concurrently: the hold is claimed
+ * with one atomic exchange, and its outcome is kept in atomics the test thread reads.
+ */
+class preparation_gate final : public IThreadAffinity {
+public:
+    /** Opens the gate on every exit from its scope, a failed assertion's early return included. */
+    class open_on_exit {
+    public:
+        explicit open_on_exit(preparation_gate& gate) noexcept : gate_(gate) {}
+        ~open_on_exit() { gate_.open(); }
+        open_on_exit(const open_on_exit&) = delete;
+        open_on_exit& operator=(const open_on_exit&) = delete;
+
+    private:
+        preparation_gate& gate_;
+    };
+
+    /** @throws std::system_error when an event cannot be created. */
+    preparation_gate() = default;
+    preparation_gate(const preparation_gate&) = delete;
+    preparation_gate& operator=(const preparation_gate&) = delete;
+
+    std::uint32_t pin(std::uint32_t worker_index, std::uint16_t group,
+                      std::uint8_t processor) override {
+        if (!claimed_.exchange(true, std::memory_order_acq_rel)) {
+            hold();
         }
+        return production_.pin(worker_index, group, processor);
+    }
+
+    /** Waits for a worker to reach the hold; true when one did within timeout_ms. */
+    bool wait_held(DWORD timeout_ms) const noexcept {
+        return WaitForSingleObject(held_event_.get(), timeout_ms) == WAIT_OBJECT_0;
+    }
+
+    /** Lets the held pin go on. Idempotent, and effective before the hold too. */
+    void open() noexcept {
+        if (!SetEvent(open_event_.get())) {
+            note_error(GetLastError());
+        }
+    }
+
+    /** QPC instant at which a worker reached the hold; 0 while none has. */
+    std::uint64_t held_ns() const noexcept { return held_ns_.load(std::memory_order_acquire); }
+
+    /** QPC instant at which the held pin went on; 0 while it is held or none was. */
+    std::uint64_t let_go_ns() const noexcept { return let_go_ns_.load(std::memory_order_acquire); }
+
+    /**
+     * How the held pin's wait ended: WAIT_OBJECT_0 when open() let it go, WAIT_TIMEOUT when the
+     * bound ran out first, and WAIT_FAILED when the wait failed or none has ended yet.
+     */
+    DWORD wait_result() const noexcept { return wait_result_.load(std::memory_order_acquire); }
+
+    /** Windows error of the first failed SetEvent or wait; ERROR_SUCCESS when none failed. */
+    DWORD error() const noexcept { return error_.load(std::memory_order_acquire); }
+
+private:
+    void hold() noexcept {
+        held_ns_.store(qpc_now_ns(), std::memory_order_release);
+        if (!SetEvent(held_event_.get())) {
+            note_error(GetLastError());
+        }
+        const DWORD waited = WaitForSingleObject(open_event_.get(), k_phase_timeout_ms);
+        if (waited == WAIT_FAILED) {
+            note_error(GetLastError());
+        }
+        let_go_ns_.store(qpc_now_ns(), std::memory_order_release);
+        wait_result_.store(waited, std::memory_order_release);
+    }
+
+    void note_error(DWORD error) noexcept {
+        DWORD none = ERROR_SUCCESS;
+        error_.compare_exchange_strong(none, error, std::memory_order_acq_rel);
+    }
+
+    win32_thread_affinity production_;
+    // The test thread is the held event's only waiter. The open event is manual-reset, so the
+    // held pin passes however open() and the hold are ordered, and opening twice is harmless.
+    event_handle held_event_{event_reset::automatic};
+    event_handle open_event_{event_reset::manual};
+    std::atomic<bool> claimed_{false};
+    std::atomic<std::uint64_t> held_ns_{0};
+    std::atomic<std::uint64_t> let_go_ns_{0};
+    std::atomic<DWORD> wait_result_{WAIT_FAILED};
+    std::atomic<DWORD> error_{ERROR_SUCCESS};
+};
+
+/**
+ * The preparation-release case's free seam: frees each chunk with VirtualFree, as production
+ * does, but only after holding it for a fixed delay, so releasing the region outlasts the stop
+ * bound however fast the machine frees memory. Each call stamps the QPC instant it began.
+ *
+ * The region calls it on one thread at a time, but a chunk it refused would be retried from any
+ * thread of the process, so each stamp has its own atomic slot, claimed through one atomic
+ * index, and nothing here allocates, takes a lock or throws. The test reads the stamps once the
+ * session is destroyed, which joins the coordinator that made the calls.
+ */
+class slow_chunk_free {
+public:
+    /** Room for capacity stamps; calls beyond it are counted but not stamped. */
+    slow_chunk_free(std::size_t capacity, std::uint64_t delay_ns)
+        : stamps_(capacity), delay_ns_(delay_ns) {}
+    slow_chunk_free(const slow_chunk_free&) = delete;
+    slow_chunk_free& operator=(const slow_chunk_free&) = delete;
+
+    /**
+     * The free_function contract: true once the chunk is freed; otherwise false, with the last
+     * error of the failed VirtualFree, and the chunk left allocated.
+     */
+    bool free_chunk(void* address) noexcept {
+        const std::uint64_t begin_ns = qpc_now_ns();
+        const std::uint64_t call = calls_.fetch_add(1U, std::memory_order_relaxed);
+        if (call < stamps_.size()) {
+            stamps_[static_cast<std::size_t>(call)].store(begin_ns, std::memory_order_relaxed);
+        }
+        // Held on QPC rather than by one Sleep, which can end up to a timer tick early, so every
+        // chunk adds at least the whole delay to the release.
+        const std::uint64_t until_ns = begin_ns + delay_ns_;
+        for (std::uint64_t now_ns = begin_ns; now_ns < until_ns; now_ns = qpc_now_ns()) {
+            Sleep(static_cast<DWORD>((until_ns - now_ns + k_ns_per_ms - 1U) / k_ns_per_ms));
+        }
+        if (VirtualFree(address, 0, MEM_RELEASE) != FALSE) {
+            return true;
+        }
+        const DWORD error = GetLastError();
+        failures_.fetch_add(1U, std::memory_order_relaxed);
+        DWORD none = ERROR_SUCCESS;
+        first_error_.compare_exchange_strong(none, error, std::memory_order_relaxed);
+        // The region reads why the chunk stayed allocated from the last error, as after a
+        // failed VirtualFree of its own.
+        SetLastError(error);
+        return false;
+    }
+
+    /** Calls made so far, freed or not. */
+    std::uint64_t calls() const noexcept { return calls_.load(std::memory_order_relaxed); }
+
+    /** Calls whose VirtualFree failed. */
+    std::uint64_t failures() const noexcept { return failures_.load(std::memory_order_relaxed); }
+
+    /** Windows error of the first failed VirtualFree; ERROR_SUCCESS when none failed. */
+    DWORD first_error() const noexcept { return first_error_.load(std::memory_order_relaxed); }
+
+    /** QPC instants at which the stamped calls began, in call order. */
+    std::vector<std::uint64_t> stamps() const {
+        const std::size_t count =
+            static_cast<std::size_t>(std::min<std::uint64_t>(calls(), stamps_.size()));
+        std::vector<std::uint64_t> copy;
+        copy.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            copy.push_back(stamps_[i].load(std::memory_order_relaxed));
+        }
+        return copy;
+    }
+
+private:
+    std::vector<std::atomic<std::uint64_t>> stamps_;
+    const std::uint64_t delay_ns_;
+    std::atomic<std::uint64_t> calls_{0};
+    std::atomic<std::uint64_t> failures_{0};
+    std::atomic<DWORD> first_error_{ERROR_SUCCESS};
+};
+
+/**
+ * A stop during preparation with the whole region locked, and a release slower than the bound.
+ * Its own suite, because gtest does not let TEST_F share the parameterised StopLatency fixture.
+ */
+class StopLatencyPreparationRelease : public ::testing::Test {
+protected:
+    /** StopLatency's precondition, as the case locks the same region: a failure, never a skip. */
+    void SetUp() override {
+        rq_system_info info{};
+        info.struct_size = sizeof(rq_system_info);
+        ASSERT_EQ(query_system(&info), RQ_OK);
+        ASSERT_GE(info.avail_phys_bytes, k_min_available_bytes)
+            << "Precondition failed: the stop-latency tests lock a 1 GiB region and need at "
+               "least 2 GiB of available physical memory, but only "
+            << info.avail_phys_bytes / k_mib << " MiB is available. Close other applications.";
+        const std::size_t processors = enumerate_logical_processors().size();
+        workers_ = static_cast<std::uint32_t>(std::min<std::size_t>(processors, k_max_workers));
+        ASSERT_GT(workers_, 0U);
     }
 
     std::uint32_t workers_ = 0;
-    std::uint64_t region_bytes_ = 0;
 };
 
-TEST_F(StopLatencyLargeRegion, CompletedWithinTwoSecondsOfAStopMidPreparation) {
-    const case_spec& spec = spec_for(stop_case::preparing);
-    RecordProperty("large_region_mib", region_bytes_ / k_mib);
-    RecordProperty("large_region_workers", workers_);
-    std::uint64_t threshold_bytes = region_bytes_ / 2U;
-    for (std::uint32_t attempt = 0; attempt < k_large_attempts; ++attempt) {
-        const std::string label = "large_preparing_attempt" + std::to_string(attempt);
-        stop_session run(spec, workers_, k_large_engine_seed + attempt, region_bytes_);
-        ASSERT_EQ(run.create(), RQ_OK) << label;
+TEST_F(StopLatencyPreparationRelease, CompletedWithinTwoSecondsBeforeASlowRelease) {
+    const std::uint64_t region_bytes = region_bytes_for(workers_);
+    const region_plan plan = plan_region(region_bytes, workers_);
+    const std::uint64_t chunk_count = std::uint64_t{plan.worker_count} * plan.chunks_per_slice;
+    ASSERT_EQ(plan.tested_bytes, region_bytes)
+        << region_bytes / k_mib << " MiB does not split into whole slices for " << workers_
+        << " workers";
+    ASSERT_GT(chunk_count, 0U);
+    // Whole milliseconds per chunk, rounded up: the chunks together are held for at least
+    // k_slow_release_ms, and release_ms, which truncates to milliseconds, can be held to it.
+    const std::uint64_t chunk_delay_ms = (k_slow_release_ms + chunk_count - 1U) / chunk_count;
+    const std::uint64_t slow_release_ms = chunk_delay_ms * chunk_count;
 
-        std::uint64_t baseline_bytes = 0;
-        DWORD query_error = ERROR_SUCCESS;
-        ASSERT_TRUE(query_working_set(baseline_bytes, query_error))
-            << label << ": GetProcessMemoryInfo failed (Windows error " << query_error << ")";
-        const std::uint64_t start_ns = qpc_now_ns();
-        ASSERT_EQ(run.start(), RQ_OK) << label;
+    const auto gate = std::make_shared<preparation_gate>();
+    const auto frees = std::make_shared<slow_chunk_free>(static_cast<std::size_t>(chunk_count),
+                                                         chunk_delay_ms * k_ns_per_ms);
+    stop_session run(spec_for(stop_case::preparing), workers_, k_preparation_release_seed);
+    // Destroyed before run, so a failed assertion lets the held worker go before
+    // session_destroy joins the coordinator that waits for it, not after the gate's bound.
+    const preparation_gate::open_on_exit opener(*gate);
+    stop_session::seams overrides;
+    overrides.affinity = gate;
+    // Shares the recorder, so it outlives every copy of the function the engine keeps.
+    overrides.free_override = [frees](void* address) noexcept {
+        return frees->free_chunk(address);
+    };
+    ASSERT_EQ(run.create(std::move(overrides)), RQ_OK);
+    ASSERT_EQ(run.start(), RQ_OK);
 
-        // Stops as soon as the threshold is locked, unless preparation ends first.
-        std::uint64_t locked_at_stop = 0;
-        bool threshold_reached = false;
-        for (;;) {
-            std::uint64_t working_set_bytes = 0;
-            ASSERT_TRUE(query_working_set(working_set_bytes, query_error))
-                << label << ": GetProcessMemoryInfo failed (Windows error " << query_error << ")";
-            locked_at_stop =
-                working_set_bytes > baseline_bytes ? working_set_bytes - baseline_bytes : 0U;
-            if (locked_at_stop >= threshold_bytes) {
-                threshold_reached = true;
-                break;
-            }
-            const run_record seen = run.recorder().snapshot();
-            ASSERT_FALSE(seen.completed())
-                << label << ": the run ended before " << threshold_bytes / k_mib
-                << " MiB was locked; " << seen.describe();
-            if (seen.prepared()) {
-                break;
-            }
-            ASSERT_LE(since(qpc_now_ns(), start_ns), k_phase_timeout_ms * k_ns_per_ms)
-                << label << ": " << locked_at_stop / k_mib << " MiB locked after 30 s; "
-                << seen.describe();
-            Sleep(1);
-        }
-        std::uint64_t stop_ns = 0;
-        ASSERT_EQ(run.stop_now(stop_ns), RQ_OK) << label;
+    // A worker reaches the hold only once allocation has locked every chunk; a run that ends
+    // first, for example for lack of lockable memory, shows its end reason here.
+    ASSERT_TRUE(gate->wait_held(k_phase_timeout_ms))
+        << "no worker pin within 30 s of the start; " << run.recorder().snapshot().describe();
+    std::uint64_t stop_ns = 0;
+    ASSERT_EQ(run.stop_now(stop_ns), RQ_OK);
+    gate->open();
 
-        ASSERT_TRUE(run.recorder().wait_completed(k_completed_timeout))
-            << label << ": no Completed within 10 s of the stop; "
-            << run.recorder().snapshot().describe();
-        ASSERT_TRUE(run.recorder().wait_released(k_released_timeout))
-            << label << ": no Released; " << run.recorder().snapshot().describe();
-        const run_record record = run.recorder().snapshot();
-        const std::uint64_t primitives = run.primitive_count();
-        ASSERT_EQ(run.destroy(), RQ_OK) << label;
+    ASSERT_TRUE(run.recorder().wait_completed(k_completed_timeout))
+        << "no Completed within 10 s of the stop; " << run.recorder().snapshot().describe();
+    ASSERT_TRUE(run.recorder().wait_released(k_released_timeout))
+        << "no Released; " << run.recorder().snapshot().describe() << "; " << frees->failures()
+        << " chunk frees failed, the first with Windows error " << frees->first_error();
+    const run_record record = run.recorder().snapshot();
+    const std::uint64_t primitives = run.primitive_count();
+    ASSERT_EQ(run.destroy(), RQ_OK);
+    const std::vector<std::uint64_t> free_ns = frees->stamps();
 
-        if (!threshold_reached || record.prepared()) {
-            // Preparation finished before the stop; aim the next attempt at an earlier point.
-            std::printf("[ stop     ] %s: Prepared arrived first at %llu MiB locked (preparation "
-                        "took %llu ms); next threshold %llu MiB\n",
-                        label.c_str(), static_cast<unsigned long long>(locked_at_stop / k_mib),
-                        static_cast<unsigned long long>(record.prepared_info.prepare_ms),
-                        static_cast<unsigned long long>(threshold_bytes / 2U / k_mib));
-            std::fflush(stdout);
-            threshold_bytes /= 2U;
-            continue;
-        }
+    const std::uint64_t latency_ns = since(record.completed_ns, stop_ns);
+    const std::string label = "preparation_release";
+    RecordProperty("region_mib_" + label, region_bytes / k_mib);
+    RecordProperty("chunks_" + label, chunk_count);
+    RecordProperty("chunk_delay_ms_" + label, chunk_delay_ms);
+    RecordProperty("stop_latency_ms_" + label, format_ms(latency_ns));
+    RecordProperty("release_ms_" + label, record.release_ms);
+    RecordProperty("released_bytes_" + label, record.released_bytes);
+    std::printf("[ stop     ] %s: stop -> Completed %s ms, release %llu ms (%llu MiB in %llu "
+                "chunks, at least %llu ms forced) after Completed\n",
+                label.c_str(), format_ms(latency_ns).c_str(),
+                static_cast<unsigned long long>(record.release_ms),
+                static_cast<unsigned long long>(record.released_bytes / k_mib),
+                static_cast<unsigned long long>(chunk_count),
+                static_cast<unsigned long long>(slow_release_ms));
+    std::fflush(stdout);
 
-        // The stop met preparation with gigabytes locked: no traffic, and Completed within the
-        // bound however much was locked.
-        const std::uint64_t latency_ns = since(record.completed_ns, stop_ns);
-        EXPECT_EQ(record.result.end_reason, RQ_END_USER_STOP) << label << ": " << record.describe();
-        EXPECT_EQ(record.prepared_calls, 0U) << label;
-        EXPECT_EQ(record.gates, 0U) << label;
-        EXPECT_EQ(record.result.step_result_count, 0U) << label;
-        EXPECT_EQ(primitives, 0U) << label << ": a stop during preparation ran traffic";
-        EXPECT_EQ(record.completed_calls, 1U) << label;
-        EXPECT_GE(record.completed_ns, stop_ns) << label << ": Completed preceded the stop request";
-        EXPECT_LE(latency_ns, k_stop_bound_ns)
-            << label << ": Completed arrived " << format_ms(latency_ns) << " ms after a stop with "
-            << locked_at_stop / k_mib << " MiB locked; the bound is 2 s";
+    // The stop met preparation held where every chunk is locked: no Prepared, no step gate, no
+    // step result and no memory traffic.
+    EXPECT_EQ(record.result.end_reason, RQ_END_USER_STOP) << record.describe();
+    EXPECT_EQ(record.prepared_calls, 0U);
+    EXPECT_EQ(record.gates, 0U);
+    EXPECT_EQ(record.result.step_result_count, 0U);
+    EXPECT_EQ(primitives, 0U) << "a stop during preparation ran traffic";
 
-        // The locked chunks are released after Completed and reported by Released. At most
-        // one chunk was still being locked when the stop was seen, and the working set also
-        // holds a little preparation memory outside the region.
-        EXPECT_EQ(record.released_calls, 1U) << label;
-        EXPECT_GE(record.released_ns, record.completed_ns)
-            << label << ": Released preceded Completed";
-        EXPECT_GT(record.released_bytes, 0U)
-            << label << ": the chunks locked before the stop were not reported by Released";
-        EXPECT_GE(record.released_bytes + k_chunk_bytes + k_large_working_set_slack_bytes,
-                  locked_at_stop)
-            << label << ": Released reported " << record.released_bytes / k_mib << " MiB but "
-            << locked_at_stop / k_mib << " MiB was locked at the stop";
-        EXPECT_LE(record.released_bytes, region_bytes_) << label;
+    // The test let the held pin go, after the stop, rather than the gate's bound running out.
+    EXPECT_EQ(gate->wait_result(), WAIT_OBJECT_0)
+        << "the held pin was not let go by the test; Windows error " << gate->error();
+    EXPECT_LE(gate->held_ns(), stop_ns) << "the stop preceded the hold";
+    EXPECT_GE(gate->let_go_ns(), stop_ns) << "the held pin went on before the stop";
 
-        // Release time is reported, never gated.
-        RecordProperty("large_attempts", attempt + 1U);
-        RecordProperty("large_locked_at_stop_mib", locked_at_stop / k_mib);
-        RecordProperty("large_stop_latency_ms", format_ms(latency_ns));
-        RecordProperty("large_released_bytes", record.released_bytes);
-        RecordProperty("large_release_ms", record.release_ms);
-        std::printf("[ stop     ] %s: %llu MiB locked at the stop, stop -> Completed %s ms, "
-                    "release %llu ms (%llu MiB) after Completed\n",
-                    label.c_str(), static_cast<unsigned long long>(locked_at_stop / k_mib),
-                    format_ms(latency_ns).c_str(),
-                    static_cast<unsigned long long>(record.release_ms),
-                    static_cast<unsigned long long>(record.released_bytes / k_mib));
-        std::fflush(stdout);
-        return;
-    }
-    FAIL() << "preparation finished before the stop in all " << k_large_attempts
-           << " attempts, so no stop met the Preparing state of the large region";
+    // The bound, although the release takes longer than it.
+    EXPECT_EQ(record.completed_calls, 1U);
+    EXPECT_GE(record.completed_ns, stop_ns) << "Completed preceded the stop request";
+    EXPECT_LE(latency_ns, k_stop_bound_ns)
+        << "Completed arrived " << format_ms(latency_ns)
+        << " ms after a stop with the whole region locked; the bound is 2 s";
+
+    // Every chunk is freed through the seam after Completed and before Released, so the release
+    // outlasted the bound without delaying Completed, and Released reports the whole region.
+    EXPECT_EQ(frees->calls(), chunk_count) << "frees through the seam, one per chunk of the region";
+    EXPECT_EQ(frees->failures(), 0U) << "the first with Windows error " << frees->first_error();
+    const auto freed_before_completed = std::count_if(
+        free_ns.begin(), free_ns.end(), [&](std::uint64_t ns) { return ns < record.completed_ns; });
+    const auto freed_after_released = std::count_if(
+        free_ns.begin(), free_ns.end(), [&](std::uint64_t ns) { return ns > record.released_ns; });
+    EXPECT_EQ(freed_before_completed, 0) << "chunks whose free began before Completed";
+    EXPECT_EQ(freed_after_released, 0) << "chunks whose free began after Released";
+    EXPECT_EQ(record.released_calls, 1U);
+    EXPECT_GE(record.released_ns, record.completed_ns) << "Released preceded Completed";
+    EXPECT_EQ(record.released_bytes, plan.tested_bytes)
+        << "Released did not report the whole region locked before the stop";
+    EXPECT_GE(record.release_ms, slow_release_ms)
+        << "the release took less than the delay the free seam forces";
+    EXPECT_GE(since(record.released_ns, record.completed_ns), slow_release_ms * k_ns_per_ms)
+        << "Released followed Completed by less than the delay the free seam forces";
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1192,13 +1904,95 @@ std::wstring unique_event_name() {
            std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(next.fetch_add(1));
 }
 
-/** Creates an unsignalled manual-reset event under a new name. */
-HANDLE create_named_event(const std::wstring& name) {
+/**
+ * Holds a test's event handle and lifts HANDLE_FLAG_PROTECT_FROM_CLOSE from it on every exit,
+ * a fatal assertion's early return and an exception included.
+ *
+ * No owner can close a handle protected from close, so a test that protected one and then ended
+ * early would leave it open for the rest of the process. The destructor therefore lifts the
+ * protection, then closes an owned handle. A borrowed handle is closed by the owner it belongs
+ * to: declared after that owner, this one is destroyed first and lifts the protection in time
+ * for that close, and adopt() takes the handle over once that owner has given it up. Only a
+ * close that succeeded gives the handle up, since after a failed one it is still open.
+ */
+class test_event_owner {
+public:
+    /** Whether the destructor closes the handle or leaves that to the owner it is borrowed from. */
+    enum class ownership { owned, borrowed };
+
+    /** Holds event, which may be null. */
+    explicit test_event_owner(HANDLE event, ownership held = ownership::owned) noexcept
+        : event_(event), owned_(held == ownership::owned) {}
+    ~test_event_owner() {
+        if (event_ == nullptr) {
+            return;
+        }
+        // A failure to lift the protection is left to the close that follows, which reports it.
+        SetHandleInformation(event_, HANDLE_FLAG_PROTECT_FROM_CLOSE, 0);
+        if (owned_) {
+            close_handle_checked(event_, L"test event");
+        }
+    }
+    test_event_owner(const test_event_owner&) = delete;
+    test_event_owner& operator=(const test_event_owner&) = delete;
+
+    HANDLE get() const noexcept { return event_; }
+
+    /** Protects the handle from close; false, with the reason in GetLastError(), on failure. */
+    bool protect() noexcept {
+        return SetHandleInformation(event_, HANDLE_FLAG_PROTECT_FROM_CLOSE,
+                                    HANDLE_FLAG_PROTECT_FROM_CLOSE) != FALSE;
+    }
+
+    /** Lifts the protection; false, with the reason in GetLastError(), on failure. */
+    bool unprotect() noexcept {
+        return SetHandleInformation(event_, HANDLE_FLAG_PROTECT_FROM_CLOSE, 0) != FALSE;
+    }
+
+    /**
+     * Takes over a borrowed handle that its owner gave up still open, and gives up one it closed.
+     * The protection tells them apart: the owner's close of a protected handle is refused, and a
+     * handle value the process reuses for a new handle comes without protection.
+     */
+    void adopt() noexcept {
+        DWORD flags = 0;
+        if (GetHandleInformation(event_, &flags) && (flags & HANDLE_FLAG_PROTECT_FROM_CLOSE) != 0) {
+            owned_ = true;
+        } else {
+            relinquish();
+        }
+    }
+
+    /** The close under test: close_handle_checked, giving the handle up only once it is closed. */
+    DWORD close_checked(const wchar_t* what) noexcept {
+        const DWORD error = close_handle_checked(event_, what);
+        if (error == ERROR_SUCCESS) {
+            relinquish();
+        }
+        return error;
+    }
+
+    /** Gives the handle up untouched, for a handle that is already closed. */
+    void relinquish() noexcept {
+        event_ = nullptr;
+        owned_ = false;
+    }
+
+private:
+    HANDLE event_;
+    bool owned_;
+};
+
+static_assert(noexcept(std::declval<test_event_owner&>().~test_event_owner()),
+              "test_event_owner cleans up while a failed assertion or an exception unwinds");
+
+/** Creates an unsignalled manual-reset event under a new name, owned by the result. */
+test_event_owner create_named_event(const std::wstring& name) {
     const HANDLE event = CreateEventW(nullptr, TRUE, FALSE, name.c_str());
     if (event == nullptr) {
         ADD_FAILURE() << "CreateEventW failed (Windows error " << GetLastError() << ")";
     }
-    return event;
+    return test_event_owner{event};
 }
 
 /** Succeeds when no event object of this name exists any more: its last handle was closed. */
@@ -1229,10 +2023,10 @@ static_assert(noexcept(close_handle_checked(nullptr, nullptr)),
 TEST(CloseHandleChecked, ClosesTheHandleAndWritesNothing) {
     debugger_line_capture capture;
     const std::wstring name = unique_event_name();
-    const HANDLE event = create_named_event(name);
-    ASSERT_NE(event, nullptr);
+    test_event_owner event = create_named_event(name);
+    ASSERT_NE(event.get(), nullptr);
 
-    EXPECT_EQ(close_handle_checked(event, L"test event"), static_cast<DWORD>(ERROR_SUCCESS));
+    EXPECT_EQ(event.close_checked(L"test event"), static_cast<DWORD>(ERROR_SUCCESS));
     EXPECT_TRUE(event_destroyed(name));
     EXPECT_TRUE(capture.lines().empty());
 }
@@ -1243,21 +2037,24 @@ TEST(CloseHandleChecked, StopSignalReportsAFailedCloseOfItsEvent) {
     }
     debugger_line_capture capture;
     auto signal = std::make_unique<stop_signal>();
-    const HANDLE event = signal->event_handle();
-    ASSERT_TRUE(
-        SetHandleInformation(event, HANDLE_FLAG_PROTECT_FROM_CLOSE, HANDLE_FLAG_PROTECT_FROM_CLOSE))
-        << "SetHandleInformation failed (Windows error " << GetLastError() << ")";
+    // Borrowed while the signal owns the event and destroyed before it, so that after a failure
+    // before reset() the signal's own close still succeeds.
+    test_event_owner event{signal->event_handle(), test_event_owner::ownership::borrowed};
+    ASSERT_TRUE(event.protect()) << "SetHandleInformation failed (Windows error " << GetLastError()
+                                 << ")";
 
-    // The destructor's close is refused; it reports that once and gives the event up.
+    // The destructor's close is refused; it reports that once and gives the event up, still
+    // open, so the test owns it from here.
     signal.reset();
+    event.adopt();
     EXPECT_EQ(capture.lines(),
               std::vector<std::wstring>{L"RAMQuick engine: CloseHandle of the session stop event "
                                         L"failed (Windows error 6)\n"});
 
     // The event is still open, so the test closes it; a second close would fail.
-    ASSERT_TRUE(SetHandleInformation(event, HANDLE_FLAG_PROTECT_FROM_CLOSE, 0))
+    ASSERT_TRUE(event.unprotect())
         << "SetHandleInformation failed (Windows error " << GetLastError() << ")";
-    EXPECT_EQ(close_handle_checked(event, L"test event"), static_cast<DWORD>(ERROR_SUCCESS));
+    EXPECT_EQ(event.close_checked(L"test event"), static_cast<DWORD>(ERROR_SUCCESS));
     EXPECT_EQ(capture.lines().size(), 1U);
 }
 
@@ -1304,15 +2101,14 @@ TEST_P(CloseHandleCheckedFailure, ReportsOnceAndLeavesTheHandleOpen) {
     const wchar_t* const what = param.what ? param.what->c_str() : nullptr;
     debugger_line_capture capture;
     const std::wstring name = unique_event_name();
-    const HANDLE event = create_named_event(name);
-    ASSERT_NE(event, nullptr);
+    test_event_owner event = create_named_event(name);
+    ASSERT_NE(event.get(), nullptr);
     // A handle protected from close makes CloseHandle fail while the handle stays valid.
-    ASSERT_TRUE(
-        SetHandleInformation(event, HANDLE_FLAG_PROTECT_FROM_CLOSE, HANDLE_FLAG_PROTECT_FROM_CLOSE))
-        << "SetHandleInformation failed (Windows error " << GetLastError() << ")";
+    ASSERT_TRUE(event.protect()) << "SetHandleInformation failed (Windows error " << GetLastError()
+                                 << ")";
 
     // Windows reports the refused close of a protected handle as ERROR_INVALID_HANDLE.
-    EXPECT_EQ(close_handle_checked(event, what), static_cast<DWORD>(ERROR_INVALID_HANDLE));
+    EXPECT_EQ(event.close_checked(what), static_cast<DWORD>(ERROR_INVALID_HANDLE));
 
     const std::wstring full = L"RAMQuick engine: CloseHandle of the " +
                               (what != nullptr ? std::wstring(what) : std::wstring(L"handle")) +
@@ -1321,16 +2117,16 @@ TEST_P(CloseHandleCheckedFailure, ReportsOnceAndLeavesTheHandleOpen) {
 
     // Neither forced closed nor stripped of its protection: the event is still open and usable.
     DWORD flags = 0;
-    EXPECT_TRUE(GetHandleInformation(event, &flags))
+    EXPECT_TRUE(GetHandleInformation(event.get(), &flags))
         << "GetHandleInformation failed (Windows error " << GetLastError() << ")";
     EXPECT_EQ(flags & HANDLE_FLAG_PROTECT_FROM_CLOSE,
               static_cast<DWORD>(HANDLE_FLAG_PROTECT_FROM_CLOSE));
-    EXPECT_EQ(WaitForSingleObject(event, 0), static_cast<DWORD>(WAIT_TIMEOUT));
+    EXPECT_EQ(WaitForSingleObject(event.get(), 0), static_cast<DWORD>(WAIT_TIMEOUT));
 
     // Once closable, one call closes it, the object goes away and nothing more is written.
-    ASSERT_TRUE(SetHandleInformation(event, HANDLE_FLAG_PROTECT_FROM_CLOSE, 0))
+    ASSERT_TRUE(event.unprotect())
         << "SetHandleInformation failed (Windows error " << GetLastError() << ")";
-    EXPECT_EQ(close_handle_checked(event, what), static_cast<DWORD>(ERROR_SUCCESS));
+    EXPECT_EQ(event.close_checked(what), static_cast<DWORD>(ERROR_SUCCESS));
     EXPECT_TRUE(event_destroyed(name));
     EXPECT_EQ(capture.lines().size(), 1U);
 }

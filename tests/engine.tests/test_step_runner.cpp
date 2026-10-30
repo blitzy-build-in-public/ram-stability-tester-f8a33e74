@@ -17,16 +17,19 @@
  * - RemainingTimeFormula and RemainingTimeStable: compute_remaining_ms as a pure function, and
  *   against the actual remaining time of a stable two-step run.
  * - StepRunnerFlushRule: at least three passes of every phase kind (windowed in four orders,
- *   hold, moving inversion, turnaround, and Half mode on two workers), each with two injected
- *   mismatches so the log carries re-reads. counting_memory_access records every primitive in
- *   issue order, and the checker requires, for every verified line on every pass, a fence, a
- *   flush covering the line and a fence after the line's previous store or load; hold steps show
- *   the same sequence before the hold and again after it. Each line is flushed exactly as often
- *   per pass as the rule requires, never more: no flush-and-reload over a small address set,
- *   the access style the product's stress bound excludes. No flush call covers more than one
- *   1 MiB work group, the unit after which workers check the stop flag. A BankStride pass
- *   issues exactly one strided stream and one strided verification per 1 MiB, whose lines
- *   expand to order_cursor's BankStride sequence.
+ *   hold, moving inversion, turnaround, and Half mode on one worker and on up to two, as many as
+ *   the host has logical processors), each with two injected mismatches so the log carries
+ *   re-reads. counting_memory_access records every primitive in issue order, and the checker
+ *   requires, for every verified line on every pass, a fence, a flush covering the line and a
+ *   fence after the line's previous store or load; hold steps show the same sequence before the
+ *   hold and again after it, and the session-clock readings around the records place each pass's
+ *   pre-hold closing fence no later than the start of the hold the runner actually waited, and
+ *   its post-hold sequence no earlier than that hold's end and at least the hold after the
+ *   fence. Each line is flushed exactly as often per pass as the rule requires, never more: no
+ *   flush-and-reload over a small address set, the access style the product's stress bound
+ *   excludes. No flush call covers more than one 1 MiB work group, the unit after which workers
+ *   check the stop flag. A BankStride pass issues exactly one strided stream and one strided
+ *   verification per 1 MiB, whose lines expand to order_cursor's BankStride sequence.
  * - StepRunnerFlushStop: a stop that lands during the first 1 MiB of every window or slice
  *   flush (windowed in two orders, pre-hold, post-hold, moving-inversion base write and sweep),
  *   or during a window's final write group, ends the phase within one work group of flushing,
@@ -34,6 +37,10 @@
  *   or slice.
  * - StepRunnerBankStrideStop: a stop during a BankStride window's verification ends it after
  *   the 1 MiB strided verification in flight, whose bytes alone are counted.
+ * - StepRunnerFlushChecker and StepRunnerHoldBracketChecker: the checker reports a log with a
+ *   dropped or duplicated fence or flush, and a hold log whose pre-hold flush is moved after
+ *   the wait or whose post-hold flush is moved before it, in time only, with order and counts
+ *   unchanged.
  *
  * Holds of 5 s finish instantly in fake time, while real worker threads still stream, flush and
  * verify real memory, so regions stay at 16 MiB or less. No test depends on an instruction set
@@ -334,13 +341,74 @@ struct harness_options {
     bool log_primitives = false;
 };
 
+/** One hold as the step runner waited it: session-clock readings at its start and its end. */
+struct hold_window {
+    std::uint64_t begin_ns = 0;
+    std::uint64_t end_ns = 0;
+};
+
+/**
+ * The step runner's session clock: forwards to the fixture's fake_clock and records every hold
+ * the runner waits. A hold issues no memory primitive, so the primitive log alone cannot show
+ * whether a flush ran before or after it; these windows are what the flush-rule checker brackets
+ * the pre-hold and post-hold sequences against.
+ *
+ * A hold is waited in slices. A wait that starts where the previous window ended, with no clock
+ * advance in between, extends that window; within a hold nothing else moves fake time, while
+ * pass_driver advances it at each pass's first primitive, so successive passes' holds stay
+ * distinct windows. Calls are forwarded, so fake_clock::waited_ms() and wait_calls() count them
+ * as before.
+ *
+ * Only the coordinator calls wait_for_stop (the test's thread inside runner_fixture::run), so the
+ * windows need no lock; the test reads them after run_step returns. now_ns() is also called from
+ * workers and only forwards, so it is as thread-safe as the clock it wraps.
+ */
+class hold_recording_clock final : public IClock {
+public:
+    /** @param inner The clock to forward to; held by reference, it must outlive this one. */
+    explicit hold_recording_clock(IClock& inner) noexcept : inner_(inner) {}
+
+    hold_recording_clock(const hold_recording_clock&) = delete;
+    hold_recording_clock& operator=(const hold_recording_clock&) = delete;
+    hold_recording_clock(hold_recording_clock&&) = delete;
+    hold_recording_clock& operator=(hold_recording_clock&&) = delete;
+
+    std::uint64_t now_ns() const noexcept override { return inner_.now_ns(); }
+
+    /**
+     * Forwards the wait and records the clock readings around it.
+     *
+     * @throws whatever the wrapped wait throws, or std::bad_alloc when the window list cannot
+     *         grow; either leaves run_step through its documented exception path.
+     */
+    bool wait_for_stop(const stop_signal& signal, std::uint64_t timeout_ms) override {
+        const std::uint64_t begin = inner_.now_ns();
+        const bool stopped = inner_.wait_for_stop(signal, timeout_ms);
+        const std::uint64_t end = inner_.now_ns();
+        if (!windows_.empty() && windows_.back().end_ns == begin) {
+            windows_.back().end_ns = end;
+        } else {
+            windows_.push_back(hold_window{begin, end});
+        }
+        return stopped;
+    }
+
+    /** Every hold window so far, in wait order. Read after run_step returns. */
+    std::span<const hold_window> windows() const noexcept { return windows_; }
+
+private:
+    IClock& inner_;
+    std::vector<hold_window> windows_;
+};
+
 /**
  * Everything session::state::prepare builds for a step runner, with substitutes: a locked
  * memory_region split into one slice per worker, a worker_pool pinned to the first placements
  * with the Win32 affinity, counting_memory_access over real_memory_access as the outermost layer
  * (the one the error collector re-reads through), a coverage_counter, an error_collector with
  * the application's cap and Stop on error off, a stop_signal, and a fake_clock that is the
- * session clock of every component.
+ * session clock of every component. The runner reads it through a hold_recording_clock, the
+ * only path to wait_for_stop, so holds() shows when each hold ran.
  *
  * Construction never throws: a failure leaves ready() false with setup_error() saying why, so
  * the test can ASSERT on it. The destructor shuts the pool down before anything the runner's
@@ -377,6 +445,9 @@ public:
     error_collector& errors() noexcept { return *errors_; }
     std::span<const slice_view> slices() const noexcept { return slices_; }
     std::uint64_t tested_bytes() const noexcept { return region_.tested_bytes(); }
+
+    /** The hold windows the runner waited, in order. Read after run(). */
+    std::span<const hold_window> holds() const noexcept { return runner_clock_.windows(); }
 
     /** One run_step call on this (the coordinator) thread. Precondition: ready(). */
     step_outcome run(const rq_step_def& step, std::uint32_t step_index, step_observer& observer) {
@@ -440,7 +511,7 @@ private:
             .pool = pool_,
             .errors = *errors_,
             .coverage = *coverage_,
-            .clock = clock_,
+            .clock = runner_clock_,
             .stop = stop_,
             .seed = k_session_seed,
         });
@@ -449,6 +520,7 @@ private:
     // Declaration order is dependency order: everything the pool's workers and the runner's
     // phase tasks refer to is declared before pool_ and therefore destroyed after it.
     fake_clock clock_;
+    hold_recording_clock runner_clock_{clock_};
     stop_signal stop_;
     memory_region region_;
     std::vector<slice_view> slices_;
@@ -688,14 +760,26 @@ private:
  * Hold steps additionally need a pre_hold_flush-phase flush after a fence following the slice
  * write, a pre_hold_flush-phase fence after it, then a verify-phase fence, a verify-phase flush
  * and a fence before the verification: the sequence before the hold and again after it.
+ * Positions alone cannot place those sequences in time, because the hold issues no primitive: a
+ * pre-hold flush issued after the wait would log the same order. So each pass's records are also
+ * bracketed by that pass's hold window on the same clock. The pass's last pre_hold_flush-phase
+ * record must be the closing fence, completed (clock_after_ns) no later than the hold began, and
+ * its first verify-phase record must start (clock_ns) no earlier than the hold ended and at least
+ * the hold's duration after that fence: no dirty cached copy is left while the hold runs.
  * Moving-inversion lines whose last access was a sweep need the full sequence before their next
  * store and at the end of the log, so every sweep, the last one included, is followed by it.
  */
 class flush_rule_checker {
 public:
-    flush_rule_checker(step_kind kind, const line_table& lines, std::uint32_t passes)
-        : kind_(kind), expected_(expectations_for(kind)), passes_(passes), lines_(lines),
-          states_(lines.line_count()) {}
+    /**
+     * @param hold_ns Hold steps: the step's hold duration. Ignored for other kinds.
+     * @param holds Hold steps: the hold window of each pass, in pass order (runner_fixture::holds);
+     *        a pass without one is reported. Ignored for other kinds. Must outlive check().
+     */
+    flush_rule_checker(step_kind kind, const line_table& lines, std::uint32_t passes,
+                       std::uint64_t hold_ns = 0, std::span<const hold_window> holds = {})
+        : kind_(kind), expected_(expectations_for(kind)), passes_(passes), hold_ns_(hold_ns),
+          holds_(holds), lines_(lines), states_(lines.line_count()) {}
 
     /** Checks one worker's complete log. Call once. */
     void check(const std::vector<primitive_record>& log) {
@@ -737,6 +821,9 @@ public:
         }
         for (std::size_t line = 0; line < states_.size(); ++line) {
             finish_line(line);
+        }
+        if (kind_ == step_kind::hold) {
+            check_hold_brackets(log);
         }
     }
 
@@ -971,6 +1058,83 @@ private:
         }
     }
 
+    /**
+     * Hold steps: places each pass's pre-hold and post-hold sequences in time against the pass's
+     * hold window, which the per-line position checks cannot do because the wait between the
+     * two sequences issues no primitive.
+     */
+    void check_hold_brackets(const std::vector<primitive_record>& log) {
+        // 1-based log positions, 0 meaning none: each pass's last pre_hold_flush-phase record
+        // (the closing fence) and its first verify-phase record (the post-hold opening fence).
+        std::vector<std::uint32_t> closing(passes_, 0);
+        std::vector<std::uint32_t> opening(passes_, 0);
+        for (std::size_t i = 0; i < log.size(); ++i) {
+            const access_context& ctx = log[i].ctx;
+            if (ctx.pass_index >= passes_) {
+                continue;
+            }
+            const std::uint32_t pos = static_cast<std::uint32_t>(i) + 1;
+            if (ctx.phase == phase_kind::pre_hold_flush) {
+                closing[ctx.pass_index] = pos;
+            } else if (ctx.phase == phase_kind::verify && opening[ctx.pass_index] == 0) {
+                opening[ctx.pass_index] = pos;
+            }
+        }
+        for (std::uint32_t pass = 0; pass < passes_; ++pass) {
+            if (pass >= holds_.size()) {
+                add_failure(where_pass(pass) + ": missing the pass's hold window (" +
+                            std::to_string(holds_.size()) + " recorded for " +
+                            std::to_string(passes_) + " passes)");
+                continue;
+            }
+            const hold_window& hold = holds_[pass];
+            if (closing[pass] == 0) {
+                add_failure(
+                    where_pass(pass) +
+                    ": missing the pre-hold closing fence (no pre_hold_flush-phase record)");
+                continue;
+            }
+            const primitive_record& fence = log[closing[pass] - 1];
+            if (fence.kind != primitive_kind::fence) {
+                fail_hold(fence, closing[pass],
+                          "the pass's last pre_hold_flush-phase record to be the pre-hold "
+                          "closing fence");
+                continue;
+            }
+            if (fence.clock_after_ns > hold.begin_ns) {
+                fail_hold(
+                    fence, closing[pass],
+                    "the pre-hold closing fence to complete before the hold: clock_after_ns " +
+                        std::to_string(fence.clock_after_ns) + " ns is after the hold's begin_ns " +
+                        std::to_string(hold.begin_ns) + " ns");
+            }
+            if (opening[pass] == 0) {
+                add_failure(where_pass(pass) +
+                            ": missing the post-hold sequence (no verify-phase record)");
+                continue;
+            }
+            const primitive_record& open = log[opening[pass] - 1];
+            if (open.clock_ns < hold.end_ns) {
+                fail_hold(open, opening[pass],
+                          "the post-hold sequence to start after the hold: clock_ns " +
+                              std::to_string(open.clock_ns) + " ns is before the hold's end_ns " +
+                              std::to_string(hold.end_ns) + " ns");
+            }
+            const std::uint64_t earliest = fence.clock_after_ns > UINT64_MAX - hold_ns_
+                                               ? UINT64_MAX
+                                               : fence.clock_after_ns + hold_ns_;
+            if (open.clock_ns < earliest) {
+                fail_hold(open, opening[pass],
+                          "the post-hold sequence to start at least the hold (" +
+                              std::to_string(hold_ns_) +
+                              " ns) after the pre-hold closing fence: clock_ns " +
+                              std::to_string(open.clock_ns) + " ns is before " +
+                              std::to_string(earliest) + " ns, the fence's clock_after_ns " +
+                              std::to_string(fence.clock_after_ns) + " ns plus the hold");
+            }
+        }
+    }
+
     /** "<kind> pass P worker W line 0x...": where a line-level failure happened. */
     std::string where(std::size_t line, std::uint32_t pass) const {
         return std::string(kind_name(kind_)) + " pass " + std::to_string(pass) + " worker " +
@@ -986,6 +1150,17 @@ private:
     void fail_record(const primitive_record& record, std::uint32_t pos, const char* missing) {
         add_failure(std::string(kind_name(kind_)) + " record #" + std::to_string(pos) + " (" +
                     describe(record) + "): expected " + missing);
+    }
+
+    /** "<kind> pass P worker W": where a pass-level failure happened. */
+    std::string where_pass(std::uint32_t pass) const {
+        return std::string(kind_name(kind_)) + " pass " + std::to_string(pass) + " worker " +
+               std::to_string(worker_);
+    }
+
+    void fail_hold(const primitive_record& record, std::uint32_t pos, const std::string& expected) {
+        add_failure(where_pass(record.ctx.pass_index) + " record #" + std::to_string(pos) + " (" +
+                    describe(record) + "): expected " + expected);
     }
 
     void fail_count(std::size_t line, std::uint32_t pass, const char* what, std::uint32_t actual,
@@ -1004,6 +1179,8 @@ private:
     const step_kind kind_;
     const kind_expectations expected_;
     const std::uint32_t passes_;
+    const std::uint64_t hold_ns_;
+    const std::span<const hold_window> holds_;
     const line_table& lines_;
     std::vector<line_state> states_;
     /** The worker whose log is checked; every record of a per-worker log carries it. */
@@ -1830,6 +2007,7 @@ struct flush_case {
     std::uint32_t order;
     std::uint32_t threads;
     std::uint32_t hold_ms;
+    /** Workers wanted; fewer when the host has fewer logical processors. */
     std::uint32_t workers;
     std::uint64_t region_bytes;
 };
@@ -1838,7 +2016,11 @@ void PrintTo(const flush_case& c, std::ostream* os) {
     *os << c.name;
 }
 
-/** Every phase kind, the windowed one in each access order, plus Half mode on two workers. */
+/**
+ * Every phase kind, the windowed one in each access order, plus Half mode twice: on two workers
+ * where the host has two logical processors, so the even worker also covers its idle partner's
+ * slice, and on one worker on every host, the odd count whose last even worker has no partner.
+ */
 constexpr flush_case k_flush_cases[] = {
     {"WindowedRandomSequentialAscending", RQ_PATTERN_RANDOM, RQ_ORDER_SEQUENTIAL_ASCENDING,
      RQ_THREADS_ALL, 0, 1, k_flush_region_bytes},
@@ -1856,15 +2038,23 @@ constexpr flush_case k_flush_cases[] = {
      RQ_THREADS_ALL, 0, 1, k_flush_region_bytes},
     {"TurnaroundRandom", RQ_PATTERN_RANDOM, RQ_ORDER_TURNAROUND, RQ_THREADS_ALL, 0, 1,
      k_flush_region_bytes},
-    {"WindowedRandomSequentialHalfOnTwoWorkers", RQ_PATTERN_RANDOM, RQ_ORDER_SEQUENTIAL_ASCENDING,
+    {"WindowedRandomSequentialHalfUpToTwoWorkers", RQ_PATTERN_RANDOM, RQ_ORDER_SEQUENTIAL_ASCENDING,
      RQ_THREADS_HALF, 0, 2, k_flush_region_bytes},
+    {"WindowedRandomSequentialHalfOnOneWorker", RQ_PATTERN_RANDOM, RQ_ORDER_SEQUENTIAL_ASCENDING,
+     RQ_THREADS_HALF, 0, 1, k_flush_region_bytes},
 };
 
 class StepRunnerFlushRule : public ::testing::TestWithParam<flush_case> {};
 
 TEST_P(StepRunnerFlushRule, EveryVerifiedLineFollowsFenceFlushFenceOnEveryPass) {
     const flush_case& c = GetParam();
-    runner_fixture fixture(harness_options{c.workers, c.region_bytes, true});
+    // A supported host may have a single logical processor; the case then runs on the workers it
+    // has, and its Half step on one worker is the even worker without a partner.
+    const std::uint32_t workers = static_cast<std::uint32_t>(
+        std::min<std::size_t>(c.workers, enumerate_logical_processors().size()));
+    SCOPED_TRACE(std::to_string(workers) + " of " + std::to_string(c.workers) +
+                 " wanted worker(s)");
+    runner_fixture fixture(harness_options{workers, c.region_bytes, true});
     ASSERT_TRUE(fixture.ready()) << fixture.setup_error();
     // Three passes of 1 s plus the hold each, against a budget of exactly three.
     const std::uint32_t pass_ms =
@@ -1887,17 +2077,20 @@ TEST_P(StepRunnerFlushRule, EveryVerifiedLineFollowsFenceFlushFenceOnEveryPass) 
     ASSERT_EQ(driver.injected().size(), k_injection_passes.size())
         << "every injection pass must reach its final fence";
 
-    // One worker covers every slice: worker 0, which in Half mode also covers worker 1's slice.
+    // One worker covers every slice: worker 0, which in Half mode on two workers also covers
+    // worker 1's slice.
     const std::vector<primitive_record> log = fixture.memory().log_for_worker(0);
-    for (std::uint32_t idle = 1; idle < c.workers; ++idle) {
+    for (std::uint32_t idle = 1; idle < workers; ++idle) {
         EXPECT_TRUE(fixture.memory().log_for_worker(idle).empty())
             << "the idle Half-mode partner, worker " << idle << ", issued primitives";
     }
 
     // The rule for every verified line, on the first pass and on every later one, with exact
-    // per-pass flush counts: nothing is flushed beyond the rule.
+    // per-pass flush counts: nothing is flushed beyond the rule. Hold steps' sequences are also
+    // bracketed by the time each hold actually ran.
+    const std::uint64_t hold_ns = std::uint64_t{c.hold_ms} * k_ns_per_ms;
     const line_table lines(fixture.slices());
-    flush_rule_checker checker(kind, lines, outcome.passes);
+    flush_rule_checker checker(kind, lines, outcome.passes, hold_ns, fixture.holds());
     checker.check(log);
     EXPECT_EQ(checker.failure_count(), 0u) << checker.report();
 
@@ -1950,6 +2143,14 @@ TEST_P(StepRunnerFlushRule, EveryVerifiedLineFollowsFenceFlushFenceOnEveryPass) 
     if (kind == step_kind::hold) {
         // The holds passed in fake time only.
         EXPECT_EQ(fixture.clock().waited_ms(), std::uint64_t{outcome.passes} * c.hold_ms);
+        // One contiguous window per pass, each exactly the hold: the windows the checker
+        // bracketed the sequences against are the holds themselves.
+        const std::span<const hold_window> holds = fixture.holds();
+        ASSERT_EQ(holds.size(), outcome.passes);
+        for (std::size_t pass = 0; pass < holds.size(); ++pass) {
+            EXPECT_EQ(holds[pass].end_ns - holds[pass].begin_ns, hold_ns)
+                << "hold of pass " << pass;
+        }
     }
 }
 
@@ -2244,6 +2445,109 @@ TEST_P(StepRunnerFlushChecker, ReportsWhatAMutatedSequenceIsMissing) {
 INSTANTIATE_TEST_SUITE_P(StepRunnerMutations, StepRunnerFlushChecker,
                          ::testing::ValuesIn(k_mutation_cases),
                          [](const ::testing::TestParamInfo<mutation_case>& info) {
+                             return std::string(info.param.name);
+                         });
+
+/** Which of pass 1's hold sequences is moved across the hold, in time only. */
+enum class hold_move {
+    /** The pre-hold stream's fence, flush, fence, as a runner issuing them after the wait. */
+    pre_hold_flush_after_the_hold,
+    /** The post-hold fence, flush, fence, as a runner issuing them before the wait. */
+    post_hold_flush_before_the_hold,
+};
+
+struct hold_mutation_case {
+    const char* name;
+    hold_move move;
+    /** Text the checker's report must contain. */
+    const char* reported;
+};
+
+void PrintTo(const hold_mutation_case& c, std::ostream* os) {
+    *os << c.name;
+}
+
+constexpr hold_mutation_case k_hold_mutation_cases[] = {
+    {"PreHoldFlushAfterTheHold", hold_move::pre_hold_flush_after_the_hold,
+     "expected the pre-hold closing fence to complete before the hold"},
+    {"PostHoldFlushBeforeTheHold", hold_move::post_hold_flush_before_the_hold,
+     "expected the post-hold sequence to start after the hold"},
+};
+
+class StepRunnerHoldBracketChecker : public ::testing::TestWithParam<hold_mutation_case> {};
+
+// A flush moved across the wait keeps the log's order and counts, so only the clock brackets
+// can show that dirty cached data could have outlived the start of the hold.
+TEST_P(StepRunnerHoldBracketChecker, ReportsAFlushMovedAcrossTheHold) {
+    const hold_mutation_case& c = GetParam();
+    constexpr std::uint32_t k_hold_ms = 5'000;
+    constexpr std::uint64_t k_hold_ns = std::uint64_t{k_hold_ms} * k_ns_per_ms;
+    runner_fixture fixture(harness_options{1, k_schedule_region_bytes, true});
+    ASSERT_TRUE(fixture.ready()) << fixture.setup_error();
+    pass_driver driver(fixture, {k_flush_pass_ns});
+    const rq_step_def step = make_step(
+        RQ_PATTERN_RANDOM, RQ_ORDER_RANDOM_BLOCKS, RQ_THREADS_ALL, k_hold_ms,
+        k_flush_passes * (static_cast<std::uint32_t>(k_flush_pass_ns / k_ns_per_ms) + k_hold_ms));
+    ASSERT_EQ(classify_step(step), step_kind::hold);
+    recording_observer observer;
+    const step_outcome outcome = fixture.run(step, 0, observer);
+    EXPECT_FALSE(driver.script_failed());
+    ASSERT_TRUE(outcome.completed);
+    ASSERT_EQ(outcome.passes, k_flush_passes);
+    ASSERT_FALSE(fixture.memory().log_overflowed());
+    const std::span<const hold_window> holds = fixture.holds();
+    ASSERT_EQ(holds.size(), outcome.passes);
+    const std::vector<primitive_record> log = fixture.memory().log_for_worker(0);
+    const line_table lines(fixture.slices());
+
+    flush_rule_checker intact(step_kind::hold, lines, outcome.passes, k_hold_ns, holds);
+    intact.check(log);
+    ASSERT_EQ(intact.failure_count(), 0u) << intact.report();
+
+    // Pass 1's records keep their places; only their clock readings become what a runner that
+    // issued them on the other side of the wait would have recorded.
+    std::vector<primitive_record> moved_log = log;
+    std::size_t moved = 0;
+    bool before_first_verification = true;
+    for (primitive_record& record : moved_log) {
+        if (record.ctx.pass_index != 1) {
+            continue;
+        }
+        if (c.move == hold_move::pre_hold_flush_after_the_hold) {
+            if (record.ctx.phase == phase_kind::pre_hold_flush) {
+                record.clock_ns = holds[1].end_ns;
+                record.clock_after_ns = holds[1].end_ns;
+                ++moved;
+            }
+            continue;
+        }
+        if (record.kind == primitive_kind::verify) {
+            before_first_verification = false;
+        }
+        if (before_first_verification && record.ctx.phase == phase_kind::verify &&
+            (record.kind == primitive_kind::fence || record.kind == primitive_kind::flush)) {
+            record.clock_ns = holds[1].begin_ns;
+            record.clock_after_ns = holds[1].begin_ns;
+            ++moved;
+        }
+    }
+    ASSERT_GT(moved, 0u) << "pass 1 has no record of the moved sequence";
+    EXPECT_EQ(pass_signature(moved_log, 1), pass_signature(log, 1))
+        << "the move must be invisible to order-only evidence";
+
+    flush_rule_checker mutated(step_kind::hold, lines, outcome.passes, k_hold_ns, holds);
+    mutated.check(moved_log);
+    EXPECT_GT(mutated.failure_count(), 0u);
+    const std::string report = mutated.report();
+    EXPECT_NE(report.find("hold pass 1 worker 0 record #"), std::string::npos) << report;
+    EXPECT_NE(report.find(c.reported), std::string::npos) << report;
+    EXPECT_EQ(report.find("hold pass 0 "), std::string::npos) << report;
+    EXPECT_EQ(report.find("hold pass 2 "), std::string::npos) << report;
+}
+
+INSTANTIATE_TEST_SUITE_P(StepRunnerHoldMutations, StepRunnerHoldBracketChecker,
+                         ::testing::ValuesIn(k_hold_mutation_cases),
+                         [](const ::testing::TestParamInfo<hold_mutation_case>& info) {
                              return std::string(info.param.name);
                          });
 

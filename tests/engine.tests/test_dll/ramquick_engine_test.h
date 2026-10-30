@@ -294,10 +294,12 @@ RQ_API rq_result RQ_CALL rq_test_session_create(const rq_session_config* config,
                                                 rq_session_handle* out) RQ_NOEXCEPT;
 
 /**
- * Reads the counting layer's total of bytes passed to the verify primitives (verify and
- * verify_and_stream; re-reads excluded). The layer counts independently of the engine's coverage
- * counter, so tests compare this total with rq_progress.verified_bytes and
- * rq_run_result.verified_bytes, which must agree within 1 %.
+ * Reads the counting layer's total of bytes passed to the verification primitives: word_count x 8
+ * for each verify and verify_and_stream call, and visit_count x 64 for each verify_strided call,
+ * which compares only the 64-byte lines it visits rather than its whole span. Re-reads are
+ * excluded. The layer counts independently of the engine's coverage counter, so tests compare
+ * this total with rq_progress.verified_bytes and rq_run_result.verified_bytes, which must agree
+ * within 1 %.
  *
  * Safe during and after a run, until rq_session_destroy; the total is read atomically.
  *

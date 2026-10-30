@@ -31,6 +31,7 @@
  */
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -50,8 +51,9 @@ namespace rq::engine {
  * ------------------------------------------------------------------------------------------- */
 
 /**
- * The replaceable seams of one session: its clock, its memory-access layer stack and its thread
- * affinity. Passed by value to session_create, which moves every member into the session.
+ * The replaceable seams of one session: its clock, its memory-access layer stack, its thread
+ * affinity, and the lock and free calls of its region. Passed by value to session_create, which
+ * moves every member into the session.
  *
  * - api.cpp passes a default-constructed instance, the production configuration: qpc_clock, the
  *   real memory-access layer alone and win32_thread_affinity.
@@ -105,6 +107,19 @@ struct session_dependencies {
      * release fail deterministically.
      */
     std::function<bool(void* address)> free_override;
+
+    /**
+     * Locks each chunk of the session's region in place of VirtualLock; empty, as in
+     * production, means VirtualLock. The same signature and contract as memory_region.h's
+     * lock_function, spelled out so this header pulls in no region type: return false with the
+     * Windows last-error set to fail that chunk's lock, and never throw. The coordinator's
+     * preparation hands it to the region, which calls it on the coordinator for every chunk it
+     * locks, so shrink-and-retry and exhaustion follow from it exactly as from VirtualLock.
+     * While it is set the region uses 4 KiB pages only, whatever the token holds, because
+     * large-page chunks are never locked and would bypass it; so every chunk passes through it.
+     * A test seam that makes lock exhaustion (RQ_END_INSUFFICIENT_MEMORY) deterministic.
+     */
+    std::function<bool(void* address, std::size_t bytes)> lock_override;
 };
 
 /* ---------------------------------------------------------------------------------------------

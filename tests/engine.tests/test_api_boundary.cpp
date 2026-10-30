@@ -3,14 +3,20 @@
  * @brief Contract tests of the flat C ABI in ramquick_engine.h, through the exports of api.cpp.
  *
  * - ApiBoundaryAbi: struct sizes and C layout, the noexcept boundary (no C++ exception can
- *   cross it: a throw inside an export would terminate the process, never propagate), the API
- *   version a host checks at bind time, and the result-code messages.
+ *   cross it: a throw that escaped an export would terminate the process, never propagate),
+ *   the API version a host checks at bind time, and the result-code messages. noexcept alone
+ *   cannot show that the exports' handlers exist; ApiBoundaryExceptions does.
  * - ApiBoundarySystem: rq_query_system's argument checks and its description of this machine.
  * - ApiBoundaryCreateInvalid and ApiBoundaryCreateValid: each validation rule of
  *   rq_session_create rejects its case with RQ_E_INVALID_ARGUMENT, leaves the handle null and
  *   registers nothing; configurations at the rules' limits are accepted.
  * - ApiBoundaryHandle: null, never-issued and destroyed handles, unknown stop reasons, double
  *   start and get_result before Completed.
+ * - ApiBoundaryExceptions: a std::bad_alloc thrown inside rq_query_system and at every
+ *   allocation of rq_session_create is translated by the export's handler into RQ_E_INTERNAL
+ *   rather than terminating the process; the out struct stays unwritten, the handle is cleared
+ *   and no session is registered. The exception comes from the allocation refusal below, which
+ *   throws a C++ exception only, never an SEH fault.
  * - ApiBoundaryRun: the event order and payloads of a normal run, the deep copy, destroy from
  *   inside every callback and while running, and the forced instruction set.
  * - ApiBoundaryStopBeforeStart and ApiBoundaryGateAbort: first-writer-wins stop reasons and the
@@ -32,8 +38,10 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <thread>
@@ -44,6 +52,81 @@
 #include "core/session.h"
 #include "core/kernels/isa_dispatch.h"
 #include "core/system_info.h"
+
+/* ---------------------------------------------------------------------------------------------
+ * Allocation refusal: the test-only failure seam of ApiBoundaryExceptions
+ *
+ * The exports build their production session_dependencies themselves, so no substitute layer
+ * reachable through api.cpp can throw; allocation is the one throwing point every export shares.
+ * These definitions replace the global allocation functions, as the standard permits a program
+ * to, for the whole of engine.tests.exe: engine_core.lib, api.cpp and GoogleTest allocate
+ * through them. Unarmed they behave as the defaults do, so every other test is unaffected.
+ *
+ * Armed on a thread, every request of at least k_refusable_bytes after the first pass_remaining
+ * such requests throws std::bad_alloc and is counted. The state is per thread, so a thread the
+ * engine or GoogleTest runs is never refused. Smaller requests always succeed: in Debug builds
+ * (_ITERATOR_DEBUG_LEVEL 2) MSVC's noexcept std::vector default constructor allocates a 16-byte
+ * _Container_proxy, where a refusal would call std::terminate instead of reaching an export's
+ * handler. Array and nothrow forms forward to these functions in the MSVC runtime.
+ * ------------------------------------------------------------------------------------------- */
+
+namespace {
+
+/** Smallest request the refusal fails. */
+constexpr std::size_t k_refusable_bytes = 64;
+
+/** Plain data, so the thread_local is constant-initialised and safe before main. */
+struct allocation_refusal_state {
+    bool armed;
+    std::uint32_t pass_remaining;
+    std::uint32_t refused;
+};
+
+constinit thread_local allocation_refusal_state refusal_state{false, 0, 0};
+
+/** True when this request must throw; consumes one let-through request otherwise. */
+bool refuse_allocation(std::size_t size) noexcept {
+    allocation_refusal_state& state = refusal_state;
+    if (!state.armed || size < k_refusable_bytes) {
+        return false;
+    }
+    if (state.pass_remaining != 0) {
+        --state.pass_remaining;
+        return false;
+    }
+    ++state.refused;
+    return true;
+}
+
+}  // namespace
+
+void* operator new(std::size_t size) {
+    if (refuse_allocation(size)) {
+        throw std::bad_alloc();
+    }
+    // As the default does: a zero-size request still yields a unique pointer, and a failure
+    // runs the installed new-handler until it frees memory or there is none left to run.
+    const std::size_t bytes = size == 0 ? 1 : size;
+    for (;;) {
+        void* const block = std::malloc(bytes);
+        if (block != nullptr) {
+            return block;
+        }
+        const std::new_handler handler = std::get_new_handler();
+        if (handler == nullptr) {
+            throw std::bad_alloc();
+        }
+        handler();
+    }
+}
+
+void operator delete(void* block) noexcept {
+    std::free(block);
+}
+
+void operator delete(void* block, std::size_t) noexcept {
+    std::free(block);
+}
 
 namespace rq::engine::test {
 namespace {
@@ -67,7 +150,9 @@ static_assert(sizeof(rq_progress) == 72 && k_is_c_layout<rq_progress>);
 static_assert(sizeof(rq_error_record) == 112 && k_is_c_layout<rq_error_record>);
 static_assert(sizeof(rq_run_result) == 192 && k_is_c_layout<rq_run_result>);
 
-// Every export is noexcept, so no C++ exception can unwind into a host frame.
+// Every export is noexcept, so no C++ exception can unwind into a host frame. This proves only
+// that an escaping exception would terminate the process; ApiBoundaryExceptions throws one
+// inside the exports at run time and shows their handlers translate it into RQ_E_INTERNAL.
 static_assert(noexcept(rq_api_version()));
 static_assert(noexcept(rq_query_system(nullptr)));
 static_assert(noexcept(rq_session_create(nullptr, nullptr, nullptr)));
@@ -1075,6 +1160,113 @@ TEST_F(ApiBoundaryHandle, StartIsAllowedOnceAndTheResultOnlyAfterCompleted) {
     ASSERT_TRUE(returns(rq_session_get_result(session.get(), &result), RQ_OK));
     EXPECT_EQ(result.end_reason, RQ_END_USER_STOP);
     EXPECT_TRUE(returns(session.destroy(), RQ_OK));
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * ApiBoundaryExceptions: C++ exceptions inside the exports
+ *
+ * rq_session_start is not swept: its only allocation, std::thread's 8-byte start state, is
+ * below k_refusable_bytes, so no refusal can reach it.
+ * ------------------------------------------------------------------------------------------- */
+
+/**
+ * Arms the allocation refusal on the constructing thread until destruction: the first
+ * pass_through refusable requests succeed and every later one throws std::bad_alloc. GoogleTest
+ * allocates, so no assertion may run while one is alive; tests capture the export's result and
+ * refused() inside the guard's scope and assert after it.
+ */
+class allocation_refusal {
+public:
+    explicit allocation_refusal(std::uint32_t pass_through = 0) noexcept {
+        refusal_state = {true, pass_through, 0};
+    }
+    allocation_refusal(const allocation_refusal&) = delete;
+    allocation_refusal& operator=(const allocation_refusal&) = delete;
+    ~allocation_refusal() { refusal_state.armed = false; }
+
+    /** Requests refused on this thread since construction. */
+    std::uint32_t refused() const noexcept { return refusal_state.refused; }
+};
+
+/** Refusal points the create sweep tries; far more than session creation allocates. */
+constexpr std::uint32_t k_max_create_refusal_points = 256;
+
+class ApiBoundaryExceptions : public ApiBoundarySession {};
+
+TEST_F(ApiBoundaryExceptions, QuerySystemTranslatesAThrownExceptionAndLeavesTheStructUnwritten) {
+    rq_system_info info{};
+    std::memset(&info, 0xA5, sizeof(info));
+    info.struct_size = sizeof(rq_system_info);
+    const rq_system_info untouched = info;
+
+    rq_result code = k_not_called;
+    std::uint32_t refused = 0;
+    {
+        const allocation_refusal refusal;
+        code = rq_query_system(&info);
+        refused = refusal.refused();
+    }
+
+    EXPECT_GE(refused, 1U) << "rq_query_system made no refusable allocation, so nothing threw";
+    EXPECT_TRUE(returns(code, RQ_E_INTERNAL));
+    // query_system fills a local and copies it once, after its last throwing call.
+    EXPECT_EQ(std::memcmp(&info, &untouched, sizeof(info)), 0) << "the struct was written";
+
+    rq_system_info after{};
+    after.struct_size = sizeof(rq_system_info);
+    EXPECT_TRUE(returns(rq_query_system(&after), RQ_OK)) << "unarmed, after the refusal";
+}
+
+TEST_F(ApiBoundaryExceptions, CreateTranslatesAThrowAtEveryAllocationAndRegistersNothing) {
+    callback_recorder recorder;
+    const std::vector<rq_step_def> steps = valid_steps();
+    const rq_session_config config = valid_config(steps);
+    const rq_callbacks callbacks = recorder.callbacks();
+
+    // Pass n lets the first n refusable allocations of the call through and throws at the next,
+    // so the sweep reaches every allocation creation makes; the first pass that refuses nothing
+    // is a complete, successful creation and ends it.
+    std::uint32_t failing_points = 0;
+    bool created_unrefused = false;
+    for (std::uint32_t pass = 0; pass < k_max_create_refusal_points && !created_unrefused; ++pass) {
+        // A non-null sentinel shows that a translated exception leaves no stale handle.
+        rq_session_handle handle = reinterpret_cast<rq_session_handle>(std::uintptr_t{0x1000});
+        const std::uint32_t before = live_session_count();
+        rq_result code = k_not_called;
+        std::uint32_t refused = 0;
+        {
+            const allocation_refusal refusal(pass);
+            code = rq_session_create(&config, &callbacks, &handle);
+            refused = refusal.refused();
+        }
+
+        if (refused == 0) {
+            created_unrefused = true;
+            EXPECT_TRUE(returns(code, RQ_OK)) << "pass " << pass << ": nothing was refused";
+            EXPECT_NE(handle, nullptr) << "pass " << pass;
+            EXPECT_EQ(live_session_count(), before + 1U) << "pass " << pass;
+            if (code == RQ_OK) {
+                EXPECT_TRUE(returns(rq_session_destroy(handle), RQ_OK)) << "pass " << pass;
+            }
+            continue;
+        }
+
+        ++failing_points;
+        EXPECT_TRUE(returns(code, RQ_E_INTERNAL))
+            << "pass " << pass << ": " << refused << " allocation(s) refused";
+        EXPECT_EQ(handle, nullptr) << "pass " << pass << ": a translated exception left a handle";
+        EXPECT_EQ(live_session_count(), before)
+            << "pass " << pass << ": a failed creation registered a session";
+        if (code == RQ_OK) {
+            // Already reported above; the session must not outlive the test.
+            static_cast<void>(rq_session_destroy(handle));
+        }
+    }
+
+    EXPECT_TRUE(created_unrefused)
+        << "creation still allocated after " << k_max_create_refusal_points << " refusal points";
+    EXPECT_GE(failing_points, 1U) << "creation made no refusable allocation, so nothing threw";
+    EXPECT_EQ(recorder.callback_count(), 0U);
 }
 
 /* ---------------------------------------------------------------------------------------------

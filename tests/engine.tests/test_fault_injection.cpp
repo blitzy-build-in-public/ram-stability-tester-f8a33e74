@@ -4,10 +4,12 @@
  *        applies is reported exactly once, with its word address, bit, step, pass and access type.
  *
  * Success criterion 3 at engine level. Each fault class runs one session of the Standard plan
- * scaled to a tenth of its time budgets (holds kept at 5 s), about two minutes of real time, over
- * a 512 MiB locked region with Stop on error off:
+ * scaled to a tenth of its time budgets (holds kept at 5 s) over a 512 MiB locked region with
+ * Stop on error off, on the controlled clock described below:
  * - FaultInjectionPlan checks the scaled plan itself against the Standard plan and validates the
- *   session configuration, so a broken harness fails in milliseconds, not after a long run.
+ *   session configuration, so a broken harness fails in milliseconds, not after a long run. It
+ *   also checks that every host from 1 to 1,024 logical processors gets a power-of-two worker
+ *   count whose 2 MiB-rounded slices test the whole 512 MiB, the region's own minimum.
  * - FaultInjection/FaultInjectionTest runs the four classes: single-bit flips (bit 17) spread
  *   over the region, a stuck bit (bit 5) in one word, an address-region fault inside a contiguous
  *   1/32 of the region, and a delay-dependent fault that only hold verifications can reach.
@@ -21,11 +23,26 @@
  * The session is built through session_create with the stack the test DLL uses, fault-injecting
  * over counting over real, so the engine runs its production coordinator, worker pool, step
  * runner and error collector. Every injection whose verification ran must match exactly one
- * reported rq_error_record by word address, bit mask, step, pass and access type, compared as
- * multisets, with nothing unmatched on either side. Before matching, the test asserts that the
- * expected reports stay at or below 2,000, well under the 10,000-record detail cap, so no record
- * can be missing for capacity reasons. The expected top-ranked cause of each class belongs to the
- * managed analyzer tests, not to this file.
+ * reported rq_error_record by word offset, virtual word address, bit mask, step, pass and access
+ * type, compared as multisets, with nothing unmatched on either side. The address an injection
+ * must match is the one its word was mapped at: the counting layer's observer captures each
+ * chunk's virtual base from the runner's own primitives and checks it against VirtualQuery while
+ * the chunk is allocated, so a record's address is held to more than its alignment. Before
+ * matching, the test asserts that the expected reports stay at or below 2,000, well under the
+ * 10,000-record detail cap, so no record can be missing for capacity reasons. The expected
+ * top-ranked cause of each class belongs to the managed analyzer tests, not to this file.
+ *
+ * Time is controlled, not measured, so no verdict depends on how the host schedules workers.
+ * The session and the fault layer share one fake_clock. It advances by 500 ms once per pass, at
+ * the pass's first primitive, and by exactly the hold while the runner waits one; nothing else
+ * moves it during a pass. Every verification checks data written in its own pass, so non-hold
+ * data is at most 500 ms old and held data at least 5 s: the delay-dependent class, at its
+ * unchanged 2000 ms threshold, can fire only on hold verifications, and every record's
+ * time_since_write_us is held to those bounds. The budgets fix each step's pass count rather
+ * than its real duration, which is however long the host takes to run those passes. Real-clock
+ * timing is validated elsewhere: stop and release latency in test_stop.cpp; through the test
+ * DLL's QPC clock, scaled-plan timing in the managed CoverageAndTimingTests and delay-dependent
+ * injection in FaultInjectionEndToEndTests.
  *
  * Injections ride only on the engine's own verification opportunities: the fault layer adds one
  * store per corrupted word and no extra access, and the stuck word is touched only when the
@@ -51,6 +68,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ostream>
 #include <set>
 #include <string>
@@ -66,7 +84,9 @@
 #include "core/kernels/kernels.h"
 #include "core/patterns/patterns.h"
 #include "core/memory/memory_access.h"
+#include "core/memory/memory_region.h"
 #include "core/memory/real_memory_access.h"
+#include "core/runner/step_runner.h"
 #include "test_dll/ramquick_engine_test.h"
 #include "fakes/fake_clock.h"
 #include "fakes/fault_spec.h"
@@ -87,6 +107,19 @@ constexpr std::uint64_t k_region_bytes = 512 * k_mib;
 
 /** Smallest worker slice the harness allows; it bounds the worker count at 128. */
 constexpr std::uint64_t k_min_worker_slice_bytes = 4 * k_mib;
+
+/** Most workers a run uses: the count at which every slice still holds the smallest slice. */
+constexpr std::uint64_t k_max_harness_workers = k_region_bytes / k_min_worker_slice_bytes;
+
+// plan_region rounds each slice down to 2 MiB, so a worker count that does not divide the
+// region's 2 MiB units tests less than the 512 MiB minimum and is refused before any traffic.
+// The units are a power of two, so every power-of-two count up to k_max_harness_workers
+// divides them.
+static_assert(std::has_single_bit(k_region_bytes / k_slice_granularity_bytes),
+              "the region must be a power-of-two number of 2 MiB slice units");
+static_assert(std::has_single_bit(k_max_harness_workers) &&
+                  k_max_harness_workers <= k_region_bytes / k_slice_granularity_bytes,
+              "every power-of-two worker count up to the maximum must divide the units");
 
 /** Available physical memory the runs require: the region plus generous headroom. */
 constexpr std::uint64_t k_min_available_bytes = 1536 * k_mib;
@@ -116,19 +149,37 @@ constexpr std::uint32_t k_hold_ms = 5'000U;
 constexpr std::uint32_t k_refresh_hold_step = 4U;
 constexpr std::uint32_t k_refresh_hold_long_step = 9U;
 
-/** Time allowed beyond the plan's budgets for preparation, overruns and release. */
+/** Minimum age of the data a delay-dependent fault corrupts. */
+constexpr std::uint32_t k_delay_threshold_ms = 2'000U;
+
+static_assert(k_delay_threshold_ms < k_hold_ms, "only data held through a hold may reach the age");
+
+/**
+ * Controlled time of one pass, which the harness adds to the session's fake clock once per
+ * (step, pass) at the pass's first primitive. Every verification checks data written in its own
+ * pass, so a non-hold verification sees data at most this old, however long the host
+ * deschedules its worker; a hold pass adds k_hold_ms on top. A quarter of the delay threshold,
+ * so no non-hold verification can come near it.
+ */
+constexpr std::uint32_t k_pass_advance_ms = 500U;
+
+static_assert(k_pass_advance_ms > 0U && 4U * k_pass_advance_ms <= k_delay_threshold_ms,
+              "a non-hold pass must keep its data well below the delay threshold");
+
+/** Time allowed beyond the scheduled passes for preparation and release. */
 constexpr std::uint32_t k_released_slack_ms = 60'000U;
 
 /**
  * Passes of each step offered to the fault layer. The layer's max_injections cap is global and
- * claimed in time order, so on a fast host the first step alone could exhaust a 2,000-report
- * budget and leave turnaround, moving-inversion and hold verifications untested. Offering every
- * step the same leading passes spreads the injections over all twelve steps and all four access
- * types whatever the host's bandwidth.
+ * claimed in run order, so the first steps' passes alone could exhaust a 2,000-report budget
+ * and leave turnaround, moving-inversion and hold verifications untested. Offering every step
+ * the same leading passes spreads the injections over all twelve steps and all four access
+ * types.
  */
 constexpr std::uint32_t k_injected_passes_per_step = 8U;
 
 constexpr std::uint64_t k_us_per_ms = 1'000U;
+constexpr std::uint64_t k_ns_per_ms = 1'000'000U;
 
 /** Distinct entries each mismatch message lists at most. */
 constexpr std::size_t k_listed_mismatches = 10U;
@@ -210,13 +261,71 @@ std::uint64_t total_budget_ms(const std::vector<rq_step_def>& steps) noexcept {
 }
 
 /**
- * One worker per active logical processor, up to the count at which every slice still holds
- * k_min_worker_slice_bytes.
+ * Passes the controlled clock schedules over the whole plan: the runner's own planned_passes of
+ * each step's budget, with every pass lasting k_pass_advance_ms plus the step's hold.
  */
-std::uint32_t harness_worker_count() {
-    const std::uint64_t processors = enumerate_logical_processors().size();
-    const std::uint64_t by_slice = k_region_bytes / k_min_worker_slice_bytes;
-    return static_cast<std::uint32_t>(processors < by_slice ? processors : by_slice);
+constexpr std::uint64_t scheduled_passes() noexcept {
+    std::uint64_t passes = 0;
+    for (const plan_step& row : k_scaled_standard_steps) {
+        passes += planned_passes(std::uint64_t{row.time_budget_ms} * k_ns_per_ms,
+                                 (std::uint64_t{k_pass_advance_ms} + row.hold_ms) * k_ns_per_ms);
+    }
+    return passes;
+}
+
+/**
+ * Real time per scheduled pass the wait for Released allows. Under the controlled clock a run's
+ * real length is its scheduled passes at whatever speed the host writes, flushes and verifies
+ * 512 MiB, not its 120 s of budgets: on a 128-processor host a pass takes tens of milliseconds
+ * in Release and under 200 ms in Debug, and a small host is slower only by its lower bandwidth.
+ * Five seconds a pass leaves room for a Debug build on a small, loaded host and still ends a
+ * hung run.
+ */
+constexpr std::uint64_t k_real_ms_per_scheduled_pass = 5'000U;
+
+/** The wait for Released: every scheduled pass at its allowance, then preparation and release. */
+constexpr std::uint64_t k_released_timeout_ms =
+    scheduled_passes() * k_real_ms_per_scheduled_pass + k_released_slack_ms;
+
+/**
+ * The workers of a run on a host with `processors` active logical processors: the largest power
+ * of two that is at most the processors and at most k_max_harness_workers.
+ *
+ * Only a power of two splits the region into whole 2 MiB slice units, so the run tests exactly
+ * k_region_bytes, its own minimum. One worker per processor would not: 12 processors give twelve
+ * 42 MiB slices, 504 MiB, which the allocator refuses. Pure, so every host size can be checked
+ * on this one.
+ *
+ * @return 0 only for 0 processors.
+ */
+constexpr std::uint32_t harness_worker_count(std::uint64_t processors) noexcept {
+    return static_cast<std::uint32_t>(
+        std::bit_floor(processors < k_max_harness_workers ? processors : k_max_harness_workers));
+}
+
+/** Active logical processors of this host: what session_create checks worker_count against. */
+std::uint64_t host_logical_processors() {
+    return enumerate_logical_processors().size();
+}
+
+/**
+ * The planning precondition of every run: `workers` fit the host's `processors`, and
+ * plan_region splits k_region_bytes over them into slices of at least k_min_worker_slice_bytes
+ * that together test all of it, so the allocator accepts the run at its 512 MiB minimum.
+ */
+::testing::AssertionResult plans_the_whole_region(std::uint64_t processors, std::uint32_t workers) {
+    const region_plan plan = plan_region(k_region_bytes, workers);
+    if (workers >= 1U && workers <= processors && plan.worker_count == workers &&
+        plan.tested_bytes == k_region_bytes && plan.slice_bytes >= k_min_worker_slice_bytes) {
+        return ::testing::AssertionSuccess();
+    }
+    return ::testing::AssertionFailure()
+           << processors << " logical processors and " << workers << " workers: slices of "
+           << plan.slice_bytes << " bytes (at least " << k_min_worker_slice_bytes
+           << " required) test " << plan.tested_bytes << " bytes, "
+           << k_region_bytes - plan.tested_bytes << " bytes short of the " << k_region_bytes
+           << "-byte region, which is also its minimum. The worker count must be between 1 and "
+              "the processors and divide the region's 2 MiB units.";
 }
 
 /** The session configuration of every fault-injection run. */
@@ -273,26 +382,35 @@ const char* end_reason_name(std::uint32_t reason) noexcept {
 }
 
 /**
- * What one verification of one word yields: logical word offset, bit mask, step, pass and access
- * type. An injection and the record it causes must have the same key.
+ * What one verification of one word yields: logical word offset, virtual word address, bit mask,
+ * step, pass and access type. An injection and the record it causes must have the same key.
  */
-using match_key =
-    std::tuple<std::uint64_t, std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t>;
+using match_key = std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::uint32_t,
+                             std::uint32_t, std::uint32_t>;
 
-match_key key_of(const rq_injected_fault& injection) noexcept {
-    return {injection.word_offset, injection.bit_mask, injection.step_index, injection.pass_index,
-            injection.access_type};
+/**
+ * @param mapped_address The virtual address the run mapped the injected word at (see
+ *        chunk_address_map), not one derived from the record it should match.
+ */
+match_key key_of(const rq_injected_fault& injection, std::uint64_t mapped_address) noexcept {
+    return {injection.word_offset, mapped_address,       injection.bit_mask,
+            injection.step_index,  injection.pass_index, injection.access_type};
 }
 
 match_key key_of(const rq_error_record& record) noexcept {
-    return {record.region_offset & ~std::uint64_t{7}, record.bit_mask, record.step_index,
-            record.pass_index, record.access_type};
+    return {record.region_offset & ~std::uint64_t{7},
+            record.address,
+            record.bit_mask,
+            record.step_index,
+            record.pass_index,
+            record.access_type};
 }
 
 std::string describe(const match_key& key) {
-    return "offset " + hex64(std::get<0>(key)) + ", mask " + hex64(std::get<1>(key)) + ", step " +
-           std::to_string(std::get<2>(key)) + ", pass " + std::to_string(std::get<3>(key)) +
-           ", access " + std::to_string(std::get<4>(key));
+    return "offset " + hex64(std::get<0>(key)) + ", address " + hex64(std::get<1>(key)) +
+           ", mask " + hex64(std::get<2>(key)) + ", step " + std::to_string(std::get<3>(key)) +
+           ", pass " + std::to_string(std::get<4>(key)) + ", access " +
+           std::to_string(std::get<5>(key));
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -375,6 +493,206 @@ private:
 
     std::unique_ptr<fault_injecting_memory_access> fault_;
     std::uint32_t injected_passes_;
+};
+
+/* ---------------------------------------------------------------------------------------------
+ * Chunk addresses
+ * ------------------------------------------------------------------------------------------- */
+
+/** One chunk of a region_plan's logical layout. */
+struct chunk_slot {
+    /** slice x chunks_per_slice + chunk within the slice. */
+    std::size_t index = 0;
+    /** slice x slice_bytes + chunk x k_chunk_bytes, as memory_region lays chunks out. */
+    std::uint64_t logical_offset = 0;
+    std::uint64_t bytes = 0;
+};
+
+/** The chunk of the plan that holds region offset `offset`; none at or past tested_bytes. */
+std::optional<chunk_slot> chunk_holding(const region_plan& plan, std::uint64_t offset) noexcept {
+    if (plan.slice_bytes == 0 || offset >= plan.tested_bytes) {
+        return std::nullopt;
+    }
+    const std::uint64_t slice = offset / plan.slice_bytes;
+    const std::uint64_t chunk = offset % plan.slice_bytes / k_chunk_bytes;
+    chunk_slot slot;
+    slot.index = static_cast<std::size_t>(slice * plan.chunks_per_slice + chunk);
+    slot.logical_offset = slice * plan.slice_bytes + chunk * k_chunk_bytes;
+    slot.bytes = chunk < plan.full_chunks_per_slice ? k_chunk_bytes : plan.final_chunk_bytes;
+    return slot;
+}
+
+/**
+ * Where each chunk of the region under test lies in virtual memory, captured from the
+ * primitives the step runner issues, so a record's reported address can be checked against the
+ * address of the word an injection corrupted rather than against its alignment alone.
+ *
+ * Every range a primitive names lies inside one chunk and carries that chunk's region_base, its
+ * virtual base minus its logical offset, so the first primitive on a chunk yields the chunk's
+ * virtual base. That capture is checked against VirtualQuery while the chunk is still
+ * allocated: the range must lie in an allocation starting at that base. Every later primitive
+ * must agree with the capture and stay inside the chunk.
+ *
+ * observe() runs on every worker at once from the counting layer's observer, which must not
+ * throw: it takes no lock and allocates nothing, and the first inconsistency is recorded rather
+ * than thrown. Read the accessors once the run has quiesced.
+ */
+class chunk_address_map {
+public:
+    /** @throws std::bad_alloc when the per-chunk bases cannot be allocated. */
+    explicit chunk_address_map(const region_plan& plan)
+        : plan_(plan), bases_(std::size_t{plan.worker_count} * plan.chunks_per_slice) {}
+
+    chunk_address_map(const chunk_address_map&) = delete;
+    chunk_address_map& operator=(const chunk_address_map&) = delete;
+
+    /** Captures or checks the base of the chunk the primitive's range lies in. */
+    void observe(const primitive_record& record) noexcept {
+        if (record.kind == primitive_kind::fence) {
+            // A fence names no range.
+            return;
+        }
+        // Modulo 2^64, as the engine computes region offsets: region_base may lie below zero.
+        const std::uint64_t offset = record.begin - record.ctx.region_base;
+        const std::optional<chunk_slot> slot = chunk_holding(plan_, offset);
+        if (!slot || slot->index >= bases_.size()) {
+            note("a primitive's range starts outside the planned region", 0U, offset, 0U,
+                 record.begin);
+            return;
+        }
+        if (record.bytes > slot->logical_offset + slot->bytes - offset) {
+            note("a primitive's range runs past the end of its chunk", slot->index, offset,
+                 record.ctx.region_base + slot->logical_offset + slot->bytes,
+                 record.begin + record.bytes);
+            return;
+        }
+        const std::uintptr_t base = record.ctx.region_base + slot->logical_offset;
+        std::uintptr_t captured = bases_[slot->index].load(std::memory_order_acquire);
+        if (captured == 0 &&
+            bases_[slot->index].compare_exchange_strong(captured, base, std::memory_order_acq_rel,
+                                                        std::memory_order_acquire)) {
+            check_allocation(*slot, offset, record.begin, base);
+            return;
+        }
+        if (captured != base) {
+            note("two primitives place the chunk at different bases", slot->index, offset, captured,
+                 base);
+        }
+    }
+
+    /** True while no primitive contradicted the layout or its allocation. */
+    bool consistent() const noexcept { return !failure_claimed_.load(std::memory_order_acquire); }
+
+    /** The first inconsistency, or an empty string while consistent(). */
+    std::string failure() const {
+        return failure_ready_.load(std::memory_order_acquire) ? std::string(failure_text_)
+                                                              : std::string();
+    }
+
+    /** Each chunk's virtual base by chunk_slot::index; 0 for a chunk no primitive named. */
+    std::vector<std::uint64_t> bases() const {
+        std::vector<std::uint64_t> snapshot;
+        snapshot.reserve(bases_.size());
+        for (const std::atomic<std::uintptr_t>& base : bases_) {
+            snapshot.push_back(base.load(std::memory_order_acquire));
+        }
+        return snapshot;
+    }
+
+private:
+    /** The first capture of a chunk: the range must lie in a committed allocation at `base`. */
+    void check_allocation(const chunk_slot& slot, std::uint64_t offset, std::uintptr_t begin,
+                          std::uintptr_t base) noexcept {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(begin), &info, sizeof(info)) !=
+            sizeof(info)) {
+            note("VirtualQuery failed on the chunk's first range (actual: the Windows error)",
+                 slot.index, offset, base, GetLastError());
+            return;
+        }
+        const std::uintptr_t allocation = reinterpret_cast<std::uintptr_t>(info.AllocationBase);
+        if (allocation != base || info.State != MEM_COMMIT) {
+            note("the chunk's first range lies in an allocation at another base, or uncommitted",
+                 slot.index, offset, base, allocation);
+        }
+    }
+
+    /** Keeps the first inconsistency; later ones are dropped. */
+    void note(const char* what, std::size_t chunk, std::uint64_t offset, std::uint64_t expected,
+              std::uint64_t actual) noexcept {
+        bool unclaimed = false;
+        if (failure_claimed_.compare_exchange_strong(unclaimed, true)) {
+            std::snprintf(failure_text_, sizeof(failure_text_),
+                          "%s: chunk %zu, region offset 0x%016llX, expected 0x%016llX, actual "
+                          "0x%016llX",
+                          what, chunk, static_cast<unsigned long long>(offset),
+                          static_cast<unsigned long long>(expected),
+                          static_cast<unsigned long long>(actual));
+            failure_ready_.store(true, std::memory_order_release);
+        }
+    }
+
+    const region_plan plan_;
+    std::vector<std::atomic<std::uintptr_t>> bases_;
+    std::atomic<bool> failure_claimed_{false};
+    std::atomic<bool> failure_ready_{false};
+    char failure_text_[256] = {};
+};
+
+/* ---------------------------------------------------------------------------------------------
+ * Controlled time
+ * ------------------------------------------------------------------------------------------- */
+
+/**
+ * Drives the run's fake clock: k_pass_advance_ms once per (step, pass), at the pass's first
+ * primitive, through pass_duration_script. Holds advance it themselves, by exactly the hold,
+ * through fake_clock::wait_for_stop, and nothing else moves it while a pass runs.
+ *
+ * Correctness then never depends on scheduling: with real time, a worker descheduled for 2 s
+ * between a non-hold write and its verification made the delay-dependent class fire outside
+ * the hold steps, a legitimate injection the test had to reject.
+ *
+ * on_primitive() runs on every worker at once from the counting layer's observer, which must not
+ * throw. Keys only grow within a run, so one exchange per pass admits its first primitive to the
+ * script's lock and every later one skips it; a script failure is recorded, not thrown.
+ */
+class pass_pacer {
+public:
+    /** @param clock The session's clock, which must outlive the pacer. */
+    explicit pass_pacer(fake_clock& clock)
+        : script_(clock, {std::uint64_t{k_pass_advance_ms} * k_ns_per_ms}) {}
+
+    pass_pacer(const pass_pacer&) = delete;
+    pass_pacer& operator=(const pass_pacer&) = delete;
+
+    void on_primitive(const access_context& ctx) noexcept {
+        // +1 keeps 0 for "none seen".
+        const std::uint64_t key = ((std::uint64_t{ctx.step_index} << 32U) | ctx.pass_index) + 1U;
+        std::uint64_t seen = key_seen_.load(std::memory_order_acquire);
+        while (seen < key) {
+            if (key_seen_.compare_exchange_weak(seen, key, std::memory_order_acq_rel,
+                                                std::memory_order_acquire)) {
+                try {
+                    script_.on_pass_begin(ctx.step_index, ctx.pass_index);
+                } catch (const std::exception&) {
+                    // The observer must not throw; the run fails through failed() instead.
+                    failed_.store(true, std::memory_order_relaxed);
+                }
+                return;
+            }
+        }
+    }
+
+    /** True when a pass's advance could not be applied. */
+    bool failed() const noexcept { return failed_.load(std::memory_order_relaxed); }
+
+    /** Distinct (step, pass) pairs advanced. Read once the run has quiesced. */
+    std::size_t passes_paced() const { return script_.passes_seen(); }
+
+private:
+    pass_duration_script script_;
+    std::atomic<std::uint64_t> key_seen_{0};
+    std::atomic<bool> failed_{false};
 };
 
 /* ---------------------------------------------------------------------------------------------
@@ -585,6 +903,16 @@ struct run_outcome {
     std::uint64_t counted_verified_bytes = 0;
     /** True when the layer session_create handed to the wrapper was the real one. */
     bool real_layer_innermost = false;
+    /** The plan the session splits the region by, and so the chunk of every region offset. */
+    region_plan plan{};
+    /** Each chunk's virtual base as chunk_address_map captured it; 0 for a chunk never named. */
+    std::vector<std::uint64_t> chunk_bases;
+    /** chunk_address_map's first inconsistency; empty when the capture was consistent. */
+    std::string mapping_failure;
+    /** True when pass_pacer could not advance the clock for some pass. */
+    bool pacing_failed = false;
+    /** Passes pass_pacer advanced the clock for, each once. */
+    std::uint64_t passes_paced = 0;
 };
 
 /**
@@ -601,8 +929,12 @@ void run_scaled_standard(const rq_fault_spec& raw_spec, run_outcome& out) {
         << system.avail_phys_bytes / k_mib << " MiB are. Close other applications and rerun.";
 
     const std::vector<rq_step_def> steps = scaled_standard_plan();
-    out.worker_count = harness_worker_count();
+    const std::uint64_t processors = host_logical_processors();
+    out.worker_count = harness_worker_count(processors);
     ASSERT_GE(out.worker_count, 1U);
+    // Before session_create, so a sizing the allocator would refuse fails here, spelled out.
+    ASSERT_TRUE(plans_the_whole_region(processors, out.worker_count));
+    out.plan = plan_region(k_region_bytes, out.worker_count);
     const rq_session_config config = make_config(steps, out.worker_count);
 
     const rq_fault_spec spec = normalized(raw_spec, k_region_bytes);
@@ -610,11 +942,13 @@ void run_scaled_standard(const rq_fault_spec& raw_spec, run_outcome& out) {
     ASSERT_TRUE(validate_fault_spec(spec, k_region_bytes, &reason))
         << fault_kind_name(spec.kind) << ": " << (reason != nullptr ? reason : "");
 
-    // Declared before the guard so the user_data, the clock and the layer pointers outlive
-    // session_destroy.
+    // Declared before the guard so the user_data, the clock, the observer's state and the layer
+    // pointers outlive session_destroy.
     run_recorder recorder;
     const rq_callbacks callbacks = make_callbacks(recorder);
-    const std::shared_ptr<qpc_clock> clock = std::make_shared<qpc_clock>();
+    const std::shared_ptr<fake_clock> clock = std::make_shared<fake_clock>();
+    pass_pacer pacer(*clock);
+    chunk_address_map addresses(out.plan);
     fault_injecting_memory_access* fault_layer = nullptr;
     counting_memory_access* counting_layer = nullptr;
     bool real_layer_innermost = false;
@@ -627,6 +961,12 @@ void run_scaled_standard(const rq_fault_spec& raw_spec, run_outcome& out) {
         [&](std::unique_ptr<IMemoryAccess> real) -> std::unique_ptr<IMemoryAccess> {
         real_layer_innermost = dynamic_cast<const real_memory_access*>(real.get()) != nullptr;
         auto counting = std::make_unique<counting_memory_access>(std::move(real));
+        // Beneath the gate and the fault layer, so it sees every primitive of every pass. Set
+        // here, before session_create can start any traffic.
+        counting->set_observer([&pacer, &addresses](const primitive_record& record) {
+            pacer.on_primitive(record.ctx);
+            addresses.observe(record);
+        });
         counting_layer = counting.get();
         auto fault =
             std::make_unique<fault_injecting_memory_access>(std::move(counting), spec, *clock);
@@ -641,16 +981,23 @@ void run_scaled_standard(const rq_fault_spec& raw_spec, run_outcome& out) {
     ASSERT_EQ(session_start(session.get()), RQ_OK);
 
     const std::chrono::milliseconds timeout(
-        static_cast<std::chrono::milliseconds::rep>(total_budget_ms(steps) + k_released_slack_ms));
+        static_cast<std::chrono::milliseconds::rep>(k_released_timeout_ms));
     ASSERT_TRUE(recorder.wait_released(timeout))
         << fault_kind_name(spec.kind) << ": Released did not arrive within " << timeout.count()
         << " ms of start; " << recorder.gates_raised.load() << " of " << k_step_count
         << " steps had started.";
 
+    out.pacing_failed = pacer.failed();
+    out.passes_paced = pacer.passes_paced();
     out.spec = fault_layer->spec();
     out.injections = fault_layer->injection_log();
     out.counted_verified_bytes = counting_layer->verified_bytes();
     out.real_layer_innermost = real_layer_innermost;
+    out.chunk_bases = addresses.bases();
+    if (!addresses.consistent()) {
+        const std::string failure = addresses.failure();
+        out.mapping_failure = failure.empty() ? "an inconsistent chunk capture" : failure;
+    }
     out.gates_raised = recorder.gates_raised.load();
     out.progress_ticks = recorder.progress_ticks.load();
     {
@@ -685,6 +1032,19 @@ std::vector<rq_injected_fault> verified_injections(const run_outcome& run) {
     return verified;
 }
 
+/**
+ * The virtual address of the word at region offset `offset`: its chunk's captured base plus its
+ * distance into the chunk. 0 when the offset lies outside the plan or in a chunk no primitive
+ * named, which no reported address can equal.
+ */
+std::uint64_t mapped_address(const run_outcome& run, std::uint64_t offset) noexcept {
+    const std::optional<chunk_slot> slot = chunk_holding(run.plan, offset);
+    if (!slot || slot->index >= run.chunk_bases.size() || run.chunk_bases[slot->index] == 0) {
+        return 0;
+    }
+    return run.chunk_bases[slot->index] + (offset - slot->logical_offset);
+}
+
 /** Verified injections per step index. */
 std::vector<std::uint64_t> injections_per_step(const std::vector<rq_injected_fault>& verified) {
     std::vector<std::uint64_t> per_step(k_step_count, 0);
@@ -711,16 +1071,18 @@ std::string list_unmatched(const std::map<match_key, std::int64_t>& balance, boo
 
 /**
  * The core of criterion 3: the verified injections and the reported records are the same
- * multiset of (word offset, bit mask, step, pass, access type). Moving inversion can inject one
- * word once per sweep, so a key may legitimately occur twice; the counts must still agree.
+ * multiset of (word offset, virtual address, bit mask, step, pass, access type). An injection's
+ * address is the one the run mapped its word at, so a record with the right offset but a wrong
+ * address matches nothing. Moving inversion can inject one word once per sweep, so a key may
+ * legitimately occur twice; the counts must still agree.
  */
-void expect_one_record_per_injection(const std::vector<rq_injected_fault>& verified,
-                                     const std::vector<rq_error_record>& records) {
+void expect_one_record_per_injection(const run_outcome& run,
+                                     const std::vector<rq_injected_fault>& verified) {
     std::map<match_key, std::int64_t> balance;
     for (const rq_injected_fault& injection : verified) {
-        ++balance[key_of(injection)];
+        ++balance[key_of(injection, mapped_address(run, injection.word_offset))];
     }
-    for (const rq_error_record& record : records) {
+    for (const rq_error_record& record : run.records) {
         --balance[key_of(record)];
     }
     std::uint64_t unmatched_injections = 0;
@@ -746,6 +1108,10 @@ void expect_well_formed_records(const run_outcome& run) {
         SCOPED_TRACE("record " + std::to_string(record.sequence) + " at offset " +
                      hex64(record.region_offset));
         EXPECT_EQ(record.address % 8U, 0U) << "address " << hex64(record.address);
+        const std::uint64_t mapped = mapped_address(run, record.region_offset);
+        EXPECT_EQ(record.address, mapped)
+            << "reported address " << hex64(record.address) << ", but the word at this offset is "
+            << "mapped at " << hex64(mapped);
         EXPECT_EQ(record.region_offset % 8U, 0U);
         EXPECT_LT(record.region_offset, run.prepared.tested_bytes);
         EXPECT_EQ(record.address_kind, RQ_ADDRESS_KIND_VIRTUAL);
@@ -755,6 +1121,15 @@ void expect_well_formed_records(const run_outcome& run) {
         EXPECT_LT(record.worker_index, run.worker_count);
         EXPECT_GE(record.reread_outcome, RQ_REREAD_MATCHES_EXPECTED);
         EXPECT_LE(record.reread_outcome, RQ_REREAD_DIFFERS);
+        // The controlled clock's bounds: a hold verification's data has waited the whole hold;
+        // any other's is at most one pass advance old, below the delay threshold.
+        if (record.access_type == RQ_ACCESS_VERIFY_AFTER_HOLD) {
+            EXPECT_GE(record.time_since_write_us, std::uint64_t{k_hold_ms} * k_us_per_ms);
+        } else {
+            EXPECT_LT(record.time_since_write_us,
+                      std::uint64_t{k_delay_threshold_ms} * k_us_per_ms);
+            EXPECT_LE(record.time_since_write_us, std::uint64_t{k_pass_advance_ms} * k_us_per_ms);
+        }
     }
 }
 
@@ -796,11 +1171,6 @@ constexpr std::uint64_t k_stuck_word_offset = k_region_bytes / 2;
 /** The address-region fault's contiguous 1/32 of the region, starting at 5/16 of it. */
 constexpr std::uint64_t k_fault_region_offset = 5 * (k_region_bytes / 16);
 constexpr std::uint64_t k_fault_region_length = k_region_bytes / 32;
-
-/** Minimum age of the data a delay-dependent fault corrupts. */
-constexpr std::uint32_t k_delay_threshold_ms = 2'000U;
-
-static_assert(k_delay_threshold_ms < k_hold_ms, "only data held through a hold may reach the age");
 
 /**
  * Worst-case injections of a class: each verification of a word yields at most one injection,
@@ -1251,9 +1621,35 @@ TEST(FaultInjectionPlan, ScaledStandardPlanIsTheStandardPlanAtOneTenth) {
 
     run_recorder recorder;
     const rq_callbacks callbacks = make_callbacks(recorder);
-    const rq_session_config config = make_config(steps, harness_worker_count());
+    const std::uint64_t processors = host_logical_processors();
+    const std::uint32_t workers = harness_worker_count(processors);
+    ASSERT_TRUE(plans_the_whole_region(processors, workers));
+    const rq_session_config config = make_config(steps, workers);
     EXPECT_GE(config.region_bytes / config.worker_count, k_min_worker_slice_bytes);
     EXPECT_EQ(validate_config(&config, &callbacks), RQ_OK);
+}
+
+// The worker count of every host size from one logical processor to 1,024, so the 6, 12, 24 and
+// 48-processor hosts that one worker per processor left short of 512 MiB are checked here too.
+TEST(FaultInjectionPlan, EveryProcessorCountGetsWorkersThatTestTheWholeRegion) {
+    constexpr std::uint64_t k_most_processors_checked = 1'024U;
+    for (std::uint64_t processors = 1; processors <= k_most_processors_checked; ++processors) {
+        const std::uint32_t workers = harness_worker_count(processors);
+        EXPECT_TRUE(plans_the_whole_region(processors, workers));
+        EXPECT_TRUE(std::has_single_bit(workers))
+            << processors << " logical processors: " << workers << " workers";
+        // The largest such count: doubling it exceeds the processors or the slice floor.
+        EXPECT_GT(std::uint64_t{workers} * 2U, std::min(processors, k_max_harness_workers))
+            << processors << " logical processors: " << workers << " workers";
+    }
+
+    // Worked by hand: the largest power of two at most min(processors, 128).
+    EXPECT_EQ(harness_worker_count(6U), 4U);
+    EXPECT_EQ(harness_worker_count(12U), 8U);
+    EXPECT_EQ(harness_worker_count(24U), 16U);
+    EXPECT_EQ(harness_worker_count(48U), 32U);
+    EXPECT_EQ(harness_worker_count(128U), 128U);
+    EXPECT_EQ(harness_worker_count(192U), 128U);
 }
 
 TEST(FaultInjectionPlan, EveryFaultClassSpecIsValidForTheRegion) {
@@ -1289,11 +1685,18 @@ TEST_P(FaultInjectionTest, EveryInjectionIsReportedOnceWithItsWordBitStepAndPass
     EXPECT_EQ(run.result.steps_completed, k_step_count);
     ASSERT_EQ(run.result.step_result_count, k_step_count);
     ASSERT_EQ(run.step_results.size(), k_step_count);
+    std::uint64_t passes_run = 0;
     for (std::uint32_t i = 0; i < k_step_count; ++i) {
         EXPECT_EQ(run.step_results[i].index, i);
         EXPECT_EQ(run.step_results[i].completed, 1U) << "step " << i;
         EXPECT_GE(run.step_results[i].passes, 1U) << "step " << i;
+        passes_run += run.step_results[i].passes;
     }
+    // The controlled clock advanced every pass exactly once, which is what bounds the age of
+    // every non-hold verification's data.
+    ASSERT_FALSE(run.pacing_failed) << "a pass's clock advance could not be applied";
+    EXPECT_EQ(run.passes_paced, passes_run);
+    RecordProperty("passes_run", std::to_string(passes_run));
 
     // Precondition: every expected report fits well under the detail cap, so a missing record
     // can only be a detection failure.
@@ -1328,8 +1731,24 @@ TEST_P(FaultInjectionTest, EveryInjectionIsReportedOnceWithItsWordBitStepAndPass
                 static_cast<double>(run.counted_verified_bytes),
                 0.01 * static_cast<double>(run.counted_verified_bytes));
 
+    // The chunk bases the addresses are matched against were captured without contradiction,
+    // and every verified injection lies in a chunk whose base was captured.
+    ASSERT_TRUE(run.mapping_failure.empty()) << run.mapping_failure;
+    std::uint64_t unmapped_injections = 0;
+    std::uint64_t first_unmapped_offset = 0;
+    for (const rq_injected_fault& injection : verified) {
+        if (mapped_address(run, injection.word_offset) == 0) {
+            first_unmapped_offset =
+                unmapped_injections == 0 ? injection.word_offset : first_unmapped_offset;
+            ++unmapped_injections;
+        }
+    }
+    EXPECT_EQ(unmapped_injections, 0U)
+        << "injections in a chunk no primitive named, the first at offset "
+        << hex64(first_unmapped_offset);
+
     expect_well_formed_records(run);
-    expect_one_record_per_injection(verified, run.records);
+    expect_one_record_per_injection(run, verified);
     fault.check(run, verified);
 }
 

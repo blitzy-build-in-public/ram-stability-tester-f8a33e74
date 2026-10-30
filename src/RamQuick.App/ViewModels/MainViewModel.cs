@@ -427,11 +427,12 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     public bool HasCauseHints => State is (RunState.Failed or RunState.Aborted) && _causeHints.Count > 0;
 
     /// <summary>
-    /// Gets the header of the grouped error list: "Errors by address" while every error is stored in detail, and
-    /// "Grouped from the first 10,000 errors" once the detail cap is reached, because the groups then describe the
-    /// stored records only.
+    /// Gets the header of the grouped error list: "Errors by address" while fewer than 10,000 records are stored, and
+    /// "Grouped from the first 10,000 errors" once the stored records reach the detail cap
+    /// (<see cref="RunController.IsStoredDetailCapReached"/>), at exactly 10,000 errors included, because later errors
+    /// are no longer stored and the groups describe the stored records only.
     /// </summary>
-    public string ErrorGroupsHeader => _controller.IsErrorDetailTruncated
+    public string ErrorGroupsHeader => _controller.IsStoredDetailCapReached
         ? UiText.ErrorGroupsTruncatedHeader
         : UiText.ErrorGroupsHeader;
 
@@ -450,15 +451,16 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
 
     /// <summary>
     /// Gets the one-line status of the minimal window layout: the current step, the time remaining, the error total
-    /// and the verdict, or the run state while there is no verdict, such as
-    /// "Random bank thrash (2 of 6) · 03:41 · 0 errors · Running".
+    /// with its noun, and the verdict, or the run state while there is no verdict, such as
+    /// "Random bank thrash (2 of 6) · 03:41 · 1 error · Running". The error total reads "—" whenever
+    /// <see cref="ErrorCountText"/> does, as in "— · — · — · Idle".
     /// </summary>
     public string StatusLineText => string.Format(
         CultureInfo.InvariantCulture,
         UiText.StatusLineFormat,
         CurrentStepText,
         RemainingText,
-        ErrorCountText,
+        RunFiguresPlan is not null ? UiText.ErrorCount(_controller.TotalErrors) : UiText.NotYetKnown,
         VerdictText.Length > 0 ? VerdictText : State.ToString());
 
     // The plan whose coverage target the run figures show: the current run's in Running, the last run's in a
@@ -589,7 +591,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
                 OnPropertyChanged(nameof(HasErrorGroups));
                 break;
 
-            case nameof(RunController.IsErrorDetailTruncated):
+            case nameof(RunController.IsStoredDetailCapReached):
                 OnPropertyChanged(nameof(ErrorGroupsHeader));
                 break;
 
@@ -718,4 +720,3 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         return true;
     }
 }
-

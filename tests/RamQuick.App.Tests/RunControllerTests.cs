@@ -1263,6 +1263,57 @@ public sealed class RunControllerTests
         Assert.Equal(UiText.EngineError(nameof(RunEndReason.Completed)), harness.Controller.ResultMessage);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Completed_BeforeFirstProgress_FinalSnapshotCarriesTheSummarysCoverage(bool prepared)
+    {
+        // A stop can interrupt step 1's first pass before the first progress tick, and the engine sends no final tick,
+        // so only Completed carries the verified bytes. Without Prepared there is no tested size, so coverage is 0.
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        IReadOnlyList<StepAttributes> steps = session.Options.Steps;
+        ulong verifiedBytes = session.Options.RegionBytes / 8 * 3;
+        TimeSpan elapsed = TimeSpan.FromMilliseconds(200);
+        ulong totalErrors = 2;
+        ulong testedBytes = 0;
+        if (prepared)
+        {
+            testedBytes = harness.Prepare().TestedBytes;
+            (StepGateDecision decision, _) = harness.RunGate(0);
+            Assert.Equal(StepGateDecision.Continue, decision);
+            session.RaiseStepStarted(0);
+            session.RaiseStepFinished(0, actualDuration: elapsed, passes: 0, verifiedBytes: verifiedBytes, errors: totalErrors, completed: false);
+        }
+
+        harness.Pump();
+        Assert.Null(harness.Controller.CurrentProgress);
+
+        session.RaiseCompleted(RunEndReason.UserStop, totalErrors, verifiedBytes: verifiedBytes, elapsed: elapsed);
+        harness.AwaitVerdict();
+
+        Assert.Equal(RunState.Aborted, harness.StateMachine.State);
+        RunProgress? final = harness.Controller.CurrentProgress;
+        Assert.NotNull(final);
+        Assert.Equal(0, final.StepIndex);
+        Assert.Equal(steps.Count, final.StepCount);
+        Assert.Equal(steps[0].Name, final.StepName);
+        Assert.Equal(elapsed, final.Elapsed);
+        Assert.Null(final.Remaining);
+        Assert.Equal(verifiedBytes, final.VerifiedBytes);
+        Assert.Equal(testedBytes, final.RegionBytes);
+        Assert.Equal(prepared ? 100.0 * verifiedBytes / testedBytes : 0, final.CoveragePercent);
+        Assert.Equal(totalErrors, final.TotalErrors);
+        Assert.Equal(totalErrors, harness.Controller.TotalErrors);
+
+        harness.Release(TimeSpan.FromMilliseconds(100));
+        using JsonDocument summary = harness.ReadSummary();
+        JsonElement root = summary.RootElement;
+        Assert.Equal(final.CoveragePercent, root.GetProperty("coverage").GetProperty("percent").GetDouble());
+        Assert.Equal(totalErrors, root.GetProperty("errors").GetProperty("total").GetUInt64());
+    }
+
     [Fact]
     public void Publication_FinalSummaryNameTaken_ShowsSaveFailureKeepsJournalAndRetriesAtNextStart()
     {
@@ -3128,4 +3179,3 @@ public sealed class RunControllerTests
         };
     }
 }
-

@@ -342,7 +342,7 @@ public static class UiText
     public const string HintPrefix = "Hint:";
 
     /// <summary>
-    /// The header of the grouped error list while every error so far is stored in detail.
+    /// The header of the grouped error list while fewer than 10,000 records are stored, below the detail cap.
     /// </summary>
     public const string ErrorGroupsHeader = "Errors by address";
 
@@ -446,14 +446,11 @@ public static class UiText
 
     /// <summary>
     /// Composite format of the one-line status of the minimal window layout: {0} the current step,
-    /// {1} the time remaining, {2} the true error total as a number, {3} the verdict.
+    /// {1} the time remaining, {2} the true error total with its noun (see <see cref="ErrorCount"/>),
+    /// or <see cref="NotYetKnown"/> while no run figures are shown, {3} the verdict. Examples:
+    /// "Random bank thrash (2 of 6) · 03:41 · 1 error · Running" and "— · — · — · Idle".
     /// </summary>
-    /// <remarks>
-    /// "errors" is a fixed field label in this compact line, not a counted noun, so callers pass the
-    /// bare number and one error reads "1 errors". Messages that count errors use
-    /// <see cref="ErrorCount"/> instead.
-    /// </remarks>
-    public const string StatusLineFormat = "{0} · {1} · {2} errors · {3}";
+    public const string StatusLineFormat = "{0} · {1} · {2} · {3}";
 
     /// <summary>
     /// Composite format of the automation name of a live reading or memory summary value: {0} the

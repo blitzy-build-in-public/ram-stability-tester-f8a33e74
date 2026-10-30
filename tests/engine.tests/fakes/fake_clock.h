@@ -126,9 +126,14 @@ static_assert(!std::is_abstract_v<fake_clock>, "fake_clock must implement every 
  * step_runner then derives passes_planned, overrun_ns and time remaining from these fake
  * durations, deterministically.
  *
- * Caveat: a scripted advance inside a pass also ages every write made earlier in that pass. Do
- * not combine a script with RQ_FAULT_DELAY_DEPENDENT injection, which compares
- * now - write_time_ns with its 2000 ms threshold and would fire outside hold steps.
+ * Caveat: a scripted advance inside a pass also ages every write made earlier in that pass.
+ * RQ_FAULT_DELAY_DEPENDENT injection compares now - write_time_ns with its threshold (2000 ms),
+ * so a script combines with it only when every entry is below that threshold and nothing else
+ * advances the clock inside a non-hold pass. Every verification checks data written in its own
+ * pass, so non-hold data is then at most one entry old and never reaches the threshold, while
+ * hold steps still age theirs by the whole hold through wait_for_stop. An entry at or above the
+ * threshold makes the injection fire outside hold steps. test_fault_injection.cpp runs on
+ * 500 ms entries.
  *
  * Thread-safe. The clock must outlive the script.
  */

@@ -219,7 +219,8 @@ struct slice_view {
  * failure it returns false with the Windows last-error set, exactly as VirtualLock does, and
  * allocate() treats that as a lock failure of the attempt. It must not throw. An empty function
  * means VirtualLock. The seam exists only so that test_memory_region.cpp can force
- * shrink-and-retry deterministically; production always passes it empty.
+ * shrink-and-retry and exhaustion deterministically; production always passes it empty.
+ * session_dependencies::lock_override carries the same signature into a session's region.
  */
 using lock_function = std::function<bool(void* address, std::size_t bytes)>;
 
