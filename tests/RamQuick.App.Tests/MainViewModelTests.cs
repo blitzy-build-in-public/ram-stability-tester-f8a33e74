@@ -899,8 +899,10 @@ public sealed class MainViewModelTests
             string.Join(UiText.NoticeSeparator, UiText.ReducedInstructionSetNotice, UiText.SensorsUnavailableNotice),
             viewModel.NoticeText);
 
-        // 1.5 GiB available plans only 0.5 GiB, so Start is refused with the low-memory notice.
+        // 1.5 GiB available plans only 0.5 GiB, so the accepted Start's continuation refuses it with the low-memory
+        // notice once the data folder has passed its probe.
         Execute(harness, viewModel.StartCommand);
+        Assert.Equal(Services.StartResult.InsufficientMemory, harness.AwaitResult(harness.Controller.StartTask));
 
         Assert.Equal(0, harness.Engine.CreateSessionCount);
         Assert.Equal(RunState.Idle, viewModel.State);

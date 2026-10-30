@@ -14,7 +14,9 @@
 
     Exactly three input controls: the test type selector, Stop on error and the Start/Stop toggle. Lists are
     read-only ItemsControls rather than ListBox or DataGrid, and every ContentControl and ItemsControl is
-    Focusable="False" (both default to True), so the tab order is selector, checkbox, toggle, detail area.
+    Focusable="False" (both default to True), so the tab order is selector, checkbox, toggle, detail area. The toggle
+    takes keyboard focus back whenever it is enabled again after a run transition disabled it
+    (app:App.RestoresKeyboardFocus), and Home and End scroll the detail area to its top and bottom.
 
     Live regions: the result (verdict with reason), the first-error message and the notice are announced to screen
     readers when they change, the live readings never. Every copy of their text carries
@@ -440,11 +442,18 @@
                           Content="{x:Static app:UiText.StopOnErrorLabel}"
                           IsChecked="{Binding StopOnError}"
                           IsEnabled="{Binding CanChangeSettings}" />
+                <!--
+                    The toggle is disabled while it has focus at every run transition (from Start until Preparing, and
+                    through releasing memory and saving results), and WPF then moves focus to the window for good.
+                    RestoresKeyboardFocus returns focus to it when it is enabled again, so Space or Enter stops the run
+                    and starts the next one without navigating back to it.
+                -->
                 <Button x:Name="StartStopButton"
                         DockPanel.Dock="Right"
                         MinWidth="88"
                         MinHeight="32"
                         TabIndex="2"
+                        app:App.RestoresKeyboardFocus="True"
                         Style="{StaticResource StartStopButtonStyle}" />
             </DockPanel>
 
@@ -502,6 +511,11 @@
                           IsTabStop="True"
                           TabIndex="3"
                           AutomationProperties.Name="{x:Static app:UiText.ResultDetailAutomationName}">
+                <!-- Plain Home/End go to the top and bottom: a stock ScrollViewer sends them to its disabled horizontal axis. -->
+                <ScrollViewer.InputBindings>
+                    <KeyBinding Key="Home" Command="{x:Static ScrollBar.ScrollToTopCommand}" />
+                    <KeyBinding Key="End" Command="{x:Static ScrollBar.ScrollToBottomCommand}" />
+                </ScrollViewer.InputBindings>
                 <StackPanel>
                     <ContentControl Style="{StaticResource MinimalOnlyStyle}"
                                     Margin="0,4,0,6"

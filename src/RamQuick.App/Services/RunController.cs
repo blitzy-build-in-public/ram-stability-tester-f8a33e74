@@ -15,15 +15,21 @@ using RamQuick.Sensors;
 namespace RamQuick.App.Services;
 
 /// <summary>
-/// The outcome of <see cref="RunController.TryStart(TestType, bool)"/>. Every value other than
-/// <see cref="Accepted"/> leaves the run state unchanged.
+/// The outcome of a Start. <see cref="RunController.TryStart(TestType, bool)"/> returns at once with
+/// <see cref="Accepted"/>, <see cref="NotElevated"/>, <see cref="RestartingElevated"/>, <see cref="Busy"/>, or
+/// <see cref="DataFolderUnusable"/> when the controller has no data folder at all. The asynchronous continuation of
+/// an accepted Start ends with <see cref="Accepted"/> once the run has entered Preparing, or with
+/// <see cref="DataFolderUnusable"/>, <see cref="EngineUnavailable"/>, <see cref="InsufficientMemory"/> or
+/// <see cref="Withdrawn"/>. Every value other than <see cref="Accepted"/> leaves the run state unchanged.
 /// </summary>
 public enum StartResult
 {
     /// <summary>
-    /// Start was accepted. The run continues asynchronously: the progress journal's <c>begin</c> record is made
-    /// durable, then the run enters Preparing. That continuation can still refuse the start, with the state
-    /// unchanged and a notice, when the data folder turns out to be unusable.
+    /// Start was accepted. The run continues asynchronously, in this order: the data folder is probed and a journal
+    /// left by an earlier failed publication is published, the engine describes the machine and the region is sized,
+    /// the results log reserves the run's base name, and the progress journal's <c>begin</c> record is made durable;
+    /// then the run enters Preparing. Each of those steps can still refuse the Start, with the state unchanged and a
+    /// notice, and the continuation then ends with that refusal instead.
     /// </summary>
     Accepted,
 
@@ -47,21 +53,34 @@ public enum StartResult
 
     /// <summary>
     /// Less than 1 GiB of the available memory can be planned for testing. The notice reads
-    /// <see cref="UiText.LowMemoryMessage"/>.
+    /// <see cref="UiText.LowMemoryMessage"/>. The continuation of an accepted Start ends with it once the data folder
+    /// has proved usable, before the run's results log or journal is created.
     /// </summary>
     InsufficientMemory,
 
     /// <summary>
-    /// No writable data folder exists, so the run could not be journalled. The notice reads
-    /// <see cref="UiText.DataFolderUnusableMessage"/>.
+    /// The run could not be journalled. <see cref="RunController.TryStart(TestType, bool)"/> returns it at once when
+    /// the controller has no data folder; the continuation of an accepted Start ends with it when the data folder's
+    /// write probe fails, the results log cannot reserve the run's name, the <c>begin</c> record is not durable
+    /// within 5 s, or preparing the run fails unexpectedly. The notice reads
+    /// <see cref="UiText.DataFolderUnusableMessage"/>, or <see cref="UiText.ResultsNotSaved(string)"/> when the
+    /// journal of an earlier run whose publication failed still cannot be published.
     /// </summary>
     DataFolderUnusable,
 
     /// <summary>
     /// The engine could not describe the machine. The notice reads <see cref="UiText.EngineError(string)"/> with
-    /// the engine's message.
+    /// the engine's message. The continuation of an accepted Start ends with it once the data folder has proved
+    /// usable, before the run's results log or journal is created.
     /// </summary>
     EngineUnavailable,
+
+    /// <summary>
+    /// An accepted Start was withdrawn by <see cref="RunController.RequestStop"/>,
+    /// <see cref="RunController.ShutdownAsync"/> or <see cref="RunController.Dispose"/> before the run entered
+    /// Preparing; the state is unchanged. Only the continuation of an accepted Start ends with it.
+    /// </summary>
+    Withdrawn,
 }
 
 /// <summary>
@@ -543,9 +562,15 @@ public sealed partial class RunController : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Gets the asynchronous continuation of the last accepted Start; tests await it deterministically.
+    /// Gets the asynchronous continuation of the last Start <see cref="TryStart(TestType, bool)"/> accepted, whose
+    /// result is that Start's outcome: <see cref="StartResult.Accepted"/> once the run has entered Preparing, or
+    /// <see cref="StartResult.DataFolderUnusable"/>, <see cref="StartResult.EngineUnavailable"/>,
+    /// <see cref="StartResult.InsufficientMemory"/> or <see cref="StartResult.Withdrawn"/> when it ended with the
+    /// state unchanged. A Start refused at once leaves it unchanged. Before the first accepted Start it is a completed
+    /// task whose result is <see cref="StartResult.Accepted"/>, so a caller awaiting it never waits on a Start that
+    /// was never made. Tests await it deterministically.
     /// </summary>
-    internal Task StartTask { get; private set; } = Task.CompletedTask;
+    internal Task<StartResult> StartTask { get; private set; } = Task.FromResult(StartResult.Accepted);
 
     /// <summary>
     /// Gets the result, release-wait, publication and disposal pipeline of the last run that ended; tests await it.
@@ -615,21 +640,27 @@ public sealed partial class RunController : ObservableObject, IDisposable
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Every refusal leaves the run state unchanged. Elevation is checked first, and a non-elevated Start shows the
-    /// elevation offer instead of starting. A missing data folder, an engine that cannot describe the machine, and
-    /// less than 1 GiB of plannable memory are refused at once with a notice.
+    /// Start validates elevation, then the data folder, then memory, then reserves the run's files, and every refusal
+    /// leaves the run state unchanged. Only the checks that need no I/O run here, and each answers at once: a Start
+    /// that is not possible now is <see cref="StartResult.Busy"/>; a non-elevated Start shows the elevation offer
+    /// instead of starting; and a controller without a data folder refuses with
+    /// <see cref="UiText.DataFolderUnusableMessage"/>.
     /// </para>
     /// <para>
-    /// An accepted Start continues asynchronously: the data folder is probed, a journal left by an earlier failed
-    /// publication is recovered, the results log reserves the run's base name, and the journal's <c>begin</c> record
-    /// is made durable within 5 s. Only then does the run enter Preparing and the engine session start. A failure
-    /// there refuses the Start with <see cref="UiText.DataFolderUnusableMessage"/> (or the save failure of the
-    /// earlier run) and re-enables Start, with the state unchanged.
+    /// An accepted Start continues asynchronously, in order. Off the UI thread, the data folder is probed and a
+    /// journal left by an earlier failed publication is published. Then the engine describes the machine and the
+    /// region is sized, so an engine that cannot describe the machine and less than 1 GiB of plannable memory are
+    /// refused only once the data folder has proved usable, and before any file of the run exists. Off the UI thread
+    /// again, the results log reserves the run's base name, and the journal's <c>begin</c> record is made durable
+    /// within 5 s. Only then does the run enter Preparing and the engine session start. A refusal on the way shows
+    /// its notice and re-enables Start, with the state unchanged; the continuation's result, which tests read through
+    /// <see cref="StartTask"/>, says which refusal it was.
     /// </para>
     /// </remarks>
     /// <param name="testType">The test type to run.</param>
     /// <param name="stopOnError">Whether the run stops at the first confirmed error.</param>
-    /// <returns><see cref="StartResult.Accepted"/>, or why the Start was refused.</returns>
+    /// <returns><see cref="StartResult.Accepted"/>, or why the Start was refused at once.</returns>
+    /// <exception cref="InvalidOperationException">The plan provider returned no plan for the test type.</exception>
     public StartResult TryStart(TestType testType, bool stopOnError)
     {
         if (_disposed || _shutdownTask is not null || !CanStart || _pendingStart is not null
@@ -650,47 +681,14 @@ public sealed partial class RunController : ObservableObject, IDisposable
             return StartResult.DataFolderUnusable;
         }
 
-        SystemSnapshot snapshot;
-        try
-        {
-            snapshot = _engine.QuerySystem();
-        }
-        catch (Exception exception)
-        {
-            ReportAppError(nameof(TryStart), exception);
-            NoticeMessage = UiText.EngineError(exception.Message);
-            return StartResult.EngineUnavailable;
-        }
-
-        System = snapshot;
-        IsReducedInstructionSet = snapshot.BestIsa == InstructionSet.Sse2;
-
-        int workers = snapshot.LogicalProcessors;
-        MemorySizingResult sizing = MemorySizing.Plan(snapshot.AvailablePhysicalBytes, workers);
-
-        // Sufficiency is judged on the uncapped plan; the cap only scales the region a test host requests.
-        ulong regionBytes = _options.MaxRegionBytes is { } cap
-            ? MemorySizing.RoundDownToSlices(Math.Min(sizing.PlannedBytes, cap), workers)
-            : sizing.PlannedBytes;
-        if (!sizing.IsSufficient || regionBytes == 0)
-        {
-            NoticeMessage = UiText.LowMemoryMessage;
-            return StartResult.InsufficientMemory;
-        }
-
         TestPlan plan = _options.PlanProvider(testType)
             ?? throw new InvalidOperationException($"The plan provider returned no plan for {testType}.");
 
-        var request = new StartRequest(
+        var selection = new StartSelection(
             testType,
             stopOnError,
             plan,
             plan.ToStepAttributes(),
-            snapshot,
-            Inventory,
-            sizing.PlannedBytes,
-            regionBytes,
-            Math.Min(MemorySizing.MinimumRegionBytes, regionBytes),
             _timeProvider.GetUtcNow(),
             dataDirectory);
 
@@ -698,7 +696,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         NoticeMessage = null;
         var pending = new CancellationTokenSource();
         _pendingStart = pending;
-        StartTask = RunStartAsync(request, pending);
+        StartTask = RunStartAsync(selection, pending);
         return StartResult.Accepted;
     }
 
@@ -706,9 +704,10 @@ public sealed partial class RunController : ObservableObject, IDisposable
     /// Requests that the current run stop with the user-stop reason. Never blocks.
     /// </summary>
     /// <remarks>
-    /// While an accepted Start is still making its <c>begin</c> record durable, the Start is withdrawn with the state
-    /// unchanged. In Preparing, including a step's journal wait, and in Running, the engine is asked to stop and the
-    /// run ends ABORTED with "Stopped by user" within 2 s. Otherwise nothing happens.
+    /// While an accepted Start has not yet entered Preparing, for example while its <c>begin</c> record is being made
+    /// durable, the Start is withdrawn with the state unchanged (<see cref="StartResult.Withdrawn"/>). In Preparing,
+    /// including a step's journal wait, and in Running, the engine is asked to stop and the run ends ABORTED with
+    /// "Stopped by user" within 2 s. Otherwise nothing happens.
     /// </remarks>
     public void RequestStop()
     {
@@ -991,28 +990,90 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
         if (recovery.PublicationError is { } error)
         {
-            NoticeMessage = UiText.ResultsNotSaved(error);
+            NoticeMessage = UiText.ResultsNotSaved(RedactForDisplay(error));
         }
     }
 
-    private async Task RunStartAsync(StartRequest request, CancellationTokenSource pending)
+    private async Task<StartResult> RunStartAsync(StartSelection selection, CancellationTokenSource pending)
     {
         ResultsLog? log = null;
         ProgressJournal? journal = null;
         Task<JournalAckStatus>? beginTask = null;
         try
         {
-            DataFolderPreparation preparation = await Task.Run(() => PrepareDataFolder(request));
-            if (preparation.RecoveryNotice is { } recoveryNotice)
+            DataDirectory dataDirectory = selection.DataDirectory;
+            DataFolderCheck check = await Task.Run(() => CheckDataFolder(dataDirectory));
+            if (check.RecoveryNotice is { } recoveryNotice)
             {
                 NoticeMessage = recoveryNotice;
             }
 
-            log = preparation.Log;
-            if (log is null || pending.IsCancellationRequested)
+            if (check.RefusalNotice is { } folderRefusal)
             {
-                await RefuseStartAsync(pending, preparation.RefusalNotice, journal, beginTask, log);
-                return;
+                return await RefuseStartAsync(
+                    pending, StartResult.DataFolderUnusable, folderRefusal, journal, beginTask, log);
+            }
+
+            if (pending.IsCancellationRequested)
+            {
+                return await RefuseStartAsync(pending, StartResult.Withdrawn, notice: null, journal, beginTask, log);
+            }
+
+            // Memory is judged only once the data folder has proved usable, and before the results log reserves the
+            // run's name, so an engine or memory refusal leaves no file behind. The query is quick and does no file
+            // I/O, so it runs here, where System is published.
+            SystemSnapshot snapshot;
+            try
+            {
+                snapshot = _engine.QuerySystem();
+            }
+            catch (Exception exception)
+            {
+                ReportAppError(nameof(TryStart), exception);
+                string engineError = UiText.EngineError(RedactForDisplay(exception.Message));
+                return await RefuseStartAsync(
+                    pending, StartResult.EngineUnavailable, engineError, journal, beginTask, log);
+            }
+
+            System = snapshot;
+            IsReducedInstructionSet = snapshot.BestIsa == InstructionSet.Sse2;
+
+            int workers = snapshot.LogicalProcessors;
+            MemorySizingResult sizing = MemorySizing.Plan(snapshot.AvailablePhysicalBytes, workers);
+
+            // Sufficiency is judged on the uncapped plan; the cap only scales the region a test host requests.
+            ulong regionBytes = _options.MaxRegionBytes is { } cap
+                ? MemorySizing.RoundDownToSlices(Math.Min(sizing.PlannedBytes, cap), workers)
+                : sizing.PlannedBytes;
+            if (!sizing.IsSufficient || regionBytes == 0)
+            {
+                return await RefuseStartAsync(
+                    pending, StartResult.InsufficientMemory, UiText.LowMemoryMessage, journal, beginTask, log);
+            }
+
+            var request = new StartRequest(
+                selection.TestType,
+                selection.StopOnError,
+                selection.Plan,
+                selection.Steps,
+                snapshot,
+                Inventory,
+                sizing.PlannedBytes,
+                regionBytes,
+                Math.Min(MemorySizing.MinimumRegionBytes, regionBytes),
+                selection.StartRequestedUtc,
+                dataDirectory);
+
+            log = await Task.Run(() => ReserveRunLog(request));
+            if (log is null)
+            {
+                return await RefuseStartAsync(
+                    pending, StartResult.DataFolderUnusable, UiText.DataFolderUnusableMessage, journal, beginTask, log);
+            }
+
+            if (pending.IsCancellationRequested)
+            {
+                return await RefuseStartAsync(pending, StartResult.Withdrawn, notice: null, journal, beginTask, log);
             }
 
             journal = _options.JournalFactory(request.DataDirectory, _timeProvider);
@@ -1034,17 +1095,17 @@ public sealed partial class RunController : ObservableObject, IDisposable
             JournalAckStatus status = await WaitForBeginAsync(beginTask, pending.Token);
             if (pending.IsCancellationRequested)
             {
-                await RefuseStartAsync(pending, notice: null, journal, beginTask, log);
-                return;
+                return await RefuseStartAsync(pending, StartResult.Withdrawn, notice: null, journal, beginTask, log);
             }
 
             if (status != JournalAckStatus.Acknowledged)
             {
-                await RefuseStartAsync(pending, UiText.DataFolderUnusableMessage, journal, beginTask, log);
-                return;
+                return await RefuseStartAsync(
+                    pending, StartResult.DataFolderUnusable, UiText.DataFolderUnusableMessage, journal, beginTask, log);
             }
 
             BeginRun(request, pending, journal, log, begin);
+            return StartResult.Accepted;
         }
         catch (Exception exception)
         {
@@ -1056,50 +1117,50 @@ public sealed partial class RunController : ObservableObject, IDisposable
                 {
                     BeginConclusion(run, StartFaultConclusion(exception), releaseExpected: run.SessionStarted);
                 }
+
+                return StartResult.Accepted;
             }
-            else
-            {
-                await RefuseStartAsync(pending, UiText.DataFolderUnusableMessage, journal, beginTask, log);
-            }
+
+            return await RefuseStartAsync(
+                pending, StartResult.DataFolderUnusable, UiText.DataFolderUnusableMessage, journal, beginTask, log);
         }
     }
 
-    // Runs on the thread pool: the probe, the recovery of a kept journal and the name reservation all do file I/O.
-    private DataFolderPreparation PrepareDataFolder(StartRequest request)
+    // Runs on the thread pool: the write probe and the recovery of a kept journal both do file I/O.
+    private DataFolderCheck CheckDataFolder(DataDirectory dataDirectory)
     {
-        DataDirectory dataDirectory = request.DataDirectory;
         if (!dataDirectory.CanWrite())
         {
-            return new DataFolderPreparation(null, UiText.DataFolderUnusableMessage, null);
+            return new DataFolderCheck(UiText.DataFolderUnusableMessage, null);
         }
 
         // A journal still on disk holds a run whose summaries could not be published. The new run would append to
         // that file and delete it with its own end record, losing the earlier run's records, so publication is
         // retried first, and Start is refused while it still fails.
-        string? recoveryNotice = null;
         if (File.Exists(dataDirectory.JournalPath))
         {
             JournalRecovery recovery = CrashDetector.Detect(dataDirectory, _timeProvider);
             if (recovery.PublicationError is { } error)
             {
-                return new DataFolderPreparation(null, UiText.ResultsNotSaved(error), null);
+                return new DataFolderCheck(UiText.ResultsNotSaved(RedactForDisplay(error)), null);
             }
 
             if (recovery.PublishedFiles.Count > 0)
             {
-                recoveryNotice = UiText.RecoveredNotice;
+                return new DataFolderCheck(null, UiText.RecoveredNotice);
             }
         }
 
-        ResultsLog? log = ResultsLog.OpenRun(
-            dataDirectory,
+        return new DataFolderCheck(null, null);
+    }
+
+    // Runs on the thread pool: the reservation creates the run's .log.
+    private ResultsLog? ReserveRunLog(StartRequest request) =>
+        ResultsLog.OpenRun(
+            request.DataDirectory,
             request.TestType.ToString(),
             request.StartRequestedUtc,
             _timeProvider);
-        return log is null
-            ? new DataFolderPreparation(null, UiText.DataFolderUnusableMessage, recoveryNotice)
-            : new DataFolderPreparation(log, null, recoveryNotice);
-    }
 
     private async Task<JournalAckStatus> WaitForBeginAsync(Task<JournalAckStatus> beginTask, CancellationToken cancellation)
     {
@@ -1118,9 +1179,10 @@ public sealed partial class RunController : ObservableObject, IDisposable
     }
 
     // Leaves the state unchanged and re-enables Start only once the journal is retired, so the next run's journal
-    // can never be deleted by this one's late end record.
-    private async Task RefuseStartAsync(
+    // can never be deleted by this one's late end record. Returns refusal, the outcome the refused Start ends with.
+    private async Task<StartResult> RefuseStartAsync(
         CancellationTokenSource pending,
+        StartResult refusal,
         string? notice,
         ProgressJournal? journal,
         Task<JournalAckStatus>? beginTask,
@@ -1152,6 +1214,8 @@ public sealed partial class RunController : ObservableObject, IDisposable
             ClearPendingStart(pending);
             CanStart = !_disposed;
         }
+
+        return refusal;
     }
 
     private static async Task RetireUnstartedJournalAsync(ProgressJournal journal, Task<JournalAckStatus>? beginTask)
@@ -1631,13 +1695,14 @@ public sealed partial class RunController : ObservableObject, IDisposable
             ReportAppError(nameof(ResultsLog), failure);
         }
 
+        string failureText = RedactForDisplay(failure.Message);
         NoticeMessage = run.PublicationOutcome switch
         {
-            null => UiText.EventLogNotSaved(failure.Message),
-            { Succeeded: true } => UiText.ResultsSavedWithoutEventLog(failure.Message),
-            { Error: var error } => UiText.ResultsNotSaved(error ?? string.Empty)
+            null => UiText.EventLogNotSaved(failureText),
+            { Succeeded: true } => UiText.ResultsSavedWithoutEventLog(failureText),
+            { Error: var error } => UiText.ResultsNotSaved(RedactForDisplay(error ?? string.Empty))
                 + UiText.NoticeSeparator
-                + UiText.EventLogNotSaved(failure.Message),
+                + UiText.EventLogNotSaved(failureText),
         };
     }
 
@@ -1868,7 +1933,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         {
             ReportAppError(nameof(PublishAsync), exception);
             run.PublicationOutcome = new SummaryPublishResult(false, null, null, exception.Message);
-            NoticeMessage = UiText.ResultsNotSaved(exception.Message);
+            NoticeMessage = UiText.ResultsNotSaved(RedactForDisplay(exception.Message));
             ReportLogFailure(run);
         }
         finally
@@ -1942,7 +2007,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
                 throw new InvalidOperationException($"A run cannot end from {StateMachine.State}.");
             }
 
-            reason = UiText.EngineError(detail);
+            reason = UiText.EngineError(RedactForDisplay(detail));
         }
 
         RunState terminalState = StateMachine.State;
@@ -2023,18 +2088,20 @@ public sealed partial class RunController : ObservableObject, IDisposable
         // Only this controller requests a thermal stop, and it keeps the verdict first.
         RunEndReason.Thermal => run.ThermalVerdict is { } verdict
             ? UiText.ThermalStop(verdict.Sensor, verdict.LimitCelsius)
-            : conclusion.EndDetail ?? conclusion.EndReason.ToString(),
+            : RedactForDisplay(conclusion.EndDetail ?? conclusion.EndReason.ToString()),
         RunEndReason.InsufficientMemory => UiText.LowMemoryMessage,
         RunEndReason.AffinityFailed => UiText.AffinityFailed(conclusion.OsError),
         RunEndReason.HostFault => run.JournalFailureText is { } journalFailure
-            ? UiText.JournalWriteFailed(journalFailure)
-            : UiText.HostFault(run.CallbackFaultText ?? conclusion.EndDetail ?? conclusion.EndReason.ToString()),
-        _ => UiText.EngineError(conclusion.EndDetail ?? conclusion.EndReason.ToString()),
+            ? UiText.JournalWriteFailed(RedactForDisplay(journalFailure))
+            : UiText.HostFault(
+                RedactForDisplay(run.CallbackFaultText ?? conclusion.EndDetail ?? conclusion.EndReason.ToString())),
+        _ => UiText.EngineError(RedactForDisplay(conclusion.EndDetail ?? conclusion.EndReason.ToString())),
     };
 
     // The engine reports a host-fault stop only as the host's request; the cause this controller recorded is what the
-    // state machine, the VERDICT line, the result record and both summaries state. The detail is persisted, so it goes
-    // through the redaction the shareable summaries need, while the displayed reason keeps the full text.
+    // state machine, the VERDICT line, the result record and both summaries state. The persisted detail and the
+    // displayed reason are both redacted, because either can carry an exception message that names a path in the
+    // user's profile; app-errors.log keeps the full exception.
     private static string? PersistedEndDetail(RunContext run, Conclusion conclusion)
     {
         string? detail = conclusion.EndReason switch
@@ -2045,6 +2112,11 @@ public sealed partial class RunController : ObservableObject, IDisposable
         };
         return detail is null ? null : SummaryFormat.RedactPersonalPaths(detail);
     }
+
+    // Every runtime text a notice or a result reason substitutes, such as an exception message, an error the results
+    // log or crash recovery reported, or an engine detail, passes through here, so the window never shows a path in
+    // the user's profile, as no persisted copy of that text does. app-errors.log keeps the full exception.
+    private static string RedactForDisplay(string text) => SummaryFormat.RedactPersonalPaths(text);
 
     private async Task<CauseHints> AnalyseAsync(RunContext run, IReadOnlyList<StepOutcome> outcomes)
     {
@@ -2142,7 +2214,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         else
         {
             // The verdict stays displayed, and the journal is kept so the next launch retries the publication.
-            string failure = UiText.ResultsNotSaved(published.Error ?? string.Empty);
+            string failure = UiText.ResultsNotSaved(RedactForDisplay(published.Error ?? string.Empty));
             NoticeMessage = failure;
             run.Log.LogNotice(failure);
         }
@@ -2278,7 +2350,16 @@ public sealed partial class RunController : ObservableObject, IDisposable
         DateTimeOffset StartRequestedUtc,
         DataDirectory DataDirectory);
 
-    private sealed record DataFolderPreparation(ResultsLog? Log, string? RefusalNotice, string? RecoveryNotice);
+    // What TryStart settles before the continuation: the user's choices, the plan, the request time and the folder.
+    private sealed record StartSelection(
+        TestType TestType,
+        bool StopOnError,
+        TestPlan Plan,
+        IReadOnlyList<StepAttributes> Steps,
+        DateTimeOffset StartRequestedUtc,
+        DataDirectory DataDirectory);
+
+    private sealed record DataFolderCheck(string? RefusalNotice, string? RecoveryNotice);
 
     private sealed record Conclusion(
         RunEndReason EndReason,

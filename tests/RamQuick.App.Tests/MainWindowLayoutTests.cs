@@ -30,7 +30,10 @@ namespace RamQuick.App.Tests;
 /// with the longest texts it can show, is measured at the preferred 560-DIP width and the narrowest supported 512:
 /// its fixed rows stay within the regular and compact budgets, and the minimal fallback keeps only the control row and
 /// the status line fixed. The window has exactly three accessible input controls, its test type selector's entries and
-/// selection are named by their labels, and its Start/Stop toggle binds the command the run state calls for. Also tests <see cref="WindowSizing.Compute"/>: the window bounds and active
+/// selection are named by their labels, and its Start/Stop toggle binds the command the run state calls for. Shown
+/// off-screen and driven from the keyboard, the toggle takes keyboard focus back after every run transition unless the
+/// user moved it elsewhere, and Home and End scroll the detail area to its top and bottom. Also tests
+/// <see cref="WindowSizing.Compute"/>: the window bounds and active
 /// layout for the worked work areas, the layout and supported-range thresholds, and the argument guards; and
 /// <see cref="WorkAreaSizing"/> on a loaded window with a real handle: DPI changes that arrive before the sizing work
 /// they defer has run, and the non-client height measured once a shown window loads, which a content margin leaves
@@ -418,6 +421,139 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
     }
 
     /// <summary>
+    /// Drives one run from the keyboard alone on the shown window, with the key pressed on the focused Start/Stop
+    /// toggle. Start disables the toggle until the run reaches Preparing, which moves keyboard focus to the window, and
+    /// focus returns to the toggle as soon as it is enabled as Stop, so the same key stops the run. The verdict disables
+    /// it again through releasing memory and saving results, and focus returns to it as Start once the summaries are
+    /// published.
+    /// </summary>
+    /// <param name="key">The key that activates the toggle.</param>
+    /// <returns>A task that completes when the run has been checked on the STA thread.</returns>
+    [Theory]
+    [InlineData(Key.Space)]
+    [InlineData(Key.Enter)]
+    public async Task StartStopButton_KeyPressedThroughOneRun_KeyboardFocusReturnsAfterEveryTransitionAsync(Key key)
+    {
+        await _fixture.RunAsync(async () =>
+        {
+            using LongestTextScene scene = LongestTextScene.Create();
+            MainViewModel viewModel = scene.ViewModel;
+            MainWindow window = scene.Window;
+            Button toggle = window.StartStopButton;
+            Assert.True(App.GetRestoresKeyboardFocus(toggle));
+            await ShowOffScreenAsync(window);
+            FocusOn(toggle);
+
+            PressOn(scene, toggle, key);
+            await SettleAsync();
+            Assert.Equal(RunState.Idle, viewModel.State);
+            Assert.False(toggle.IsEnabled, "Start stays enabled while its begin record becomes durable.");
+            Assert.False(toggle.IsKeyboardFocused);
+            Assert.Same(window, Keyboard.FocusedElement);
+
+            RunToPreparing(scene);
+            await SettleAsync();
+            AssertToggle(toggle, viewModel.StopCommand, UiText.StopLabel, UiText.StopAutomationName);
+            Assert.True(toggle.IsKeyboardFocused, "Focus did not return to the toggle once it showed Stop.");
+
+            PressOn(scene, toggle, key);
+            Assert.Equal(new[] { StopReason.User }, scene.Harness.Session.StopRequests);
+
+            scene.Harness.Session.CompleteWithFirstRecordedReason();
+            scene.Harness.AwaitVerdict();
+            await SettleAsync();
+            Assert.Equal(RunState.Aborted, viewModel.State);
+            Assert.Equal(UiText.StoppedByUser, viewModel.ResultReasonText);
+            Assert.Same(viewModel.StartCommand, toggle.Command);
+            Assert.False(toggle.IsEnabled, "Start is enabled before the stopped run has released its memory.");
+            Assert.False(toggle.IsKeyboardFocused);
+
+            scene.Harness.Release(_releaseTime);
+            await SettleAsync();
+            AssertToggle(toggle, viewModel.StartCommand, UiText.StartLabel, UiText.StartAutomationName);
+            Assert.True(toggle.IsKeyboardFocused, "Focus did not return to the toggle once it offered Start again.");
+        });
+    }
+
+    /// <summary>
+    /// Starts a run with Space on the shown window's focused Start/Stop toggle and moves keyboard focus to the detail
+    /// area while the toggle is disabled: when the toggle is enabled again as Stop, focus stays where the user put it.
+    /// </summary>
+    /// <returns>A task that completes when the focus has been checked on the STA thread.</returns>
+    [Fact]
+    public async Task StartStopButton_FocusMovedWhileDisabled_FocusStaysWhereTheUserMovedItAsync()
+    {
+        await _fixture.RunAsync(async () =>
+        {
+            using LongestTextScene scene = LongestTextScene.Create();
+            MainWindow window = scene.Window;
+            Button toggle = window.StartStopButton;
+            await ShowOffScreenAsync(window);
+            FocusOn(toggle);
+
+            PressOn(scene, toggle, Key.Space);
+            await SettleAsync();
+            Assert.False(toggle.IsEnabled);
+            FocusOn(window.DetailScroller);
+
+            RunToPreparing(scene);
+            await SettleAsync();
+            Assert.True(toggle.IsEnabled, "The toggle is not enabled as Stop in Preparing.");
+            Assert.True(window.DetailScroller.IsKeyboardFocused, "The toggle took focus back from the detail area.");
+            Assert.False(toggle.IsKeyboardFocused);
+        });
+    }
+
+    // Shows the window far beyond every screen, outside the taskbar and without activating it, so its controls can
+    // take keyboard focus without the window appearing on the desktop. The work-area behavior is detached first, since
+    // it would move the window back onto its monitor.
+    private static async Task ShowOffScreenAsync(Window window)
+    {
+        const double OffScreen = -20_000;
+        WorkAreaSizing.SetIsEnabled(window, false);
+        window.WindowStartupLocation = WindowStartupLocation.Manual;
+        window.Left = OffScreen;
+        window.Top = OffScreen;
+        window.ShowInTaskbar = false;
+        window.ShowActivated = false;
+        window.Show();
+        await SettleAsync();
+    }
+
+    // Gives an element keyboard focus, as Tab or a click does, which also activates its window: focus returns to the
+    // toggle only in an active window.
+    private static void FocusOn(UIElement element)
+    {
+        Assert.True(element.Focus(), $"{Describe(element)} did not take keyboard focus.");
+        Assert.True(element.IsKeyboardFocused);
+        Assert.True(Window.GetWindow(element)?.IsActive, "The focused element's window is not active.");
+    }
+
+    // Presses a key on the toggle as the keyboard does while it has focus: KeyDown, where a button clicks on Enter,
+    // then KeyUp, where it clicks on Space. Raised with the harness context installed, so the command's awaits resume on
+    // the context the harness pumps.
+    private static void PressOn(LongestTextScene scene, Button toggle, Key key)
+    {
+        PresentationSource? source = PresentationSource.FromVisual(toggle);
+        Assert.NotNull(source);
+        bool handled = scene.Harness.OnUiThread(() =>
+        {
+            var keyDown = new KeyEventArgs(Keyboard.PrimaryDevice, source, 0, key) { RoutedEvent = Keyboard.KeyDownEvent };
+            toggle.RaiseEvent(keyDown);
+            toggle.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, source, 0, key) { RoutedEvent = Keyboard.KeyUpEvent });
+            return keyDown.Handled;
+        });
+        Assert.True(handled, $"The toggle did not handle {key}.");
+    }
+
+    // Pumps the accepted Start until its begin record is durable and the run has entered Preparing.
+    private static void RunToPreparing(LongestTextScene scene)
+    {
+        ControllerHarness harness = scene.Harness;
+        harness.RunUntil(() => harness.StateMachine.State == RunState.Preparing && harness.Session.IsStarted);
+    }
+
+    /// <summary>
     /// Reads the test type selector through its automation peers, as assistive technology does: one item per test
     /// type, each named by the label it shows, and the default Quick entry the one selected.
     /// </summary>
@@ -470,6 +606,49 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
                 TextBlock headerBlock = Assert.Single(LaidOutTextBlocks(window.DetailScroller, header));
                 AutomationPeer peer = UIElementAutomationPeer.CreatePeerForElement(headerBlock);
                 Assert.Equal(AutomationHeadingLevel.Level1, peer.GetHeadingLevel());
+            }
+        });
+    }
+
+    /// <summary>
+    /// Stops a run that counted errors and lays the window out at the regular layout's minimum client height, so the
+    /// detail area holds more than it shows, then presses End and Home in it: End scrolls it to the bottom and Home back
+    /// to the top, as Ctrl+End and Ctrl+Home do, rather than to the ends of its disabled horizontal axis.
+    /// </summary>
+    /// <returns>A task that completes when the scrolling has been checked on the STA thread.</returns>
+    [Fact]
+    public async Task DetailScroller_EndThenHome_ScrollsToBottomThenTopAsync()
+    {
+        await _fixture.RunAsync(async () =>
+        {
+            using LongestTextScene scene = LongestTextScene.Create();
+            scene.RunTo(RunState.Aborted);
+            await scene.MeasureAsync(WindowLayout.Regular, WindowSizing.PreferredWidth);
+
+            ScrollViewer detail = scene.Window.DetailScroller;
+            double clientHeight = WindowSizing.FixedRowsBudget(WindowLayout.Regular) + WindowSizing.MinimumDetailHeight;
+            scene.DetailHeightAt(WindowSizing.PreferredWidth, clientHeight);
+            Assert.True(detail.ScrollableHeight > 0, "The detail area shows everything it holds, so it cannot scroll.");
+            Assert.Equal(0, detail.VerticalOffset, Tolerance);
+
+            // A key event needs a presentation source; a hidden one of its own leaves the window unshown.
+            using var keyboardSource = new HwndSource(new HwndSourceParameters(nameof(MainWindowLayoutTests)) { WindowStyle = 0 });
+
+            await PressAsync(Key.End);
+            Assert.Equal(detail.ScrollableHeight, detail.VerticalOffset, Tolerance);
+
+            await PressAsync(Key.Home);
+            Assert.Equal(0, detail.VerticalOffset, Tolerance);
+
+            // Raises the key's KeyDown on the detail area, as the keyboard does while the area has focus, then lays the
+            // grid out again so the scroll the key queued takes effect.
+            async Task PressAsync(Key key)
+            {
+                var keyDown = new KeyEventArgs(Keyboard.PrimaryDevice, keyboardSource, 0, key) { RoutedEvent = Keyboard.KeyDownEvent };
+                detail.RaiseEvent(keyDown);
+                Assert.True(keyDown.Handled, $"The detail area did not handle {key}.");
+                await SettleAsync();
+                scene.DetailHeightAt(WindowSizing.PreferredWidth, clientHeight);
             }
         });
     }

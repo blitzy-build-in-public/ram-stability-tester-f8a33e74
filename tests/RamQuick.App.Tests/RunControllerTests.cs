@@ -727,9 +727,10 @@ public sealed class RunControllerTests
         harness.StateMachine.StateChanged += (_, _) => transitions++;
         harness.Initialize();
 
-        // min(0.90 × 1.5 GiB, 1.5 GiB − 1 GiB) plans 0.5 GiB, below the 1 GiB floor.
-        Assert.Equal(StartResult.InsufficientMemory, harness.TryStart());
-        harness.Pump();
+        // min(0.90 × 1.5 GiB, 1.5 GiB − 1 GiB) plans 0.5 GiB, below the 1 GiB floor. Memory is judged after the data
+        // folder's probe, so the Start is accepted first and refused by its continuation.
+        Assert.Equal(StartResult.Accepted, harness.TryStart());
+        Assert.Equal(StartResult.InsufficientMemory, harness.AwaitResult(harness.Controller.StartTask));
 
         Assert.Equal(UiText.LowMemoryMessage, harness.Controller.NoticeMessage);
         Assert.Equal(RunState.Idle, harness.StateMachine.State);
@@ -774,10 +775,11 @@ public sealed class RunControllerTests
         harness.StateMachine.StateChanged += (_, _) => transitions++;
         harness.Initialize();
 
-        // The probe runs asynchronously, so the Start is accepted first and withdrawn once the probe fails.
+        // The probe runs asynchronously, so the Start is accepted first and refused once the probe fails.
         Assert.Equal(StartResult.Accepted, harness.TryStart());
         Assert.False(harness.Controller.CanStart);
         harness.RunUntil(() => harness.Controller.CanStart);
+        Assert.Equal(StartResult.DataFolderUnusable, harness.AwaitResult(harness.Controller.StartTask));
 
         Assert.Equal(UiText.DataFolderUnusableMessage, harness.Controller.NoticeMessage);
         Assert.Equal(RunState.Idle, harness.StateMachine.State);
@@ -805,6 +807,7 @@ public sealed class RunControllerTests
         harness.Time.Advance(harness.Options.BeginTimeout);
         harness.RunUntil(() => harness.Controller.CanStart);
 
+        Assert.Equal(StartResult.DataFolderUnusable, harness.AwaitResult(harness.Controller.StartTask));
         Assert.Equal(UiText.DataFolderUnusableMessage, harness.Controller.NoticeMessage);
         Assert.Equal(RunState.Idle, harness.StateMachine.State);
         Assert.Equal(0, transitions);
@@ -850,6 +853,7 @@ public sealed class RunControllerTests
         Assert.Equal(StartResult.Accepted, harness.TryStart());
         harness.RunUntil(() => harness.Controller.CanStart);
 
+        Assert.Equal(StartResult.DataFolderUnusable, harness.AwaitResult(harness.Controller.StartTask));
         Assert.Equal(UiText.DataFolderUnusableMessage, harness.Controller.NoticeMessage);
         Assert.Equal(RunState.Idle, harness.StateMachine.State);
         Assert.Equal(0, harness.Engine.CreateSessionCount);
@@ -923,16 +927,60 @@ public sealed class RunControllerTests
     public void TryStart_EngineCannotDescribeMachine_RefusesWithEngineError()
     {
         using var harness = new ControllerHarness();
+        int transitions = 0;
+        harness.StateMachine.StateChanged += (_, _) => transitions++;
         harness.Initialize();
         harness.Engine.QuerySystemException = new EngineException(EngineResultCode.Internal, "rq_query_system failed");
 
-        Assert.Equal(StartResult.EngineUnavailable, harness.TryStart());
+        // The engine is asked only after the data folder's probe, so the Start is accepted first.
+        Assert.Equal(StartResult.Accepted, harness.TryStart());
+        Assert.Equal(StartResult.EngineUnavailable, harness.AwaitResult(harness.Controller.StartTask));
 
         Assert.Equal(UiText.EngineError("rq_query_system failed"), harness.Controller.NoticeMessage);
         Assert.Equal(RunState.Idle, harness.StateMachine.State);
+        Assert.Equal(0, transitions);
         Assert.Equal(0, harness.Engine.CreateSessionCount);
+        Assert.Empty(harness.Journals);
+        Assert.Empty(harness.RunLogPaths());
+        Assert.False(harness.JournalExists);
         Assert.True(harness.Controller.CanStart);
         harness.RunUntil(() => harness.AppErrorsLogText().Contains("rq_query_system failed", StringComparison.Ordinal));
+    }
+
+    // The data folder is validated before memory: an unwritable folder is what a Start reports even when too little
+    // memory is free or the engine cannot describe the machine, and the engine is not asked at all.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TryStart_DataFolderUnwritableAndMemoryOrEngineFails_RefusesForTheDataFolder(bool engineFails)
+    {
+        using var harness = new ControllerHarness();
+        harness.WithUnwritableDataDirectory();
+        int transitions = 0;
+        harness.StateMachine.StateChanged += (_, _) => transitions++;
+        harness.Initialize();
+        if (engineFails)
+        {
+            harness.Engine.QuerySystemException = new EngineException(EngineResultCode.Internal, "rq_query_system failed");
+        }
+        else
+        {
+            // 1.5 GiB available plans only 0.5 GiB, which on its own is refused as low memory.
+            harness.Engine.WithAvailableBytes(3 * GiB / 2);
+        }
+
+        int queriesBefore = harness.Engine.QuerySystemCount;
+
+        Assert.Equal(StartResult.Accepted, harness.TryStart());
+        Assert.Equal(StartResult.DataFolderUnusable, harness.AwaitResult(harness.Controller.StartTask));
+
+        Assert.Equal(UiText.DataFolderUnusableMessage, harness.Controller.NoticeMessage);
+        Assert.Equal(queriesBefore, harness.Engine.QuerySystemCount);
+        Assert.Equal(RunState.Idle, harness.StateMachine.State);
+        Assert.Equal(0, transitions);
+        Assert.Equal(0, harness.Engine.CreateSessionCount);
+        Assert.Empty(harness.Journals);
+        Assert.True(harness.Controller.CanStart);
     }
 
     [Fact]
@@ -1062,6 +1110,7 @@ public sealed class RunControllerTests
         harness.Initialize();
 
         FakeEngineSession session = harness.StartAccepted(testType, stopOnError);
+        Assert.Equal(StartResult.Accepted, harness.AwaitResult(harness.Controller.StartTask));
 
         SystemSnapshot system = harness.Engine.System;
         TestPlan plan = TestPlans.Get(testType);
@@ -1113,10 +1162,14 @@ public sealed class RunControllerTests
         harness.Engine.WithAvailableBytes(3 * GiB / 2);
         harness.Initialize();
 
-        Assert.Equal(StartResult.InsufficientMemory, harness.TryStart());
+        Assert.Equal(StartResult.Accepted, harness.TryStart());
+        Assert.Equal(StartResult.InsufficientMemory, harness.AwaitResult(harness.Controller.StartTask));
 
         Assert.Equal(UiText.LowMemoryMessage, harness.Controller.NoticeMessage);
         Assert.Equal(0, harness.Engine.CreateSessionCount);
+        Assert.Empty(harness.Journals);
+        Assert.Empty(harness.RunLogPaths());
+        Assert.True(harness.Controller.CanStart);
     }
 
     [Fact]
@@ -1461,9 +1514,9 @@ public sealed class RunControllerTests
         harness.RunUntil(() => harness.AppErrorsLogText().Contains(failure.Message, StringComparison.Ordinal));
     }
 
-    // A managed exception from the engine seam can name a path in the user's profile. The display keeps it, and so
-    // does app-errors.log, the local diagnostic log; the journal's result record, both shareable summaries and the
-    // .log's COMPLETED and VERDICT lines do not.
+    // A managed exception from the engine seam can name a path in the user's profile. app-errors.log, the local
+    // diagnostic log, keeps the full exception; the displayed reason, the journal's result record, both shareable
+    // summaries and the .log's COMPLETED and VERDICT lines do not.
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -1496,7 +1549,7 @@ public sealed class RunControllerTests
 
         Assert.Equal(RunState.Aborted, harness.StateMachine.State);
         Assert.Equal(RunEndReason.EngineFault, harness.StateMachine.EndReason);
-        Assert.Equal(UiText.EngineError(failure.Message), harness.Controller.ResultMessage);
+        Assert.Equal(UiText.EngineError(Redacted), harness.Controller.ResultMessage);
         Assert.Equal(Redacted, harness.StateMachine.EndDetail);
         AssertPublishedEndDetail(harness, Redacted);
         string json = File.ReadAllText(harness.SummaryJsonPath());
@@ -1892,6 +1945,7 @@ public sealed class RunControllerTests
         harness.Controller.RequestStop();
         harness.RunUntil(() => harness.Controller.CanStart);
 
+        Assert.Equal(StartResult.Withdrawn, harness.AwaitResult(harness.Controller.StartTask));
         Assert.Equal(RunState.Idle, harness.StateMachine.State);
         Assert.Equal(0, transitions);
         Assert.Empty(harness.Engine.Sessions);
@@ -1919,6 +1973,7 @@ public sealed class RunControllerTests
         storage.Release();
         harness.RunUntil(() => harness.Controller.CanStart);
 
+        Assert.Equal(StartResult.Withdrawn, harness.AwaitResult(harness.Controller.StartTask));
         Assert.Equal(RunState.Idle, harness.StateMachine.State);
         Assert.Empty(harness.Engine.Sessions);
         Assert.Null(harness.Controller.NoticeMessage);
@@ -2417,8 +2472,8 @@ public sealed class RunControllerTests
         AssertGateFailureLogged(RunLogLines(harness), failure.Message, failedAt);
     }
 
-    // The failed write names the journal in the user's profile: the display keeps the path, and the persisted cause
-    // is redacted like every persisted end detail.
+    // The failed write names the journal in the user's profile: the displayed reason and the persisted cause are
+    // redacted alike.
     [Theory]
     [InlineData("stepEnd")]
     [InlineData("beat")]
@@ -2465,14 +2520,14 @@ public sealed class RunControllerTests
 
         session.CompleteWithFirstRecordedReason();
         harness.AwaitVerdict();
+        string redacted = UiText.JournalWriteFailed(
+            @"The process cannot access the file '%USERPROFILE%\RamQuick\data\journal\active-run.jsonl'.");
         Assert.Equal(RunState.Aborted, harness.StateMachine.State);
         Assert.Equal(RunEndReason.HostFault, harness.StateMachine.EndReason);
-        Assert.Equal(UiText.JournalWriteFailed(failure.Message), harness.Controller.ResultMessage);
+        Assert.Equal(redacted, harness.Controller.ResultMessage);
 
         harness.Release(TimeSpan.FromMilliseconds(100));
-        AssertPublishedEndDetail(
-            harness,
-            UiText.JournalWriteFailed(@"The process cannot access the file '%USERPROFILE%\RamQuick\data\journal\active-run.jsonl'."));
+        AssertPublishedEndDetail(harness, redacted);
     }
 
     [Fact]
@@ -2561,6 +2616,93 @@ public sealed class RunControllerTests
 
         harness.Release(TimeSpan.FromMilliseconds(100));
         AssertFaultLogged(harness, "RunController.OnSessionProgressChanged", fault);
+    }
+
+    // A notice or result reason that substitutes a runtime text is redacted like that text's persisted copies: an
+    // exception naming a file in the user's profile, or a publication failure naming the data folder, shows the
+    // UiText wording with placeholders, never the path or the account name.
+    [Theory]
+    [InlineData("QuerySystem")]
+    [InlineData("CreateSession")]
+    [InlineData("SessionStart")]
+    [InlineData("CallbackFault")]
+    [InlineData("Publication")]
+    public void DisplayedFailure_TextNamesPersonalPath_ShowsWordingWithPlaceholdersOnly(string failurePoint)
+    {
+        using var harness = new ControllerHarness();
+        string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        string secretPath = Path.Combine(profile, "AppData", "Local", "RamQuick", "secret.bin");
+        var failure = new UnauthorizedAccessException("Access to the path '" + secretPath + "' is denied.");
+        string[] placeholders = { "%USERPROFILE%", "%LOCALAPPDATA%" };
+        string expectedPrefix;
+        string displayed;
+        switch (failurePoint)
+        {
+            case "QuerySystem":
+                harness.Initialize();
+                harness.Engine.QuerySystemException = failure;
+                Assert.Equal(StartResult.Accepted, harness.TryStart());
+                Assert.Equal(StartResult.EngineUnavailable, harness.AwaitResult(harness.Controller.StartTask));
+                expectedPrefix = UiText.EngineError(string.Empty);
+                displayed = harness.Controller.NoticeMessage!;
+                break;
+
+            case "CreateSession" or "SessionStart":
+                if (failurePoint == "CreateSession")
+                {
+                    harness.Engine.CreateSessionException = failure;
+                }
+                else
+                {
+                    harness.Engine.StartException = failure;
+                }
+
+                harness.Initialize();
+                Assert.Equal(StartResult.Accepted, harness.TryStart());
+                harness.WaitForPublication();
+                Assert.Equal(RunEndReason.EngineFault, harness.StateMachine.EndReason);
+                expectedPrefix = UiText.EngineError(string.Empty);
+                displayed = harness.Controller.ResultMessage!;
+                Assert.Equal(UiText.EngineError(harness.StateMachine.EndDetail!), displayed);
+                break;
+
+            case "CallbackFault":
+                harness.Initialize();
+                FakeEngineSession session = harness.StartAccepted();
+                harness.Prepare();
+                session.InvokeCallbackFault("on_progress", failure);
+                session.CompleteWithFirstRecordedReason();
+                harness.AwaitVerdict();
+                Assert.Equal(RunEndReason.HostFault, harness.StateMachine.EndReason);
+                expectedPrefix = UiText.HostFault(string.Empty);
+                displayed = harness.Controller.ResultMessage!;
+                Assert.Equal(harness.StateMachine.EndDetail, displayed);
+                break;
+
+            default:
+                // A folder stands where publication writes the JSON summary's temporary file ("<final name>.tmp"),
+                // so, with no access-control change, publication fails with an access error naming that file. The
+                // data folder lies in the temporary folder and holds a segment named after the account.
+                DataDirectory data = DataDirectory.FromRoot(Path.Combine(harness.RootPath, Environment.UserName, "data"));
+                harness.Data = data;
+                harness.Initialize();
+                harness.RunToVerdict();
+                string baseName = Path.GetFileNameWithoutExtension(Assert.Single(harness.RunLogPaths()));
+                Directory.CreateDirectory(ResultsLog.GetSummaryJsonPath(data, baseName) + ".tmp");
+                harness.Release(TimeSpan.FromMilliseconds(100));
+                placeholders = new[] { "%TEMP%" };
+                expectedPrefix = UiText.ResultsNotSaved(string.Empty);
+                displayed = harness.Controller.NoticeMessage!;
+                break;
+        }
+
+        Assert.StartsWith(expectedPrefix, displayed, StringComparison.Ordinal);
+        Assert.True(
+            placeholders.Any(placeholder => displayed.Contains(placeholder, StringComparison.Ordinal)),
+            $"'{displayed}' holds none of {string.Join(", ", placeholders)}.");
+        Assert.DoesNotContain(profile, displayed, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(harness.RootPath, displayed, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(@"\" + Environment.UserName + @"\", displayed, StringComparison.OrdinalIgnoreCase);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -2805,6 +2947,7 @@ public sealed class RunControllerTests
         Task shutdown = harness.Shutdown();
         harness.AwaitTask(shutdown);
 
+        Assert.Equal(StartResult.Withdrawn, harness.AwaitResult(harness.Controller.StartTask));
         Assert.Equal(RunState.Idle, harness.StateMachine.State);
         Assert.Empty(harness.Engine.Sessions);
         Assert.False(harness.JournalExists);

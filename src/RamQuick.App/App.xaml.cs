@@ -5,6 +5,7 @@ using System.Windows.Automation;
 using System.Windows.Automation.Peers;
 using System.Windows.Controls;
 using System.Windows.Data;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 using RamQuick.App.Services;
@@ -25,8 +26,8 @@ namespace RamQuick.App;
 /// <para>
 /// <c>App.xaml</c> sets <c>ShutdownMode="OnExplicitShutdown"</c> and no <c>StartupUri</c>: every exit goes through an
 /// explicit <see cref="Application.Shutdown(int)"/> with one of these exit codes: 0 after the window has closed, 1 for
-/// an unsupported platform or an unexpected startup failure, 2 when another instance is running, and 3 when the test
-/// engine cannot be loaded.
+/// an unsupported platform, an unexpected startup failure or a main window that failed to close, 2 when another
+/// instance is running, and 3 when the test engine cannot be loaded.
 /// </para>
 /// <para>
 /// The constructor does no work, so tests can create the application and call <c>InitializeComponent()</c> only to
@@ -34,7 +35,9 @@ namespace RamQuick.App;
 /// </para>
 /// <para>
 /// The application also announces the main window's live regions to assistive technology; see
-/// <see cref="LiveRegionProperty"/>.
+/// <see cref="LiveRegionProperty"/>. It returns keyboard focus to a control that was disabled while it held focus, as
+/// the Start/Stop toggle is around every run transition, once that control is enabled again; see
+/// <see cref="RestoresKeyboardFocusProperty"/>.
 /// </para>
 /// </remarks>
 public partial class App : Application
@@ -82,6 +85,35 @@ public partial class App : Application
         typeof(App),
         new PropertyMetadata(LiveRegion.None));
 
+    /// <summary>
+    /// Identifies the <c>RestoresKeyboardFocus</c> attached property: whether an element takes keyboard focus back
+    /// when it is enabled again after it was disabled while it held focus. The default is <see langword="false"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WPF moves keyboard focus off a focused element as soon as it is disabled, to its nearest focusable ancestor,
+    /// which in the main window is the window itself, and never gives it back. The Start/Stop toggle is disabled
+    /// while it has focus at every run transition: from an accepted Start until Preparing, while the journal's
+    /// <c>begin</c> record becomes durable, and after the verdict through "Releasing memory…" and "Saving results…".
+    /// Without this property a keyboard or screen-reader user who presses Space or Enter on Start is left on the bare
+    /// window, and the next key press neither stops the run nor starts the next one. The element opts in from XAML:
+    /// </para>
+    /// <code language="xml">
+    /// &lt;Button app:App.RestoresKeyboardFocus="True" /&gt;
+    /// </code>
+    /// <para>
+    /// Focus returns only while the element is still the focused element of its focus scope, which WPF leaves
+    /// unchanged when focus falls to the window, and keyboard focus is on the window, on the scope or nowhere: focus
+    /// the user has moved to another control stays there. In a window that is not active, focus returns when the
+    /// window is next activated, so the element never takes the foreground from another application.
+    /// </para>
+    /// </remarks>
+    public static readonly DependencyProperty RestoresKeyboardFocusProperty = DependencyProperty.RegisterAttached(
+        "RestoresKeyboardFocus",
+        typeof(bool),
+        typeof(App),
+        new PropertyMetadata(false, OnRestoresKeyboardFocusChanged));
+
     private const int ExitCodeClosed = 0;
     private const int ExitCodeFailure = 1;
     private const int ExitCodeAlreadyRunning = 2;
@@ -97,6 +129,12 @@ public partial class App : Application
     // seconds, which covers a running screen reader connecting to the window once it has appeared.
     private const int LiveRegionRetries = 8;
 
+    // How many times a close of the main window that failed is tried again, and how often: about five seconds, the
+    // time an elevated instance waits for this one's mutex. A refusal that outlasts them, as a Closing raise held open
+    // by a modal dialog can, is left to Application.Shutdown, whose own close then fails too and so reaches
+    // DispatcherUnhandledException and the fatal report.
+    private const int CloseRetries = 50;
+
     // Covers an elevated restart: the instance that launched it holds the mutex until its window has closed.
     private static readonly TimeSpan _singleInstanceWait = TimeSpan.FromSeconds(5);
 
@@ -107,6 +145,8 @@ public partial class App : Application
     private static readonly TimeSpan _appErrorWriteBound = TimeSpan.FromSeconds(2);
 
     private static readonly TimeSpan _liveRegionRetryInterval = TimeSpan.FromMilliseconds(250);
+
+    private static readonly TimeSpan _closeRetryInterval = TimeSpan.FromMilliseconds(100);
 
     // Per-window live-region state lives on the window itself, as WorkAreaSizing keeps its sizing state, so two
     // windows, or two tests, never share it, and it is collected with its window.
@@ -125,6 +165,7 @@ public partial class App : Application
     private bool _crashHandlersAttached;
     private bool _closing;
     private bool _closeConfirmed;
+    private bool _closeFailed;
     private bool _windowClosed;
 
     // An exception the dispatcher leaves unhandled reaches AppDomain.UnhandledException as the same object; it is
@@ -177,10 +218,35 @@ public partial class App : Application
         element.SetValue(LiveRegionProperty, value);
     }
 
+    /// <summary>Gets whether an element takes keyboard focus back when it is enabled again.</summary>
+    /// <param name="element">The element.</param>
+    /// <returns>The value of the <c>RestoresKeyboardFocus</c> attached property.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="element"/> is <see langword="null"/>.</exception>
+    [AttachedPropertyBrowsableForType(typeof(UIElement))]
+    public static bool GetRestoresKeyboardFocus(UIElement element)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        return (bool)element.GetValue(RestoresKeyboardFocusProperty);
+    }
+
+    /// <summary>
+    /// Sets whether an element takes keyboard focus back when it is enabled again after it was disabled while it held
+    /// focus; see <see cref="RestoresKeyboardFocusProperty"/>.
+    /// </summary>
+    /// <param name="element">The element.</param>
+    /// <param name="value"><see langword="true"/> to return focus to the element; <see langword="false"/> to leave it.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="element"/> is <see langword="null"/>.</exception>
+    public static void SetRestoresKeyboardFocus(UIElement element, bool value)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        element.SetValue(RestoresKeyboardFocusProperty, value);
+    }
+
     /// <summary>
     /// Starts the application: checks the platform, acquires the single-instance guard, resolves the data folder,
     /// binds the engine, composes the controller, view model and window, shows the window, starts the sensor monitor
-    /// and initialises the controller, which recovers the previous run and offers the elevated restart.
+    /// and initialises the controller, which reads the system and the memory inventory, offers the elevated restart
+    /// when the process is not elevated, and then recovers the previous run.
     /// </summary>
     /// <remarks>
     /// Every refusal shows its message and shuts the application down with its exit code. An unexpected failure is
@@ -320,8 +386,9 @@ public partial class App : Application
         SynchronizationContext uiContext = SynchronizationContext.Current ?? new DispatcherSynchronizationContext(Dispatcher);
         _sensorMonitor.Start(uiContext);
 
-        // Recovers the previous run off the UI thread, reads the memory inventory and the system, and, last, offers
-        // the elevated restart over the now visible window.
+        // Reads the system and the memory inventory off the UI thread, offers the elevated restart over the now visible
+        // window when the process is not elevated, and only then recovers the previous run off the UI thread, so that
+        // an accepted restart leaves the recovery to the elevated instance.
         await _controller.InitializeAsync();
     }
 
@@ -333,7 +400,7 @@ public partial class App : Application
 
         try
         {
-            prompt.Inform(UiText.UnexpectedErrorTitle, exception.Message);
+            prompt.Inform(UiText.UnexpectedErrorTitle, SummaryFormat.RedactPersonalPaths(exception.Message));
         }
         catch (Exception promptFailure)
         {
@@ -390,7 +457,7 @@ public partial class App : Application
     private void OnMainWindowClosed(object? sender, EventArgs e)
     {
         _windowClosed = true;
-        Shutdown(ExitCodeClosed);
+        Shutdown(_closeFailed ? ExitCodeFailure : ExitCodeClosed);
     }
 
     // The elevated instance has started and waits for this instance's mutex: close through the deferred path, which
@@ -399,15 +466,81 @@ public partial class App : Application
 
     // Window.Close throws while the window's Closing event is being raised, and the controller can raise
     // ShutdownRequested from inside InitializeAsync. Posting the close runs it from the dispatcher loop, after the
-    // raising code has returned.
+    // raising code has returned. InvokeAsync keeps an exception its delegate throws in the operation's task, where
+    // nothing observes it, and the window would stay open with the exit, or an elevated restart's takeover, never
+    // finished; so CloseMainWindow contains a failed close itself and ends the application.
     private void RequestWindowClose() => _ = Dispatcher.InvokeAsync(CloseMainWindow);
 
     private void CloseMainWindow()
     {
         if (_window is { } window && !_windowClosed)
         {
-            window.Close();
+            try
+            {
+                window.Close();
+            }
+            catch (Exception exception)
+            {
+                EndAfterCloseFailureAsync(window, exception);
+            }
         }
+    }
+
+    // Concludes the run as the deferred close does, reports the failure and ends the application with exit code 1.
+    // async void, so that an exception escaping it is raised on the dispatcher, where DispatcherUnhandledException
+    // reports it, rather than kept in a task.
+    private async void EndAfterCloseFailureAsync(Window window, Exception exception)
+    {
+        // A title-bar close meanwhile stays deferred, and whichever close ends the application exits with failure.
+        _closing = true;
+        _closeFailed = true;
+
+        // Returns the deferred close's work when that has run, and runs it when the close failed before the Closing
+        // handler did, as an elevated takeover's can. It never throws, and it comes first so that a run in progress is
+        // concluded before the report disposes what is left of its session.
+        if (_controller is { } controller)
+        {
+            await controller.ShutdownAsync();
+        }
+
+        await Task.Run(() => ReportFatalException(exception, ClosingErrorSource));
+        await DisposeSensorMonitorOffUiThreadAsync();
+        _closeConfirmed = true;
+
+        // Application.Shutdown closes the window as Window.Close does, so while a Closing event is still being raised,
+        // from a nested dispatcher frame, it would fail too and skip OnExit, which releases the mutex. The close is
+        // therefore retried until that raise has returned; once the window has closed, its Closed handler has already
+        // shut the application down and the call below does nothing.
+        for (int retry = 0; retry < CloseRetries && !TryCloseMainWindow(window); retry++)
+        {
+            await Task.Delay(_closeRetryInterval);
+        }
+
+        // A claimed dispatcher exception is being reported, and its rethrow ends the process; exiting now would end it
+        // before the report.
+        if (Volatile.Read(ref _dispatcherExceptionClaimed) == 0)
+        {
+            Shutdown(ExitCodeFailure);
+        }
+    }
+
+    // Whether the main window has closed. Window.Close refuses with InvalidOperationException while the window is
+    // closing; the failure that led to the retries has already been reported.
+    private bool TryCloseMainWindow(Window window)
+    {
+        if (!_windowClosed)
+        {
+            try
+            {
+                window.Close();
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
+        }
+
+        return _windowClosed;
     }
 
     // The report disposes the session and writes the error, which can take up to its bound, so it runs on the thread
@@ -666,6 +799,95 @@ public partial class App : Application
         }
 
         return state;
+    }
+
+    // Only the element's return to enabled is followed: WPF has already moved focus off it when it was disabled. The
+    // handler is removed first, so setting the property again never subscribes twice. Its accessors take a UIElement,
+    // so a value set on any other element through the property itself is ignored.
+    private static void OnRestoresKeyboardFocusChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is not UIElement element)
+        {
+            return;
+        }
+
+        element.IsEnabledChanged -= OnRestoringElementIsEnabledChanged;
+        if (e.NewValue is true)
+        {
+            element.IsEnabledChanged += OnRestoringElementIsEnabledChanged;
+        }
+    }
+
+    private static void OnRestoringElementIsEnabledChanged(object? sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (sender is UIElement element && e.NewValue is true)
+        {
+            QueueKeyboardFocusRestore(element);
+        }
+    }
+
+    // Disabling a focused element queues WPF's own focus re-evaluation at Input priority, which moves focus to the
+    // window. The restore is queued at the same priority, so it runs after that re-evaluation and finds where it left
+    // focus, even when the element was disabled and enabled again within one dispatcher turn.
+    private static void QueueKeyboardFocusRestore(UIElement element) =>
+        _ = element.Dispatcher.InvokeAsync(() => RestoreKeyboardFocus(element), DispatcherPriority.Input);
+
+    // Returns keyboard focus to an enabled element that lost it by being disabled. Its focus scope still names it as
+    // the focused element only while the user has not moved focus elsewhere, and the element takes focus back only
+    // from the window, the scope or nowhere, never from another control.
+    private static void RestoreKeyboardFocus(UIElement element)
+    {
+        // An element outside a shown window, as in a window never shown or already closed, cannot hold focus.
+        if (!GetRestoresKeyboardFocus(element)
+            || !element.IsEnabled
+            || element.IsKeyboardFocusWithin
+            || PresentationSource.FromVisual(element) is null)
+        {
+            return;
+        }
+
+        DependencyObject? scope = FocusManager.GetFocusScope(element);
+        if (scope is null || !ReferenceEquals(FocusManager.GetFocusedElement(scope), element))
+        {
+            return;
+        }
+
+        if (Window.GetWindow(element) is not { } window)
+        {
+            return;
+        }
+
+        // Focusing an element of an inactive window would activate it and take the foreground from another
+        // application, so the restore waits for the user to come back to the window.
+        if (!window.IsActive)
+        {
+            window.Activated -= OnRestoringWindowActivated;
+            window.Activated += OnRestoringWindowActivated;
+            return;
+        }
+
+        IInputElement? focused = Keyboard.FocusedElement;
+        if (focused is null || ReferenceEquals(focused, window) || ReferenceEquals(focused, scope))
+        {
+            element.Focus();
+        }
+    }
+
+    // On activation WPF puts keyboard focus back where it was when the window was deactivated, the window itself when
+    // focus had fallen there, after this event; the restore is queued behind that work. One activation serves every
+    // waiting restore, since a window's focus scope names one focused element.
+    private static void OnRestoringWindowActivated(object? sender, EventArgs e)
+    {
+        if (sender is not Window window)
+        {
+            return;
+        }
+
+        window.Activated -= OnRestoringWindowActivated;
+        if (FocusManager.GetFocusedElement(window) is UIElement element && GetRestoresKeyboardFocus(element))
+        {
+            QueueKeyboardFocusRestore(element);
+        }
     }
 
     // One live region of one window: the text it last announced, and a change still waiting for a listener. Used on
