@@ -39,6 +39,15 @@ namespace RamQuick.IntegrationTests;
 /// <c>rq_test_live_session_count</c> reaching 0 proves that <c>rq_session_destroy</c> ran for the abandoned session.
 /// Neither abandonment test disposes or shuts down what it abandons: that would replace the finalizer path under test.
 /// </para>
+/// <para>
+/// Each test runs its scenario in a child <c>RamQuick.IntegrationTests.exe</c> through <see cref="IsolatedTestRun"/>,
+/// because a blocked finalizer, such as a deadlocked <c>rq_session_destroy</c> in
+/// <c>SafeSessionHandle.ReleaseHandle</c>, cannot be recovered in-process. Nothing unblocks the finalizer thread, so
+/// every later collection in the process would wait behind it, and the never-destroyed session would keep its region
+/// locked and the live-session count above 0 for every test after it. Killing and reaping the child at its deadline
+/// releases all of that. Within the child, each forced collection is still awaited for at most what is left of its
+/// deadline, so a blocked finalizer fails the scenario with that cause before the child's deadline.
+/// </para>
 /// </remarks>
 public sealed class SessionLifetimeTests
 {
@@ -62,6 +71,22 @@ public sealed class SessionLifetimeTests
     private static readonly TimeSpan _heldHandlePollInterval = TimeSpan.FromMilliseconds(5);
     private static readonly TimeSpan _disposeTimeout = TimeSpan.FromSeconds(60);
 
+    // The isolated child's deadline covers the longest scenario's own waits in sequence, the callback-held handle's:
+    // settle 10 s + dispatcher start 10 s + holding 60 s + Dispose 60 s + observation 60 s + collection 30 s +
+    // dispatcher shutdown 5 s = 235 s (the production graph's sum is 175 s, the self-referencing gate's 115 s), plus
+    // 20 s for the child runner's start, discovery and report: 255 s. A wait the scenario leaves unbounded ends there
+    // too. The parent then needs at most 10 s to kill and reap an overrunning child, and 10 s more when that fails and
+    // disposal retries it: 275 s, which leaves 25 s of the Fact timeout for the launch, the result and the report. The
+    // child runs under the same Fact timeout, which its deadline always cuts first.
+    private const int IsolatedTimeoutMilliseconds = 300_000;
+    private static readonly TimeSpan _childDeadline = TimeSpan.FromSeconds(255);
+
+    // The one forced collection in flight in this process. A collection stuck behind a blocked finalizer can never be
+    // interrupted, so a later wait joins it rather than queuing another WaitForPendingFinalizers behind the same block.
+    private static readonly object _collectionSync = new();
+    private static Task? _pendingCollection;
+    private static long _pendingCollectionStarted;
+
     private readonly ITestOutputHelper _output;
 
     public SessionLifetimeTests(ITestOutputHelper output)
@@ -70,8 +95,37 @@ public sealed class SessionLifetimeTests
         _output = output;
     }
 
-    [Fact(Timeout = 180_000)]
-    public async Task ProductionGraph_Abandoned_IsCollectedAndDestroyedAsync()
+    [Fact(Timeout = IsolatedTimeoutMilliseconds)]
+    public Task ProductionGraph_Abandoned_IsCollectedAndDestroyedAsync() =>
+        IsolatedTestRun.RunAsync<SessionLifetimeTests>(
+            RunProductionGraphAbandonedAsync,
+            _childDeadline,
+            _output,
+            TestContext.Current.CancellationToken);
+
+    [Fact(Timeout = IsolatedTimeoutMilliseconds)]
+    public Task SelfReferencingGate_Abandoned_IsCollectedAndDestroyedAsync() =>
+        IsolatedTestRun.RunAsync<SessionLifetimeTests>(
+            RunSelfReferencingGateAbandonedAsync,
+            _childDeadline,
+            _output,
+            TestContext.Current.CancellationToken);
+
+    /// <summary>
+    /// A callback-origin <c>rq_session_*</c> call holds the session's handle, as every marshalled handle argument does,
+    /// while a concurrent <c>Dispose</c> disposes it, so the last reference is dropped on the coordinator inside the
+    /// callback, where <c>rq_session_destroy</c> is refused. The session must still be destroyed before
+    /// <c>Dispose</c> returns, and its <c>GCHandle</c> freed, so the <c>CallbackState</c> becomes collectible.
+    /// </summary>
+    [Fact(Timeout = IsolatedTimeoutMilliseconds)]
+    public Task CallbackHeldHandle_DisposedConcurrently_IsDestroyedOffCoordinatorAsync() =>
+        IsolatedTestRun.RunAsync<SessionLifetimeTests>(
+            RunCallbackHeldHandleDisposedConcurrentlyAsync,
+            _childDeadline,
+            _output,
+            TestContext.Current.CancellationToken);
+
+    private async Task RunProductionGraphAbandonedAsync()
     {
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
         await AssertNoLiveSessionAsync();
@@ -136,8 +190,7 @@ public sealed class SessionLifetimeTests
         Assert.Equal(0, SessionProbe.LiveSessionCount());
     }
 
-    [Fact(Timeout = 180_000)]
-    public async Task SelfReferencingGate_Abandoned_IsCollectedAndDestroyedAsync()
+    private async Task RunSelfReferencingGateAbandonedAsync()
     {
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
         await AssertNoLiveSessionAsync();
@@ -180,14 +233,7 @@ public sealed class SessionLifetimeTests
         Assert.Equal(0, SessionProbe.LiveSessionCount());
     }
 
-    /// <summary>
-    /// A callback-origin <c>rq_session_*</c> call holds the session's handle, as every marshalled handle argument does,
-    /// while a concurrent <c>Dispose</c> disposes it, so the last reference is dropped on the coordinator inside the
-    /// callback, where <c>rq_session_destroy</c> is refused. The session must still be destroyed before
-    /// <c>Dispose</c> returns, and its <c>GCHandle</c> freed, so the <c>CallbackState</c> becomes collectible.
-    /// </summary>
-    [Fact(Timeout = 180_000)]
-    public async Task CallbackHeldHandle_DisposedConcurrently_IsDestroyedOffCoordinatorAsync()
+    private async Task RunCallbackHeldHandleDisposedConcurrentlyAsync()
     {
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
         await AssertNoLiveSessionAsync();
@@ -230,7 +276,7 @@ public sealed class SessionLifetimeTests
             + $"{observed.ReleasedLast}, held for {observed.HeldFor.TotalSeconds:0.000} s, fault {observed.Fault?.GetType().Name ?? "none"}; "
             + $"live native sessions when Dispose returned: {liveAfterDispose}; "
             + $"CallbackState collected {outcome.Collected} after {outcome.Iterations} forced full collection(s) in "
-            + $"{outcome.Elapsed.TotalSeconds:0.00} s.");
+            + $"{outcome.Elapsed.TotalSeconds:0.00} s.{(outcome.Stall is null ? string.Empty : " " + outcome.Stall)}");
         _output.WriteLine(description);
 
         Assert.True(observed.Fault is null, $"The step gate failed, so the race was not set up: {observed.Fault}");
@@ -393,10 +439,17 @@ public sealed class SessionLifetimeTests
     /// holds or <paramref name="timeout"/> has passed.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Native destruction runs on the finalizer thread (stop, wait for in-flight callbacks, join, release), and the
     /// <c>CallbackState</c> becomes collectible only once that has freed its <c>GCHandle</c>, so the live-session
     /// count and the callback state lag the session by a collection or more: the condition is polled until stable
     /// rather than checked once.
+    /// </para>
+    /// <para>
+    /// Each collection is awaited for at most what is left of <paramref name="timeout"/>, because the loop's own check
+    /// cannot run while a collection waits on a blocked finalizer; such a stall ends the loop and is stated in the
+    /// outcome.
+    /// </para>
     /// </remarks>
     private static async Task<CollectionOutcome> CollectUntilAsync(Func<bool> collected, DispatcherThread ui, TimeSpan timeout)
     {
@@ -408,22 +461,72 @@ public sealed class SessionLifetimeTests
             // Drains the events posted so far; each holds only a record and a weak session reference.
             await ui.FlushAsync();
 
-            // On the thread pool rather than wherever the last await resumed, which can be the dispatcher thread: no
-            // test or dispatcher frame is then on the collecting stack, and the dispatcher keeps pumping meanwhile.
-            await Task.Run(ForceFullCollection, cancellationToken);
+            TimeSpan remaining = timeout - stopwatch.Elapsed;
+            if (remaining <= TimeSpan.Zero)
+            {
+                return new CollectionOutcome(false, iterations, stopwatch.Elapsed, Stall: null);
+            }
+
+            string? stall = await TryForceFullCollectionAsync(remaining, cancellationToken);
+            if (stall is not null)
+            {
+                return new CollectionOutcome(false, iterations, stopwatch.Elapsed, stall);
+            }
+
             iterations++;
 
             if (collected())
             {
-                return new CollectionOutcome(true, iterations, stopwatch.Elapsed);
+                return new CollectionOutcome(true, iterations, stopwatch.Elapsed, Stall: null);
             }
 
             if (stopwatch.Elapsed >= timeout)
             {
-                return new CollectionOutcome(false, iterations, stopwatch.Elapsed);
+                return new CollectionOutcome(false, iterations, stopwatch.Elapsed, Stall: null);
             }
 
             await Task.Delay(_collectionPause, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Runs a forced full collection, with the finalizers it queues, and waits for it at most <paramref name="bound"/>.
+    /// A collection still in flight from an earlier call is joined rather than started again.
+    /// </summary>
+    /// <returns>
+    /// <see langword="null"/> once the collection has finished; otherwise the stall, stated for a failure message.
+    /// </returns>
+    private static async Task<string?> TryForceFullCollectionAsync(TimeSpan bound, CancellationToken cancellationToken)
+    {
+        Task collection;
+        long started;
+        lock (_collectionSync)
+        {
+            if (_pendingCollection is null || _pendingCollection.IsCompleted)
+            {
+                // On the thread pool rather than wherever the last await resumed, which can be the dispatcher thread:
+                // no test or dispatcher frame is then on the collecting stack, and the dispatcher keeps pumping
+                // meanwhile. No token: a running collection cannot be cancelled, only no longer awaited.
+                _pendingCollectionStarted = Stopwatch.GetTimestamp();
+                _pendingCollection = Task.Run(ForceFullCollection);
+            }
+
+            collection = _pendingCollection;
+            started = _pendingCollectionStarted;
+        }
+
+        try
+        {
+            await collection.WaitAsync(bound, cancellationToken);
+            return null;
+        }
+        catch (TimeoutException) when (!collection.IsCompleted)
+        {
+            return string.Create(
+                CultureInfo.InvariantCulture,
+                $"The finalizer thread did not drain the pending finalizers within {Stopwatch.GetElapsedTime(started).TotalSeconds:0.0} s "
+                + $"of the forced collection: a finalizer, such as SafeSessionHandle.ReleaseHandle in rq_session_destroy, is "
+                + $"blocked or has not returned, so this process can finalize nothing more.");
         }
     }
 
@@ -448,9 +551,18 @@ public sealed class SessionLifetimeTests
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
         var stopwatch = Stopwatch.StartNew();
         int live = SessionProbe.LiveSessionCount();
-        while (live != 0 && stopwatch.Elapsed < _settleTimeout)
+        while (live != 0)
         {
-            await Task.Run(ForceFullCollection, cancellationToken);
+            TimeSpan remaining = _settleTimeout - stopwatch.Elapsed;
+            if (remaining <= TimeSpan.Zero)
+            {
+                break;
+            }
+
+            string? stall = await TryForceFullCollectionAsync(remaining, cancellationToken);
+            Assert.True(
+                stall is null,
+                string.Create(CultureInfo.InvariantCulture, $"{live} native session(s) were live before the test and could not be finalized. {stall}"));
             await Task.Delay(_collectionPause, cancellationToken);
             live = SessionProbe.LiveSessionCount();
         }
@@ -482,9 +594,10 @@ public sealed class SessionLifetimeTests
         string survivors = alive.Count == 0
             ? "none"
             : string.Join(", ", alive) + ", each through a strong path from a root the run created";
+        string stall = outcome.Stall is null ? string.Empty : outcome.Stall + " ";
         return string.Create(
             CultureInfo.InvariantCulture,
-            $"After {outcome.Iterations} forced full collection(s) in {outcome.Elapsed.TotalSeconds:0.00} s, still reachable: "
+            $"{stall}After {outcome.Iterations} forced full collection(s) in {outcome.Elapsed.TotalSeconds:0.00} s, still reachable: "
             + $"{survivors}; live native sessions: {live} (0 proves rq_session_destroy ran and released the locked region).");
     }
 
@@ -519,8 +632,19 @@ public sealed class SessionLifetimeTests
             }
             else if (keepAlive.TryGet(out IEngineSession? session))
             {
-                // Dispose blocks until the engine has released the region; the thread pool keeps that off the dispatcher.
-                await Task.Run(session.Dispose);
+                // Dispose blocks until the engine has released the region; the thread pool keeps that off the dispatcher,
+                // and the bound keeps a Dispose that never returns from holding up the failure it cleans up after.
+                Task dispose = Task.Run(session.Dispose);
+                try
+                {
+                    await dispose.WaitAsync(_disposeTimeout);
+                }
+                catch (TimeoutException) when (!dispose.IsCompleted)
+                {
+                    _output.WriteLine(string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Disposing the session after the failure did not return within {_disposeTimeout.TotalSeconds:0} s; its native session and locked region may outlive this test."));
+                }
             }
         }
         catch (Exception exception)
@@ -762,5 +886,6 @@ public sealed class SessionLifetimeTests
 
     private sealed record ControllerSnapshot(RunState State, string Description);
 
-    private readonly record struct CollectionOutcome(bool Collected, int Iterations, TimeSpan Elapsed);
+    // Stall, when set, states that a forced collection did not return within what was left of the deadline.
+    private readonly record struct CollectionOutcome(bool Collected, int Iterations, TimeSpan Elapsed, string? Stall);
 }

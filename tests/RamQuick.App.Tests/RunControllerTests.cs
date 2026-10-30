@@ -514,7 +514,9 @@ internal sealed class ControllerHarness : IDisposable
 
     /// <summary>
     /// Releases everything the test left behind: blocked journal appends, the controller, its journals, the sensor
-    /// monitor and source, and the temporary folder.
+    /// monitor and source, and the temporary folder. The folder is deleted only after a bounded wait for the
+    /// controller to go quiet: for a Start still in flight to end, for its background work
+    /// (<see cref="RunController.HasBackgroundWork"/>) to finish, and for every journal's writer to retire.
     /// </summary>
     public void Dispose()
     {
@@ -538,6 +540,23 @@ internal sealed class ControllerHarness : IDisposable
         Monitor.Dispose();
         Sensors.Dispose();
         Storage?.Dispose();
+
+        // App-error writes and journal appends recreate the folders they write to, so one that lands after the
+        // deletion leaves the root behind. A withdrawn or refused Start discards its reserved .log and retires its
+        // journal only as its continuations run on Context, so an unfinished one is pumped; a finished one is not,
+        // so no unrelated queued post runs after the test. Neither wait throws when its bound passes: a test that
+        // leaves work hung still gets as much of its folder deleted as can be.
+        if (_controller is { } controller)
+        {
+            if (!controller.StartTask.IsCompleted)
+            {
+                _ = Context.RunUntil(() => controller.StartTask.IsCompleted, DefaultWait);
+            }
+
+            _ = SpinWait.SpinUntil(
+                () => !controller.HasBackgroundWork && Journals.All(journal => journal.Retired.IsCompleted),
+                DefaultWait);
+        }
 
         // A test that installed the context and failed before disposing its scope leaves it on this thread.
         if (ReferenceEquals(SynchronizationContext.Current, Context))
@@ -693,6 +712,10 @@ public sealed class RunControllerTests
     private static readonly TimeSpan _journalDisposeWindow = TimeSpan.FromSeconds(2);
 
     private static readonly TimeSpan _collectionPause = TimeSpan.FromMilliseconds(50);
+
+    // How long a held app-error write stays held once the test has ended, so the harness's disposal is already under
+    // way, with the write still running, when the write ends.
+    private static readonly TimeSpan _heldWriteRelease = TimeSpan.FromMilliseconds(200);
 
     private static readonly IReadOnlyList<StepAttributes> _quickSteps = TestPlans.Quick.ToStepAttributes();
 
@@ -3490,6 +3513,47 @@ public sealed class RunControllerTests
         Assert.False(File.Exists(Path.Combine(harness.RootPath, "data", "logs", "app-errors.log")));
     }
 
+    // A Start refused because the engine cannot describe the machine queues its app-errors.log entry on the thread
+    // pool, where it may still be running when the test ends; a write that lands after the folder's deletion
+    // recreates it. The exception's text is formatted only once released, which holds the write past the test's end.
+    [Fact]
+    public void HasBackgroundWork_AppErrorWriteHeldPastTestEnd_HarnessDeletesFolderOnlyOnceWriteEnds()
+    {
+        CancellationToken cancellation = TestContext.Current.CancellationToken;
+        using var entered = new ManualResetEventSlim(initialState: false);
+        using var release = new ManualResetEventSlim(initialState: false);
+        var harness = new ControllerHarness();
+        try
+        {
+            harness.Initialize();
+            harness.Engine.QuerySystemException = new HeldTextException(entered, release);
+            Assert.Equal(StartResult.Accepted, harness.TryStart());
+            Assert.Equal(StartResult.EngineUnavailable, harness.AwaitResult(harness.Controller.StartTask));
+            Assert.True(
+                entered.Wait(ControllerHarness.DefaultWait, cancellation),
+                "The app-error write never formatted the exception.");
+            Assert.True(harness.Controller.HasBackgroundWork);
+
+            _ = Task.Run(
+                async () =>
+                {
+                    await Task.Delay(_heldWriteRelease, cancellation);
+                    release.Set();
+                },
+                cancellation);
+            harness.Dispose();
+
+            Assert.False(harness.Controller.HasBackgroundWork);
+            Assert.False(Directory.Exists(harness.RootPath));
+        }
+        finally
+        {
+            // A failure before the disposal still lets the write end, so the folder is deleted and nothing hangs.
+            release.Set();
+            harness.Dispose();
+        }
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Run log readers
     // ---------------------------------------------------------------------------------------------
@@ -3852,6 +3916,32 @@ public sealed class RunControllerTests
             {
                 return call();
             }
+        }
+    }
+
+    /// <summary>
+    /// An exception whose text is formatted only once the test releases it, after signalling that formatting began:
+    /// app-errors.log formats the exception on the thread-pool thread that writes the entry, so the write is held
+    /// there, as a stalled disk would hold it.
+    /// </summary>
+    private sealed class HeldTextException : Exception
+    {
+        private readonly ManualResetEventSlim _entered;
+        private readonly ManualResetEventSlim _release;
+
+        public HeldTextException(ManualResetEventSlim entered, ManualResetEventSlim release)
+            : base("the engine cannot describe the machine")
+        {
+            _entered = entered;
+            _release = release;
+        }
+
+        // Bounded, so a write the test never releases still ends and its folder can still be deleted.
+        public override string ToString()
+        {
+            _entered.Set();
+            _ = _release.Wait(ControllerHarness.DefaultWait);
+            return base.ToString();
         }
     }
 }

@@ -929,50 +929,6 @@ public sealed class InteropMarshallingTests
     }
 
     [Fact(Timeout = TestTimeoutMs)]
-    public async Task EventSubscriber_Throws_LaterSubscribersStillReceiveAndRunEndsWithHostFaultAsync()
-    {
-        CancellationToken cancellation = TestContext.Current.CancellationToken;
-        using var ui = new DispatcherThread();
-        NativeEngine engine = TestEngines.Create();
-        SystemSnapshot system = engine.QuerySystem();
-        var subscriberFailure = new InvalidOperationException("Prepared subscriber failure injected by the test.");
-        var faults = new ConcurrentQueue<(string CallbackName, Exception Exception)>();
-        EngineSessionOptions options = CreateOptions(
-            system,
-            OneStepPlan(),
-            faultSink: (callbackName, exception) => faults.Enqueue((callbackName, exception)));
-
-        IEngineSession session = await ui.InvokeAsync(() => engine.CreateSession(options));
-        try
-        {
-            // Subscribed ahead of the recorder, so the recorder receiving Prepared proves the fault skipped no one.
-            session.Prepared += (_, _) => throw subscriberFailure;
-            EngineRunRecorder recorder = EngineRunRecorder.Attach(session);
-            session.Start();
-            EngineCompleted completed = await recorder.WaitCompletedAsync(_runTimeout, cancellation);
-            await recorder.WaitReleasedAsync(_runTimeout, cancellation);
-            await ui.FlushAsync();
-            _output.WriteLine($"Faults: {string.Join("; ", faults.Select(fault => fault.CallbackName))}; Completed {completed.EndReason}");
-
-            Assert.NotNull(recorder.Prepared);
-            (string callbackName, Exception reported) = Assert.Single(faults);
-            Assert.Equal("Prepared handler", callbackName);
-            Assert.Same(subscriberFailure, reported);
-
-            // The lost event stops the run, so it ends ABORTED rather than continuing as if every subscriber had seen it.
-            Assert.Equal(RunEndReason.HostFault, completed.EndReason);
-        }
-        finally
-        {
-            session.Dispose();
-        }
-
-        // The exception was contained inside the posted delivery and never reached the dispatcher.
-        Assert.Empty(ui.UnhandledExceptions);
-        AssertNoLiveSessions();
-    }
-
-    [Fact(Timeout = TestTimeoutMs)]
     public async Task Dispose_FromCompletedSubscriber_SkipsLaterSubscribersAndReleasedAsync()
     {
         CancellationToken cancellation = TestContext.Current.CancellationToken;
@@ -1496,7 +1452,8 @@ public sealed class InteropMarshallingTests
                 $"Throwing Prepared handler calls {Volatile.Read(ref throwingHandlerCalls)}, gate wakes [{string.Join(", ", gateWakes)}]"));
 
             // Contained per subscriber on the dispatcher: the throwing handler ran once, and the recorder after it still
-            // received Prepared.
+            // received Prepared. The lost event stops the run, so it ends ABORTED rather than continuing as if every
+            // subscriber had seen it.
             Assert.Equal(1, Volatile.Read(ref throwingHandlerCalls));
             Assert.Single(faults.Faults);
             AssertHostFaultContained(run, recorder, faults, ui, "Prepared handler", thrown, caughtOnDispatcher: true);
@@ -1509,6 +1466,7 @@ public sealed class InteropMarshallingTests
             session.Dispose();
         }
 
+        // The exception was contained inside the posted delivery and never reached the dispatcher.
         Assert.Empty(ui.UnhandledExceptions);
         AssertNoLiveSessions();
     }

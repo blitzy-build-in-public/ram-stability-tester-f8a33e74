@@ -29,7 +29,9 @@
                      platform, FakeTimeProvider or GoogleTest. dumpbin /dependents must show that
                      ramquick_engine.dll needs no Visual C++ or Universal CRT DLL. Every violation
                      is listed before the run fails.
-      5. Package     Copies THIRD-PARTY-NOTICES.txt and README.md into the folder, then zips it to
+      5. Package     Copies THIRD-PARTY-NOTICES.txt, README.md and docs/METHODOLOGY.md into the
+                     folder at their repository-relative paths, so the README's link to
+                     docs/METHODOLOGY.md also resolves in the folder, then zips it to
                      artifacts/publish/RamQuick-win-x64.zip, which extracts to a single
                      RamQuick-win-x64 folder.
 
@@ -131,7 +133,9 @@ $ForbiddenEngineDependencyPatterns = @(
     'api-ms-win-crt-*.dll'
 )
 
-$ReleaseDocuments = @('THIRD-PARTY-NOTICES.txt', 'README.md')
+# Repository-relative paths, kept relative in the folder: README.md links to
+# docs/METHODOLOGY.md.
+$ReleaseDocuments = @('THIRD-PARTY-NOTICES.txt', 'README.md', 'docs\METHODOLOGY.md')
 
 # -LiteralPath because a checkout folder such as RAMQuick[dev] is a wildcard pattern to -Path;
 # ProviderPath because Path keeps a PowerShell drive or provider prefix that MSBuild and the
@@ -491,8 +495,9 @@ function Test-PublishOutput {
 # Packaging
 # ---------------------------------------------------------------------------------------------
 
-# Copies the notices and readme beside RamQuick.exe. Returns the paths of missing sources, in
-# which case nothing is copied.
+# Copies the notices and readme beside RamQuick.exe and the methodology to docs\ under it, each at
+# its repository-relative path. Returns the paths of missing sources, in which case nothing is
+# copied.
 function Copy-ReleaseDocument {
     [OutputType([string])]
     param()
@@ -509,7 +514,12 @@ function Copy-ReleaseDocument {
     }
 
     foreach ($name in $ReleaseDocuments) {
-        Copy-Item -LiteralPath (Join-Path $RepoRoot $name) -Destination $PublishDir -Force
+        $destination = Join-Path $PublishDir $name
+        $folder = Split-Path -Parent $destination
+        if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
+            $null = New-Item -ItemType Directory -Path $folder -Force
+        }
+        Copy-Item -LiteralPath (Join-Path $RepoRoot $name) -Destination $destination -Force
         Write-Host ('Copied {0}' -f $name)
     }
 }

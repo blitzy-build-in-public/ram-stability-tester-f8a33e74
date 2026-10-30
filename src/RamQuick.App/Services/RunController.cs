@@ -266,6 +266,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
     private readonly TimeProvider _timeProvider;
     private readonly DataDirectory? _dataDirectory;
     private readonly RunControllerOptions _options;
+    private readonly BackgroundWork _backgroundWork = new();
 
     private RunProgress? _currentProgress;
     private SensorReadings _latestReadings;
@@ -602,6 +603,14 @@ public sealed partial class RunController : ObservableObject, IDisposable
     /// </summary>
     internal Task PostRunTask { get; private set; } = Task.CompletedTask;
 
+    /// <summary>
+    /// Gets a value indicating whether thread-pool work the controller handed off without awaiting it is still queued
+    /// or running: the <c>app-errors.log</c> writes it queues, and the session, journal and results-log disposals that
+    /// <see cref="Dispose"/>, <see cref="ShutdownAsync"/> and <see cref="HandleFatalException(Exception)"/> start.
+    /// Tests wait for it to clear before deleting the data folder, which a late write would recreate.
+    /// </summary>
+    internal bool HasBackgroundWork => _backgroundWork.IsRunning;
+
 
     /// <summary>
     /// Prepares the controller once, after the window is shown: reads the system snapshot and the memory inventory,
@@ -801,7 +810,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         if (dataDirectory is not null && exception is not null)
         {
             DateTimeOffset caughtUtc = _timeProvider.GetUtcNow();
-            pending.Add(Task.Run(
+            pending.Add(_backgroundWork.RunAsync(
                 () => ResultsLog.AppendAppError(dataDirectory, FatalErrorSource, exception, caughtUtc, runId)));
         }
 
@@ -1312,7 +1321,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         JournalBegin begin)
     {
         ClearPendingStart(pending);
-        var run = new RunContext(request, journal, log, begin, _timeProvider);
+        var run = new RunContext(request, journal, log, begin, _timeProvider, _backgroundWork);
         Volatile.Write(ref _run, run);
         log.LogRunStarting(begin);
 
@@ -1486,7 +1495,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
     {
         string source = EngineCallbackSourcePrefix + callbackName;
         DateTimeOffset caughtUtc = run.TimeProvider.GetUtcNow();
-        ResultsLog.QueueAppError(run.Request.DataDirectory, source, exception, caughtUtc, run.Log.RunId);
+        run.BackgroundWork.QueueAppError(run.Request.DataDirectory, source, exception, caughtUtc, run.Log.RunId);
         run.Log.LogCallbackFault(caughtUtc, source, exception);
         run.TryRecordCallbackFault(exception.Message);
         RequestEngineStop(run, StopReason.HostFault);
@@ -2395,9 +2404,10 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
     // Disposal joins the engine's threads, or waits for the journal writer and the log's drain, so a caller that must
     // not block hands it to the thread pool. The task never faults, provided reportFailure, which receives any
-    // failure on the pool thread, does not throw.
-    private static Task DisposeOnThreadPoolAsync(Action dispose, Action<Exception> reportFailure) =>
-        Task.Run(() =>
+    // failure on the pool thread, does not throw. It is counted as background work, and a failure report it queues is
+    // counted before the disposal's own count ends, so the count never reads zero between the two.
+    private Task DisposeOnThreadPoolAsync(Action dispose, Action<Exception> reportFailure) =>
+        _backgroundWork.RunAsync(() =>
         {
             try
             {
@@ -2453,7 +2463,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         if (_dataDirectory is { } dataDirectory)
         {
             Guid? runId = Volatile.Read(ref _run)?.Log.RunId;
-            ResultsLog.QueueAppError(dataDirectory, AppErrorSourceOf(where), exception, utc, runId);
+            _backgroundWork.QueueAppError(dataDirectory, AppErrorSourceOf(where), exception, utc, runId);
         }
     }
 
@@ -2567,6 +2577,58 @@ public sealed partial class RunController : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// Counts the thread-pool work the controller hands off without awaiting it: queued <c>app-errors.log</c> writes
+    /// and the disposals it leaves running. It holds the count and nothing else, so no controller, run, journal or
+    /// session is reachable from it, and a run that references it adds no edge back to its owner.
+    /// </summary>
+    private sealed class BackgroundWork
+    {
+        private int _running;
+
+        /// <summary>Gets a value indicating whether any counted work is still queued or running.</summary>
+        public bool IsRunning => Volatile.Read(ref _running) != 0;
+
+        /// <summary>
+        /// Runs <paramref name="work"/> on the thread pool, counted from before it is queued until it has returned or
+        /// thrown, so the count cannot read zero while the work is pending.
+        /// </summary>
+        /// <param name="work">The work; an exception it throws faults the returned task.</param>
+        /// <returns>The work's task.</returns>
+        public Task RunAsync(Action work)
+        {
+            _ = Interlocked.Increment(ref _running);
+            return Task.Run(() =>
+            {
+                try
+                {
+                    work();
+                }
+                finally
+                {
+                    _ = Interlocked.Decrement(ref _running);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Appends an entry to <c>app-errors.log</c> on the thread pool and returns at once, counted until the write
+        /// has ended. Never blocks and performs no I/O on the calling thread, so the engine's coordinator may call it.
+        /// </summary>
+        public void QueueAppError(
+            DataDirectory dataDirectory,
+            string source,
+            Exception exception,
+            DateTimeOffset utc,
+            Guid? runId)
+        {
+            // Nothing observes the task: AppendAppError swallows every failure to format or write the entry, and it
+            // throws only for a missing argument or a blank source, which the controller's callers never pass, so
+            // the task never faults.
+            _ = RunAsync(() => ResultsLog.AppendAppError(dataDirectory, source, exception, utc, runId));
+        }
+    }
+
+    /// <summary>
     /// The state of one accepted run, from Preparing until its session is disposed. The session, journal-failure,
     /// callback-fault and last-started-step fields are published atomically, and the stop decision is taken under a
     /// lock, because the coordinator thread reads or writes them; everything else belongs to the UI thread.
@@ -2590,13 +2652,15 @@ public sealed partial class RunController : ObservableObject, IDisposable
             ProgressJournal journal,
             ResultsLog log,
             JournalBegin begin,
-            TimeProvider timeProvider)
+            TimeProvider timeProvider,
+            BackgroundWork backgroundWork)
         {
             Request = request;
             Journal = journal;
             Log = log;
             Begin = begin;
             TimeProvider = timeProvider;
+            BackgroundWork = backgroundWork;
             WorkerCount = request.Snapshot.LogicalProcessors;
         }
 
@@ -2609,6 +2673,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
         public JournalBegin Begin { get; }
 
         public TimeProvider TimeProvider { get; }
+
+        // The controller's tracker, so the static callback-fault sink counts its app-error write like the controller's.
+        public BackgroundWork BackgroundWork { get; }
 
         public IEngineSession? Session => Volatile.Read(ref _session);
 

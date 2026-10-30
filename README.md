@@ -19,7 +19,7 @@ RAMQuick does not force failures, search for the exact failure point, auto-tune 
 
 ## Running RAMQuick
 
-1. Extract `RamQuick-win-x64.zip`, or copy the `RamQuick-win-x64` folder, to any location.
+1. Extract `RamQuick-win-x64.zip`, or copy the `RamQuick-win-x64` folder, to any location. Besides the application, the folder holds this README, `THIRD-PARTY-NOTICES.txt` and [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 2. Close other applications, then run `RamQuick.exe` from that folder.
 
 Nothing is installed. No .NET or Visual C++ runtime is needed, and RAMQuick needs no network access. Only one instance runs at a time; a second one shows "RAMQuick is already running" and exits.
@@ -33,6 +33,8 @@ The single window has three controls:
 While a test runs, the window shows RAM and CPU temperature, the current step ("name (n of N)"), elapsed time, time remaining ("calculating…" until the first step has completed a pass), coverage against the type's target, and the running error count. The detected-memory summary shows total memory, tested capacity, speed, channel count and DIMM count; speed and channels read "Unknown" when the firmware does not report them.
 
 RAMQuick tests up to 90 % of the memory that is free when you press Start, always leaving at least 1 GiB free. The test region is locked in memory and split evenly across one test thread per logical processor. If less than 1 GiB can be tested, Start is refused with "Not enough free memory to test: at least 1 GB must be lockable. Close other applications and try again." If locking fails at the planned size, RAMQuick retries 10 % smaller, down to 1 GiB, and reports the size it actually tested; below 1 GiB the test ends as ABORTED with the same message.
+
+After the verdict, Start stays unavailable until the tested memory is released and the results are saved; meanwhile the current step reads "Releasing memory…" and then "Saving results…". The 2-second bound for Stop ends at the verdict; releasing the memory comes after it, is not covered by that bound and grows with the tested size, so it takes longest on PCs with a lot of memory. If the release is not confirmed within 30 seconds of the verdict, the results are saved anyway with the release time recorded as not confirmed (`memory.releaseSeconds: null` in the JSON summary, "memory release not confirmed" in the `.log`). If it is still not confirmed once they are saved, the current step reads "Releasing memory…" again and the notice line reads "Memory release not confirmed yet. Start becomes available once it is; if it never is, restart RAMQuick."
 
 Closing the window during a test stops the test; the results are saved as ABORTED before RAMQuick exits.
 
@@ -51,7 +53,8 @@ Elevation happens only through UAC consent. RAMQuick never grants a privilege to
 
 CPU and RAM temperatures are read with LibreHardwareMonitorLib 0.9.6, which needs the PawnIO driver to be already installed. RAMQuick never installs, bundles or prompts you to install PawnIO or any other driver.
 
-- Without PawnIO or Administrator rights, or on modules without a thermal sensor, the reading shows "N/A" and its thermal limit is inactive. The test still runs, and the notice line names the inactive limit, for example "Temperature sensors unavailable — thermal safety inactive".
+- With Administrator rights but without PawnIO, both readings show "N/A". When the memory modules have no thermal sensor, only the RAM reading shows "N/A". Each missing reading leaves only its own thermal limit inactive. The test still runs, and the notice line names the inactive limit: "CPU temperature unavailable — CPU thermal limit inactive", "RAM temperature unavailable — RAM thermal limit inactive", or "Temperature sensors unavailable — thermal safety inactive" when both are missing.
+- Without Administrator rights, both readings also show "N/A", because reading the sensors needs elevation too, and no test runs: pressing Start shows the restart dialog described under Administrator rights above.
 - The RAM temperature is the highest reading across the DIMMs' thermal sensors, which on DDR5 sit in the SPD hub.
 - **Thermal safety:** a test stops as ABORTED when a fresh reading reaches 95 °C for the CPU or 85 °C for the RAM, for example "Stopped for safety: CPU temperature reached 95 °C".
 
@@ -131,11 +134,13 @@ Other Windows 10 builds from 14393 onward can run RAMQuick but sit outside that 
 
 A CPU without AVX2 runs the SSE2 code path; the notice line reads "Reduced instruction set (SSE2): this test runs slower".
 
-**.NET 8 support ends on 10 November 2026.** To retarget, change `RamQuickTargetFramework` in [Directory.Build.props](Directory.Build.props) to `net10.0-windows` and the SDK in [global.json](global.json) to a .NET 10 SDK. No source change is expected, because only .NET 8 APIs are used.
+**.NET 8 support ends on 10 November 2026.** Retargeting is done in the RAMQuick source checkout; the files linked in this paragraph and the next are part of the checkout, not of the portable folder. To retarget, change `RamQuickTargetFramework` in [Directory.Build.props](Directory.Build.props) to `net10.0-windows` and the SDK in [global.json](global.json) to a .NET 10 SDK. No source change is expected, because only .NET 8 APIs are used.
 
 A .NET 10 SDK also needs a newer toolchain. From the 10.0.2xx feature band on, .NET 10 SDKs require MSBuild 18.0 or later (Visual Studio 2026); the MSBuild of Visual Studio 2022 17.14 refuses to load them ("requires at least version 18.0.0 of MSBuild"), and Microsoft does not support targeting `net10.0` from 17.14 even with a 10.0.1xx SDK ([.NET SDK, MSBuild, and Visual Studio versioning](https://learn.microsoft.com/en-us/dotnet/core/porting/versioning-sdk-msbuild-vs)). The scripts select only a 17.14 installation (`$VisualStudioVersionRange` is `[17.14,18.0)` in [scripts/build.ps1](scripts/build.ps1) and [scripts/publish-portable.ps1](scripts/publish-portable.ps1)), so building the retargeted solution also needs Visual Studio 2026 Build Tools, with the v143 toolset that [src/engine/engine.props](src/engine/engine.props) pins, and that range raised. Visual Studio 2022 17.14 stays the pinned toolchain for .NET 8.
 
 ## Building from source
+
+This section applies to the RAMQuick source checkout. The scripts, project and configuration files it links to are part of the checkout and are not in the portable folder.
 
 ### Prerequisites
 
@@ -149,6 +154,15 @@ A .NET 10 SDK also needs a newer toolchain. From the 10.0.2xx feature band on, .
 | Windows PowerShell | 5.1 |
 
 GoogleTest 1.18.0 is restored automatically in vcpkg manifest mode from [vcpkg.json](vcpkg.json), for the `x64-windows-static` triplet so it matches the engine's static C runtime. NuGet package versions are pinned in [Directory.Packages.props](Directory.Packages.props) and frozen by each project's `packages.lock.json`.
+
+The native test projects rely on vcpkg's user-wide MSBuild integration and import no vcpkg file themselves. Without it they cannot restore GoogleTest or find its headers and libraries, so the build fails. Enable it once per Windows user with the vcpkg bundled with Visual Studio. The first run needs Administrator rights, so run it in Windows PowerShell started with **Run as administrator** under the account that builds RAMQuick:
+
+```powershell
+$vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -version '[17.14,18.0)' -requires Microsoft.VisualStudio.Component.Vcpkg -property installationPath
+& "$vs\VC\vcpkg\vcpkg.exe" integrate install
+```
+
+In a Developer PowerShell for VS 2022, `vcpkg integrate install` does the same. See [vcpkg in MSBuild projects](https://learn.microsoft.com/en-us/vcpkg/users/buildsystems/msbuild-integration).
 
 ### Build
 
@@ -194,7 +208,7 @@ Some tests run only where their preconditions hold:
 .\scripts\publish-portable.ps1
 ```
 
-[scripts/publish-portable.ps1](scripts/publish-portable.ps1) locates MSBuild with `vswhere` and publishes `src\RamQuick.App` with the `Portable` profile ([Portable.pubxml](src/RamQuick.App/Properties/PublishProfiles/Portable.pubxml)): self-contained `win-x64` with ReadyToRun, neither trimmed nor single-file. It verifies that the folder holds no test-only files and that the engine needs no Visual C++ runtime DLL, copies `THIRD-PARTY-NOTICES.txt` and this README into it, and zips it:
+[scripts/publish-portable.ps1](scripts/publish-portable.ps1) locates MSBuild with `vswhere` and publishes `src\RamQuick.App` with the `Portable` profile ([Portable.pubxml](src/RamQuick.App/Properties/PublishProfiles/Portable.pubxml)): self-contained `win-x64` with ReadyToRun, neither trimmed nor single-file. It verifies that the folder holds no test-only files and that the engine needs no Visual C++ runtime DLL, copies `THIRD-PARTY-NOTICES.txt`, this README and `docs/METHODOLOGY.md` into it at their repository-relative paths, and zips it:
 
 - `artifacts/publish/RamQuick-win-x64/`: the portable folder;
 - `artifacts/publish/RamQuick-win-x64.zip`: the same folder, zipped.
