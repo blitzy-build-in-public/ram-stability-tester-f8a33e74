@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
+using System.Runtime;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Text;
@@ -1014,6 +1015,44 @@ public sealed partial class ProgressJournalTests
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Wait_SeveralThreadsWaiting_EveryWaiterReturnsTheCompletion(bool fails)
+    {
+        const int WaiterCount = 4;
+        var ack = new JournalAck();
+        using var stopEvent = new ManualResetEvent(false);
+        var statuses = new JournalAckStatus?[WaiterCount];
+        var waiters = new Thread[WaiterCount];
+        for (int i = 0; i < WaiterCount; i++)
+        {
+            int index = i;
+            waiters[i] = new Thread(() => statuses[index] = ack.Wait(stopEvent, _ceiling))
+            {
+                IsBackground = true,
+                Name = $"Test waiter {index}",
+            };
+            waiters[i].Start();
+        }
+
+        Assert.True(
+            SpinWait.SpinUntil(() => waiters.All(IsBlocked), _ceiling),
+            "The waiting threads never blocked on the pending acknowledgment.");
+
+        // A wait that gives up while the others still wait leaves their registrations in place.
+        Assert.Equal(JournalAckStatus.TimedOut, ack.Wait(stopEvent, TimeSpan.FromMilliseconds(50)));
+
+        JournalFailure? failure = fails ? new JournalFailure(StepType, SimulatedFailureText, null, _t0) : null;
+        ack.Complete(failure);
+
+        JournalAckStatus expected = fails ? JournalAckStatus.Failed : JournalAckStatus.Acknowledged;
+        Assert.All(waiters, waiter => Assert.True(waiter.Join(_ceiling), $"{waiter.Name} never returned."));
+        Assert.All(statuses, status => Assert.Equal(expected, status));
+        Assert.Same(failure, ack.Failure);
+        Assert.Equal(expected, ack.Wait(stopEvent, TimeSpan.Zero));
+    }
+
+    [Theory]
     [InlineData(-1, 6)]
     [InlineData(6, 6)]
     [InlineData(0, 0)]
@@ -1357,7 +1396,8 @@ public sealed partial class ProgressJournalTests
     public void JournalWriter_HoldsNoDelegateEventOrJournalReference()
     {
         // The writer thread and the heartbeat timer reach only this core, so nothing a run creates is kept alive
-        // through it: no callback, no event and no path back to the journal.
+        // through it: no callback, no event, no path back to the journal, and no strong hold on the retirement signal,
+        // whose continuations lead to the callers awaiting it.
         Type writer = Assert.Single(
             typeof(ProgressJournal).GetNestedTypes(BindingFlags.NonPublic),
             type => type.Name == "JournalWriter");
@@ -1368,6 +1408,7 @@ public sealed partial class ProgressJournalTests
                 typeof(Delegate).IsAssignableFrom(field.FieldType),
                 $"JournalWriter.{field.Name} holds a delegate.");
             Assert.NotEqual(typeof(ProgressJournal), field.FieldType);
+            Assert.NotEqual(typeof(TaskCompletionSource), field.FieldType);
         });
     }
 
@@ -1775,6 +1816,149 @@ public sealed partial class ProgressJournalTests
         Assert.Equal(_t0, failure.OccurredUtc);
     }
 
+    [Theory]
+    [InlineData("never begun")]
+    [InlineData("begin fails")]
+    [InlineData("end")]
+    [InlineData("disposed")]
+    public async Task Retired_WriterStops_CompletesOnceStorageIsClosedAsync(string ending)
+    {
+        var storage = new ThrowingCleanupStorage();
+        FakeTimeProvider time = JournalSamples.CreateTimeProvider();
+        using var journal = new ProgressJournal(storage, time);
+        Assert.False(journal.Retired.IsCompleted, "A journal retired before it was used.");
+
+        switch (ending)
+        {
+            case "never begun":
+                // With no writer thread, Dispose closes the storage and so retires the journal itself.
+                journal.Dispose();
+                Assert.True(journal.Retired.IsCompleted, "Dispose of a journal that never began did not retire it.");
+                break;
+            case "begin fails":
+                storage.Inner.FailNext(BeginType);
+                Assert.Equal(
+                    JournalAckStatus.Failed,
+                    await journal.BeginAsync(JournalSamples.BeginA(_t0)).WaitAsync(_ceiling, Cancellation));
+                break;
+            case "end":
+                await BeginAcknowledgedAsync(journal);
+                Assert.False(journal.Retired.IsCompleted, "A running journal reported its writer retired.");
+                Assert.Equal(JournalAckStatus.Acknowledged, await journal.EndAsync().WaitAsync(_ceiling, Cancellation));
+                break;
+            default:
+                await BeginAcknowledgedAsync(journal);
+                Assert.False(journal.Retired.IsCompleted, "A running journal reported its writer retired.");
+                journal.Dispose();
+                break;
+        }
+
+        await journal.Retired.WaitAsync(_ceiling, Cancellation);
+        Assert.Equal(TaskStatus.RanToCompletion, journal.Retired.Status);
+        Assert.True(storage.IsDisposed, "The journal retired with its storage still open.");
+    }
+
+    [Theory]
+    [InlineData(BeginType)]
+    [InlineData(PreparedType)]
+    [InlineData(EndType)]
+    public async Task Retired_AppendStalledPastDispose_CompletesOnlyOnceAppendReturnsAndStorageIsClosedAsync(string stalledRecord)
+    {
+        var storage = new ThrowingCleanupStorage();
+        FakeTimeProvider time = JournalSamples.CreateTimeProvider();
+        var journal = new ProgressJournal(storage, time);
+        try
+        {
+            if (stalledRecord == BeginType)
+            {
+                storage.Inner.BlockNext(BeginType);
+                Task<JournalAckStatus> begin = journal.BeginAsync(JournalSamples.BeginA(_t0));
+                Assert.True(storage.Inner.WaitForBlocked(_ceiling), "The begin append never reached the storage.");
+                time.Advance(ProgressJournal.AcknowledgmentTimeout);
+                Assert.Equal(JournalAckStatus.TimedOut, await begin.WaitAsync(_ceiling, Cancellation));
+            }
+            else
+            {
+                await BeginAcknowledgedAsync(journal);
+                storage.Inner.BlockNext(stalledRecord);
+                Task<JournalAckStatus>? end = null;
+                if (stalledRecord == EndType)
+                {
+                    end = journal.EndAsync();
+                }
+                else
+                {
+                    journal.RecordPrepared(JournalSamples.Prepared());
+                }
+
+                Assert.True(storage.Inner.WaitForBlocked(_ceiling), $"The {stalledRecord} append never reached the storage.");
+                if (end is not null)
+                {
+                    time.Advance(ProgressJournal.AcknowledgmentTimeout);
+                    Assert.Equal(JournalAckStatus.TimedOut, await end.WaitAsync(_ceiling, Cancellation));
+                }
+            }
+
+            // Dispose gives up on the stalled writer after 1 s, so its return does not mean the writer is gone.
+            journal.Dispose();
+            Assert.False(journal.Retired.IsCompleted, $"The journal retired while its {stalledRecord} append was stalled.");
+            Assert.False(storage.IsDisposed);
+            Assert.Equal(0, storage.Inner.DeleteCount);
+        }
+        finally
+        {
+            storage.Inner.Release();
+            journal.Dispose();
+        }
+
+        await journal.Retired.WaitAsync(_ceiling, Cancellation);
+        Assert.Equal(TaskStatus.RanToCompletion, journal.Retired.Status);
+        Assert.True(storage.IsDisposed, "The journal retired with its storage still open.");
+
+        // The writer finished the stalled append first, then deleted a begin-only or ended journal; a journal
+        // disposed mid-run stays for recovery.
+        Assert.Contains(stalledRecord, storage.Inner.RecordTypesWritten());
+        Assert.Equal(stalledRecord == PreparedType ? 0 : 1, storage.Inner.DeleteCount);
+    }
+
+    [Theory]
+    [InlineData(BeginType)]
+    [InlineData(EndType)]
+    public void Retired_AwaitedWhileAppendStalledPastDispose_KeepsNeitherJournalNorAwaiterAlive(string stalledRecord)
+    {
+        var storage = new ThrowingCleanupStorage();
+        FakeTimeProvider time = JournalSamples.CreateTimeProvider();
+        try
+        {
+            (WeakReference journal, WeakReference awaiter) = DisposeAndAwaitRetirementWhileStalled(storage, time, stalledRecord);
+
+            // The writer thread stays parked in the append, and must keep neither the disposed journal nor a caller
+            // awaiting its retirement alive.
+            for (int attempt = 0; attempt < 10 && (journal.IsAlive || awaiter.IsAlive); attempt++)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+            }
+
+            Assert.Equal(1, storage.Inner.BlockedCount);
+            Assert.False(journal.IsAlive, $"A writer stalled in its {stalledRecord} append kept its disposed journal alive.");
+            Assert.False(awaiter.IsAlive, $"A writer stalled in its {stalledRecord} append kept a caller awaiting Retired alive.");
+        }
+        finally
+        {
+            storage.Inner.Release();
+        }
+
+        // Released, the writer finishes the append, deletes the begin-only or ended journal and closes the storage,
+        // with nobody left to notify of its retirement.
+        WaitUntil(() => storage.IsDisposed, $"The writer released from its {stalledRecord} append never closed its storage.");
+        Assert.Equal(AppendOutcome.Succeeded, Assert.Single(storage.Inner.Calls, call => call.RecordType == stalledRecord).Outcome);
+        Assert.Equal(1, storage.Inner.DeleteCount);
+        Assert.Equal(0, storage.Inner.BlockedCount);
+    }
+
+
     [Fact]
     public async Task BeginAsync_CalledTwice_ThrowsInvalidOperationAsync()
     {
@@ -1868,6 +2052,13 @@ public sealed partial class ProgressJournalTests
 
     private static void WaitUntil(Func<bool> condition, string because) => WaitUntil(condition, _ceiling, because);
 
+    /// <summary>
+    /// Returns whether <paramref name="thread"/> is blocked in a managed wait, such as an acknowledgment wait that has
+    /// reached its kernel wait.
+    /// </summary>
+    internal static bool IsBlocked(Thread thread) =>
+        (thread.ThreadState & System.Threading.ThreadState.WaitSleepJoin) != 0;
+
     private static async Task<JournalBegin> BeginAcknowledgedAsync(ProgressJournal journal)
     {
         JournalBegin begin = JournalSamples.BeginA(_t0);
@@ -1933,6 +2124,54 @@ public sealed partial class ProgressJournalTests
         WaitUntil(() => begin.IsCompleted, "The begin record was not acknowledged.");
         Assert.Equal(new string?[] { BeginType }, storage.Inner.RecordTypesWritten());
         return new WeakReference(journal);
+    }
+
+    // Not inlined and not async, so no frame or state machine of the caller can keep the journal or its awaiter
+    // reachable. Leaves the journal disposed, with its writer stalled in the begin or end append past Dispose's 1 s wait
+    // and a caller awaiting Retired; the returned references track the journal and the awaiter's sentinel.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static (WeakReference Journal, WeakReference Awaiter) DisposeAndAwaitRetirementWhileStalled(
+        ThrowingCleanupStorage storage,
+        FakeTimeProvider time,
+        string stalledRecord)
+    {
+        var journal = new ProgressJournal(storage, time);
+        Task<JournalAckStatus> stalled;
+        if (stalledRecord == BeginType)
+        {
+            storage.Inner.BlockNext(BeginType);
+            stalled = journal.BeginAsync(JournalSamples.BeginA(_t0));
+        }
+        else
+        {
+            Task<JournalAckStatus> begin = journal.BeginAsync(JournalSamples.BeginA(_t0));
+            WaitUntil(() => begin.IsCompleted, "The begin record was not acknowledged.");
+            Assert.Equal(JournalAckStatus.Acknowledged, begin.Result);
+            storage.Inner.BlockNext(EndType);
+            stalled = journal.EndAsync();
+        }
+
+        Assert.True(storage.Inner.WaitForBlocked(_ceiling), $"The {stalledRecord} append never reached the storage.");
+        time.Advance(ProgressJournal.AcknowledgmentTimeout);
+        WaitUntil(() => stalled.IsCompleted, $"The {stalledRecord} acknowledgment never gave up.");
+        Assert.Equal(JournalAckStatus.TimedOut, stalled.Result);
+
+        // Dispose gives up on the stalled writer after 1 s and returns with the append still blocked.
+        journal.Dispose();
+        Assert.Equal(1, storage.Inner.BlockedCount);
+        Assert.False(journal.Retired.IsCompleted, $"The journal retired while its {stalledRecord} append was stalled.");
+
+        var sentinel = new StrongBox<bool>();
+        _ = AwaitRetirementAsync(journal, sentinel);
+        return (new WeakReference(journal), new WeakReference(sentinel));
+    }
+
+    // Awaits the journal's retirement while holding the journal, as its owner does, and a sentinel that only this
+    // continuation references.
+    private static async Task AwaitRetirementAsync(ProgressJournal journal, StrongBox<bool> sentinel)
+    {
+        await journal.Retired.ConfigureAwait(false);
+        sentinel.Value = true;
     }
 
     private static int CountOf(StalledJournalStorage storage, string recordType) =>
@@ -2173,6 +2412,119 @@ public sealed partial class ProgressJournalTests
                 throw new IOException("Simulated journal close failure (ThrowingCleanupStorage)");
             }
         }
+    }
+}
+
+/// <summary>
+/// The collection of the tests that count the process's kernel handles. The count is process-wide, so it also moves
+/// with every handle a test running beside them opens or closes; they therefore run alone, after the parallel tests.
+/// </summary>
+[CollectionDefinition(nameof(HandleCountCollection), DisableParallelization = true)]
+public sealed class HandleCountCollection
+{
+}
+
+/// <summary>
+/// Kernel-handle counts around many <see cref="JournalAck.Wait(WaitHandle, TimeSpan)"/> calls: no wait may leave a
+/// kernel object behind for the garbage collector to release.
+/// </summary>
+/// <remarks>
+/// Each count runs inside a no-GC region, because a collection and the finalizers it queues would close a leaked
+/// handle and hide it. Nothing here induces a collection.
+/// </remarks>
+[Collection(nameof(HandleCountCollection))]
+public sealed class JournalAckHandleTests
+{
+    private const int WaitCount = 200;
+
+    // Room for every allocation the process makes during one count, the waits' own included, so that no collection
+    // ends the region early.
+    private const long NoGcRegionBytes = 64L << 20;
+
+    private static readonly TimeSpan _ceiling = TimeSpan.FromSeconds(5);
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Wait_ManyAcknowledgments_LeavesNoKernelHandleBehind(bool completedBeforeWait)
+    {
+        var acks = new JournalAck[WaitCount];
+        for (int i = 0; i < WaitCount; i++)
+        {
+            acks[i] = new JournalAck();
+            if (completedBeforeWait)
+            {
+                acks[i].Complete(null);
+            }
+        }
+
+        using var stopEvent = new ManualResetEvent(false);
+        var statuses = new JournalAckStatus[WaitCount];
+        Thread waiter = Thread.CurrentThread;
+        int waiting = -1;
+
+        // Stands in for the writer: completes each acknowledgment only once the test thread is blocked in its wait,
+        // so every wait has passed its completed check and reached the kernel wait. Started before the count, so its
+        // own thread handle is not counted.
+        Thread? completer = null;
+        if (!completedBeforeWait)
+        {
+            completer = new Thread(() =>
+            {
+                for (int i = 0; i < WaitCount; i++)
+                {
+                    int index = i;
+                    _ = SpinWait.SpinUntil(
+                        () => Volatile.Read(ref waiting) == index && ProgressJournalTests.IsBlocked(waiter),
+                        _ceiling);
+                    acks[index].Complete(null);
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "Test acknowledgment writer",
+            };
+            completer.Start();
+        }
+
+        Assert.True(GC.TryStartNoGCRegion(NoGcRegionBytes), "The no-GC region could not be entered.");
+        int before;
+        int after;
+        bool regionHeld;
+        try
+        {
+            // Entering the region may have run a collection whose finalizers would close handles during the count and
+            // offset a leak; they finish first.
+            GC.WaitForPendingFinalizers();
+            before = CurrentHandleCount();
+            for (int i = 0; i < WaitCount; i++)
+            {
+                Volatile.Write(ref waiting, i);
+                statuses[i] = acks[i].Wait(stopEvent, _ceiling);
+            }
+
+            after = CurrentHandleCount();
+            regionHeld = GCSettings.LatencyMode == GCLatencyMode.NoGCRegion;
+        }
+        finally
+        {
+            if (GCSettings.LatencyMode == GCLatencyMode.NoGCRegion)
+            {
+                GC.EndNoGCRegion();
+            }
+        }
+
+        Assert.True(completer?.Join(_ceiling) ?? true, "The acknowledgment writer never finished.");
+        Assert.True(regionHeld, "A garbage collection ran during the count, so a leaked handle could have been closed.");
+        Assert.All(statuses, status => Assert.Equal(JournalAckStatus.Acknowledged, status));
+        int growth = after - before;
+        Assert.True(growth < WaitCount / 10, $"{WaitCount} acknowledgment waits left {growth} more kernel handles open.");
+    }
+
+    private static int CurrentHandleCount()
+    {
+        using Process self = Process.GetCurrentProcess();
+        return self.HandleCount;
     }
 }
 

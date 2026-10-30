@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Runtime;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
@@ -8,6 +9,7 @@ using Microsoft.Extensions.Time.Testing;
 using RamQuick.Analysis;
 using RamQuick.App.Services;
 using RamQuick.App.Tests.Fakes;
+using RamQuick.App.ViewModels;
 using RamQuick.Core;
 using RamQuick.Interop;
 using RamQuick.Logging;
@@ -180,8 +182,10 @@ internal sealed class ControllerHarness : IDisposable
     }
 
     /// <summary>
-    /// Makes every run journal into one <see cref="StalledJournalStorage"/>, which the test can block or fail. The
-    /// journal takes ownership of the storage, so it serves one run.
+    /// Makes every run journal write to one <see cref="StalledJournalStorage"/>, which the test can block or fail,
+    /// through a handle of its own, as every run's journal opens its own handle on the one file
+    /// <c>active-run.jsonl</c>. A journal closing its handle leaves the shared storage open for the next run, and a
+    /// journal deleting through its handle deletes the shared journal, whichever run wrote it.
     /// </summary>
     /// <param name="journalTime">
     /// The clock of the journal's acknowledgment and heartbeat bounds; the controller's, <see cref="Time"/>, when
@@ -193,7 +197,8 @@ internal sealed class ControllerHarness : IDisposable
         StalledJournalStorage storage = Storage ??= new StalledJournalStorage();
         Options = CopyOptions(
             Options,
-            journalFactory: (_, timeProvider) => new ProgressJournal(storage, journalTime ?? timeProvider));
+            journalFactory: (_, timeProvider) =>
+                new ProgressJournal(new SharedJournalHandle(storage), journalTime ?? timeProvider));
     }
 
     /// <summary>Makes every Start run <paramref name="plan"/>, whatever test type is selected.</summary>
@@ -357,13 +362,13 @@ internal sealed class ControllerHarness : IDisposable
     }
 
     /// <summary>
-    /// Pumps until the run is in a terminal state and the controller has finished concluding it: the verdict and
-    /// hints are shown and the <c>result</c> record has been written, so the controller is releasing memory, saving
-    /// results, or already done.
+    /// Pumps until the run is in a terminal state and the controller has finished concluding it
+    /// (<see cref="RunController.ConclusionTask"/>): the verdict and hints are shown and the <c>result</c> record has
+    /// been acknowledged, has failed or has timed out, so the controller is releasing memory, saving results, or
+    /// already done.
     /// </summary>
     public void AwaitVerdict() =>
-        RunUntil(() => StateMachine.IsTerminal
-            && (Controller.PostRunActivity != PostRunActivity.None || Controller.CanStart));
+        RunUntil(() => StateMachine.IsTerminal && Controller.ConclusionTask.IsCompleted);
 
     /// <summary>Raises Released for the whole region and pumps until the summaries are published.</summary>
     /// <param name="releaseTime">The release time the engine reports.</param>
@@ -540,7 +545,7 @@ internal sealed class ControllerHarness : IDisposable
             SynchronizationContext.SetSynchronizationContext(null);
         }
 
-        DeleteRoot();
+        DeleteFolder(RootPath);
     }
 
     private DataDirectory RequiredData =>
@@ -592,16 +597,20 @@ internal sealed class ControllerHarness : IDisposable
         }
     }
 
-    // The thread pool may still be appending to app-errors.log, and a results log may still be draining.
-    private void DeleteRoot()
+    /// <summary>
+    /// Deletes a test's temporary folder, retrying while the thread pool may still be appending to app-errors.log or a
+    /// results log may still be draining into it.
+    /// </summary>
+    /// <param name="rootPath">The folder.</param>
+    public static void DeleteFolder(string rootPath)
     {
         for (int attempt = 1; ; attempt++)
         {
             try
             {
-                if (Directory.Exists(RootPath))
+                if (Directory.Exists(rootPath))
                 {
-                    Directory.Delete(RootPath, recursive: true);
+                    Directory.Delete(rootPath, recursive: true);
                 }
 
                 return;
@@ -611,6 +620,35 @@ internal sealed class ControllerHarness : IDisposable
                 Thread.Sleep(_deleteRetryDelay);
             }
         }
+    }
+
+    /// <summary>
+    /// One journal's handle on the harness's shared <see cref="StalledJournalStorage"/>, standing for the file handle
+    /// each run's journal opens on <c>active-run.jsonl</c>: appends after <see cref="Dispose"/> throw, as on a
+    /// closed file, while every other member, deletion included, acts on the shared journal.
+    /// </summary>
+    private sealed class SharedJournalHandle : IJournalStorage
+    {
+        private readonly StalledJournalStorage _shared;
+        private int _closed;
+
+        public SharedJournalHandle(StalledJournalStorage shared) => _shared = shared;
+
+        public string Location => _shared.Location;
+
+        public bool Exists() => _shared.Exists();
+
+        public void AppendDurable(string line)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _closed) != 0, this);
+            _shared.AppendDurable(line);
+        }
+
+        public IReadOnlyList<string> ReadLines() => _shared.ReadLines();
+
+        public void Delete() => _shared.Delete();
+
+        public void Dispose() => Volatile.Write(ref _closed, 1);
     }
 }
 
@@ -631,6 +669,10 @@ public sealed class RunControllerTests
     // test lies at n × WordSpacing and has its own 8-byte word.
     private const ulong WordSpacing = 4_096;
 
+    // The forced collections a retirement-wait test runs at most before judging what a stalled journal writer keeps
+    // alive; the pause after each lets thread-pool work started by the controller's disposal finish.
+    private const int CollectionAttempts = 10;
+
     // Real-time bounds: the step gate's journal wait is real time, and Stop must release it within 2 s.
     private static readonly TimeSpan _stopBound = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan _gateTimeoutWait = TimeSpan.FromSeconds(15);
@@ -645,6 +687,12 @@ public sealed class RunControllerTests
 
     // Long enough for a gate that ignored the events still queued before it to journal its step and return.
     private static readonly TimeSpan _undeliveredEventsWindow = TimeSpan.FromMilliseconds(300);
+
+    // Longer than ProgressJournal.Dispose's 1 s wait for a stalled writer, so a Start re-enabled once that bounded wait
+    // returns, rather than once the writer has retired, shows within it.
+    private static readonly TimeSpan _journalDisposeWindow = TimeSpan.FromSeconds(2);
+
+    private static readonly TimeSpan _collectionPause = TimeSpan.FromMilliseconds(50);
 
     private static readonly IReadOnlyList<StepAttributes> _quickSteps = TestPlans.Quick.ToStepAttributes();
 
@@ -789,7 +837,7 @@ public sealed class RunControllerTests
     }
 
     [Fact]
-    public void TryStart_BeginRecordNotDurableWithinBound_RefusesAsUnusableDataFolder()
+    public void TryStart_BeginRecordNotDurableWithinBound_RefusesAsUnusableDataFolderUntilWriterRetires()
     {
         using var harness = new ControllerHarness();
         harness.UseStalledJournal();
@@ -805,16 +853,36 @@ public sealed class RunControllerTests
 
         // The 5 s bound is measured on the controller's clock.
         harness.Time.Advance(harness.Options.BeginTimeout);
-        harness.RunUntil(() => harness.Controller.CanStart);
-
-        Assert.Equal(StartResult.DataFolderUnusable, harness.AwaitResult(harness.Controller.StartTask));
-        Assert.Equal(UiText.DataFolderUnusableMessage, harness.Controller.NoticeMessage);
+        harness.RunUntil(() => harness.Controller.NoticeMessage == UiText.DataFolderUnusableMessage);
         Assert.Equal(RunState.Idle, harness.StateMachine.State);
         Assert.Equal(0, transitions);
         Assert.Equal(0, harness.Engine.CreateSessionCount);
 
+        // The journal's Dispose gives up on the stalled writer after 1 s, but the writer still owns the journal file:
+        // once its begin append returns it deletes that file, which by then would hold the next run's journal.
+        ProgressJournal refused = Assert.Single(harness.Journals);
+        Assert.False(harness.Context.RunUntil(() => harness.Controller.CanStart, _journalDisposeWindow));
+        Assert.Equal(StartResult.Busy, harness.TryStart());
+        Assert.False(refused.Retired.IsCompleted);
+        Assert.False(harness.Controller.StartTask.IsCompleted);
+        Assert.Equal(0, storage.DeleteCount);
+
+        storage.Release();
+        harness.RunUntil(() => harness.Controller.CanStart);
+        Assert.Equal(StartResult.DataFolderUnusable, harness.AwaitResult(harness.Controller.StartTask));
+        Assert.True(refused.Retired.IsCompleted);
+        Assert.Equal(1, storage.DeleteCount);
+        Assert.False(harness.JournalExists);
+
         // The name the refused Start reserved is given back.
         Assert.Empty(harness.RunLogPaths());
+
+        // The next run's journal is the same file, and nothing of the refused run touches it any more.
+        harness.StartAccepted();
+        harness.Pump();
+        JournalBegin begin = Assert.Single(harness.ReadJournal().OfType<JournalBegin>());
+        Assert.Equal(RunIdOf(harness), begin.RunId.ToString("N"));
+        Assert.Equal(1, storage.DeleteCount);
     }
 
     [Fact]
@@ -832,10 +900,13 @@ public sealed class RunControllerTests
         harness.Time.Advance(harness.Options.BeginTimeout);
         harness.RunUntil(() => harness.Controller.NoticeMessage == UiText.DataFolderUnusableMessage);
 
-        // Start is offered again only once the journal has given up on its begin record too.
+        // Start is offered again only once the journal has given up on its begin record too, and its writer, released
+        // from the stalled append, has deleted the begin-only journal and retired.
         Assert.False(harness.Controller.CanStart);
         harness.Time.Advance(ProgressJournal.AcknowledgmentTimeout - harness.Options.BeginTimeout);
+        storage.Release();
         harness.RunUntil(() => harness.Controller.CanStart);
+        Assert.True(storage.IsDeleted);
         Assert.Equal(RunState.Idle, harness.StateMachine.State);
         Assert.Equal(0, harness.Engine.CreateSessionCount);
     }
@@ -1217,24 +1288,120 @@ public sealed class RunControllerTests
     }
 
     [Fact]
-    public void Released_NotWithinFallback_PublishesWithUnconfirmedRelease()
+    public void Completed_ResultRecordStalled_ReportsReleasingMemoryFromTheTerminalTransitionAndPublishesAfterTheRecord()
+    {
+        using var harness = new ControllerHarness();
+        harness.UseStalledJournal();
+        StalledJournalStorage storage = harness.Storage!;
+        harness.Initialize();
+        using var viewModel = new MainViewModel(harness.Controller, harness.StateMachine);
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+        storage.BlockNext("result");
+
+        session.RaiseCompleted(RunEndReason.Completed);
+        harness.RunUntil(() => harness.StateMachine.IsTerminal);
+
+        // The activity is set in the frame of the terminal transition, so with Start unavailable the step field never
+        // reads "—", although the result record's acknowledgment is still pending.
+        Assert.Equal(PostRunActivity.ReleasingMemory, harness.Controller.PostRunActivity);
+        Assert.Equal(UiText.ReleasingMemory, viewModel.CurrentStepText);
+        Assert.False(viewModel.CanStart);
+        harness.RunUntil(() => storage.BlockedCount == 1);
+        Assert.False(harness.Controller.ConclusionTask.IsCompleted);
+
+        // Released does not let the summaries overtake the result record.
+        session.RaiseReleased(session.Options.RegionBytes, TimeSpan.FromMilliseconds(600));
+        harness.Pump();
+        Assert.Empty(harness.SummaryJsonPaths());
+        Assert.Equal(UiText.ReleasingMemory, viewModel.CurrentStepText);
+
+        storage.Release();
+        harness.WaitForPublication();
+        Assert.Equal(new[] { "begin", "prepared", "result", "released", "end" }, storage.RecordTypesWritten());
+        Assert.Single(harness.SummaryJsonPaths());
+        Assert.Equal(UiText.NotYetKnown, viewModel.CurrentStepText);
+    }
+
+    // The fallback frees only the publication. Start waits for Released itself, which a slow release of a large region
+    // delays and a chunk Windows refuses to free withholds; a controller that gives up on it leaves Start unavailable.
+    [Theory]
+    [InlineData("Released", false)]
+    [InlineData("Released", true)]
+    [InlineData("Dispose", false)]
+    [InlineData("ShutdownAsync", false)]
+    public void Released_NotWithinFallback_PublishesWithUnconfirmedReleaseButStartWaitsForReleased(string ending, bool publicationFails)
     {
         using var harness = new ControllerHarness();
         harness.Initialize();
         FakeEngineSession session = harness.RunToVerdict();
         Assert.Equal(PostRunActivity.ReleasingMemory, harness.Controller.PostRunActivity);
+        if (publicationFails)
+        {
+            // A file already holding the JSON summary's final name makes the publication fail.
+            string baseName = Path.GetFileNameWithoutExtension(Assert.Single(harness.RunLogPaths()));
+            File.WriteAllText(ResultsLog.GetSummaryJsonPath(harness.Data!, baseName), "{}");
+        }
 
         harness.Time.Advance(harness.Options.PublicationFallback);
-        harness.WaitForPublication();
+        harness.RunUntil(() => harness.Controller.NoticeMessage?.EndsWith(UiText.ReleaseNotConfirmedNotice, StringComparison.Ordinal) == true);
 
-        using JsonDocument summary = harness.ReadSummary();
-        Assert.Equal(JsonValueKind.Null, summary.RootElement.GetProperty("memory").GetProperty("releaseSeconds").ValueKind);
-        Assert.Equal("PASS", summary.RootElement.GetProperty("run").GetProperty("verdict").GetString());
+        // The summaries are published without a release time, and any notice already shown stays ahead of the new one.
+        string? earlierNotice = null;
+        if (publicationFails)
+        {
+            string notice = harness.Controller.NoticeMessage!;
+            earlierNotice = notice[..^(UiText.NoticeSeparator.Length + UiText.ReleaseNotConfirmedNotice.Length)];
+            Assert.StartsWith(UiText.ResultsNotSaved(string.Empty), earlierNotice, StringComparison.Ordinal);
+            Assert.Equal(earlierNotice + UiText.NoticeSeparator + UiText.ReleaseNotConfirmedNotice, notice);
+            Assert.True(harness.JournalExists);
+        }
+        else
+        {
+            Assert.Equal(UiText.ReleaseNotConfirmedNotice, harness.Controller.NoticeMessage);
+            using JsonDocument summary = harness.ReadSummary();
+            Assert.Equal(JsonValueKind.Null, summary.RootElement.GetProperty("memory").GetProperty("releaseSeconds").ValueKind);
+            Assert.Equal("PASS", summary.RootElement.GetProperty("run").GetProperty("verdict").GetString());
+            Assert.False(harness.JournalExists);
+        }
 
         // ResultsLog's wording is internal to RamQuick.Logging; this is the wording the results-log contract names.
         Assert.Contains("memory release not confirmed", harness.LogText(), StringComparison.Ordinal);
+
+        // The fallback is no Released: the session stays subscribed and undisposed, and Start unavailable.
+        harness.Pump();
+        Assert.False(harness.Controller.CanStart);
+        Assert.Equal(StartResult.Busy, harness.TryStart());
+        Assert.Equal(PostRunActivity.ReleasingMemory, harness.Controller.PostRunActivity);
+        Assert.Equal(0, session.DisposeCount);
+        Assert.False(harness.Controller.PostRunTask.IsCompleted);
+
+        switch (ending)
+        {
+            case "Released":
+                // A late Released ends the teardown: the session is disposed and Start offered, without the notice.
+                harness.Release(TimeSpan.FromSeconds(42));
+                Assert.Equal(earlierNotice, harness.Controller.NoticeMessage);
+                Assert.Equal(1, session.DisposeCount);
+                harness.StartAccepted();
+                return;
+            case "Dispose":
+                harness.Controller.Dispose();
+                break;
+            default:
+                // Past its deadline the shutdown disposes the session without waiting for Released.
+                harness.AwaitTask(harness.Shutdown());
+                break;
+        }
+
+        // The controller gave up on Released: the teardown ends, and Start stays unavailable with the notice shown.
+        harness.AwaitTask(harness.Controller.PostRunTask);
+        harness.RunUntil(() => session.IsDisposed);
         Assert.Equal(1, session.DisposeCount);
-        Assert.False(harness.JournalExists);
+        Assert.False(harness.Controller.CanStart);
+        Assert.Equal(StartResult.Busy, harness.TryStart());
+        Assert.Equal(PostRunActivity.ReleasingMemory, harness.Controller.PostRunActivity);
+        Assert.Equal(UiText.ReleaseNotConfirmedNotice, harness.Controller.NoticeMessage);
     }
 
     [Theory]
@@ -1390,6 +1557,47 @@ public sealed class RunControllerTests
         Assert.Equal(UiText.RecoveredNotice, harness.Controller.NoticeMessage);
         Assert.True(File.Exists(ResultsLog.GetRecoveredSummaryJsonPath(harness.Data!, baseName)));
         Assert.Equal("{}", File.ReadAllText(takenJsonPath));
+    }
+
+    [Fact]
+    public void Publication_EndAppendStalledPastJournalDispose_KeepsStartUnavailableUntilWriterRetires()
+    {
+        using var harness = new ControllerHarness();
+        harness.UseStalledJournal();
+        StalledJournalStorage storage = harness.Storage!;
+        harness.Initialize();
+        FakeEngineSession session = harness.RunToVerdict();
+        Guid endedRunId = Assert.Single(harness.ReadJournal().OfType<JournalBegin>()).RunId;
+        storage.BlockNext("end");
+
+        // Publication waits 5 s for the end record, then tears the run down.
+        session.RaiseReleased(session.Options.RegionBytes, TimeSpan.FromMilliseconds(400));
+        harness.RunUntil(() => storage.BlockedCount == 1);
+        harness.Time.Advance(ProgressJournal.AcknowledgmentTimeout);
+        harness.RunUntil(() => session.IsDisposed);
+        Assert.Single(harness.SummaryJsonPaths());
+
+        // The journal's Dispose gives up on the stalled writer after 1 s, but once its end append returns the writer
+        // deletes the journal file, which by then would hold the next run's journal.
+        ProgressJournal ended = Assert.Single(harness.Journals);
+        Assert.False(harness.Context.RunUntil(() => harness.Controller.CanStart, _journalDisposeWindow));
+        Assert.Equal(StartResult.Busy, harness.TryStart());
+        Assert.Equal(PostRunActivity.SavingResults, harness.Controller.PostRunActivity);
+        Assert.False(ended.Retired.IsCompleted);
+        Assert.Equal(0, storage.DeleteCount);
+
+        storage.Release();
+        harness.WaitForPublication();
+        Assert.True(ended.Retired.IsCompleted);
+        Assert.Equal(1, storage.DeleteCount);
+        Assert.False(harness.JournalExists);
+
+        // The next run's journal is the same file, and nothing of the ended run touches it any more.
+        harness.StartAccepted();
+        harness.Pump();
+        JournalBegin begin = Assert.Single(harness.ReadJournal().OfType<JournalBegin>());
+        Assert.NotEqual(endedRunId, begin.RunId);
+        Assert.Equal(1, storage.DeleteCount);
     }
 
     // The .log is made to fail mid-run, with no access-control change, by a byte-range lock held through a second
@@ -2407,6 +2615,75 @@ public sealed class RunControllerTests
     }
 
     [Fact]
+    public void StepGate_StopWhileEarlierEventsUndelivered_AbortsWithinTwoSecondsWithoutHostFault()
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+
+        // The UI context is not pumped, so the gate's barrier stays queued.
+        Task<StepGateDecision> gate = session.InvokeStepGateOnBackgroundThread(0);
+        Assert.False(
+            SpinWait.SpinUntil(() => gate.IsCompleted, _undeliveredEventsWindow),
+            "The gate returned while its barrier was still queued.");
+        long stoppedAt = Stopwatch.GetTimestamp();
+        harness.Controller.RequestStop();
+        Assert.True(
+            SpinWait.SpinUntil(() => gate.IsCompleted, _stopBound),
+            "The gate did not honour the stop while its barrier was queued.");
+        Assert.True(harness.Context.PendingCount > 0, "The barrier ran although the UI context was never pumped.");
+
+        // Pumping runs the barrier after the gate has disposed its event; nothing may reach the dispatcher.
+        (StepGateDecision decision, TimeSpan elapsed) = harness.AwaitGate(gate, stoppedAt);
+
+        Assert.Equal(StepGateDecision.Abort, decision);
+        Assert.True(elapsed < _stopBound, $"The gate returned {elapsed.TotalMilliseconds:0} ms after Stop.");
+        Assert.Equal(new[] { StopReason.User }, session.StopRequests);
+        Assert.Equal(RunEndReason.UserStop, session.FirstRecordedEndReason);
+        Assert.Empty(harness.ReadJournal().OfType<JournalStepStart>());
+
+        session.CompleteWithFirstRecordedReason();
+        harness.AwaitVerdict();
+        Assert.Equal(RunState.Aborted, harness.StateMachine.State);
+        Assert.Equal(RunEndReason.UserStop, harness.StateMachine.EndReason);
+        Assert.Equal(UiText.StoppedByUser, harness.Controller.ResultMessage);
+    }
+
+    [Fact]
+    public void StepGate_EarlierEventsUndeliveredForTheWholeBound_RequestsHostFaultBeforeAbort()
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+
+        // The UI context is not pumped for the gate's whole real-time bound, so its barrier never runs in time.
+        long startedAt = Stopwatch.GetTimestamp();
+        Task<StepGateDecision> gate = session.InvokeStepGateOnBackgroundThread(0);
+        Assert.True(
+            SpinWait.SpinUntil(() => gate.IsCompleted, _gateTimeoutWait),
+            "The gate never gave up on its undelivered barrier.");
+        Assert.True(harness.Context.PendingCount > 0, "The barrier ran although the UI context was never pumped.");
+
+        // Pumping runs the barrier after the gate has disposed its event; nothing may reach the dispatcher.
+        (StepGateDecision decision, TimeSpan elapsed) = harness.AwaitGate(gate, startedAt);
+
+        Assert.Equal(StepGateDecision.Abort, decision);
+        Assert.True(elapsed >= _gateTimeoutFloor, $"The gate gave up after {elapsed.TotalMilliseconds:0} ms.");
+        GateInvocation invocation = Assert.Single(session.GateInvocations);
+        Assert.Equal(1, invocation.StopRequestCountAtReturn);
+        Assert.Equal(new[] { StopReason.HostFault }, session.StopRequests);
+        Assert.Empty(harness.ReadJournal().OfType<JournalStepStart>());
+
+        session.CompleteWithFirstRecordedReason();
+        harness.AwaitVerdict();
+        Assert.Equal(RunState.Aborted, harness.StateMachine.State);
+        Assert.Equal(RunEndReason.HostFault, harness.StateMachine.EndReason);
+        Assert.Equal(UiText.JournalWriteFailed(UiText.JournalAcknowledgmentTimedOut), harness.Controller.ResultMessage);
+    }
+
+    [Fact]
     public void StepGate_AcknowledgmentTimesOut_RequestsHostFaultBeforeAbort()
     {
         using var harness = new ControllerHarness();
@@ -2955,6 +3232,108 @@ public sealed class RunControllerTests
         Assert.Equal(StartResult.Busy, harness.TryStart());
     }
 
+    [Fact]
+    public void ShutdownAsync_WithdrawnStartsWriterStalled_CompletesByDeadlineWithoutAwaitingItsRetirement()
+    {
+        using var harness = new ControllerHarness();
+        harness.UseStalledJournal();
+        StalledJournalStorage storage = harness.Storage!;
+        storage.BlockNext("begin");
+        harness.Initialize();
+        Assert.Equal(StartResult.Accepted, harness.TryStart());
+        harness.RunUntil(() => storage.BlockedCount == 1);
+
+        // The withdrawn Start waits for its writer to retire, which a stalled append prevents; the shutdown does not.
+        Task shutdown = harness.Shutdown();
+        harness.Time.Advance(harness.Options.ShutdownReleasedTimeout);
+        harness.AwaitTask(shutdown);
+
+        ProgressJournal withdrawn = Assert.Single(harness.Journals);
+        Assert.False(withdrawn.Retired.IsCompleted);
+        Assert.Equal(1, storage.BlockedCount);
+        Assert.Equal(RunState.Idle, harness.StateMachine.State);
+        Assert.Empty(harness.Engine.Sessions);
+        Assert.Equal(StartResult.Busy, harness.TryStart());
+    }
+
+    [Theory]
+    [InlineData("begin")]
+    [InlineData("end")]
+    public void RetirementWait_ControllerDisposedWhileWriterStalled_IsCollectedBeforeWriterReturns(string stalledRecord)
+    {
+        string rootPath = DirectControllerGraph.CreateRoot();
+        try
+        {
+            var storage = new StalledJournalStorage();
+            try
+            {
+                WeakReference controller = AbandonInStalledRetirementWait(storage, rootPath, stalledRecord);
+
+                // The writer thread stays parked in the append, and must keep neither the disposed controller, which
+                // awaits its retirement, nor anything else of the run alive.
+                for (int attempt = 0; attempt < CollectionAttempts && controller.IsAlive; attempt++)
+                {
+                    ForceFullCollection();
+                    Thread.Sleep(_collectionPause);
+                }
+
+                Assert.Equal(1, storage.BlockedCount);
+                Assert.False(
+                    controller.IsAlive,
+                    $"A journal writer stalled in its {stalledRecord} append kept the disposed controller alive.");
+            }
+            finally
+            {
+                storage.Release();
+            }
+
+            // Released, the writer finishes the append and deletes the begin-only or ended journal, with nobody left to
+            // notify of its retirement.
+            Assert.True(
+                SpinWait.SpinUntil(() => storage.DeleteCount == 1, ControllerHarness.DefaultWait),
+                $"The writer released from its {stalledRecord} append never deleted the journal.");
+            Assert.Equal(AppendOutcome.Succeeded, Assert.Single(storage.Calls, call => call.RecordType == stalledRecord).Outcome);
+        }
+        finally
+        {
+            ControllerHarness.DeleteFolder(rootPath);
+        }
+    }
+
+    [Theory]
+    [InlineData("begin")]
+    [InlineData("end")]
+    public void RetirementWait_CollectionsWhileWriterStalled_LiveControllerOffersStartOnceWriterRetires(string stalledRecord)
+    {
+        string rootPath = DirectControllerGraph.CreateRoot();
+        var storage = new StalledJournalStorage();
+        try
+        {
+            using var graph = new DirectControllerGraph(storage, rootPath);
+            graph.EnterStalledRetirementWait(stalledRecord);
+
+            // The stalled writer holds the retirement signal only weakly, so only the live graph, held here as the
+            // controller's owner holds it, keeps the awaited journal, and with it the signal, reachable.
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                ForceFullCollection();
+                graph.Context.RunPending();
+            }
+
+            Assert.False(graph.Controller.CanStart);
+            Assert.Equal(1, storage.BlockedCount);
+
+            storage.Release();
+            graph.RunUntil(() => graph.Controller.CanStart);
+            Assert.Equal(1, storage.DeleteCount);
+        }
+        finally
+        {
+            storage.Release();
+            ControllerHarness.DeleteFolder(rootPath);
+        }
+    }
+
 
     [Fact]
     public void Dispose_DuringRun_ReleasesSessionAndKeepsJournalForRecovery()
@@ -3320,5 +3699,261 @@ public sealed class RunControllerTests
                 verdict) with { Utc = verdict },
             new JournalReleased { ReleasedBytes = 20 * GiB, ReleaseMs = 900, Utc = completed + TimeSpan.FromSeconds(1) },
         };
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Retirement-wait graphs
+    // ---------------------------------------------------------------------------------------------
+
+    // Not inlined and not async, so no frame or state machine of the caller keeps the graph reachable: the controller is
+    // left disposed in its wait for a journal writer stalled in the begin or end append, tracked only by the returned
+    // weak reference.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static WeakReference AbandonInStalledRetirementWait(StalledJournalStorage storage, string rootPath, string stalledRecord)
+    {
+        var graph = new DirectControllerGraph(storage, rootPath);
+        graph.EnterStalledRetirementWait(stalledRecord);
+        graph.Dispose();
+        return new WeakReference(graph.Controller);
+    }
+
+    private static void ForceFullCollection()
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+    }
+
+    /// <summary>
+    /// A controller over the fakes, built without <see cref="ControllerHarness"/>, which references the controller, every
+    /// journal and the engine's sessions for the whole test. Here only the graph references them, so a test that lets the
+    /// graph go can tell whether anything else keeps the controller alive. Every journal writes straight to one
+    /// <see cref="StalledJournalStorage"/>, which its writer closes on exit.
+    /// </summary>
+    private sealed class DirectControllerGraph : IDisposable
+    {
+        private readonly StalledJournalStorage _storage;
+        private readonly FakeTimeProvider _time = new(ControllerHarness.StartTime);
+        private readonly RunStateMachine _stateMachine = new();
+        private readonly FakeEngine _engine;
+        private readonly FakeSensorSource _sensors;
+        private readonly SensorMonitor _monitor;
+        private readonly RunControllerOptions _options;
+
+        public DirectControllerGraph(StalledJournalStorage storage, string rootPath)
+        {
+            _storage = storage;
+            _engine = new FakeEngine(contextOverride: Context);
+            _sensors = new FakeSensorSource(_time);
+            _monitor = new SensorMonitor(_sensors, _time);
+            _options = new RunControllerOptions
+            {
+                JournalFactory = (_, timeProvider) => new ProgressJournal(storage, timeProvider),
+            };
+            Controller = new RunController(
+                _engine,
+                _stateMachine,
+                _monitor,
+                new FakeMemoryInventorySource(),
+                new FakeElevationService(),
+                new FakeUserPrompt(),
+                _time,
+                DataDirectory.FromRoot(Path.Combine(rootPath, "data")),
+                _options);
+        }
+
+        /// <summary>Gets the queued context that stands in for the UI thread.</summary>
+        public ImmediateSynchronizationContext Context { get; } = new(queuePosts: true);
+
+        /// <summary>Gets the controller.</summary>
+        public RunController Controller { get; }
+
+        /// <summary>Creates a unique temporary folder for one test's data folder.</summary>
+        /// <returns>The folder's path.</returns>
+        public static string CreateRoot()
+        {
+            string rootPath = Path.Combine(Path.GetTempPath(), "RamQuick.App.Tests-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(rootPath);
+            return rootPath;
+        }
+
+        /// <summary>
+        /// Drives the controller until it awaits the retirement of a journal whose writer is stalled in its
+        /// <paramref name="stalledRecord"/> append past the journal's 1 s Dispose wait: a Start refused because its
+        /// <c>begin</c> record timed out, or a published run whose <c>end</c> record timed out.
+        /// </summary>
+        /// <param name="stalledRecord"><c>"begin"</c> or <c>"end"</c>.</param>
+        public void EnterStalledRetirementWait(string stalledRecord)
+        {
+            if (stalledRecord == "begin")
+            {
+                _storage.BlockNext("begin");
+            }
+
+            Task initialized = OnUiThread(Controller.InitializeAsync);
+            RunUntil(() => initialized.IsCompleted);
+            Assert.True(initialized.IsCompletedSuccessfully);
+            Assert.Equal(StartResult.Accepted, OnUiThread(() => Controller.TryStart(TestType.Quick, stopOnError: true)));
+            if (stalledRecord == "begin")
+            {
+                // The controller and the journal give up on the begin record together, both after 5 s on this clock.
+                RunUntil(() => _storage.BlockedCount == 1);
+                _time.Advance(_options.BeginTimeout);
+                RunUntil(() => Controller.NoticeMessage == UiText.DataFolderUnusableMessage);
+            }
+            else
+            {
+                RunUntil(() => _engine.LastSession is { IsStarted: true } && _stateMachine.State == RunState.Preparing);
+                FakeEngineSession session = _engine.LastSession!;
+                session.RaisePrepared();
+                RunUntil(() => _stateMachine.State == RunState.Running);
+                session.RaiseCompleted(RunEndReason.Completed);
+                RunUntil(() => _stateMachine.IsTerminal && Controller.ConclusionTask.IsCompleted);
+
+                // Publication waits 5 s for the end record, then tears the run down.
+                _storage.BlockNext("end");
+                session.RaiseReleased(session.Options.RegionBytes, TimeSpan.FromMilliseconds(400));
+                RunUntil(() => _storage.BlockedCount == 1);
+                _time.Advance(ProgressJournal.AcknowledgmentTimeout);
+                RunUntil(() => session.IsDisposed);
+            }
+
+            // Longer than the journal's Dispose wait, after which the controller awaits the stalled writer's retirement.
+            Assert.False(Context.RunUntil(() => Controller.CanStart, _journalDisposeWindow));
+            Assert.Equal(1, _storage.BlockedCount);
+        }
+
+        /// <summary>Pumps <see cref="Context"/> on the calling thread until <paramref name="condition"/> holds.</summary>
+        /// <param name="condition">The condition, evaluated on the calling thread after each drain.</param>
+        /// <param name="conditionText">The condition's source text, for the timeout message.</param>
+        /// <exception cref="TimeoutException">The condition did not hold within <see cref="ControllerHarness.DefaultWait"/>.</exception>
+        public void RunUntil(Func<bool> condition, [CallerArgumentExpression(nameof(condition))] string? conditionText = null)
+        {
+            if (!Context.RunUntil(condition, ControllerHarness.DefaultWait))
+            {
+                throw new TimeoutException(
+                    $"'{conditionText}' did not hold within {ControllerHarness.DefaultWait.TotalSeconds:0} s: state "
+                    + $"{_stateMachine.State}, can start {Controller.CanStart}, {Context.PendingCount} queued post(s).");
+            }
+        }
+
+        /// <summary>Disposes the controller, runs what its disposal queued, and disposes the sensor monitor and source.</summary>
+        public void Dispose()
+        {
+            Controller.Dispose();
+            Context.RunPending();
+            _monitor.Dispose();
+            _sensors.Dispose();
+        }
+
+        private T OnUiThread<T>(Func<T> call)
+        {
+            using (Context.Install())
+            {
+                return call();
+            }
+        }
+    }
+}
+
+/// <summary>
+/// The collection of the tests that count the process's kernel handles. The count is process-wide, so it also moves
+/// with every handle a test running beside them opens or closes; they therefore run alone, after the parallel tests.
+/// </summary>
+[CollectionDefinition(nameof(HandleCountCollection), DisableParallelization = true)]
+public sealed class HandleCountCollection
+{
+}
+
+/// <summary>
+/// Kernel-handle counts around many step gates of one run: neither the gate's barrier nor its journal acknowledgment
+/// wait may leave a kernel object behind for the garbage collector to release.
+/// </summary>
+/// <remarks>
+/// The count runs inside a no-GC region, because a collection and the finalizers it queues would close a leaked
+/// handle and hide it. Nothing here induces a collection.
+/// </remarks>
+[Collection(nameof(HandleCountCollection))]
+public sealed class StepGateHandleTests
+{
+    private const int GateCount = 200;
+
+    // Room for every allocation the process makes during the count, the gates' own included, so that no collection
+    // ends the region early.
+    private const long NoGcRegionBytes = 64L << 20;
+
+    [Fact]
+    public void StepGate_ManyGates_LeaveNoKernelHandleBehind()
+    {
+        using var harness = new ControllerHarness();
+        harness.UseStalledJournal();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+
+        int stepCount = session.Options.Steps.Count;
+        var decisions = new StepGateDecision[GateCount];
+        int released = 0;
+        int finished = 0;
+
+        // One coordinator thread runs every gate, as the engine's does, so no thread is created during the count; it
+        // starts the gates only once the count has begun.
+        var coordinator = new Thread(() =>
+        {
+            if (!SpinWait.SpinUntil(() => Volatile.Read(ref released) != 0, ControllerHarness.DefaultWait))
+            {
+                return;
+            }
+
+            for (int i = 0; i < GateCount; i++)
+            {
+                decisions[i] = session.InvokeStepGate(i % stepCount);
+            }
+
+            Volatile.Write(ref finished, 1);
+        })
+        {
+            IsBackground = true,
+            Name = "Test coordinator",
+        };
+        coordinator.Start();
+
+        Assert.True(GC.TryStartNoGCRegion(NoGcRegionBytes), "The no-GC region could not be entered.");
+        int before;
+        int after;
+        bool regionHeld;
+        try
+        {
+            // Entering the region may have run a collection whose finalizers would close handles during the count and
+            // offset a leak; they finish first.
+            GC.WaitForPendingFinalizers();
+            before = CurrentHandleCount();
+            Volatile.Write(ref released, 1);
+
+            // Pumped, because each gate first waits for its barrier to run on the UI context.
+            harness.RunUntil(() => Volatile.Read(ref finished) != 0);
+            after = CurrentHandleCount();
+            regionHeld = GCSettings.LatencyMode == GCLatencyMode.NoGCRegion;
+        }
+        finally
+        {
+            if (GCSettings.LatencyMode == GCLatencyMode.NoGCRegion)
+            {
+                GC.EndNoGCRegion();
+            }
+        }
+
+        Assert.True(coordinator.Join(ControllerHarness.DefaultWait), "The test coordinator never finished.");
+        Assert.True(regionHeld, "A garbage collection ran during the count, so a leaked handle could have been closed.");
+        Assert.All(decisions, decision => Assert.Equal(StepGateDecision.Continue, decision));
+        Assert.Equal(GateCount, session.GateInvocations.Count);
+        int growth = after - before;
+        Assert.True(growth < GateCount / 10, $"{GateCount} step gates left {growth} more kernel handles open.");
+    }
+
+    private static int CurrentHandleCount()
+    {
+        using Process self = Process.GetCurrentProcess();
+        return self.HandleCount;
     }
 }

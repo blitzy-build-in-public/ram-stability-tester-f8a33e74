@@ -47,7 +47,7 @@ public enum StartResult
 
     /// <summary>
     /// Start is not possible now: launch recovery has not finished, a run is in progress, or the previous run has
-    /// not yet released its memory and published its summaries.
+    /// not yet confirmed the release of its memory, published its summaries and retired its journal writer.
     /// </summary>
     Busy,
 
@@ -89,19 +89,23 @@ public enum StartResult
 public enum PostRunActivity
 {
     /// <summary>
-    /// Nothing is pending: no run has ended, or the last run's memory is released and its summaries published.
+    /// Nothing is pending: no run has ended, or the last run's memory release is confirmed, its summaries are
+    /// published and its journal writer has retired.
     /// </summary>
     None,
 
     /// <summary>
     /// The verdict is shown and the engine is releasing the locked memory; the step field reads
-    /// <see cref="UiText.ReleasingMemory"/>.
+    /// <see cref="UiText.ReleasingMemory"/>. Set with the terminal transition. It returns after a publication that
+    /// stopped waiting for Released, while the notice reads <see cref="UiText.ReleaseNotConfirmedNotice"/>, and
+    /// stays until Released arrives, or for good once the controller gives up on it at disposal or shutdown.
     /// </summary>
     ReleasingMemory,
 
     /// <summary>
-    /// The memory is released (or its release was given up on) and the summaries are being published; the step
-    /// field reads <see cref="UiText.SavingResults"/>.
+    /// The memory is released, or publication stopped waiting for Released after the fallback, and the summaries
+    /// are being published; the step field reads <see cref="UiText.SavingResults"/>. A run whose memory was never
+    /// locked goes straight here from the terminal transition.
     /// </summary>
     SavingResults,
 }
@@ -218,7 +222,11 @@ public sealed class RunControllerOptions
 /// <b>Publication.</b> The verdict is shown on Completed and journalled as the acknowledged <c>result</c> record; the
 /// summaries are published only after Released (or after giving up on it 30 s later), then the journal's <c>end</c>
 /// record is written and the journal deleted. A new Start stays unavailable (<see cref="CanStart"/> is
-/// <see langword="false"/>) until that sequence has finished and the session has been disposed.
+/// <see langword="false"/>) until that sequence has finished, Released has arrived, the session has been disposed and
+/// the journal's writer has retired. The 30 s fallback frees only the publication: until a late Released arrives the
+/// session stays subscribed and undisposed, the step field reads <see cref="UiText.ReleasingMemory"/> and the notice
+/// <see cref="UiText.ReleaseNotConfirmedNotice"/>, and once the controller gives up on Released, at disposal or
+/// shutdown, Start stays unavailable.
 /// </para>
 /// <para>
 /// <b>Lifetime.</b> The controller holds the only strong reference to the run's session, and nothing static or
@@ -543,9 +551,15 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
     /// <summary>
     /// Gets a value indicating whether <see cref="TryStart(TestType, bool)"/> can be accepted: initialisation has
-    /// finished, no Start is pending, no run is in progress, and the last run has released its memory and published
-    /// its summaries.
+    /// finished, no Start is pending, no run is in progress, and the last run's session has reported Released, its
+    /// summaries are published, its session is disposed and its journal writer has retired.
     /// </summary>
+    /// <remarks>
+    /// The publication fallback publishes the summaries without Released but never counts as it: until Released
+    /// arrives, this stays <see langword="false"/> with the notice <see cref="UiText.ReleaseNotConfirmedNotice"/>.
+    /// It stays <see langword="false"/> for good once the controller gives up on Released, at disposal or
+    /// shutdown. A refused Start re-enables it only once that Start's journal writer has retired.
+    /// </remarks>
     public bool CanStart
     {
         get => _canStart;
@@ -570,10 +584,21 @@ public sealed partial class RunController : ObservableObject, IDisposable
     /// task whose result is <see cref="StartResult.Accepted"/>, so a caller awaiting it never waits on a Start that
     /// was never made. Tests await it deterministically.
     /// </summary>
+    /// <remarks>
+    /// Holding it also keeps a refused Start's wait for its journal writer's retirement, and that journal, reachable
+    /// from the controller: the writer holds the journal's retirement signal only weakly.
+    /// </remarks>
     internal Task<StartResult> StartTask { get; private set; } = Task.FromResult(StartResult.Accepted);
 
     /// <summary>
-    /// Gets the result, release-wait, publication and disposal pipeline of the last run that ended; tests await it.
+    /// Gets the conclusion of the last run that ended: its verdict, cause hints and acknowledged <c>result</c> record,
+    /// the first part of <see cref="PostRunTask"/>; tests await it. It never faults.
+    /// </summary>
+    internal Task ConclusionTask { get; private set; } = Task.CompletedTask;
+
+    /// <summary>
+    /// Gets the result, release-wait, publication, release-confirmation, disposal and journal-retirement pipeline of
+    /// the last run that ended; tests await it.
     /// </summary>
     internal Task PostRunTask { get; private set; } = Task.CompletedTask;
 
@@ -653,7 +678,8 @@ public sealed partial class RunController : ObservableObject, IDisposable
     /// refused only once the data folder has proved usable, and before any file of the run exists. Off the UI thread
     /// again, the results log reserves the run's base name, and the journal's <c>begin</c> record is made durable
     /// within 5 s. Only then does the run enter Preparing and the engine session start. A refusal on the way shows
-    /// its notice and re-enables Start, with the state unchanged; the continuation's result, which tests read through
+    /// its notice and re-enables Start, with the state unchanged, once the refused run's journal writer, if it has
+    /// one, has retired (<see cref="ProgressJournal.Retired"/>); the continuation's result, which tests read through
     /// <see cref="StartTask"/>, says which refusal it was.
     /// </para>
     /// </remarks>
@@ -833,6 +859,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
         if (Volatile.Read(ref _run) is { } run)
         {
             run.ReleaseSignal.TrySetResult(null);
+
+            // Unsubscribed below, the session can no longer report Released, so a teardown waiting for it ends.
+            run.ReleaseConfirmed.TrySetResult(false);
             if (run.TakeSession() is { } session)
             {
                 Unsubscribe(session);
@@ -923,12 +952,17 @@ public sealed partial class RunController : ObservableObject, IDisposable
         _ = await CompletesWithinAsync(run.PublicationDone.Task, _options.ShutdownReleasedTimeout);
 
         // Past the deadline the process may exit with the session still releasing; Windows reclaims the pages. A
-        // pipeline still short of its teardown has not started the release, so it is started here, on the thread
-        // pool and unawaited, and the pipeline's own teardown then finds no session left.
+        // pipeline still short of its teardown, or whose teardown still waits for Released, has not started the
+        // release, so it is started here, on the thread pool and unawaited, and the pipeline's own teardown then finds
+        // no session left.
         if (!await CompletesWithinAsync(run.Pipeline, RemainingUntil(run.ConcludedUtc, _options.ShutdownReleasedTimeout))
             && run.TakeSession() is { } session)
         {
             Unsubscribe(session);
+
+            // The unsubscribed session can no longer report Released, so a teardown waiting for it ends, with Start
+            // left unavailable.
+            run.ReleaseConfirmed.TrySetResult(false);
             _ = DisposeOnThreadPoolAsync(session.Dispose, failure => ReportAppError(nameof(ShutdownAsync), failure));
         }
     }
@@ -1178,8 +1212,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
         }
     }
 
-    // Leaves the state unchanged and re-enables Start only once the journal is retired, so the next run's journal
-    // can never be deleted by this one's late end record. Returns refusal, the outcome the refused Start ends with.
+    // Leaves the state unchanged and re-enables Start only once the journal's writer has retired, so the next run's
+    // journal can never be deleted by this one's late begin cleanup or end record. Returns refusal, the outcome the
+    // refused Start ends with.
     private async Task<StartResult> RefuseStartAsync(
         CancellationTokenSource pending,
         StartResult refusal,
@@ -1193,16 +1228,25 @@ public sealed partial class RunController : ObservableObject, IDisposable
             NoticeMessage = notice;
         }
 
+        // The reserved log first: the journal's writer may take arbitrarily long to retire, and the log would stay open
+        // and on disk for that long. Its own try keeps a failure there from skipping the journal's retirement.
+        try
+        {
+            if (log is not null)
+            {
+                await Task.Run(() => DiscardReservedLog(log));
+            }
+        }
+        catch (Exception exception)
+        {
+            ReportAppError(nameof(TryStart), exception);
+        }
+
         try
         {
             if (journal is not null)
             {
                 await RetireUnstartedJournalAsync(journal, beginTask);
-            }
-
-            if (log is not null)
-            {
-                await Task.Run(() => DiscardReservedLog(log));
             }
         }
         catch (Exception exception)
@@ -1228,6 +1272,11 @@ public sealed partial class RunController : ObservableObject, IDisposable
         }
 
         await Task.Run(journal.Dispose);
+
+        // Dispose waits only 1 s for the writer. One still stalled in its begin or end append deletes the journal
+        // file once the append returns, and that file is the next run's journal too. The writer holds the retirement
+        // signal only weakly, so the journal this method holds, reachable through StartTask, keeps it alive for the wait.
+        await journal.Retired;
     }
 
     private void DiscardReservedLog(ResultsLog log)
@@ -1391,20 +1440,21 @@ public sealed partial class RunController : ObservableObject, IDisposable
     }
 
     // The UI context runs its posts in order, so once the barrier has run, every handler of an event posted before it
-    // has offered its record to the journal. The barrier holds only its completion source, never a run, journal or
-    // session, so a barrier still queued when its run is abandoned keeps none of them alive.
+    // has offered its record to the journal. The barrier holds only its kernel event, never a run, journal or session,
+    // so a barrier still queued when its run is abandoned keeps none of them alive. The event is this wait's own and is
+    // disposed as the wait returns, so no kernel object outlives the wait; a completion task's wait handle would stay
+    // open until finalization, one more per step for as long as no garbage collection runs.
     private static EventBarrierOutcome WaitForEarlierEvents(
         SynchronizationContext eventContext,
         WaitHandle stopEvent,
         TimeSpan timeout)
     {
-        var barrier = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        eventContext.Post(static state => ((TaskCompletionSource)state!).TrySetResult(), barrier);
-        Task delivered = barrier.Task;
+        using var barrier = new EventBarrier();
+        eventContext.Post(static state => ((EventBarrier)state!).Deliver(), barrier);
         try
         {
-            int signalled = WaitHandle.WaitAny(new[] { ((IAsyncResult)delivered).AsyncWaitHandle, stopEvent }, timeout);
-            if (signalled == 0 || delivered.IsCompleted)
+            int signalled = WaitHandle.WaitAny(new[] { barrier.Signal, stopEvent }, timeout);
+            if (signalled == 0 || barrier.IsDelivered)
             {
                 return EventBarrierOutcome.Delivered;
             }
@@ -1415,7 +1465,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         {
             // Only a session being destroyed disposes its stop event, so the wait ends as a stop, as the journal
             // acknowledgment's own wait ends.
-            return delivered.IsCompleted ? EventBarrierOutcome.Delivered : EventBarrierOutcome.Stopped;
+            return barrier.IsDelivered ? EventBarrierOutcome.Delivered : EventBarrierOutcome.Stopped;
         }
     }
 
@@ -1648,6 +1698,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
         if (RunFor(sender) is { } run)
         {
             run.ReleaseSignal.TrySetResult(new ReleaseNotice(e, _timeProvider.GetUtcNow()));
+
+            // Also after the publication fallback: the next Start waits for this confirmation, not for the fallback.
+            run.ReleaseConfirmed.TrySetResult(true);
         }
     }
 
@@ -1903,12 +1956,14 @@ public sealed partial class RunController : ObservableObject, IDisposable
         run.ConcludedUtc = conclusion.CompletedUtc;
         run.ReleaseExpected = releaseExpected;
         run.ConclusionStarted.TrySetResult();
+        ConclusionTask = run.ConclusionDone.Task;
         run.Pipeline = RunPostRunPipelineAsync(run, conclusion);
         PostRunTask = run.Pipeline;
     }
 
     // Verdict now, summaries after Released: result record, then released, then both summaries, then end, then the
-    // session's disposal, and only then is Start offered again. The pipeline never faults.
+    // confirmation of Released if the fallback published without it, the session's disposal and the journal writer's
+    // retirement, and only then is Start offered again. The pipeline never faults.
     private async Task RunPostRunPipelineAsync(RunContext run, Conclusion conclusion)
     {
         try
@@ -2010,6 +2065,10 @@ public sealed partial class RunController : ObservableObject, IDisposable
             reason = UiText.EngineError(RedactForDisplay(detail));
         }
 
+        // Set in the frame of the terminal transition: from it until Start is possible again the step field reports
+        // what the controller waits for, never the "—" of a terminal state with Start still unavailable.
+        PostRunActivity = run.ReleaseExpected ? PostRunActivity.ReleasingMemory : PostRunActivity.SavingResults;
+
         RunState terminalState = StateMachine.State;
         // An ABORTED run keeps its stop reason and adds the count, joined by the notice separator so both texts stay
         // verbatim from UiText.
@@ -2049,8 +2108,6 @@ public sealed partial class RunController : ObservableObject, IDisposable
         {
             run.Log.LogJournalFailure(run.Journal.Failure?.Message ?? resultStatus.ToString());
         }
-
-        PostRunActivity = run.ReleaseExpected ? PostRunActivity.ReleasingMemory : PostRunActivity.SavingResults;
     }
 
     // The snapshot of a run no progress tick reached: at the step the gate last let start, or else before step 1, with
@@ -2136,7 +2193,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
         }
     }
 
-    // The fallback is measured from the conclusion, so publication never waits more than 30 s for Released.
+    // The fallback is measured from the conclusion, so publication never waits more than 30 s for Released. It frees
+    // only the publication: the session stays subscribed, and TeardownAsync keeps Start unavailable until Released
+    // itself arrives.
     private async Task<ReleaseNotice?> WaitForReleaseAsync(RunContext run)
     {
         Task<ReleaseNotice?> signal = run.ReleaseSignal.Task;
@@ -2223,9 +2282,12 @@ public sealed partial class RunController : ObservableObject, IDisposable
     }
 
     // Disposal joins the engine's threads and releases the locked region, which can take long on a large region,
-    // so it runs on the thread pool; Start is offered again only after it.
+    // so it runs on the thread pool. Start is offered again only once Released has been confirmed, the session is
+    // disposed and the journal's writer has retired.
     private async Task TeardownAsync(RunContext run)
     {
+        bool releaseConfirmed = !run.ReleaseExpected || await WaitForReleaseConfirmationAsync(run);
+
         try
         {
             if (run.Session is { } current)
@@ -2256,6 +2318,12 @@ public sealed partial class RunController : ObservableObject, IDisposable
             ReportAppError(nameof(TeardownAsync), exception);
         }
 
+        // Dispose waits only 1 s for the journal's writer. One still stalled in its end append deletes the journal
+        // file once the append returns, and that file is the next run's journal too. The task never faults. The writer
+        // holds the retirement signal only weakly, so the run, which keeps the journal and stays the current run until
+        // below, keeps it alive for the wait.
+        await run.Journal.Retired;
+
         // Closing the log writes what it still buffered, so the close can meet the log's first write failure.
         if (!run.LogFailureReported)
         {
@@ -2267,8 +2335,62 @@ public sealed partial class RunController : ObservableObject, IDisposable
             Volatile.Write(ref _run, null);
         }
 
-        PostRunActivity = PostRunActivity.None;
-        CanStart = !_disposed;
+        // A release the controller gave up on, at disposal or shutdown, leaves Start unavailable and the release
+        // notice in place: the engine may still hold the region.
+        if (releaseConfirmed)
+        {
+            PostRunActivity = PostRunActivity.None;
+            CanStart = !_disposed;
+        }
+
+        // A finished run leaves exited per-run threads, the journal's writer and the engine's coordinator that ran the
+        // callbacks, whose thread handles and runtime events are released only when their Thread objects are
+        // finalized. One background collection per finished run, requested after the session's disposal and the
+        // writer's retirement, keeps the process at its baseline handle count instead of letting it grow until an
+        // unrelated gen-2 collection. The request returns at once, so it does not block the UI thread.
+        GC.Collect(2, GCCollectionMode.Forced, blocking: false);
+    }
+
+    // The publication fallback publishes without Released, yet the engine may still hold the region: it withholds
+    // Released while Windows refuses to free a chunk, and a large region can take longer than the fallback to release.
+    // The session therefore stays subscribed and undisposed, since a disposed session drops a late Released, and the
+    // UI thread awaits the confirmation without blocking. True once Released arrives; false once the controller gives
+    // up on it at disposal or shutdown.
+    private async Task<bool> WaitForReleaseConfirmationAsync(RunContext run)
+    {
+        Task<bool> confirmation = run.ReleaseConfirmed.Task;
+        if (confirmation.IsCompleted)
+        {
+            return await confirmation;
+        }
+
+        PostRunActivity = PostRunActivity.ReleasingMemory;
+        NoticeMessage = NoticeMessage is { Length: > 0 } notice
+            ? notice + UiText.NoticeSeparator + UiText.ReleaseNotConfirmedNotice
+            : UiText.ReleaseNotConfirmedNotice;
+
+        bool confirmed = await confirmation;
+        if (confirmed)
+        {
+            NoticeMessage = WithoutReleaseNotice(NoticeMessage);
+        }
+
+        return confirmed;
+    }
+
+    // Removes only the release notice, which WaitForReleaseConfirmationAsync appended last, and keeps any notice shown
+    // before it, such as a failure to save the results.
+    private static string? WithoutReleaseNotice(string? notice)
+    {
+        const string AppendedNotice = UiText.NoticeSeparator + UiText.ReleaseNotConfirmedNotice;
+        if (notice == UiText.ReleaseNotConfirmedNotice)
+        {
+            return null;
+        }
+
+        return notice is not null && notice.EndsWith(AppendedNotice, StringComparison.Ordinal)
+            ? notice[..^AppendedNotice.Length]
+            : notice;
     }
 
     // Disposal joins the engine's threads, or waits for the journal writer and the log's drain, so a caller that must
@@ -2385,6 +2507,66 @@ public sealed partial class RunController : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// The step gate's barrier: the UI context runs <see cref="Deliver"/>, which sets the kernel event the gate waits
+    /// on, and the gate disposes the event as its wait ends. The state keeps the two apart without a lock, which a
+    /// woken gate would contend for and so give a kernel event that only a garbage collection releases: a barrier the
+    /// context runs after the gate stopped waiting sets nothing, so no exception reaches the dispatcher, and the gate
+    /// never disposes the event while it is being set.
+    /// </summary>
+    private sealed class EventBarrier : IDisposable
+    {
+        private const int Waiting = 0;
+        private const int Delivering = 1;
+        private const int Delivered = 2;
+        private const int Abandoned = 3;
+
+        private readonly ManualResetEvent _signal = new(initialState: false);
+        private int _state;
+
+        /// <summary>Gets the event the gate waits on.</summary>
+        public WaitHandle Signal => _signal;
+
+        /// <summary>Gets a value indicating whether the context ran the barrier while the gate still waited.</summary>
+        public bool IsDelivered => Volatile.Read(ref _state) is Delivering or Delivered;
+
+        /// <summary>Runs on the UI context: sets the event, unless the gate has already stopped waiting.</summary>
+        public void Deliver()
+        {
+            if (Interlocked.CompareExchange(ref _state, Delivering, Waiting) != Waiting)
+            {
+                return;
+            }
+
+            try
+            {
+                _signal.Set();
+            }
+            finally
+            {
+                Volatile.Write(ref _state, Delivered);
+            }
+        }
+
+        /// <summary>
+        /// Runs on the gate once its wait has ended: disposes the event, first waiting out a <see cref="Deliver"/>
+        /// already setting it, which takes one system call.
+        /// </summary>
+        public void Dispose()
+        {
+            if (Interlocked.CompareExchange(ref _state, Abandoned, Waiting) == Delivering)
+            {
+                var spinner = default(SpinWait);
+                while (Volatile.Read(ref _state) == Delivering)
+                {
+                    spinner.SpinOnce();
+                }
+            }
+
+            _signal.Dispose();
+        }
+    }
+
+    /// <summary>
     /// The state of one accepted run, from Preparing until its session is disposed. The session, journal-failure,
     /// callback-fault and last-started-step fields are published atomically, and the stop decision is taken under a
     /// lock, because the coordinator thread reads or writes them; everything else belongs to the UI thread.
@@ -2480,6 +2662,12 @@ public sealed partial class RunController : ObservableObject, IDisposable
         public TaskCompletionSource PublicationDone { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public TaskCompletionSource<ReleaseNotice?> ReleaseSignal { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // Whether the engine confirmed the release, kept apart from ReleaseSignal, which the publication fallback also
+        // completes: true only on Released, false only once the controller gives up on it for good, at disposal or
+        // when the shutdown takes the session past its deadline.
+        public TaskCompletionSource<bool> ReleaseConfirmed { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Task Pipeline { get; set; } = Task.CompletedTask;

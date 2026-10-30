@@ -287,6 +287,14 @@ public static class UiText
     public const string RecoveredNotice = "Results of the previous test were recovered and saved.";
 
     /// <summary>
+    /// The notice shown after a run's summaries were published without its memory release confirmed,
+    /// while the engine still has not reported that it released the locked memory. Start stays
+    /// unavailable until it does, and the notice is removed then.
+    /// </summary>
+    public const string ReleaseNotConfirmedNotice =
+        "Memory release not confirmed yet. Start becomes available once it is; if it never is, restart RAMQuick.";
+
+    /// <summary>
     /// The message shown when Start is refused because less than 1 GiB can be planned for testing,
     /// and the result reason when locking fails below 1 GiB.
     /// </summary>

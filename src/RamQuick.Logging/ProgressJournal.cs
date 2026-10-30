@@ -68,6 +68,11 @@ public sealed class JournalAck
     private readonly TaskCompletionSource<JournalAckStatus> _completion =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    // The Wait calls that found the acknowledgment pending, newest first, which Complete takes all at once and signals.
+    // Pushed and taken with Interlocked rather than under a lock: a waiter woken by Complete would contend for a lock
+    // Complete still held, and a contended lock gets a kernel event that only a garbage collection releases.
+    private Waiter? _waiters;
+
     private JournalFailure? _failure;
     private int _completed;
 
@@ -98,11 +103,20 @@ public sealed class JournalAck
     /// <paramref name="timeout"/> elapses, whichever comes first.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Called on the engine coordinator inside the step gate with the session's managed stop event and
     /// <see cref="ProgressJournal.AcknowledgmentTimeout"/>. The timeout is real time, never the journal's
-    /// <see cref="TimeProvider"/>. An acknowledgment completed before the call returns its status at once. A stop
-    /// event disposed during the wait is treated as signalled, and nothing here throws on a completed or
-    /// disposed state.
+    /// <see cref="TimeProvider"/>. An acknowledgment completed before the call returns its status at once and
+    /// creates nothing. A stop event already disposed when the wait reaches it is treated as signalled; one disposed
+    /// while the wait is blocked stays open until the wait ends, because the wait holds a reference to it. Nothing
+    /// here throws on a completed or disposed state.
+    /// </para>
+    /// <para>
+    /// A pending acknowledgment is waited on through a kernel event of the call's own, which the writer sets once it
+    /// completes the acknowledgment and which is disposed before the call returns, so no kernel object outlives the
+    /// wait. The completion task's own wait handle is not used: the task would keep that event until finalization,
+    /// one more per step for as long as no garbage collection runs. Several threads may wait at once.
+    /// </para>
     /// </remarks>
     /// <param name="stopEvent">The event that ends the wait early; it is only waited on, never set or reset.</param>
     /// <param name="timeout">
@@ -137,12 +151,25 @@ public sealed class JournalAck
             return completion.Result;
         }
 
+        var waiter = new Waiter();
         try
         {
-            // The task creates its completion event lazily and sets it when it completes, so this handle is
-            // signalled whether completion happened before or after it was obtained.
-            WaitHandle acknowledged = ((IAsyncResult)completion).AsyncWaitHandle;
-            int signalled = WaitHandle.WaitAny(new[] { acknowledged, stopEvent }, timeout);
+            Waiter? head;
+            do
+            {
+                head = Volatile.Read(ref _waiters);
+                waiter.Next = head;
+            }
+            while (Interlocked.CompareExchange(ref _waiters, waiter, head) != head);
+
+            // Pushed before this check, and Complete takes the waiters only after completing the task, so either the
+            // completion is seen here or Complete signals this waiter.
+            if (completion.IsCompleted)
+            {
+                return completion.Result;
+            }
+
+            int signalled = WaitHandle.WaitAny(new[] { waiter.Signal, stopEvent }, timeout);
             if (signalled == 0 || completion.IsCompleted)
             {
                 return completion.Result;
@@ -153,6 +180,10 @@ public sealed class JournalAck
         catch (ObjectDisposedException)
         {
             return completion.IsCompleted ? completion.Result : JournalAckStatus.Stopped;
+        }
+        finally
+        {
+            waiter.Leave();
         }
     }
 
@@ -184,6 +215,69 @@ public sealed class JournalAck
         // Published before the task completes, so a caller that sees Failed also sees the failure.
         Volatile.Write(ref _failure, failure);
         _completion.TrySetResult(failure is null ? JournalAckStatus.Acknowledged : JournalAckStatus.Failed);
+
+        // After the task completes, so every waiter woken here finds its result.
+        for (Waiter? waiter = Interlocked.Exchange(ref _waiters, null); waiter is not null; waiter = waiter.Next)
+        {
+            waiter.Wake();
+        }
+    }
+
+    /// <summary>
+    /// One <see cref="Wait(WaitHandle, TimeSpan)"/> call's kernel event. The call disposes it as it returns;
+    /// <see cref="Complete"/> only sets it. The state keeps the two apart without a lock: the event is set only while
+    /// its call still waits, and disposed only once no set is in progress.
+    /// </summary>
+    private sealed class Waiter
+    {
+        private const int Waiting = 0;
+        private const int Waking = 1;
+        private const int Done = 2;
+
+        private readonly ManualResetEvent _signal = new(initialState: false);
+        private int _state;
+
+        /// <summary>Gets the event the call waits on.</summary>
+        public WaitHandle Signal => _signal;
+
+        /// <summary>Gets or sets the waiter pushed before this one; written only before this one is pushed.</summary>
+        public Waiter? Next { get; set; }
+
+        /// <summary>Sets the event, unless its call has already left.</summary>
+        public void Wake()
+        {
+            if (Interlocked.CompareExchange(ref _state, Waking, Waiting) != Waiting)
+            {
+                return;
+            }
+
+            try
+            {
+                _signal.Set();
+            }
+            finally
+            {
+                Volatile.Write(ref _state, Done);
+            }
+        }
+
+        /// <summary>
+        /// Ends the call's interest in the event and disposes it, first waiting out a <see cref="Wake"/> already
+        /// setting it, which takes one system call.
+        /// </summary>
+        public void Leave()
+        {
+            if (Interlocked.CompareExchange(ref _state, Done, Waiting) == Waking)
+            {
+                var spinner = default(SpinWait);
+                while (Volatile.Read(ref _state) == Waking)
+                {
+                    spinner.SpinOnce();
+                }
+            }
+
+            _signal.Dispose();
+        }
     }
 }
 
@@ -211,8 +305,11 @@ public sealed class JournalAck
 /// <para>
 /// Ownership: the writer thread and its heartbeat timer reference only a private writer core, which holds the
 /// storage, the queue, the latest snapshots and the failure slot, and nothing that refers back to this journal or
-/// its callers. A journal its owner lets go is therefore collectable while its writer thread is still alive. For
-/// the same reason a write failure is exposed as the polled <see cref="Failure"/> property rather than an event.
+/// its callers. The <see cref="Retired"/> signal belongs to this journal: the core holds it only weakly, because the
+/// signal's continuations lead to the callers awaiting it. A journal its owner lets go is therefore collectable while
+/// its writer thread is still alive, even one stalled for good in an append, and so is every caller awaiting its
+/// retirement. For the same reason a write failure is exposed as the polled <see cref="Failure"/> property rather
+/// than an event.
 /// </para>
 /// <para>
 /// Lifetime: <see cref="EndAsync"/> deletes the journal once the run's summaries are published.
@@ -220,6 +317,12 @@ public sealed class JournalAck
 /// launch. A <c>begin</c> record that fails or is not acknowledged in time makes the writer delete the journal
 /// and exit, because Start is then refused and a journal holding only <c>begin</c> would be misreported as an
 /// unfinished run.
+/// </para>
+/// <para>
+/// Every run's journal is the same file, and a writer can outlive <see cref="Dispose"/> while it is stalled in an
+/// append; once that append returns it may still delete the file, after a <c>begin</c> that was not acknowledged
+/// or after <c>end</c>. <see cref="Retired"/> completes when the writer can no longer touch the file, so the next
+/// run's journal must not be started before it.
 /// </para>
 /// </remarks>
 public sealed class ProgressJournal : IDisposable
@@ -253,12 +356,18 @@ public sealed class ProgressJournal : IDisposable
     private const string CloseType = "close";
 
     // Dispose blocks its caller, normally the UI thread at shutdown, for at most this long; a writer stalled in
-    // an append is left behind as a background thread that holds no run object.
+    // an append is left behind as a background thread that holds no run object, and reports through Retired once
+    // it has closed the storage.
     private static readonly TimeSpan _disposeJoinTimeout = TimeSpan.FromSeconds(1);
 
     private readonly JournalWriter _writer;
     private readonly TimeProvider _timeProvider;
     private readonly object _lifecycleSync = new();
+
+    // The Retired signal, referenced strongly only by this field: the writer core keeps a weak reference to it, so a
+    // writer stalled for good roots no caller awaiting it. Asynchronous continuations keep those callers off the writer
+    // thread, and the source drops its continuations once completed.
+    private readonly TaskCompletionSource _retired = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private Thread? _writerThread;
     private Guid _runId;
@@ -286,7 +395,7 @@ public sealed class ProgressJournal : IDisposable
         ArgumentNullException.ThrowIfNull(timeProvider);
 
         _timeProvider = timeProvider;
-        _writer = new JournalWriter(storage, timeProvider);
+        _writer = new JournalWriter(storage, timeProvider, _retired);
     }
 
     /// <summary>
@@ -313,6 +422,39 @@ public sealed class ProgressJournal : IDisposable
     /// here, and block nothing.
     /// </remarks>
     public JournalFailure? Failure => _writer.Failure;
+
+    /// <summary>
+    /// Gets a task that completes once this journal can no longer touch its storage: its writer thread has
+    /// deleted the journal where it had to, closed the storage, completed every pending acknowledgment and exited;
+    /// or, for a journal whose <see cref="BeginAsync"/> was never called, <see cref="Dispose"/> has closed the
+    /// storage.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every run's journal is the same file, so its owner starts the next run's journal only after this task has
+    /// completed. <see cref="Dispose"/> waits at most 1 s for the writer: a writer stalled in an append outlives it,
+    /// and once the append returns it may still delete the file, after a <c>begin</c> that was not acknowledged in
+    /// time or after <c>end</c>.
+    /// </para>
+    /// <para>
+    /// The task never faults and is never cancelled. It has no bound of its own: it stays pending until
+    /// <see cref="EndAsync"/>, a <c>begin</c> that failed or timed out, <see cref="Dispose"/> or finalization
+    /// stops the writer, and after that for as long as an append stays stalled. A caller that must bound its wait
+    /// applies its own timeout.
+    /// </para>
+    /// <para>
+    /// Lifetime: the task completes only while this journal is reachable, so a caller awaits it while still holding
+    /// the journal. The journal holds the task's completion source, and its writer holds that source only weakly, so
+    /// that a writer stalled for good in an append keeps neither the journal nor any caller awaiting the task alive.
+    /// Once the journal is collected, which also happens to a journal finalized without <see cref="Dispose"/>, the
+    /// task never completes, and a caller that kept only the task waits for good.
+    /// </para>
+    /// <para>
+    /// Threading: any thread may read it, before and after <see cref="Dispose"/>, and its continuations never run
+    /// on the writer thread. It reaches an awaiting continuation only until it completes.
+    /// </para>
+    /// </remarks>
+    public Task Retired => _retired.Task;
 
     /// <summary>
     /// Creates the journal of a run over the production file storage at
@@ -343,7 +485,7 @@ public sealed class ProgressJournal : IDisposable
     /// Any result other than <see cref="JournalAckStatus.Acknowledged"/> means Start must be refused. The writer
     /// then deletes the journal and exits: at once after a failed append, and after a timeout as soon as the
     /// stalled append returns, so no journal holding only <c>begin</c> survives to be misreported as an unfinished
-    /// run. Later records are ignored.
+    /// run. Later records are ignored. <see cref="Retired"/> completes once that deletion is done.
     /// </para>
     /// </remarks>
     /// <param name="begin">The run's <c>begin</c> record; its <see cref="JournalBegin.RunId"/> is reused by <c>end</c>.</param>
@@ -577,8 +719,10 @@ public sealed class ProgressJournal : IDisposable
     /// <remarks>
     /// <para>
     /// Never deletes the journal, so a run disposed before its <c>end</c> record stays recoverable. A writer still
-    /// stalled in an append after 1 s is abandoned as a background thread that holds no run object; it closes the
-    /// storage once the append returns.
+    /// stalled in an append after 1 s is abandoned as a background thread that holds no run object; it finishes
+    /// that append, deletes the journal if its <c>begin</c> timed out or the append was <c>end</c>, and closes the
+    /// storage. The return of this method therefore does not mean the writer is gone: <see cref="Retired"/>
+    /// completes when it is.
     /// </para>
     /// <para>
     /// After this call the recording methods are no-ops: <see cref="RecordStepStarting"/> returns an
@@ -606,6 +750,7 @@ public sealed class ProgressJournal : IDisposable
         {
             // No writer thread ever started, so this thread is the storage's only user.
             _writer.DisposeStorage();
+            _retired.TrySetResult();
             return;
         }
 
@@ -672,11 +817,13 @@ public sealed class ProgressJournal : IDisposable
 
     /// <summary>
     /// The writer thread's core: the storage, the FIFO queue with its wake-up signal, the latest progress and
-    /// readings snapshots, the heartbeat state and the first-writer-wins failure slot.
+    /// readings snapshots, the heartbeat state, the first-writer-wins failure slot and a weak reference to the
+    /// journal's retirement signal.
     /// </summary>
     /// <remarks>
     /// It holds no delegate, event or reference to <see cref="ProgressJournal"/>, its callers or the engine
-    /// session; the thread and the heartbeat timer reach it through static callbacks with the core as their
+    /// session, and holds the retirement signal only weakly, since that signal's continuations reach the callers
+    /// awaiting it; the thread and the heartbeat timer reach the core through static callbacks with the core as their
     /// state. Every storage call happens on the writer thread, except <see cref="DisposeStorage"/> for a journal
     /// whose writer never started. The lock guards only queue and flag updates and is never held during I/O or
     /// while calling the <see cref="TimeProvider"/>.
@@ -687,6 +834,11 @@ public sealed class ProgressJournal : IDisposable
         private readonly TimeProvider _timeProvider;
         private readonly object _sync = new();
         private readonly Queue<(JournalRecord Record, JournalAck? Ack)> _queue = new();
+
+        // The journal's retirement signal, completed once the storage is closed for good. Weak, so a writer stalled for
+        // good in an append keeps neither the journal nor its awaiting callers alive. A signal collected with its
+        // journal has no awaiter left that holds the journal, so it needs no completion.
+        private readonly WeakReference<TaskCompletionSource> _retired;
 
         private RunProgress? _latestProgress;
         private JournalReadings? _latestReadings;
@@ -700,10 +852,11 @@ public sealed class ProgressJournal : IDisposable
         private bool _abandoned;
         private bool _closed;
 
-        public JournalWriter(IJournalStorage storage, TimeProvider timeProvider)
+        public JournalWriter(IJournalStorage storage, TimeProvider timeProvider, TaskCompletionSource retired)
         {
             _storage = storage;
             _timeProvider = timeProvider;
+            _retired = new WeakReference<TaskCompletionSource>(retired);
         }
 
         public JournalFailure? Failure => Volatile.Read(ref _failure);
@@ -754,6 +907,16 @@ public sealed class ProgressJournal : IDisposable
             catch (Exception exception)
             {
                 _ = RecordFailure(CloseType, exception, "The journal could not be closed: ");
+            }
+        }
+
+        // Called by the writer thread as its last act, once the storage is closed; from then on nothing of this journal
+        // touches the file.
+        public void MarkRetired()
+        {
+            if (_retired.TryGetTarget(out TaskCompletionSource? retired))
+            {
+                retired.TrySetResult();
             }
         }
 
@@ -845,6 +1008,9 @@ public sealed class ProgressJournal : IDisposable
             }
 
             Close(deleteJournal);
+
+            // Last: the journal is deleted where it had to be, the storage closed and every acknowledgment completed.
+            MarkRetired();
         }
 
         private void ArmHeartbeats()
