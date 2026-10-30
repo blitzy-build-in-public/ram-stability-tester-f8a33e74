@@ -9,8 +9,11 @@
       Regular  rows 0 + 1 within 340 DIPs.
       Compact  rows 0 + 1 within 240 DIPs: readings in three columns, the memory summary on one line, the notice
                and the first-error message on one line each, their full text opening the detail area.
-      Minimal  only the control row and the one-line status stay fixed; everything else scrolls.
-    MainWindowLayoutTests measure those budgets with the longest texts, so fixed rows carry no fixed heights.
+      Minimal  only the control row and the one-line status stay fixed; everything else scrolls, the readings and
+               the memory summary one pair per line.
+    The live readings are never shortened: the fixed rows hold their only copy, so each reading is placed where its
+    longest value fits on one line. MainWindowLayoutTests measure those budgets and widths with the longest texts, so
+    fixed rows carry no fixed heights.
 
     Exactly three input controls: the test type selector, Stop on error and the Start/Stop toggle. Lists are
     read-only ItemsControls rather than ListBox or DataGrid, and every ContentControl and ItemsControl is
@@ -95,27 +98,165 @@
             </Style.Triggers>
         </Style>
 
-        <!-- One label/value pair; the value takes the remaining width and ends in an ellipsis when it is too long. -->
+        <!-- One label/value pair: the value takes the width the label leaves; the right margin separates columns. -->
         <Style x:Key="FieldPairStyle" TargetType="DockPanel">
             <Setter Property="Margin" Value="0,1,12,1" />
         </Style>
 
-        <Style x:Key="ReadingsGridStyle" TargetType="UniformGrid">
-            <Setter Property="Columns" Value="2" />
+        <!--
+            The value of a live reading or memory summary pair. The fixed rows show it on one line, so it never adds
+            height to them. The minimal layout shows it only in the scrolling detail area, where it wraps rather than
+            losing its end at any width.
+        -->
+        <Style x:Key="LayoutFieldValueStyle" TargetType="TextBlock" BasedOn="{StaticResource FieldValueStyle}">
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
-                             Value="{x:Static behaviors:WindowLayout.Compact}">
-                    <Setter Property="Columns" Value="3" />
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="TextWrapping" Value="Wrap" />
+                    <Setter Property="TextTrimming" Value="None" />
                 </DataTrigger>
             </Style.Triggers>
         </Style>
 
+        <!--
+            No column follows a full-width pair, so it drops the column margin and its value keeps the whole width.
+            The minimal layout shows the pair in the scrolling detail area beside its scroll bar, where the value wraps,
+            so there the margin costs no text and ends the pair with every other pair of the detail area.
+        -->
+        <Style x:Key="FullWidthFieldPairStyle" TargetType="DockPanel" BasedOn="{StaticResource FieldPairStyle}">
+            <Setter Property="Margin" Value="0,1,0,1" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="Margin" Value="0,1,12,1" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!--
+            The live readings are placed on six equal columns: a reading spans three of them in the regular layout's
+            two columns, two in the compact layout's three, and all six in the minimal layout's one. Equal columns keep
+            every reading in place while values change four times a second. In the compact layout the time remaining
+            and the coverage span two of its columns, because a third of the narrowest supported width cannot hold
+            "calculating…" or a coverage with its target, and a live reading is never shortened.
+        -->
+        <Style x:Key="ReadingPairStyle" TargetType="DockPanel" BasedOn="{StaticResource FieldPairStyle}">
+            <Setter Property="Grid.ColumnSpan" Value="3" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="Grid.Column" Value="0" />
+                    <Setter Property="Grid.ColumnSpan" Value="6" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="RamTemperaturePairStyle" TargetType="DockPanel" BasedOn="{StaticResource ReadingPairStyle}">
+            <Setter Property="Grid.Row" Value="0" />
+            <Setter Property="Grid.Column" Value="0" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Compact}">
+                    <Setter Property="Grid.ColumnSpan" Value="2" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="CpuTemperaturePairStyle" TargetType="DockPanel" BasedOn="{StaticResource ReadingPairStyle}">
+            <Setter Property="Grid.Row" Value="0" />
+            <Setter Property="Grid.Column" Value="3" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Compact}">
+                    <Setter Property="Grid.Column" Value="2" />
+                    <Setter Property="Grid.ColumnSpan" Value="2" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="Grid.Row" Value="1" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="ElapsedPairStyle" TargetType="DockPanel" BasedOn="{StaticResource ReadingPairStyle}">
+            <Setter Property="Grid.Row" Value="1" />
+            <Setter Property="Grid.Column" Value="0" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Compact}">
+                    <Setter Property="Grid.Row" Value="0" />
+                    <Setter Property="Grid.Column" Value="4" />
+                    <Setter Property="Grid.ColumnSpan" Value="2" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="Grid.Row" Value="2" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="RemainingPairStyle" TargetType="DockPanel" BasedOn="{StaticResource ReadingPairStyle}">
+            <Setter Property="Grid.Row" Value="1" />
+            <Setter Property="Grid.Column" Value="3" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Compact}">
+                    <Setter Property="Grid.Column" Value="0" />
+                    <Setter Property="Grid.ColumnSpan" Value="4" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="Grid.Row" Value="3" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="CoveragePairStyle" TargetType="DockPanel" BasedOn="{StaticResource ReadingPairStyle}">
+            <Setter Property="Grid.Row" Value="2" />
+            <Setter Property="Grid.Column" Value="0" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Compact}">
+                    <Setter Property="Grid.ColumnSpan" Value="4" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="Grid.Row" Value="4" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="ErrorCountPairStyle" TargetType="DockPanel" BasedOn="{StaticResource ReadingPairStyle}">
+            <Setter Property="Grid.Row" Value="2" />
+            <Setter Property="Grid.Column" Value="3" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Compact}">
+                    <Setter Property="Grid.Row" Value="1" />
+                    <Setter Property="Grid.Column" Value="4" />
+                    <Setter Property="Grid.ColumnSpan" Value="2" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="Grid.Row" Value="5" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!--
+            The minimal layout's work area can be far narrower than the supported 512 DIPs, and its copy scrolls, so it
+            takes one pair per line rather than cutting values short.
+        -->
         <Style x:Key="MemoryGridStyle" TargetType="UniformGrid">
             <Setter Property="Columns" Value="3" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
                              Value="{x:Static behaviors:WindowLayout.Compact}">
                     <Setter Property="Visibility" Value="Collapsed" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Path=(behaviors:WorkAreaSizing.Layout), RelativeSource={RelativeSource AncestorType=Window}}"
+                             Value="{x:Static behaviors:WindowLayout.Minimal}">
+                    <Setter Property="Columns" Value="1" />
                 </DataTrigger>
             </Style.Triggers>
         </Style>
@@ -210,9 +351,9 @@
         -->
         <DataTemplate x:Key="LiveReadingsTemplate">
             <StackPanel>
-                <DockPanel Style="{StaticResource FieldPairStyle}">
+                <DockPanel Style="{StaticResource FullWidthFieldPairStyle}">
                     <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.CurrentStepLabel}" />
-                    <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding CurrentStepText}">
+                    <TextBlock Style="{StaticResource LayoutFieldValueStyle}" Text="{Binding CurrentStepText}">
                         <AutomationProperties.Name>
                             <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
                                 <Binding Source="{x:Static app:UiText.CurrentStepLabel}" />
@@ -221,10 +362,26 @@
                         </AutomationProperties.Name>
                     </TextBlock>
                 </DockPanel>
-                <UniformGrid Style="{StaticResource ReadingsGridStyle}">
-                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <DockPanel Style="{StaticResource RamTemperaturePairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.RamTemperatureLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding RamTemperatureText}">
+                        <TextBlock Style="{StaticResource LayoutFieldValueStyle}" Text="{Binding RamTemperatureText}">
                             <AutomationProperties.Name>
                                 <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
                                     <Binding Source="{x:Static app:UiText.RamTemperatureLabel}" />
@@ -233,9 +390,9 @@
                             </AutomationProperties.Name>
                         </TextBlock>
                     </DockPanel>
-                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                    <DockPanel Style="{StaticResource CpuTemperaturePairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.CpuTemperatureLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding CpuTemperatureText}">
+                        <TextBlock Style="{StaticResource LayoutFieldValueStyle}" Text="{Binding CpuTemperatureText}">
                             <AutomationProperties.Name>
                                 <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
                                     <Binding Source="{x:Static app:UiText.CpuTemperatureLabel}" />
@@ -244,9 +401,9 @@
                             </AutomationProperties.Name>
                         </TextBlock>
                     </DockPanel>
-                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                    <DockPanel Style="{StaticResource ElapsedPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.ElapsedLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding ElapsedText}">
+                        <TextBlock Style="{StaticResource LayoutFieldValueStyle}" Text="{Binding ElapsedText}">
                             <AutomationProperties.Name>
                                 <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
                                     <Binding Source="{x:Static app:UiText.ElapsedLabel}" />
@@ -255,9 +412,9 @@
                             </AutomationProperties.Name>
                         </TextBlock>
                     </DockPanel>
-                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                    <DockPanel Style="{StaticResource RemainingPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.RemainingLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding RemainingText}">
+                        <TextBlock Style="{StaticResource LayoutFieldValueStyle}" Text="{Binding RemainingText}">
                             <AutomationProperties.Name>
                                 <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
                                     <Binding Source="{x:Static app:UiText.RemainingLabel}" />
@@ -266,9 +423,9 @@
                             </AutomationProperties.Name>
                         </TextBlock>
                     </DockPanel>
-                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                    <DockPanel Style="{StaticResource CoveragePairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.CoverageLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding CoverageText}">
+                        <TextBlock Style="{StaticResource LayoutFieldValueStyle}" Text="{Binding CoverageText}">
                             <AutomationProperties.Name>
                                 <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
                                     <Binding Source="{x:Static app:UiText.CoverageLabel}" />
@@ -277,9 +434,9 @@
                             </AutomationProperties.Name>
                         </TextBlock>
                     </DockPanel>
-                    <DockPanel Style="{StaticResource FieldPairStyle}">
+                    <DockPanel Style="{StaticResource ErrorCountPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.ErrorsLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding ErrorCountText}">
+                        <TextBlock Style="{StaticResource LayoutFieldValueStyle}" Text="{Binding ErrorCountText}">
                             <AutomationProperties.Name>
                                 <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
                                     <Binding Source="{x:Static app:UiText.ErrorsLabel}" />
@@ -288,7 +445,7 @@
                             </AutomationProperties.Name>
                         </TextBlock>
                     </DockPanel>
-                </UniformGrid>
+                </Grid>
             </StackPanel>
         </DataTemplate>
 
@@ -301,7 +458,7 @@
                 <UniformGrid Style="{StaticResource MemoryGridStyle}">
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.InstalledLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding InstalledText}">
+                        <TextBlock Style="{StaticResource LayoutFieldValueStyle}" Text="{Binding InstalledText}">
                             <AutomationProperties.Name>
                                 <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
                                     <Binding Source="{x:Static app:UiText.InstalledLabel}" />
@@ -312,7 +469,7 @@
                     </DockPanel>
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.TestedLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding TestedText}">
+                        <TextBlock Style="{StaticResource LayoutFieldValueStyle}" Text="{Binding TestedText}">
                             <AutomationProperties.Name>
                                 <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
                                     <Binding Source="{x:Static app:UiText.TestedLabel}" />
@@ -323,7 +480,7 @@
                     </DockPanel>
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.SpeedLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding SpeedText}">
+                        <TextBlock Style="{StaticResource LayoutFieldValueStyle}" Text="{Binding SpeedText}">
                             <AutomationProperties.Name>
                                 <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
                                     <Binding Source="{x:Static app:UiText.SpeedLabel}" />
@@ -334,7 +491,7 @@
                     </DockPanel>
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.ChannelsLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding ChannelsText}">
+                        <TextBlock Style="{StaticResource LayoutFieldValueStyle}" Text="{Binding ChannelsText}">
                             <AutomationProperties.Name>
                                 <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
                                     <Binding Source="{x:Static app:UiText.ChannelsLabel}" />
@@ -345,7 +502,7 @@
                     </DockPanel>
                     <DockPanel Style="{StaticResource FieldPairStyle}">
                         <TextBlock Style="{StaticResource FieldLabelStyle}" Text="{x:Static app:UiText.DimmsLabel}" />
-                        <TextBlock Style="{StaticResource FieldValueStyle}" Text="{Binding DimmsText}">
+                        <TextBlock Style="{StaticResource LayoutFieldValueStyle}" Text="{Binding DimmsText}">
                             <AutomationProperties.Name>
                                 <MultiBinding StringFormat="{x:Static app:UiText.LabeledValueAutomationFormat}">
                                     <Binding Source="{x:Static app:UiText.DimmsLabel}" />

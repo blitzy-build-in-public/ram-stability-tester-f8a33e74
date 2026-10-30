@@ -4,12 +4,14 @@
  *        token allows them, shrink-and-retry on a locking shortfall and RAII release.
  *
  * Allocation and locking run in Preparing on the coordinator thread, one 256 MiB chunk at a
- * time with a stop check before each, so a stop waits for at most one chunk's commit-and-lock
- * and neither the UI nor Windows is starved while gigabytes are faulted in and locked.
+ * time with a stop check before each, so a stop waits for at most one chunk's commit-and-lock.
+ * Each 4 KiB-page chunk is faulted in page by page before VirtualLock pins it, so neither the UI
+ * nor Windows is starved while gigabytes are faulted in and locked.
  *
- * Stress bound: this file touches page contents only as far as VirtualLock faults them in, and
- * issues no cache flushes. Every OS change it makes is process-local (the working-set limits and
- * the enabled state of a privilege the token already holds), and release() undoes both.
+ * Stress bound: this file touches page contents only to fault 4 KiB pages in, with one store of
+ * zero per page once per allocation, and issues no cache flushes. Every OS change it makes is
+ * process-local (the working-set limits and the enabled state of a privilege the token already
+ * holds), and release() undoes both.
  */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -469,6 +471,32 @@ constexpr std::uint64_t round_down(std::uint64_t x, std::uint64_t unit) noexcept
     return x / unit * unit;
 }
 
+/** The x64 Windows standard page, the unit in which a 4 KiB-page chunk is committed and locked. */
+constexpr std::uint64_t k_page_bytes = 4096;
+
+static_assert(k_slice_granularity_bytes % k_page_bytes == 0, "every chunk is whole pages");
+
+/**
+ * Faults every page of a freshly committed 4 KiB-page chunk in, with one store of zero per page,
+ * so that the VirtualLock that follows pins pages that are already resident.
+ *
+ * VirtualLock faults non-resident pages in itself, inside one call that keeps the process's
+ * working-set lock held throughout, so every other thread of the process that commits or touches
+ * a page meanwhile (the UI thread rendering, the runtime compiling) would wait for the whole
+ * call, and so for the whole preparation. Each fault taken here takes and releases that lock on
+ * its own, so the other threads' faults interleave with these. The minimum working set is raised
+ * before the first 4 KiB-page chunk, so the pages faulted in here stay resident until they are
+ * locked. The pages are demand-zero, so a store of zero leaves their contents unchanged; it is
+ * volatile so that it is kept. Each page is stored to once per allocation and nothing is flushed,
+ * so the stress bound is unaffected. Cannot fail: the pages are committed.
+ */
+void fault_in_pages(void* base, std::uint64_t bytes) noexcept {
+    volatile std::uint8_t* const first = static_cast<volatile std::uint8_t*>(base);
+    for (std::uint64_t offset = 0; offset < bytes; offset += k_page_bytes) {
+        first[offset] = 0;
+    }
+}
+
 }  // namespace
 
 region_plan plan_region(std::uint64_t region_bytes, std::uint32_t worker_count) noexcept {
@@ -716,6 +744,9 @@ allocation_outcome memory_region::allocate(const region_options& options, const 
                         return attempt_status::failed;
                     }
                     pending_allocation pending(allocation);
+                    // Faulted in page by page first, so the lock (or the override standing in
+                    // for it) never keeps the working-set lock while it faults the chunk in.
+                    fault_in_pages(allocation, size);
                     const bool locked = options.lock_override
                                             ? options.lock_override(allocation, size)
                                             : VirtualLock(allocation, size) != FALSE;

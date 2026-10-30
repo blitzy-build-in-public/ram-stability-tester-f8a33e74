@@ -27,6 +27,13 @@
  *   chunk by chunk as well. A chunk VirtualFree refuses to free stays owned by the region for
  *   a later release() to retry, and by a process-wide owner once the region is destroyed (see
  *   orphaned_bytes()), so no allocation is ever lost while reported as released.
+ * - VirtualLock faults non-resident pages in itself, inside one call that keeps the process's
+ *   working-set lock held throughout, which would stall every other thread of the process that
+ *   commits or touches a page, the UI thread included, for the whole preparation. allocate()
+ *   therefore faults each 4 KiB-page chunk in first, with one store of zero per page, so the
+ *   other threads' faults interleave with its own and VirtualLock pins resident pages only. The
+ *   minimum working set is raised before the first such chunk, so the faulted-in pages stay
+ *   resident until they are locked.
  * - No documented user-mode API yields physical addresses, so every address here is virtual.
  *
  * Deliberately free of <windows.h>: Win32 handles and values are held as fixed-width integers,
@@ -215,7 +222,8 @@ struct slice_view {
 /**
  * Locks one 4 KiB-page chunk in place of VirtualLock.
  *
- * Called on the coordinator thread with the chunk's base and size. Returns true on success. On
+ * Called on the coordinator thread with the chunk's base and size, once every page of the chunk
+ * has been faulted in, exactly where VirtualLock would be called. Returns true on success. On
  * failure it returns false with the Windows last-error set, exactly as VirtualLock does, and
  * allocate() treats that as a lock failure of the attempt. It must not throw. An empty function
  * means VirtualLock. The seam exists only so that test_memory_region.cpp can force
@@ -409,10 +417,11 @@ public:
      * minimum is tested_bytes + k_working_set_headroom_bytes), and then, slice by slice and
      * chunk by chunk, checks the stop signal, allocates the chunk and locks it. With
      * options.lock_privilege_held, each chunk is first tried as a large-page allocation, and a
-     * chunk that fails falls back to 4 KiB pages. 4 KiB-page chunks are locked with VirtualLock,
-     * or with options.lock_override when it is set. A failure to raise the working set, to
-     * allocate a chunk or to lock it releases that attempt's chunks and retries at
-     * next_retry_bytes() of the attempt's size; when that is 0, the call returns
+     * chunk that fails falls back to 4 KiB pages. A 4 KiB-page chunk is faulted in with one
+     * store of zero per page, which leaves its demand-zero contents unchanged, and then locked
+     * with VirtualLock, or with options.lock_override when it is set. A failure to raise the
+     * working set, to allocate a chunk or to lock it releases that attempt's chunks and retries
+     * at next_retry_bytes() of the attempt's size; when that is 0, the call returns
      * insufficient_memory. When Windows refuses to free a chunk of the failed attempt
      * (VirtualFree, or options.free_override), no retry is planned over it: the call returns
      * insufficient_memory naming VirtualFree with its error, and the chunk stays held, with

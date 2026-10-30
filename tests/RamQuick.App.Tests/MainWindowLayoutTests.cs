@@ -28,16 +28,17 @@ namespace RamQuick.App.Tests;
 /// <summary>
 /// Tests for the main window's layout. <see cref="MainWindow"/>, never shown and bound to a real view model filled
 /// with the longest texts it can show, is measured at the preferred 560-DIP width and the narrowest supported 512:
-/// its fixed rows stay within the regular and compact budgets, and the minimal fallback keeps only the control row and
-/// the status line fixed. The window has exactly three accessible input controls, its test type selector's entries and
-/// selection are named by their labels, and its Start/Stop toggle binds the command the run state calls for. Shown
-/// off-screen and driven from the keyboard, the toggle takes keyboard focus back after every run transition unless the
-/// user moved it elsewhere, and Home and End scroll the detail area to its top and bottom. Also tests
-/// <see cref="WindowSizing.Compute"/>: the window bounds and active
+/// its fixed rows stay within the regular and compact budgets and show every live reading whole, and the minimal
+/// fallback keeps only the control row and the status line fixed and shows every reading and memory value whole in
+/// its scrolling detail area, down to 409.6 DIPs. The window has exactly three accessible input controls, its test
+/// type selector's entries and selection are named by their labels, and its Start/Stop toggle binds the command the
+/// run state calls for. Shown off-screen and driven from the keyboard, the toggle takes keyboard focus back after every
+/// run transition unless the user moved it elsewhere, and Home and End scroll the detail area to its top and bottom.
+/// Also tests <see cref="WindowSizing.Compute"/>: the window bounds and active
 /// layout for the worked work areas, the layout and supported-range thresholds, and the argument guards; and
 /// <see cref="WorkAreaSizing"/> on a loaded window with a real handle: DPI changes that arrive before the sizing work
 /// they defer has run, and the non-client height measured once a shown window loads, which a content margin leaves
-/// unchanged.
+/// unchanged, and measured again on a DPI change.
 /// </summary>
 /// <remarks>
 /// Every <see cref="MainWindow"/> is built and measured on the STA thread of <see cref="WpfStaFixture"/>, which also
@@ -52,6 +53,14 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
 
     // Measured heights are compared to within one DIP: the window rounds layout to whole device pixels.
     private const double LayoutTolerance = 1;
+
+    // A text's width is compared to its block's arranged width only to within rounding error: a block trims or wraps
+    // its text as soon as the text is wider than the block.
+    private const double TextFitTolerance = 0.05;
+
+    // 1024 × 768 at 250 % custom scaling: the work area, and with it the window, is 409.6 DIPs wide, below the
+    // supported 512, so the minimal fallback applies.
+    private const double CustomScalingWorkAreaWidth = 1024 / 2.5;
 
     // The margin the main window's root grid keeps on every side of the client area, in DIPs.
     private const double RootGridMargin = 12;
@@ -71,6 +80,29 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
     // Two-digit minutes: the widest "mm:ss" a run of any type shows.
     private static readonly TimeSpan _widestRunTime = TimeSpan.FromSeconds(3599);
     private static readonly TimeSpan _releaseTime = TimeSpan.FromMilliseconds(100);
+
+    // The view model properties of the current step and the six live readings. Only the notice, the first error and
+    // the minimal status line are designed to shorten, so every layout shows these values whole.
+    private static readonly string[] _liveReadingPaths =
+    [
+        nameof(MainViewModel.CurrentStepText),
+        nameof(MainViewModel.RamTemperatureText),
+        nameof(MainViewModel.CpuTemperatureText),
+        nameof(MainViewModel.ElapsedText),
+        nameof(MainViewModel.RemainingText),
+        nameof(MainViewModel.CoverageText),
+        nameof(MainViewModel.ErrorCountText),
+    ];
+
+    // The view model properties of the detected-memory values the summary grid shows beside their labels.
+    private static readonly string[] _memorySummaryPaths =
+    [
+        nameof(MainViewModel.InstalledText),
+        nameof(MainViewModel.TestedText),
+        nameof(MainViewModel.SpeedText),
+        nameof(MainViewModel.ChannelsText),
+        nameof(MainViewModel.DimmsText),
+    ];
 
     // The user's size as a fraction of the work area at the window's own DPI: more than half of it, so the same
     // pixels converted at twice that DPI cannot hold it, yet within it, so the window's own DPI never shrinks it.
@@ -208,7 +240,8 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
     /// Measures the fixed rows (the top area and the result header) of the never-shown main window in the regular and
     /// compact layouts, at the preferred and the narrowest supported width, with the longest texts in place: while
     /// running, the longest step name, the both-sensors notice and a full-length first-error message; after a user
-    /// stop with errors, the ABORTED reason with its error count beside the badge as well.
+    /// stop with errors, the ABORTED reason with its error count beside the badge as well. The current step and every
+    /// live reading, the widest coverage among them, show their whole value on one line in both layouts.
     /// </summary>
     /// <param name="runState">The state the run is driven to: <see cref="RunState.Running"/> or <see cref="RunState.Aborted"/>.</param>
     /// <param name="layout">The layout forced on the window.</param>
@@ -243,6 +276,16 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
                 Assert.NotEmpty(LaidOutTextBlocks(FixedRowsOf(window), text));
             }
 
+            string context = FormattableString.Invariant($"{layout} fixed rows at {width} DIPs");
+            IReadOnlyDictionary<string, TextBlock> readings = LaidOutValueBlocks(window.FixedArea, _liveReadingPaths);
+            foreach (TextBlock valueBlock in readings.Values)
+            {
+                AssertFitsOnOneLine(valueBlock, valueBlock.Text, context);
+            }
+
+            // Until step 1 completes a pass the time remaining reads "calculating…", wider than any "mm:ss".
+            AssertFitsOnOneLine(readings[nameof(MainViewModel.RemainingText)], UiText.Calculating, context);
+
             if (layout == WindowLayout.Compact)
             {
                 // The fixed rows show the notice and the first error on one line each, and the detail area opens
@@ -267,25 +310,30 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
     }
 
     /// <summary>
-    /// Measures the minimal fallback at the narrowest supported width with the longest texts: only the control row and
-    /// the one-line status stay fixed, within the budget <see cref="WindowSizing.Compute"/> reserves for them, and the
-    /// notice, the first error and the result open the scrolling detail area instead.
+    /// Measures the minimal fallback at the narrowest supported width, and at the narrower width of 1024 pixels at
+    /// 250 % scaling, with the longest texts: only the control row and the one-line status stay fixed, within the budget
+    /// <see cref="WindowSizing.Compute"/> reserves for them, and the notice, the first error and the result open the
+    /// scrolling detail area instead. The detail area's copies of the live readings and the memory summary show every
+    /// value whole, on one line or wrapped, and every one of their label/value pairs ends at the same right edge.
     /// </summary>
     /// <param name="runState">The state the run is driven to: <see cref="RunState.Running"/> or <see cref="RunState.Aborted"/>.</param>
+    /// <param name="width">The width the root grid is measured at, in DIPs.</param>
     /// <returns>A task that completes when the measurement has been checked on the STA thread.</returns>
     [Theory]
-    [InlineData(RunState.Running)]
-    [InlineData(RunState.Aborted)]
-    public async Task FixedRows_MinimalLayoutAtNarrowestWidth_KeepOnlyControlRowAndStatusLineAsync(RunState runState)
+    [InlineData(RunState.Running, WindowSizing.MinimalWorkAreaWidth)]
+    [InlineData(RunState.Running, CustomScalingWorkAreaWidth)]
+    [InlineData(RunState.Aborted, WindowSizing.MinimalWorkAreaWidth)]
+    [InlineData(RunState.Aborted, CustomScalingWorkAreaWidth)]
+    public async Task FixedRows_MinimalLayoutAtNarrowWidths_KeepOnlyControlRowAndStatusLineAsync(RunState runState, double width)
     {
         await _fixture.RunAsync(async () =>
         {
             using LongestTextScene scene = LongestTextScene.Create();
             scene.RunTo(runState);
 
-            FixedRows rows = await scene.MeasureAsync(WindowLayout.Minimal, WindowSizing.MinimalWorkAreaWidth);
+            FixedRows rows = await scene.MeasureAsync(WindowLayout.Minimal, width);
 
-            AssertWithinBudget(rows, WindowLayout.Minimal, WindowSizing.MinimalWorkAreaWidth);
+            AssertWithinBudget(rows, WindowLayout.Minimal, width);
             AssertRowsHoldTheirContent(scene.Window, rows);
             AssertLongestTexts(scene, runState);
 
@@ -310,7 +358,17 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
                 Assert.NotEmpty(LaidOutTextBlocks(window.DetailScroller, text));
             }
 
-            AssertDetailLineShownAtMinimumHeight(scene, WindowLayout.Minimal, WindowSizing.MinimalWorkAreaWidth);
+            string context = FormattableString.Invariant($"Minimal detail area at {width} DIPs");
+            IReadOnlyDictionary<string, TextBlock> detailValues =
+                LaidOutValueBlocks(window.DetailScroller, [.. _liveReadingPaths, .. _memorySummaryPaths]);
+            foreach (TextBlock valueBlock in detailValues.Values)
+            {
+                AssertShowsWholeText(valueBlock, context);
+            }
+
+            AssertPairsEndAtOneEdge(window.DetailScroller, detailValues, context);
+
+            AssertDetailLineShownAtMinimumHeight(scene, WindowLayout.Minimal, width);
         });
     }
 
@@ -971,6 +1029,64 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
             }
         });
 
+    /// <summary>
+    /// Shows a window with content and lets it load, so the behavior measures its non-client height, then changes the
+    /// window's chrome, as a new DPI's system metrics do, and raises a DPI change. The minimum height that change
+    /// computes is the layout's fixed-row budget plus 40 DIPs of detail plus the chrome as it now is, not as it was
+    /// measured at Loaded.
+    /// </summary>
+    [Fact]
+    public void DpiChanged_ChromeChangedSinceLoaded_MeasuresNonClientHeightAgain() =>
+        RunOnStaThread(() =>
+        {
+            static double ChromeHeight(Window shown) =>
+                shown.ActualHeight - ((FrameworkElement)VisualTreeHelper.GetChild(shown, 0)).ActualHeight;
+
+            var window = new Window
+            {
+                ShowInTaskbar = false,
+                ShowActivated = false,
+                Content = new Grid(),
+            };
+            WorkAreaSizing.SetIsEnabled(window, true);
+            try
+            {
+                window.Show();
+                DrainDispatcher();
+                DrainDispatcher();
+                Assert.True(window.IsLoaded, "The shown window did not load.");
+                double chromeAtLoad = ChromeHeight(window);
+
+                // Dropping the caption leaves only the resize frame. The window's DPI, and with it the work area in
+                // DIPs, stays as it was, so only a measurement taken after the change can tell. A tool window would not
+                // do: on current themes its caption is as tall as a standard one.
+                window.WindowStyle = WindowStyle.None;
+                DrainDispatcher();
+                double chrome = ChromeHeight(window);
+                double minHeightBefore = window.MinHeight;
+
+                DpiScale dpi = VisualTreeHelper.GetDpi(window);
+                window.RaiseEvent(CreateDpiChangedEventArgs(dpi, dpi, window));
+                DrainDispatcher();
+
+                nint hwnd = new WindowInteropHelper(window).Handle;
+                Size workArea = ToDips(Assert.NotNull(Win32Display.GetWorkArea(hwnd)), dpi);
+                WindowLayout layout = WorkAreaSizing.GetLayout(window);
+                double expectedMinHeight = Math.Min(
+                    WindowSizing.FixedRowsBudget(layout) + WindowSizing.MinimumDetailHeight + chrome,
+                    workArea.Height);
+                string measurement = FormattableString.Invariant(
+                    $"Chrome {chromeAtLoad:F1} DIPs at Loaded, {chrome:F1} after the change; {layout} MinHeight {minHeightBefore:F1} before the DPI change, {window.MinHeight:F1} after, expected {expectedMinHeight:F1} of H {workArea.Height:F1} DIPs.");
+                TestContext.Current.TestOutputHelper?.WriteLine(measurement);
+                Assert.True(Math.Abs(chrome - chromeAtLoad) > LayoutTolerance, measurement);
+                Assert.True(Math.Abs(expectedMinHeight - window.MinHeight) <= LayoutTolerance, measurement);
+            }
+            finally
+            {
+                window.Close();
+            }
+        });
+
     // WPF's Size constructor rejects negative dimensions, so the only negative work area that can
     // reach Compute is Size.Empty, whose width and height are both negative infinity.
     private static Size CreateWorkArea(double width, double height) =>
@@ -1132,6 +1248,92 @@ public sealed class MainWindowLayoutTests : IClassFixture<WpfStaFixture>
             .Where(textBlock => string.Equals(textBlock.Text, text, StringComparison.Ordinal) && IsLaidOut(textBlock, root))
             .ToArray();
     }
+
+    // The one laid-out text block under a root whose text is bound to each view model property, keyed by property.
+    private static IReadOnlyDictionary<string, TextBlock> LaidOutValueBlocks(DependencyObject root, IEnumerable<string> paths)
+    {
+        TextBlock[] laidOut = VisualDescendants(root)
+            .OfType<TextBlock>()
+            .Where(textBlock => IsLaidOut(textBlock, root))
+            .ToArray();
+        return paths.ToDictionary(
+            path => path,
+            path => Assert.Single(
+                laidOut,
+                textBlock => string.Equals(
+                    BindingOperations.GetBinding(textBlock, TextBlock.TextProperty)?.Path?.Path,
+                    path,
+                    StringComparison.Ordinal)),
+            StringComparer.Ordinal);
+    }
+
+    // A text fits on one line when it is no wider than the width its block was arranged to, so the block shows it
+    // neither trimmed nor wrapped.
+    private static void AssertFitsOnOneLine(TextBlock textBlock, string text, string context)
+    {
+        double needed = FormatLike(textBlock, text).WidthIncludingTrailingWhitespace;
+        double available = TextWidth(textBlock);
+        Assert.True(
+            needed <= available + TextFitTolerance,
+            FormattableString.Invariant($"{context}: '{text}' needs {needed:F1} DIPs on one line, but its block has {available:F1}."));
+    }
+
+    // A block shows its whole text when the text fits on one line, or when the block wraps it without trimming and is
+    // tall enough for every line it wraps to.
+    private static void AssertShowsWholeText(TextBlock textBlock, string context)
+    {
+        string text = textBlock.Text;
+        FormattedText formatted = FormatLike(textBlock, text);
+        double available = TextWidth(textBlock);
+        if (formatted.WidthIncludingTrailingWhitespace <= available + TextFitTolerance)
+        {
+            return;
+        }
+
+        string measurement = FormattableString.Invariant(
+            $"{context}: '{text}' needs {formatted.WidthIncludingTrailingWhitespace:F1} DIPs on one line, but its block has {available:F1}");
+        Assert.True(
+            textBlock.TextWrapping != TextWrapping.NoWrap && textBlock.TextTrimming == TextTrimming.None,
+            FormattableString.Invariant($"{measurement} and shows it with {textBlock.TextWrapping} and {textBlock.TextTrimming}."));
+        formatted.MaxTextWidth = available;
+        Assert.True(
+            formatted.Height <= textBlock.ActualHeight + LayoutTolerance,
+            FormattableString.Invariant($"{measurement}; wrapped, it needs {formatted.Height:F1} DIPs of height, but its block has {textBlock.ActualHeight:F1}."));
+    }
+
+    // Label/value pairs laid out one per line end at one right edge, inside their margins, so each keeps the same
+    // distance from the scroll bar beside them. The edges are compared in the root's coordinates.
+    private static void AssertPairsEndAtOneEdge(Visual root, IReadOnlyDictionary<string, TextBlock> valueBlocks, string context)
+    {
+        Dictionary<string, double> rightEdges = valueBlocks.ToDictionary(
+            entry => entry.Key,
+            entry =>
+            {
+                DockPanel pair = Assert.IsType<DockPanel>(VisualTreeHelper.GetParent(entry.Value));
+                return pair.TransformToAncestor(root).Transform(new Point(pair.ActualWidth, 0)).X;
+            },
+            StringComparer.Ordinal);
+        string edges = string.Join(", ", rightEdges.Select(edge => FormattableString.Invariant($"{edge.Key} {edge.Value:F1}")));
+        Assert.True(
+            rightEdges.Values.Max() - rightEdges.Values.Min() <= LayoutTolerance,
+            FormattableString.Invariant($"{context}: the label/value pairs end at different right edges (DIPs): {edges}."));
+    }
+
+    // The text in the block's own font, culture, flow direction, formatting mode and DPI, on one unbounded line.
+    private static FormattedText FormatLike(TextBlock textBlock, string text) =>
+        new(
+            text,
+            textBlock.Language.GetSpecificCulture(),
+            textBlock.FlowDirection,
+            new Typeface(textBlock.FontFamily, textBlock.FontStyle, textBlock.FontWeight, textBlock.FontStretch),
+            textBlock.FontSize,
+            textBlock.Foreground,
+            new NumberSubstitution(),
+            TextOptions.GetTextFormattingMode(textBlock),
+            VisualTreeHelper.GetDpi(textBlock).PixelsPerDip);
+
+    private static double TextWidth(TextBlock textBlock) =>
+        textBlock.ActualWidth - textBlock.Padding.Left - textBlock.Padding.Right;
 
     // Shown in the measured layout: arranged with a size, and neither the element nor any ancestor up to the root
     // collapsed or hidden. A window that is never shown has no presentation source, so IsVisible cannot tell.

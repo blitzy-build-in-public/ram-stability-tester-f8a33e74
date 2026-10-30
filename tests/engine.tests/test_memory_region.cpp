@@ -15,6 +15,10 @@
  *   with the working-set limits restored.
  * - MemoryRegionLargePages: large-page chunks, skipped when the token lacks
  *   SeLockMemoryPrivilege, which nobody holds by default.
+ * - MemoryRegionResponsiveness: while allocate() prepares a 1 GiB region, over one worker and
+ *   over one per logical processor, another thread that commits, touches and frees fresh memory
+ *   every 10 ms keeps completing, and no probe takes longer than the 250 ms within which the UI
+ *   must answer throughout a run.
  * - MemoryRegionRelease: whole sessions ending in each of completed, user stop, first error,
  *   thermal stop, insufficient memory, affinity failure, host fault and engine fault. Each raises
  *   Completed and then Released, once each and last. Released reports the tested (or planned)
@@ -32,8 +36,10 @@
  *   still refused when its region or session is destroyed passes to the process-wide owner
  *   until a later retry frees it and restores the working-set limits.
  *
- * Regions stay at or below 512 MiB and sessions use at most two workers. Locking up to that size
- * needs no elevation once the working set is raised, which memory_region does itself.
+ * Regions stay at or below 512 MiB and sessions use at most two workers, except in
+ * MemoryRegionResponsiveness, which locks 1 GiB, the application's smallest region. Locking up
+ * to that size needs no elevation once the working set is raised, which memory_region does
+ * itself.
  */
 #include <gtest/gtest.h>
 #include <windows.h>
@@ -53,6 +59,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1943,6 +1950,255 @@ TEST(MemoryRegionLargePages, AllocatesLargePageChunksWhenThePrivilegeIsHeld) {
         GTEST_SKIP() << "every large-page chunk fell back to 4 KiB pages (physical fragmentation)";
     }
 }
+
+/* ---------------------------------------------------------------------------------------------
+ * Responsiveness of the process during preparation
+ * ------------------------------------------------------------------------------------------- */
+
+/** The region prepared under the probe: 1 GiB, the smallest region the application runs. */
+constexpr std::uint64_t k_responsiveness_region_bytes = k_gib;
+
+/** Below this much available physical memory the measurement fails its precondition. */
+constexpr std::uint64_t k_responsiveness_min_available_bytes = 2 * k_responsiveness_region_bytes;
+
+/** Workers are capped so that every slice of the region holds at least 4 MiB, as test_stop does. */
+constexpr std::uint64_t k_min_responsiveness_slice_bytes = 4 * k_mib;
+constexpr std::uint32_t k_max_responsiveness_workers =
+    static_cast<std::uint32_t>(k_responsiveness_region_bytes / k_min_responsiveness_slice_bytes);
+
+/** Each probe commits one allocation granularity of fresh memory. */
+constexpr std::uint64_t k_probe_bytes = k_allocation_granularity_bytes;
+
+/** A probe starts every 10 ms; the system timer tick can stretch that to about 16 ms. */
+constexpr std::chrono::milliseconds k_probe_interval{10};
+
+/**
+ * The longest a probe may take: the 250 ms within which the UI must service a probe posted every
+ * 100 ms throughout a run, preparation included.
+ */
+constexpr std::chrono::microseconds k_max_probe_latency{250'000};
+
+/**
+ * Once allocate() runs for at least k_min_window_intervals probe intervals, at least
+ * k_min_probes_inside probes must complete inside it: a thread that commits memory must keep
+ * making progress during preparation, not merely be let through once it ends.
+ */
+constexpr std::uint32_t k_min_window_intervals = 5;
+constexpr std::size_t k_min_probes_inside = 2;
+
+/** Room for the probes of over a minute of preparation, so recording one does not reallocate. */
+constexpr std::size_t k_probe_capacity = 8192;
+
+using probe_clock = std::chrono::steady_clock;
+
+/** When one probe began and ended. */
+struct probe_sample {
+    probe_clock::time_point begin;
+    probe_clock::time_point end;
+};
+
+/**
+ * Measures how long another thread of the process waits to commit and touch fresh memory.
+ *
+ * Its thread commits a fresh allocation with VirtualAlloc, writes one byte of it and frees it,
+ * every k_probe_interval, and records when each probe began and ended. That is what any other
+ * thread of the process does when it grows a heap, a stack or the runtime's code space: it
+ * changes the address space and takes a page fault, so it waits for whatever keeps the
+ * process's working-set lock. The constructor returns once the first probe has ended, so a
+ * measurement never starts before the thread runs. stop() lets the probe in flight end before
+ * the thread does, so a probe that straddles the measured call is measured to its end. A failed
+ * VirtualAlloc or VirtualFree ends the probing, with its Windows error in failure().
+ */
+class allocation_probe {
+public:
+    allocation_probe() {
+        // Reserved before the thread starts, so recording a probe never allocates.
+        samples_.reserve(k_probe_capacity);
+        thread_ = std::thread([this] { run(); });
+        std::unique_lock<std::mutex> lock(mutex_);
+        changed_.wait(lock, [this] { return !samples_.empty() || failure_ != ERROR_SUCCESS; });
+    }
+    ~allocation_probe() { stop(); }
+    allocation_probe(const allocation_probe&) = delete;
+    allocation_probe& operator=(const allocation_probe&) = delete;
+
+    /** Ends the probing once the probe in flight has ended. Idempotent. */
+    void stop() {
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        changed_.notify_all();
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    /** Every probe, in order; read after stop(), which ends the thread that writes them. */
+    const std::vector<probe_sample>& samples() const noexcept { return samples_; }
+
+    /** The Windows error that ended the probing; ERROR_SUCCESS while every probe succeeded. */
+    DWORD failure() {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return failure_;
+    }
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!stop_) {
+            lock.unlock();
+            const probe_clock::time_point begin = probe_clock::now();
+            DWORD error = ERROR_SUCCESS;
+            void* const block =
+                VirtualAlloc(nullptr, k_probe_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (block == nullptr) {
+                error = GetLastError();
+            } else {
+                *static_cast<volatile std::uint8_t*>(block) = 1;
+                if (!VirtualFree(block, 0, MEM_RELEASE)) {
+                    error = GetLastError();
+                }
+            }
+            const probe_clock::time_point end = probe_clock::now();
+            lock.lock();
+            if (error != ERROR_SUCCESS) {
+                failure_ = error;
+                changed_.notify_all();
+                return;
+            }
+            samples_.push_back(probe_sample{begin, end});
+            changed_.notify_all();
+            changed_.wait_until(lock, begin + k_probe_interval, [this] { return stop_; });
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::vector<probe_sample> samples_;
+    DWORD failure_ = ERROR_SUCCESS;
+    bool stop_ = false;
+    std::thread thread_;
+};
+
+/** The worker counts whose preparation the probe watches. */
+enum class responsiveness_case {
+    /** One worker: four 256 MiB chunks, the most one VirtualLock call covers. */
+    one_worker,
+    /** One worker per logical processor, capped as above: the application's chunking. */
+    every_logical_processor,
+};
+
+const char* responsiveness_case_name(responsiveness_case value) noexcept {
+    return value == responsiveness_case::one_worker ? "OneWorker" : "EveryLogicalProcessor";
+}
+
+void PrintTo(responsiveness_case value, std::ostream* os) {
+    *os << responsiveness_case_name(value);
+}
+
+std::int64_t whole_microseconds(probe_clock::duration duration) noexcept {
+    return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+}
+
+class MemoryRegionResponsiveness : public ::testing::TestWithParam<responsiveness_case> {};
+
+TEST_P(MemoryRegionResponsiveness, AnotherThreadKeepsCommittingMemoryWhileTheRegionIsLocked) {
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof(memory);
+    ASSERT_TRUE(GlobalMemoryStatusEx(&memory))
+        << "GlobalMemoryStatusEx failed (Windows error " << GetLastError() << ")";
+    // Fails rather than skips, so a short machine never reports a pass it did not measure.
+    ASSERT_GE(memory.ullAvailPhys, k_responsiveness_min_available_bytes)
+        << "Precondition failed: the responsiveness test locks a 1 GiB region and needs at least "
+           "2 GiB of available physical memory, but only "
+        << memory.ullAvailPhys / k_mib << " MiB is available. Close other applications.";
+
+    const std::uint32_t workers =
+        GetParam() == responsiveness_case::one_worker
+            ? 1u
+            : static_cast<std::uint32_t>(std::min<std::size_t>(
+                  enumerate_logical_processors().size(), k_max_responsiveness_workers));
+    ASSERT_GT(workers, 0u);
+    const region_plan plan = plan_region(k_responsiveness_region_bytes, workers);
+    ASSERT_GT(plan.tested_bytes, 0u);
+    const working_set_limits limits_before = current_working_set_limits();
+
+    stop_signal stop;
+    memory_region region;
+    allocation_probe probe;
+    ASSERT_EQ(probe.failure(), static_cast<DWORD>(ERROR_SUCCESS))
+        << "the probe's VirtualAlloc or VirtualFree failed with this Windows error before "
+           "allocate()";
+    const probe_clock::time_point begin = probe_clock::now();
+    // The minimum is the planned size itself, so no shrink can hide a slow lock behind a smaller
+    // region.
+    const allocation_outcome outcome = region.allocate(
+        make_options(k_responsiveness_region_bytes, plan.tested_bytes, workers), stop);
+    const probe_clock::time_point end = probe_clock::now();
+    probe.stop();
+    ASSERT_EQ(outcome.status, allocation_status::ok)
+        << status_name(outcome.status) << ": " << outcome.end_detail;
+    EXPECT_EQ(outcome.attempts, 1u);
+    EXPECT_EQ(probe.failure(), static_cast<DWORD>(ERROR_SUCCESS))
+        << "the probe's VirtualAlloc or VirtualFree failed with this Windows error during "
+           "allocate()";
+
+    // Every probe that overlapped allocate(), the ones in flight when it began or returned
+    // included, each measured from its start to its end.
+    std::size_t overlapping = 0;
+    std::size_t completed_inside = 0;
+    probe_clock::duration longest{0};
+    for (const probe_sample& sample : probe.samples()) {
+        if (sample.begin >= end || sample.end <= begin) {
+            continue;
+        }
+        ++overlapping;
+        longest = std::max(longest, sample.end - sample.begin);
+        if (sample.end <= end) {
+            ++completed_inside;
+        }
+    }
+    const probe_clock::duration window = end - begin;
+    const std::int64_t window_us = whole_microseconds(window);
+    const std::int64_t longest_us = whole_microseconds(longest);
+    RecordProperty("workers", workers);
+    RecordProperty("chunks", region.chunks().size());
+    RecordProperty("prepare_us", window_us);
+    RecordProperty("probe_count", overlapping);
+    RecordProperty("probes_completed_inside", completed_inside);
+    RecordProperty("max_probe_latency_us", longest_us);
+    std::printf("[ probe    ] %s: %u workers, %zu chunks, allocate() %.1f ms; %zu probes "
+                "overlapped it, %zu completed inside it, longest %.1f ms\n",
+                responsiveness_case_name(GetParam()), workers, region.chunks().size(),
+                static_cast<double>(window_us) / 1000.0, overlapping, completed_inside,
+                static_cast<double>(longest_us) / 1000.0);
+    std::fflush(stdout);
+
+    EXPECT_LE(longest_us, k_max_probe_latency.count())
+        << "a thread committing 64 KiB waited " << longest_us
+        << " us while allocate() prepared the region; the bound is " << k_max_probe_latency.count()
+        << " us";
+    if (window >= k_min_window_intervals * k_probe_interval) {
+        EXPECT_GE(completed_inside, k_min_probes_inside)
+            << "allocate() ran " << window_us << " us, yet only " << completed_inside << " of "
+            << overlapping << " overlapping probes completed inside it";
+    }
+
+    const std::vector<const void*> bases = chunk_bases(region);
+    EXPECT_EQ(region.release(), plan.tested_bytes);
+    for (const void* base : bases) {
+        expect_freed(base, "after release() of the probed region");
+    }
+    expect_limits_restored(limits_before, "after release() of the probed region");
+}
+
+INSTANTIATE_TEST_SUITE_P(MemoryRegionResponsivenessCases, MemoryRegionResponsiveness,
+                         ::testing::Values(responsiveness_case::one_worker,
+                                           responsiveness_case::every_logical_processor),
+                         [](const ::testing::TestParamInfo<responsiveness_case>& info) {
+                             return std::string(responsiveness_case_name(info.param));
+                         });
 
 /* ---------------------------------------------------------------------------------------------
  * Release on every end reason

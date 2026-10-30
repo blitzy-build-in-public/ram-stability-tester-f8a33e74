@@ -23,8 +23,9 @@ namespace RamQuick.App.Behaviors;
 /// Bounds and the layout come from <see cref="WindowSizing.Compute"/>. They are recomputed when the window's handle
 /// is created (<see cref="Window.SourceInitialized"/>), once the real non-client height can be measured
 /// (<see cref="FrameworkElement.Loaded"/>), after a DPI change (<see cref="Window.DpiChanged"/>), and when
-/// <see cref="Window.LocationChanged"/> finds the window on another monitor. The work area is always that of the
-/// window's own monitor, queried through <see cref="Win32Display.GetWorkArea"/>, never
+/// <see cref="Window.LocationChanged"/> finds the window on another monitor. The last two measure the non-client height
+/// again, because the caption and frame follow the DPI's system metrics rather than a fixed size in DIPs. The work
+/// area is always that of the window's own monitor, queried through <see cref="Win32Display.GetWorkArea"/>, never
 /// <c>SystemParameters.WorkArea</c>, which describes only the primary monitor.
 /// </para>
 /// <para>
@@ -89,8 +90,9 @@ public static class WorkAreaSizing
 
     // Loaded deliberately keeps the estimate when the measured non-client height is within one DIP of it: that gap is
     // rounding or theme noise, not worth a second pass that re-applies the initial and minimum sizes. It is no
-    // guarantee of an identical result: later recomputes keep the estimate too, near the exact 380/280-DIP thresholds
-    // it can select another layout than the measured height would, and one DIP can be two physical pixels at 200 %.
+    // guarantee of an identical result: until a DPI or monitor change measures the height again, near the exact
+    // 380/280-DIP thresholds the estimate can select another layout than the measured height would, and one DIP can
+    // be two physical pixels at 200 %.
     private const double NonClientHeightTolerance = 1;
 
     /// <summary>Gets whether the behavior is attached to an element.</summary>
@@ -312,10 +314,22 @@ public static class WorkAreaSizing
     // then no longer the window's, and the work is dropped.
     private static void RecomputeIfCurrent(Window window, SizingState state, DpiScale dpi, bool applyInitialSize)
     {
-        if (ReferenceEquals(GetState(window), state))
+        if (!ReferenceEquals(GetState(window), state))
         {
-            Recompute(window, state, dpi, applyInitialSize);
+            return;
         }
+
+        // Caption and frame come from per-DPI system metrics rounded to whole pixels, so a non-client height measured
+        // at the old DPI would give a minimum height whose client area misses the fixed rows plus the detail
+        // allowance. This work runs at Loaded priority, after the Render-priority layout pass that follows the new
+        // DPI's rectangle, so it measures the chrome as it now is. Before Loaded, Loaded itself measures; when nothing
+        // can be measured, as with no content or a minimized window, the last value stays.
+        if (state.IsLoaded && TryMeasureNonClientHeight(window, out double nonClientHeight))
+        {
+            state.NonClientHeight = nonClientHeight;
+        }
+
+        Recompute(window, state, dpi, applyInitialSize);
     }
 
     private static void Recompute(Window window, SizingState state, DpiScale dpi, bool applyInitialSize)
@@ -461,7 +475,8 @@ public static class WorkAreaSizing
 
         public nint LastMonitor { get; set; }
 
-        // In DIPs. WPF lays out in DIPs, so it stays valid across DPI changes.
+        // In DIPs, yet tied to the DPI it was measured at: caption and frame follow per-DPI system metrics, not a
+        // fixed DIP size, so the deferred DPI and monitor work measures it again.
         public double NonClientHeight { get; set; }
 
         public bool IsLoaded { get; set; }

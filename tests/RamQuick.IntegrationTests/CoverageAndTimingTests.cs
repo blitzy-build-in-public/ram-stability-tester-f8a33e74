@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows.Threading;
 using RamQuick.App.Services;
@@ -24,7 +25,8 @@ namespace RamQuick.IntegrationTests;
 /// ±10 % of the actual remaining time on every per-second sample whose actual remaining time is at least 10 s (shorter
 /// samples are measured and reported but not gated, the open deviation recorded for the final seconds); run duration,
 /// Running → Completed, within ±15 % of the plan's target; progress at most 1 s apart on the UI thread; a 100 ms
-/// dispatcher probe serviced within 250 ms; and Completed within 2 s of a stop request. Each assertion message carries
+/// dispatcher probe, whose work commits and touches fresh memory as UI work does, serviced within 250 ms from post to
+/// the end of that work, Preparing included; and Completed within 2 s of a stop request. Each assertion message carries
 /// the measured value and its bound, and the tables written to the test output make the margins visible in the TRX
 /// results.
 /// </para>
@@ -227,6 +229,8 @@ public sealed class CoverageAndTimingTests
     // Criterion 7: progress reaches the UI thread at least once a second and the dispatcher stays responsive, through
     // the production controller graph, with and without a stalled journal writer. The beat stall ends inside step 1,
     // because the step gate blocks the coordinator, and with it progress, while it waits for a step acknowledgment.
+    // The probe starts before Start, so it spans Preparing too, and its work commits and touches fresh memory, so it
+    // waits wherever the engine's locking would make the application's own page faults wait.
     [Theory(Timeout = 300_000)]
     [InlineData(false)]
     [InlineData(true)]
@@ -273,6 +277,7 @@ public sealed class CoverageAndTimingTests
             ControllerView view = await ReadControllerAsync(ui, graph);
 
             WriteProbeSummary(probe);
+            WritePreparingProbeSummary(probe, run);
             ProgressGap gap = LargestProgressGap(run);
             _output.WriteLine(Invariant(
                 $"Largest progress gap on the UI thread, Prepared → Completed: {gap.Length.TotalMilliseconds:0} ms after {gap.After} (bound {_maxProgressGap.TotalMilliseconds:0} ms), over {run.Progress.Count} progress events."));
@@ -291,7 +296,7 @@ public sealed class CoverageAndTimingTests
                 Invariant($"The dispatcher serviced {probe.Samples} of {probe.Posted} probe posts (drain completed: {probe.DrainCompleted})."));
             Assert.True(
                 probe.MaxLatency <= _maxProbeLatency,
-                Invariant($"A dispatcher probe waited {probe.MaxLatency.TotalMilliseconds:0.0} ms from post to run; the bound is {_maxProbeLatency.TotalMilliseconds:0} ms."));
+                Invariant($"A dispatcher probe took {probe.MaxLatency.TotalMilliseconds:0.0} ms from post to the end of its work; the bound is {_maxProbeLatency.TotalMilliseconds:0} ms."));
 
             if (storage is not null)
             {
@@ -725,7 +730,17 @@ public sealed class CoverageAndTimingTests
             : latencies[Math.Min(latencies.Length - 1, (int)Math.Ceiling(fraction * latencies.Length) - 1)];
 
         _output.WriteLine(Invariant(
-            $"Dispatcher probe every {ResponsivenessProbe.Interval.TotalMilliseconds:0} ms: {probe.Samples} of {probe.Posted} posts serviced; post → run latency median {Percentile(0.50).TotalMilliseconds:0.0} ms, p99 {Percentile(0.99).TotalMilliseconds:0.0} ms, max {probe.MaxLatency.TotalMilliseconds:0.0} ms (bound {_maxProbeLatency.TotalMilliseconds:0} ms, at least {MinimumProbeSamples} samples)."));
+            $"Dispatcher probe every {ResponsivenessProbe.Interval.TotalMilliseconds:0} ms: {probe.Samples} of {probe.Posted} posts serviced; post → end of work latency median {Percentile(0.50).TotalMilliseconds:0.0} ms, p99 {Percentile(0.99).TotalMilliseconds:0.0} ms, max {probe.MaxLatency.TotalMilliseconds:0.0} ms (bound {_maxProbeLatency.TotalMilliseconds:0} ms, at least {MinimumProbeSamples} samples)."));
+    }
+
+    // Reported, not gated: preparing a 1 GiB region can take less than one probe interval, so no post need fall in it.
+    private void WritePreparingProbeSummary(ResponsivenessProbe probe, InstrumentedRun run)
+    {
+        long preparedAt = run.PreparedAt ?? throw new InvalidOperationException("The run raised no Prepared event.");
+        TimeSpan[] latencies = probe.LatenciesPostedBetween(run.CreatedAt, preparedAt).ToArray();
+        TimeSpan longest = latencies.Length == 0 ? TimeSpan.Zero : latencies.Max();
+        _output.WriteLine(Invariant(
+            $"Dispatcher probe posts during Preparing (session created and started → Prepared receipt, {Stopwatch.GetElapsedTime(run.CreatedAt, preparedAt).TotalMilliseconds:0} ms): {latencies.Length}, longest post → end of work {longest.TotalMilliseconds:0.0} ms (reported, not gated)."));
     }
 
     // The gaps between consecutive UI-thread receipts from Prepared, through every progress event, to Completed.
@@ -1042,7 +1057,9 @@ public sealed class CoverageAndTimingTests
     /// Measures UI-thread responsiveness. A dedicated thread posts a work item to the dispatcher every 100 ms of real
     /// time with <see cref="Dispatcher.BeginInvoke(DispatcherPriority, Delegate)"/> at
     /// <see cref="DispatcherPriority.Normal"/>, the priority at which the dispatcher's synchronization context delivers
-    /// engine events, and each work item records how long it waited from post to run.
+    /// engine events. Each work item does what UI work does when it grows a heap, renders or compiles: it commits fresh
+    /// memory, takes a page fault on it and frees it. It then records how long it took from post to the end of that
+    /// work, so a work item waits both for the dispatcher and for anything that stalls the process's page faults.
     /// </summary>
     /// <remarks>
     /// Every member may be called from any thread. Disposal stops the posting thread and then drains every outstanding
@@ -1050,6 +1067,10 @@ public sealed class CoverageAndTimingTests
     /// </remarks>
     private sealed class ResponsivenessProbe : IAsyncDisposable
     {
+        // Above the process heap's direct-allocation threshold, so the heap serves every work item's block with a
+        // fresh VirtualAlloc rather than with pages it already holds.
+        private const int WorkAllocationBytes = 1024 * 1024;
+
         private static readonly TimeSpan _drainTimeout = TimeSpan.FromSeconds(10);
 
         private readonly Dispatcher _dispatcher;
@@ -1057,7 +1078,7 @@ public sealed class CoverageAndTimingTests
         private readonly ManualResetEventSlim _stopSignal = new(initialState: false);
         private readonly TaskCompletionSource _threadEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly object _sync = new();
-        private readonly List<TimeSpan> _latencies = new();
+        private readonly List<ProbeSample> _samples = new();
         private int _posted;
         private int _disposed;
         private volatile bool _drainCompleted;
@@ -1085,31 +1106,31 @@ public sealed class CoverageAndTimingTests
             {
                 lock (_sync)
                 {
-                    return _latencies.Count;
+                    return _samples.Count;
                 }
             }
         }
 
-        /// <summary>Gets the longest post → run latency so far; zero before the first sample.</summary>
+        /// <summary>Gets the longest post → end of work latency so far; zero before the first sample.</summary>
         public TimeSpan MaxLatency
         {
             get
             {
                 lock (_sync)
                 {
-                    return _latencies.Count == 0 ? TimeSpan.Zero : _latencies.Max();
+                    return _samples.Count == 0 ? TimeSpan.Zero : _samples.Max(sample => sample.Latency);
                 }
             }
         }
 
-        /// <summary>Gets every post → run latency so far, in the order the work items ran.</summary>
+        /// <summary>Gets every post → end of work latency so far, in the order the work items ran.</summary>
         public IReadOnlyList<TimeSpan> Latencies
         {
             get
             {
                 lock (_sync)
                 {
-                    return _latencies.ToArray();
+                    return _samples.Select(sample => sample.Latency).ToArray();
                 }
             }
         }
@@ -1119,6 +1140,24 @@ public sealed class CoverageAndTimingTests
         /// 10 s each.
         /// </summary>
         public bool DrainCompleted => _drainCompleted;
+
+        /// <summary>
+        /// Gets the post → end of work latency of every work item posted from <paramref name="fromTimestamp"/> to
+        /// <paramref name="toTimestamp"/> that has run, in the order the work items ran.
+        /// </summary>
+        /// <param name="fromTimestamp">The <see cref="Stopwatch"/> timestamp at which the window begins.</param>
+        /// <param name="toTimestamp">The <see cref="Stopwatch"/> timestamp at which the window ends.</param>
+        /// <returns>The latencies of the work items posted inside the window.</returns>
+        public IReadOnlyList<TimeSpan> LatenciesPostedBetween(long fromTimestamp, long toTimestamp)
+        {
+            lock (_sync)
+            {
+                return _samples
+                    .Where(sample => sample.PostedAt >= fromTimestamp && sample.PostedAt <= toTimestamp)
+                    .Select(sample => sample.Latency)
+                    .ToArray();
+            }
+        }
 
         /// <summary>Starts probing the dispatcher of <paramref name="ui"/>.</summary>
         /// <param name="ui">The dispatcher thread to probe.</param>
@@ -1188,20 +1227,42 @@ public sealed class CoverageAndTimingTests
             }
         }
 
+        private static void CommitAndTouchFreshMemory()
+        {
+            nint block = Marshal.AllocHGlobal(WorkAllocationBytes);
+            try
+            {
+                Marshal.WriteByte(block, 1);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(block);
+            }
+        }
+
         private void Post()
         {
             long postedAt = Stopwatch.GetTimestamp();
             Interlocked.Increment(ref _posted);
-            _dispatcher.BeginInvoke(DispatcherPriority.Normal, new Action(() => Record(Stopwatch.GetElapsedTime(postedAt))));
+            _dispatcher.BeginInvoke(DispatcherPriority.Normal, new Action(() =>
+            {
+                CommitAndTouchFreshMemory();
+                Record(new ProbeSample(postedAt, Stopwatch.GetElapsedTime(postedAt)));
+            }));
         }
 
-        private void Record(TimeSpan latency)
+        private void Record(ProbeSample sample)
         {
             lock (_sync)
             {
-                _latencies.Add(latency);
+                _samples.Add(sample);
             }
         }
+
+        /// <summary>One work item that has run.</summary>
+        /// <param name="PostedAt">The <see cref="Stopwatch"/> timestamp at which it was posted.</param>
+        /// <param name="Latency">The time from its post to the end of its work.</param>
+        private readonly record struct ProbeSample(long PostedAt, TimeSpan Latency);
     }
 }
 
