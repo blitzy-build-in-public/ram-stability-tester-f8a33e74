@@ -750,7 +750,7 @@ public sealed class LibreHardwareMonitorSmokeCheckTests
         AssertProblems(SmokeReadingsCheck.FirstReadProblems(first), first, cpuProblemExpected, ramProblemExpected);
     }
 
-    // The first case is the one that used to pass: both sensors stop reading after a good first read.
+    // Both sensors losing availability after a good first read must be reported as problems.
     [Theory]
     [InlineData(SensorStatus.Available, 50.0, SensorStatus.Available, 40.0, SensorStatus.Failed, null, SensorStatus.Failed, null, true, true)]
     [InlineData(SensorStatus.Available, 50.0, SensorStatus.Available, 40.0, SensorStatus.Failed, null, SensorStatus.Available, 41.0, true, false)]

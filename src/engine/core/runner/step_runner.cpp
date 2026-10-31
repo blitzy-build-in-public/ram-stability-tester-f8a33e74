@@ -309,8 +309,10 @@ bool phase_worker::fence_flush_fence(const slice_view& slice, phase_kind phase,
         }
     }
     // Second fence: the weakly ordered flushes complete before any later load, so the next
-    // verification of these lines is served from beyond the CPU caches. A stop still gets it,
-    // so the flushes already issued are ordered before the phase is abandoned.
+    // verification of these lines cannot use a copy cached before the flush. A prefetch or
+    // speculative fill after the flush may still satisfy it, with the memory-side contents at
+    // fill time. A stop still gets the fence, so the flushes already issued are ordered before
+    // the phase is abandoned.
     deps_.memory.fence(fence_ctx);
     return flushed;
 }

@@ -414,7 +414,9 @@ void flush_range_clflush(const void* p, std::size_t bytes) noexcept {
  * The re-read rule: the first MFENCE makes earlier stores, streaming ones included, globally
  * visible before the flush; the flush removes any cached copy of the line; the second MFENCE
  * orders the flush before the load. The volatile load cannot be elided, merged or hoisted
- * above the fences, so the value comes from beyond the CPU caches.
+ * above the fences, so it cannot be served by a copy cached before the flush. A prefetch or
+ * speculative fill after the flush may still satisfy it, with the memory-side contents at fill
+ * time.
  */
 std::uint64_t reread_clflushopt(const std::uint64_t* p) noexcept {
     _mm_mfence();

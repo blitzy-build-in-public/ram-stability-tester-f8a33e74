@@ -5,14 +5,21 @@
  *
  * The Windows rules behind the design:
  * - VirtualLock can lock only up to the process's minimum working-set size. allocate()
- *   therefore raises the minimum with SetProcessWorkingSetSizeEx before locking, by the
- *   attempt's region. The minimum is one limit for the whole process, so the raises of regions
- *   alive at once, such as those of concurrent sessions, add up under a process-wide lock: the
- *   minimum is the sum of every live region's raise plus one k_working_set_headroom_bytes, which
- *   for a lone region is its bytes plus the headroom. Raising it needs
- *   SeIncreaseWorkingSetPrivilege, which the default policy grants to Users, so a 1 GiB region
- *   locks without elevation. release() withdraws the region's raise, and the limits in force
- *   before the first raise return once no region holds one.
+ *   therefore raises the minimum with SetProcessWorkingSetSizeEx once per attempt, before the
+ *   attempt's first 4 KiB-page chunk, by the bytes from that chunk to the end of the region;
+ *   the later chunks count because any large-page chunk among them may still fall back.
+ *   Large-page chunks before that one raise nothing: large-page memory is non-pageable and
+ *   outside the working set, so charging it as well would count the same memory twice and could
+ *   itself make large-page allocations fail. An attempt whose chunks are all large pages never
+ *   raises the minimum. The minimum is one limit for the whole process, so the raises of regions
+ *   alive at once, such as those of concurrent sessions, add up under a process-wide lock: while
+ *   any is held, the minimum is the sum of every live region's raise plus one
+ *   k_working_set_headroom_bytes, which for a lone region is its raise plus the headroom: its
+ *   bytes plus the headroom when its first chunk uses 4 KiB pages, less when large-page chunks
+ *   precede the first 4 KiB-page one. Raising it needs SeIncreaseWorkingSetPrivilege, which the
+ *   default policy grants to Users, so a 1 GiB region locks without elevation. release()
+ *   withdraws the region's raise once every chunk is freed, and the limits in force before the
+ *   first raise return once no region holds one.
  * - Large pages (VirtualAlloc with MEM_LARGE_PAGES) need SeLockMemoryPrivilege enabled in the
  *   token. "Lock pages in memory" is assigned to nobody by default, Administrators included, so
  *   large pages are attempted only when the token already holds the privilege. allocate() then
@@ -77,9 +84,9 @@ inline constexpr std::uint64_t k_slice_granularity_bytes = 2 * k_mib;
 inline constexpr std::uint64_t k_chunk_bytes = 256 * k_mib;
 
 /**
- * Working-set headroom, 256 MiB: the minimum working set is raised to the live regions' bytes
- * plus this, once, so the process's own code, stacks and heaps still fit beside the locked
- * pages.
+ * Working-set headroom, 256 MiB: the minimum working set is raised to the sum of the live
+ * regions' raises plus this, once, so the process's own code, stacks and heaps still fit beside
+ * the locked pages.
  */
 inline constexpr std::uint64_t k_working_set_headroom_bytes = 256 * k_mib;
 
@@ -412,21 +419,23 @@ public:
      * size plans tested_bytes equal to it and at least the minimum, so no attempt ever tests
      * fewer bytes than options.min_region_bytes.
      *
-     * Each attempt plans its size with plan_region(), raises the process's minimum working set
-     * by tested_bytes, on top of the raises of the other live regions (so a lone region's
-     * minimum is tested_bytes + k_working_set_headroom_bytes), and then, slice by slice and
-     * chunk by chunk, checks the stop signal, allocates the chunk and locks it. With
+     * Each attempt plans its size with plan_region() and then, slice by slice and chunk by
+     * chunk, checks the stop signal, allocates the chunk and locks it. With
      * options.lock_privilege_held, each chunk is first tried as a large-page allocation, and a
-     * chunk that fails falls back to 4 KiB pages. A 4 KiB-page chunk is faulted in with one
-     * store of zero per page, which leaves its demand-zero contents unchanged, and then locked
-     * with VirtualLock, or with options.lock_override when it is set. A failure to raise the
-     * working set, to allocate a chunk or to lock it releases that attempt's chunks and retries
-     * at next_retry_bytes() of the attempt's size; when that is 0, the call returns
-     * insufficient_memory. When Windows refuses to free a chunk of the failed attempt
-     * (VirtualFree, or options.free_override), no retry is planned over it: the call returns
-     * insufficient_memory naming VirtualFree with its error, and the chunk stays held, with
-     * the working-set raise covering it, for release(). A raised stop returns stopped at once
-     * and leaves what the region holds, the chunks locked so far included, to release() (see
+     * chunk that fails falls back to 4 KiB pages. Immediately before its first 4 KiB-page chunk,
+     * the attempt raises the process's minimum working set by tested_bytes minus that chunk's
+     * logical_offset, on top of the raises of the other live regions, so a lone region whose
+     * chunks all use 4 KiB pages has a minimum of tested_bytes + k_working_set_headroom_bytes.
+     * An attempt whose chunks are all large pages raises nothing. A 4 KiB-page chunk is faulted
+     * in with one store of zero per page, which leaves its demand-zero contents unchanged, and
+     * then locked with VirtualLock, or with options.lock_override when it is set. A failure to
+     * raise the working set, to allocate a chunk or to lock it releases that attempt's chunks and
+     * its working-set raise and retries at next_retry_bytes() of the attempt's size; when that is
+     * 0, the call returns insufficient_memory. When Windows refuses to free a chunk of the failed
+     * attempt (VirtualFree, or options.free_override), no retry is planned over it: the call
+     * returns insufficient_memory naming VirtualFree with its error, and the chunk stays held,
+     * with the working-set raise covering it, for release(). A raised stop returns stopped at
+     * once and leaves what the region holds, the chunks locked so far included, to release() (see
      * allocation_status::stopped).
      *
      * Whatever the region still holds, a stopped call's chunks included, is released first, so

@@ -50,9 +50,13 @@
  * rq_result_message and rq_query_system may be called from any thread. rq_session_stop may be
  * called from any thread at any time, including from inside a callback. Sessions in one process
  * may run concurrently, each on its own coordinator, so callbacks of different sessions may
- * overlap. Each raises the process's minimum working set by its own region while it holds that
- * region, and the limits in force before the first raise return once the last session has
- * released its memory.
+ * overlap. The process has one minimum working set, and VirtualLock can lock 4 KiB pages only up
+ * to it. A session raises it before its first 4 KiB-page chunk, by the bytes from that chunk to
+ * the end of its region; large-page chunks before that one are outside the working set and add
+ * nothing, so a region of large pages alone raises nothing. The raises of concurrent sessions
+ * add up, with one headroom for the process's own pages; each is withdrawn once its session's
+ * memory is freed, and the limits in force before the first raise return once the last is
+ * withdrawn.
  *
  * @par Event order
  * create -> start -> prepared -> (step_starting -> step_finished, with progress* and errors*
@@ -218,7 +222,12 @@ typedef int32_t rq_result;
 
 /* ---------------------------------------------------------------------------------------------
  * Value groups. Each is carried in a uint32_t field; 0 is invalid unless the group lists it.
- * The managed enums in RamQuick.Core use the same numbers.
+ * The managed enums of the same meaning use the same numbers and convert by value: PatternKind,
+ * AccessOrder, ThreadMode, InstructionSet (which has no member for RQ_ISA_AUTO), PageMode,
+ * AddressKind, AccessType and RereadOutcome in RamQuick.Core, and StopReason and
+ * StepGateDecision in RamQuick.Interop. End reasons are the exception: RamQuick.Core's
+ * RunEndReason numbers its members differently, so a host maps each RQ_END_* value to the reason
+ * of the same meaning explicitly, never by a cast (RQ_END_INTERNAL_FAULT is EngineFault).
  * ------------------------------------------------------------------------------------------- */
 
 /**

@@ -254,10 +254,11 @@ constexpr std::uint64_t saturating_add(std::uint64_t a, std::uint64_t b) noexcep
  *
  * VirtualLock is bounded by a single minimum working set per process, so the regions of
  * sessions running at once in one process must share it. Each region adds its contribution,
- * the bytes it is about to lock, and the minimum is the sum of every live contribution plus
- * one k_working_set_headroom_bytes, which for a lone region is its own bytes plus the
- * headroom. Without the sum, each raise would replace the minimum another live region relies
- * on, and the next VirtualLock of either would fail with ERROR_WORKING_SET_QUOTA. The limits in
+ * the bytes from its attempt's first 4 KiB-page chunk to the end of the region (see
+ * memory_region::allocate), and the minimum is the sum of every live contribution plus one
+ * k_working_set_headroom_bytes, which for a lone region is its contribution plus the headroom.
+ * Without the sum, each raise would replace the minimum another live region relies on, and
+ * the next VirtualLock of either would fail with ERROR_WORKING_SET_QUOTA. The limits in
  * force before the first contribution are restored once the last one is withdrawn; they are
  * kept until a restore succeeds, so a failed restore never makes raised limits the baseline.
  *

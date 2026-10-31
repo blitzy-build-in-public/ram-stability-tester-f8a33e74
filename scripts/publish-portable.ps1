@@ -444,8 +444,8 @@ function Test-EngineDependency {
     }
     else {
         $dependencies = @(Get-DumpBinDependency -Line $lines.ToArray())
-        # Every Windows DLL imports at least KERNEL32.dll, so an empty list means the output was
-        # not understood, and the CRT linkage is unverified.
+        # The RAMQuick engine imports KERNEL32.dll for its Win32 calls, so an empty dependency list
+        # means the dumpbin output was not understood and leaves its CRT linkage unverified.
         if ($dependencies.Count -eq 0) {
             $violations.Add('dumpbin /dependents listed no dependency of ramquick_engine.dll, so its C runtime linkage could not be verified.')
         }
