@@ -40,6 +40,13 @@ insert_final_newline = false
 trim_trailing_whitespace = false
 indent_style = unset
 
+# NuGet restore generates every project's lock file without a final newline, and the files are
+# committed byte for byte as restore wrote them, so an editor must not rewrite them.
+[packages.lock.json]
+charset = unset
+insert_final_newline = false
+trim_trailing_whitespace = false
+
 # Native layout is defined by .clang-format, which scripts/build.ps1 checks with
 # clang-format --dry-run --Werror; these keys only keep editors consistent with it.
 # C++ naming is snake_case with the rq_ prefix on every exported symbol. No analyzer checks

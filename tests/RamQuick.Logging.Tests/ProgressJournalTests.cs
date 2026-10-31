@@ -1828,7 +1828,7 @@ public sealed partial class ProgressJournalTests
     [Theory]
     [InlineData("journal folder")]
     [InlineData("data folder")]
-    [InlineData("journal file")]
+    [InlineData("journal file", Traits = ["Requires", "SymbolicLinks"])]
     public void FileJournalStorage_AppendThroughLink_ThrowsAndLeavesTargetUntouched(string linked)
     {
         using var root = new TestDataRoot();
@@ -1879,6 +1879,7 @@ public sealed partial class ProgressJournalTests
     }
 
     [Fact]
+    [Trait("Requires", "SymbolicLinks")]
     public void FileJournalStorage_DeleteJournalFileLink_RemovesLinkOnly()
     {
         using var root = new TestDataRoot();
@@ -2535,7 +2536,10 @@ public sealed partial class ProgressJournalTests
                 1,
                 completed,
                 completed + TimeSpan.FromMilliseconds(50),
-                "Stopped on the first error at step 2 of 6 (\"Random bank thrash\")") with { RunId = JournalSamples.RunIdB },
+                "Stopped on the first error at step 2 of 6 (\"Random bank thrash\")") with
+            {
+                RunId = JournalSamples.RunIdB,
+            },
             ReleasedType => new JournalReleased
             {
                 RunId = JournalSamples.RunIdB,

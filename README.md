@@ -113,7 +113,7 @@ In the `<data>\logs` names, the timestamp is the test's local start time, and `<
 
 The JSON and text summaries are the files meant for sharing, for example to compare attempts: they hold memory-test data and hardware descriptors. The `.log` and `app-errors.log` are local diagnostic logs that can also hold exception messages and stack traces. In them, the data folder is written `<data>`, your folders `%LOCALAPPDATA%`, `%APPDATA%` and `%USERPROFILE%`, and your Windows user name, where it is part of a path, `%USERNAME%`. Inspect them before you share them. Nothing leaves the PC.
 
-**Retention and erasure.** Results and logs do not expire. RAMQuick never deletes, rotates or expires the logs and summaries it saves in `<data>\logs`: they accumulate, one set per test, until you remove them. Nor does it delete the damaged progress journals it keeps in `<data>\journal`; they too accumulate until you remove them. To erase the test data stored on this PC, kept journals included, close RAMQuick and delete its data folder; RAMQuick creates a new, empty one at the next launch. If RAMQuick has run from more than one place, check both locations: `<app folder>\data` beside each copy you ran, and `%LOCALAPPDATA%\RamQuick`. Copies you saved or shared elsewhere are not affected; delete them separately.
+**Retention and erasure.** Results and logs do not expire. RAMQuick never deletes, rotates or expires the logs and summaries it saves in `<data>\logs`: they accumulate, one set per test, until you remove them. Nor does it delete the damaged progress journals it keeps in `<data>\journal`; they too accumulate until you remove them. To erase the test data stored on this PC, kept journals included, close RAMQuick and delete its data folder; RAMQuick creates a new, empty one at the next launch. Once an elevated RAMQuick has protected a data folder, in either location, that folder and the files in it can be deleted only with Administrator rights: File Explorer asks for administrator permission, and from a command line, use one started with **Run as administrator**. If RAMQuick has run from more than one place, check both locations: `<app folder>\data` beside each copy you ran, and `%LOCALAPPDATA%\RamQuick`. Copies you saved or shared elsewhere are not affected; delete them separately.
 
 ## Privacy and safety
 
@@ -208,6 +208,12 @@ Some tests run only where their preconditions hold:
 - The `Requires=Hardware` sensor smoke test needs an elevated process, an installed PawnIO driver and a real sensor, and is skipped otherwise.
 - The large-page test is skipped without `SeLockMemoryPrivilege`.
 - The AVX2 and AVX-512 kernel-equivalence tests are skipped on CPUs that lack those instructions.
+- The protected data-folder tests in `RamQuick.Logging.Tests`, tagged `Requires=Elevation`, need an elevated process and are skipped otherwise. Five of them are also skipped when a folder created in the temporary folder can be changed only by SYSTEM and administrators, because they need one that a standard user could change.
+- In an elevated run, those tests and four other data-folder resolution tests are skipped when the temporary folder lies below a junction or symbolic link: an elevated RAMQuick refuses a data folder below a link that a standard user could change, and the tests do not tell such links apart. Set `TEMP` to a folder reached without links to run them.
+- The file symbolic-link cases of the journal, results-log and crash-recovery tests, tagged `Requires=SymbolicLinks`, need `SeCreateSymbolicLinkPrivilege`, which an elevated administrator holds by default, or Developer Mode, and are skipped otherwise. The junction cases of the journal and results-log tests need no privilege and always run.
+- The missing-volume case of the data-folder pin test is skipped when every drive letter from D to Z is in use.
+
+`scripts\build.ps1` states, for each managed suite, how many tests were skipped and how many of those carry each `Requires` trait. Run it from an elevated PowerShell to include the `Requires=Elevation` and `Requires=SymbolicLinks` tests. To run one class alone, pass its trait to `vstest.console.exe`, for example `/TestCaseFilter:Requires=Elevation`.
 
 ### Publish the portable folder
 

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Publishes RAMQuick as a self-contained portable folder for Windows 10/11 x64 and zips it.
 
@@ -68,8 +68,9 @@
     run before anything was built. Every run the script itself ends closes with a line that
     begins "publish-portable:".
 
-    Compatible with Windows PowerShell 5.1. The source is ASCII-only because Windows
-    PowerShell reads a BOM-less script as ANSI.
+    Compatible with Windows PowerShell 5.1. The source is saved as UTF-8 with a byte order
+    mark, as .editorconfig requires, and stays ASCII-only, because Windows PowerShell 5.1
+    reads a BOM-less script as ANSI.
 #>
 [CmdletBinding()]
 param()

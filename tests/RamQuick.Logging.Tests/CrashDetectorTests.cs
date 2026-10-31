@@ -958,6 +958,7 @@ public sealed class CrashDetectorTests
     }
 
     [Fact]
+    [Trait("Requires", "SymbolicLinks")]
     public async Task Detect_LinkAtFinalJsonName_NeverReadOrReplaced_RecoveredSummaryPublishedAsync()
     {
         using var root = new TestDataRoot();
@@ -1808,7 +1809,11 @@ public sealed class CrashDetectorTests
                 null,
                 StepCount,
                 _completedUtc,
-                _verdictUtc) with { RunId = foreignId, Utc = _verdictUtc },
+                _verdictUtc) with
+            {
+                RunId = foreignId,
+                Utc = _verdictUtc,
+            },
             "stepEnd" => JournalStepEnd.FromOutcome(JournalSamples.Outcome(
                 _steps[1], TimeSpan.FromSeconds(50), 1, JournalSamples.GiB, 0, completed: true)) with
             {
@@ -2004,7 +2009,7 @@ public sealed class CrashDetectorTests
     // otherwise keep.
     [Theory]
     [InlineData("Directory")]
-    [InlineData("SymbolicLink")]
+    [InlineData("SymbolicLink", Traits = ["Requires", "SymbolicLinks"])]
     [InlineData("Oversized")]
     public async Task Detect_FinalJsonNameHeldByFolderLinkOrOversizedFile_PublishesUnderRecoveredNameAsync(string entry)
     {

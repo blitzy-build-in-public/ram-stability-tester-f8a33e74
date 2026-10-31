@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Builds RAMQuick, runs every automated test suite and enforces the quality gates, in one
     command.
@@ -31,8 +31,14 @@
       7. Managed tests         vstest.console.exe over each of the six managed test projects,
                                one step per project, excluding Category=Long unless
                                -IncludeLong is given. A step passes only when its TRX shows at
-                               least one passed test and no failure. Requires=Hardware tests
-                               that skip are allowed.
+                               least one passed test and no failure. Tests that skip where
+                               their precondition is missing are allowed: Requires=Hardware
+                               (elevation, PawnIO and a real sensor), Requires=Elevation (an
+                               elevated process) and Requires=SymbolicLinks
+                               (SeCreateSymbolicLinkPrivilege or Developer Mode). Each step's
+                               detail states how many tests were skipped and how many of those
+                               carry each Requires trait, untagged ones included, so a run that
+                               is not elevated shows what it did not exercise.
       8. Coverage              With -Coverage only: line coverage merged across every suite's
                                Cobertura report and gated per library (see -Coverage).
 
@@ -115,8 +121,9 @@
     printing anything. A caller therefore tells a rejected command line, or -?, from a run of
     the script by the absence of that closing "build:" line, not by the exit code alone.
 
-    Compatible with Windows PowerShell 5.1. The source is ASCII-only because Windows
-    PowerShell reads a BOM-less script as ANSI.
+    Compatible with Windows PowerShell 5.1. The source is saved as UTF-8 with a byte order
+    mark, as .editorconfig requires, and stays ASCII-only, because Windows PowerShell 5.1
+    reads a BOM-less script as ANSI.
 #>
 [CmdletBinding()]
 param(
@@ -219,6 +226,17 @@ function Write-Section {
     Write-Host ('==> {0}' -f $Text) -ForegroundColor Cyan
 }
 
+# The call operator and powershell.exe resolve a command path as a wildcard pattern, so in a
+# checkout such as RAMQuick[dev] an unescaped path can run the same-named file of a sibling
+# folder such as RAMQuickd. The backtick is escaped too, so a folder name containing one still
+# matches only itself. [WildcardPattern]::Escape is not used: Windows PowerShell 5.1 leaves the
+# backtick unescaped, and such a path then names no file at all.
+function ConvertTo-LiteralCommandPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    return ($Path -replace '([`\[\]*?])', '`$1')
+}
+
 # Runs one external tool. Every native call in this script goes through here.
 # Output streams to the console by default; -CaptureTo collects the lines of a small output
 # (versions, paths) instead, and -Quiet discards everything for a re-run whose output has
@@ -244,15 +262,16 @@ function Invoke-NativeTool {
     }
     Write-Verbose ('{0}: "{1}" {2}' -f $StepName, $FilePath, ($ArgumentList -join ' '))
 
+    $commandPath = ConvertTo-LiteralCommandPath -Path $FilePath
     if ($null -ne $CaptureTo) {
-        & $FilePath @ArgumentList | ForEach-Object { $CaptureTo.Add([string]$_) }
+        & $commandPath @ArgumentList | ForEach-Object { $CaptureTo.Add([string]$_) }
     }
     elseif ($Quiet) {
-        & $FilePath @ArgumentList 2>&1 | Out-Null
+        & $commandPath @ArgumentList 2>&1 | Out-Null
     }
     else {
         # Write-Host, not Out-Host: a caller that redirects this script's streams captures it.
-        & $FilePath @ArgumentList | ForEach-Object { Write-Host $_ }
+        & $commandPath @ArgumentList | ForEach-Object { Write-Host $_ }
     }
     return [int]$LASTEXITCODE
 }
@@ -959,7 +978,7 @@ function Invoke-ConstraintsGate {
     $ErrorActionPreference = 'Continue'
     $summaryLines = New-Object 'System.Collections.Generic.List[string]'
     $global:LASTEXITCODE = -1
-    & $scriptPath | ForEach-Object {
+    & (ConvertTo-LiteralCommandPath -Path $scriptPath) | ForEach-Object {
         $text = [string]$_
         Write-Host $text
         if ($text.StartsWith('check-constraints: ')) {
@@ -1057,7 +1076,7 @@ function Invoke-ValidationSelfTest {
 
     # Its own process, because run in-process a parameter-binding failure or a script that only
     # writes non-terminating errors leaves the exit code untouched. Its case lines are required
-    # as well, because a script run with -File can still end with exit code 0 without completing.
+    # as well, because the child can still end with exit code 0 without completing.
     $powerShellPath = Join-Path $PSHOME 'powershell.exe'
     if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
         $powerShellPath = Join-Path $PSHOME 'pwsh.exe'
@@ -1066,12 +1085,18 @@ function Invoke-ValidationSelfTest {
         throw ('Neither powershell.exe nor pwsh.exe was found in {0}, so the self-test cannot run in its own process.' -f $PSHOME)
     }
 
+    # -Command, not -File, because -File cannot take a wildcard-escaped path. The catch prints a
+    # terminating error and ends with exit code 1, as -File does; without it a parameter-binding
+    # failure would end -Command with exit code 0.
+    $literalScriptPath = [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent((ConvertTo-LiteralCommandPath -Path $scriptPath))
+    $command = 'try {{ & ''{0}'' -SelfTest }} catch {{ [Console]::Error.Write(($_ | Out-String)); exit 1 }}; exit $LASTEXITCODE' -f $literalScriptPath
+
     # The caller's effective policy keeps the child under exactly this script's policy, never a
     # weaker one.
     $arguments = @(
         '-NoLogo', '-NoProfile', '-NonInteractive',
         '-ExecutionPolicy', [string](Get-ExecutionPolicy),
-        '-File', $scriptPath, '-SelfTest'
+        '-Command', $command
     )
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $code = Invoke-NativeTool -FilePath $powerShellPath -ArgumentList $arguments -StepName 'Validation self-test' -CaptureTo $lines
@@ -1306,6 +1331,83 @@ function Get-TrxCounter {
     return $result
 }
 
+# Reads the skipped tests of a VSTest TRX report and the Requires traits they carry, so that a
+# step states what its run did not exercise. The TRX logger records a skipped xUnit test as a
+# result with outcome NotExecuted and counts it in total only. Each such result is joined by its
+# testId to the Requires properties of its test definition. A test with several Requires values
+# counts once under each, so the trait counts can add up to more than the skipped count; a test
+# with none counts as untagged. Text is "skipped <n>", followed, when n is not zero, by the
+# per-trait counts in ordinal order and the untagged count, for example
+# "skipped 3 (Requires=Elevation 2, untagged 1)".
+function Get-TrxSkipSummary {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $name = [System.IO.Path]::GetFileName($Path)
+    try {
+        try {
+            $document = Get-XmlDocument -Path $Path
+        }
+        catch {
+            throw ('it could not be read as XML ({0})' -f $_.Exception.GetBaseException().Message)
+        }
+        $root = $document.SelectSingleNode("/*[local-name()='TestRun']")
+        if ($null -eq $root) {
+            throw ('its root element is {0}, not TestRun' -f $document.DocumentElement.LocalName)
+        }
+
+        $requiresByTestId = @{}
+        foreach ($definition in $root.SelectNodes("*[local-name()='TestDefinitions']/*[local-name()='UnitTest'][@id]")) {
+            $values = New-Object 'System.Collections.Generic.SortedSet[string]' ([System.StringComparer]::Ordinal)
+            foreach ($property in $definition.SelectNodes("*[local-name()='Properties']/*[local-name()='Property'][@Key='Requires']")) {
+                $value = $property.GetAttribute('Value').Trim()
+                if ($value.Length -gt 0) {
+                    $null = $values.Add($value)
+                }
+            }
+            $requiresByTestId[$definition.GetAttribute('id')] = $values
+        }
+
+        $skipped = 0
+        $untagged = 0
+        $traitCounts = New-Object 'System.Collections.Generic.SortedDictionary[string,int]' ([System.StringComparer]::Ordinal)
+        foreach ($testResult in $root.SelectNodes("*[local-name()='Results']/*[local-name()='UnitTestResult'][@outcome='NotExecuted']")) {
+            $testId = $testResult.GetAttribute('testId')
+            if (-not $requiresByTestId.ContainsKey($testId)) {
+                # A skip whose traits cannot be told is a reason to reject the report, never one to guess at.
+                throw ('the skipped result "{0}" names no test definition' -f $testResult.GetAttribute('testName'))
+            }
+            $skipped++
+            $values = $requiresByTestId[$testId]
+            if ($values.Count -eq 0) {
+                $untagged++
+            }
+            foreach ($value in $values) {
+                $count = 0
+                $null = $traitCounts.TryGetValue($value, [ref]$count)
+                $traitCounts[$value] = $count + 1
+            }
+        }
+    }
+    catch {
+        throw ('{0} has no readable skipped results: {1}' -f $name, $_.Exception.Message)
+    }
+
+    $parts = @($traitCounts.Keys | ForEach-Object { 'Requires={0} {1}' -f $_, $traitCounts[$_] })
+    if ($untagged -gt 0) {
+        $parts += 'untagged {0}' -f $untagged
+    }
+    $text = 'skipped {0}' -f $skipped
+    if ($parts.Count -gt 0) {
+        $text += ' ({0})' -f ($parts -join ', ')
+    }
+    return [pscustomobject]@{
+        Skipped  = $skipped
+        Untagged = $untagged
+        ByTrait  = $traitCounts
+        Text     = $text
+    }
+}
+
 
 # Runs one managed test project with vstest.console.exe from the Visual Studio installation.
 #
@@ -1340,8 +1442,9 @@ function Invoke-ManagedTest {
         throw ('{0} was not built: {1} is missing.' -f $projectName, $assembly)
     }
 
-    # Tests tagged Requires=Hardware skip themselves at run time, so no filter is needed for
-    # them, and the integration tests lock at most 1 GiB, which needs no elevation.
+    # Tests tagged Requires=Hardware, Requires=Elevation or Requires=SymbolicLinks skip themselves
+    # at run time where their precondition is missing, so no filter is needed for them, and the
+    # integration tests lock at most 1 GiB, which needs no elevation.
     $trxName = '{0}.trx' -f $projectName
     $testArguments = @(
         $assembly, '/Platform:x64',
@@ -1359,15 +1462,21 @@ function Invoke-ManagedTest {
 
     # Exit code 0 alone proves nothing: vstest.console.exe also exits 0 when discovery or the
     # test case filter yields no test. The verdict therefore needs valid TRX counters that show
-    # at least one passed test. Requires=Hardware tests that skip (not executed) stay allowed.
+    # at least one passed test. Tests that skip (not executed), such as the Requires=Hardware,
+    # Requires=Elevation and Requires=SymbolicLinks ones, stay allowed; the detail states how many
+    # skipped and how many of those carry each Requires trait.
     $trxPath = Join-Path $TestResultsDir $trxName
     $trxWritten = Test-Path -LiteralPath $trxPath -PathType Leaf
     $counters = $null
     $detail = 'no TRX report was written'
     if ($trxWritten) {
         try {
-            $counters = Get-TrxCounter -Path $trxPath
-            $detail = 'total {0}, passed {1}, failed {2}, not executed {3}' -f $counters.Total, $counters.Passed, $counters.Failed, $counters.NotExecuted
+            # The counters count only once the skipped results are read as well, so a report whose
+            # skips cannot be told apart is rejected like one without valid counters.
+            $read = Get-TrxCounter -Path $trxPath
+            $skips = Get-TrxSkipSummary -Path $trxPath
+            $detail = 'total {0}, passed {1}, failed {2}, not executed {3}, {4}' -f $read.Total, $read.Passed, $read.Failed, $read.NotExecuted, $skips.Text
+            $counters = $read
         }
         catch {
             $detail = $_.Exception.Message

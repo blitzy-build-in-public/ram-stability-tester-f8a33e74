@@ -186,7 +186,8 @@ internal sealed class TestDataRoot : IDisposable
     /// <summary>
     /// Creates a file symbolic link at <paramref name="link"/> pointing to <paramref name="target"/>,
     /// which may not exist, or skips the test when this host refuses symbolic links (they need
-    /// <c>SeCreateSymbolicLinkPrivilege</c> or Developer Mode).
+    /// <c>SeCreateSymbolicLinkPrivilege</c> or Developer Mode). Callers tag the test, or the data row
+    /// that reaches this call, <c>Requires=SymbolicLinks</c>, so such a skip can be seen and selected.
     /// </summary>
     public static void CreateFileSymbolicLinkOrSkip(string link, string target)
     {
@@ -738,7 +739,7 @@ public sealed class DataDirectoryTests
 
     [Theory]
     [InlineData("data", false)]
-    [InlineData("data", true)]
+    [InlineData("data", true, Traits = ["Requires", "Elevation"])]
     [InlineData(@"data\journal", false)]
     [InlineData(@"data\logs", false)]
     public void Resolve_AppDataTreeFolderIsJunction_FallsBackToLocalAppDataAndLeavesTargetUntouched(
@@ -853,6 +854,7 @@ public sealed class DataDirectoryTests
     }
 
     [Fact]
+    [Trait("Requires", "Elevation")]
     public void Resolve_Elevated_MissingRoot_CreatesProtectedRootAndSubfolders()
     {
         Assert.SkipUnless(Environment.IsPrivilegedProcess, ElevationRequired);
@@ -878,6 +880,7 @@ public sealed class DataDirectoryTests
     }
 
     [Theory]
+    [Trait("Requires", "Elevation")]
     [InlineData(false, false)]
     [InlineData(true, false)]
     [InlineData(false, true)]
@@ -908,6 +911,7 @@ public sealed class DataDirectoryTests
     }
 
     [Theory]
+    [Trait("Requires", "Elevation")]
     [InlineData("earlier.txt", false)]
     [InlineData(@"logs\RamQuick-earlier-summary.json", false)]
     [InlineData(@"other\file.txt", false)]
@@ -959,6 +963,7 @@ public sealed class DataDirectoryTests
     }
 
     [Fact]
+    [Trait("Requires", "Elevation")]
     public void CanWrite_Elevated_ProtectedRootSwappedForUserFolder_RefusesProbeAndWrites()
     {
         Assert.SkipUnless(Environment.IsPrivilegedProcess, ElevationRequired);
@@ -994,6 +999,7 @@ public sealed class DataDirectoryTests
     }
 
     [Theory]
+    [Trait("Requires", "Elevation")]
     [InlineData("app", false)]
     [InlineData("app", true)]
     [InlineData("local", false)]
@@ -1049,6 +1055,7 @@ public sealed class DataDirectoryTests
     }
 
     [Fact]
+    [Trait("Requires", "Elevation")]
     public void CanWrite_Elevated_AncestorReplacedByUserJunction_RefusesProbeAndWrites()
     {
         Assert.SkipUnless(Environment.IsPrivilegedProcess, ElevationRequired);
@@ -1081,6 +1088,7 @@ public sealed class DataDirectoryTests
     }
 
     [Theory]
+    [Trait("Requires", "Elevation")]
     [InlineData("plain target")]
     [InlineData("target below a user junction")]
     [InlineData("missing target")]
@@ -1134,6 +1142,7 @@ public sealed class DataDirectoryTests
     }
 
     [Theory]
+    [Trait("Requires", "Elevation")]
     [InlineData("query reports another folder")]
     [InlineData("no query")]
     [InlineData("no opener")]
@@ -1278,6 +1287,7 @@ public sealed class DataDirectoryTests
     }
 
     [Theory]
+    [Trait("Requires", "Elevation")]
     [InlineData("app", "app", false, false)]
     [InlineData("app", "app", true, false)]
     [InlineData(@"outer\app", "outer", false, false)]
@@ -1359,6 +1369,7 @@ public sealed class DataDirectoryTests
     }
 
     [Fact]
+    [Trait("Requires", "Elevation")]
     public void Resolve_Elevated_PristineRootTakeover_AppFolderCannotBeSwappedUntilTheNewRootIsPinned()
     {
         Assert.SkipUnless(Environment.IsPrivilegedProcess, ElevationRequired);

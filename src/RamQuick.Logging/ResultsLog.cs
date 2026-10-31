@@ -70,8 +70,9 @@ public sealed record SummaryPublishResult(bool Succeeded, string? JsonPath, stri
 /// the engine's own first-error stop with Stop on error on, adding <c>time_into_test_ms</c>, the decision's test
 /// time on the engine clock that <c>COMPLETED elapsed_ms</c> uses. It is logged when the controller learns of that
 /// stop, from the error report or at Completed, and only when that stop ended the run; reported before any request,
-/// it is the run's only stop line. <c>scripts/Summarize-ValidationRuns.ps1</c> reads the first
-/// <c>STOP_REQUESTED</c>: the stop-to-Completed latency is the difference of its and <c>COMPLETED</c>'s timestamps.
+/// it is the run's only stop line. <c>scripts/Summarize-ValidationRuns.ps1</c> reads every <c>STOP_REQUESTED</c>
+/// line: a requested stop's latency is the difference of its and <c>COMPLETED</c>'s timestamps, and an
+/// engine-decided stop's is <c>COMPLETED elapsed_ms</c> minus its <c>time_into_test_ms</c>.
 /// </para>
 /// <para>
 /// <b>app-errors.log</b>: per exception, an <c>APP_ERROR source="…"</c> header, with <c>run_id=</c> while a run is

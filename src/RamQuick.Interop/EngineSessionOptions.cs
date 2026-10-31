@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.ObjectModel;
 using System.Text.Unicode;
 using RamQuick.Core;
 
@@ -103,8 +104,8 @@ public delegate void CallbackFaultSink(string callbackName, Exception exception)
 
 /// <summary>
 /// The configuration of one engine session: the region to test, the workers, the plan's steps, and the hooks the
-/// coordinator calls synchronously. <c>IEngine.CreateSession</c> validates it with <see cref="Validate"/> and marshals
-/// it into <c>rq_session_config</c> and <c>rq_step_def[]</c>.
+/// coordinator calls synchronously. <c>IEngine.CreateSession</c> validates it as <see cref="Validate"/> does and
+/// marshals it into <c>rq_session_config</c> and <c>rq_step_def[]</c>.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -115,8 +116,9 @@ public delegate void CallbackFaultSink(string callbackName, Exception exception)
 /// native reaches it, and its handle's finalizer destroys the native session and releases its memory.
 /// </para>
 /// <para>
-/// <b>Validation.</b> <see cref="Validate"/> reports programming errors as exceptions before any native call, and the
-/// session copies <see cref="Steps"/> once validated, so later changes to the caller's list never reach it. Rules that
+/// <b>Validation.</b> <see cref="Validate"/> reports programming errors as exceptions before any native call. The
+/// session reads <see cref="Steps"/> once into its own copy and validates that copy, so the steps it marshals are the
+/// steps it checked, and changes to the caller's list, during creation or after it, never reach it. Rules that
 /// depend on the machine, such as a worker count above the logical processor count or a forced instruction set the CPU
 /// lacks, are left to <c>rq_session_create</c>, whose <c>RQ_E_INVALID_ARGUMENT</c> surfaces as
 /// <see cref="ArgumentException"/>.
@@ -268,6 +270,30 @@ public sealed class EngineSessionOptions
     /// </exception>
     public void Validate()
     {
+        // The same single read of Steps a session takes, so the verdict is on one consistent list even when the
+        // caller's list changes while it is read.
+        _ = ValidateAndCopySteps();
+    }
+
+    /// <summary>
+    /// Checks every option as <see cref="Validate"/> does and returns the steps it checked: a copy of
+    /// <see cref="Steps"/> made by reading the caller's list once. <c>EngineSession</c> keeps and marshals this copy.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Steps"/> holds the caller's list by reference, and another thread, or a list whose count or elements
+    /// are unstable, can change what a second read returns. The copy is therefore taken before any step rule runs, from
+    /// one <see cref="IReadOnlyCollection{T}.Count"/> read and exactly that many indexer reads, and the rules run over
+    /// the copy, so the steps a session marshals and reports are the steps that were checked.
+    /// </remarks>
+    /// <returns>The checked steps, immutable and independent of the caller's list.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// An option is out of range, as for <see cref="Validate"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// <see cref="Steps"/> or one of its steps is invalid, as for <see cref="Validate"/>.
+    /// </exception>
+    internal ReadOnlyCollection<StepAttributes> ValidateAndCopySteps()
+    {
         ArgumentOutOfRangeException.ThrowIfZero(MinRegionBytes);
         ArgumentOutOfRangeException.ThrowIfLessThan(RegionBytes, MinRegionBytes);
         ArgumentOutOfRangeException.ThrowIfLessThan(WorkerCount, 1);
@@ -289,31 +315,50 @@ public sealed class EngineSessionOptions
                 $"{nameof(IsaOverride)} must be null or a defined {nameof(InstructionSet)}.");
         }
 
-        ValidateSteps();
+        StepAttributes[] steps = CopySteps();
+        ValidateSteps(steps);
+        return Array.AsReadOnly(steps);
     }
 
-    private void ValidateSteps()
+    // Reads the caller's list exactly once. The count is read a single time and bounds everything after it, and the
+    // copy is filled by indexer rather than enumeration, so a list that grows while it is read still yields a copy of
+    // the size that was checked.
+    private StepAttributes[] CopySteps()
     {
         // Steps is declared non-nullable, but an initializer can still assign null under a suppression or from code
         // without nullable analysis; it must fail here as an argument error, not later as a NullReferenceException.
+        // A list reporting a negative count holds no steps either.
         IReadOnlyList<StepAttributes>? steps = Steps;
-        if (steps is null || steps.Count == 0)
+        int count = steps?.Count ?? 0;
+        if (steps is null || count < 1)
         {
             throw new ArgumentException("A session needs at least one step.", nameof(Steps));
         }
 
-        // Decided from the count alone, before any element is read: the session copies and marshals every step it
-        // accepts, so an oversized list must fail here rather than after that work, at the engine's own limit.
-        if (steps.Count > MaxStepCount)
+        // Decided from the count alone, before any element is read or the copy is allocated: the session copies and
+        // marshals every step it accepts, so an oversized list must fail here rather than after that work, at the
+        // engine's own limit.
+        if (count > MaxStepCount)
         {
             throw new ArgumentException(
-                $"{nameof(Steps)} holds {steps.Count} steps; a session holds at most {MaxStepCount}, "
+                $"{nameof(Steps)} holds {count} steps; a session holds at most {MaxStepCount}, "
                 + "the engine's limit.",
                 nameof(Steps));
         }
 
+        var copy = new StepAttributes[count];
+        for (int i = 0; i < copy.Length; i++)
+        {
+            copy[i] = steps[i];
+        }
+
+        return copy;
+    }
+
+    private static void ValidateSteps(StepAttributes[] steps)
+    {
         Span<byte> nameScratch = stackalloc byte[MaxStepNameBytes];
-        for (int i = 0; i < steps.Count; i++)
+        for (int i = 0; i < steps.Length; i++)
         {
             StepAttributes? step = steps[i];
             if (step is null)

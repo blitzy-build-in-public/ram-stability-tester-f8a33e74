@@ -1100,8 +1100,8 @@ public sealed partial class ResultsLogTests
     }
 
     [Theory]
-    [InlineData("file link")]
-    [InlineData("dangling file link")]
+    [InlineData("file link", Traits = ["Requires", "SymbolicLinks"])]
+    [InlineData("dangling file link", Traits = ["Requires", "SymbolicLinks"])]
     [InlineData("junction")]
     public void PublishFile_LinkAtTempName_RemovesOnlyTheLinkAndPublishes(string planted)
     {
@@ -2226,7 +2226,7 @@ public sealed partial class ResultsLogTests
 
     [Theory]
     [InlineData(false)]
-    [InlineData(true)]
+    [InlineData(true, Traits = ["Requires", "SymbolicLinks"])]
     public void TryAppendAppError_ThroughLink_ReturnsFalseAndWritesNothingToTarget(bool fileLink)
     {
         using var root = new TestDataRoot();

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Aggregates the validation-PC runs of RAMQuick and of the baseline tools into the markdown tables
     of docs/METHODOLOGY.md, applying the censoring, interval and decision rules of the validation
@@ -15,6 +15,11 @@
         is observed; a PASS or ABORTED run on the failing profile is right-censored at its
         timeToVerdictSeconds and counts as a miss. A FAIL without a verdict time (a run recovered
         from an unfinished journal) is excluded from the medians and still counts as a miss.
+      - Criterion 1 counts only runs with Stop on error on (run.stopOnError true) of the
+        full-length production plan of their type (see criteria 2, 5 and 6 below). A run with Stop
+        on error off, Stop on error not recorded, or another plan is listed with its reason and
+        excluded from the medians and counts, so a type with fewer than 10 counted runs is
+        indeterminate in its 9-of-10 check unless two misses already make it not met.
       - A baseline run with no error by 120 min, or written "> t", is right-censored; any value
         above 120 is censored at 120; censored = 1 with a smaller value is censored at that value.
       - The baseline evidence is complete only with Karhu RAM Test (default settings), TestMem5
@@ -28,8 +33,14 @@
       - Time remaining is gated on every PROGRESS sample after step 1: remaining_ms = -1
         ("calculating") is allowed only during step 1, so a sample after it without an estimate
         counts as outside +-10 %.
-      - The five Stop trials are the STOP_REQUESTED events with reason UserStop. Thermal and
-        host-fault stops are requested by RAMQuick itself; they are reported, never counted.
+      - Every STOP_REQUESTED line of a .log is read; a run logs at most two. The five Stop trials
+        are those with reason UserStop, each timed from its stamp (Stop pressed) to COMPLETED's.
+        Thermal and host-fault stops, requested by RAMQuick itself and timed the same way, and
+        the engine's own FirstError stop are reported, never counted. A FirstError line is
+        stamped only when RAMQuick learns of the stop, so it is timed from the decision to
+        Completed on the engine clock, COMPLETED elapsed_ms minus its time_into_test_ms; one
+        without those values keeps the timestamp difference, labelled as measured from
+        RAMQuick's notice of the stop, which understates the interval.
       - A median is reported as an interval [L, U]: L puts every censored run at its censoring time,
         U puts it at +infinity. An even count averages the two middle values at each bound. No
         Kaplan-Meier estimate, confidence interval or significance test is computed.
@@ -71,8 +82,10 @@
                                                     full-length clean run
         ### Criterion 7: UI behaviour and stop latency
                                                     stop-request to Completed latency per user Stop
-                                                    trial, stops RAMQuick requested itself and
-                                                    memory release time (both reported only)
+                                                    trial, by timestamps; reported only: stops
+                                                    RAMQuick requested itself, by timestamps,
+                                                    engine FirstError stops, decision to Completed
+                                                    on the engine clock, and memory release time
         ### Stress-bound measurement               whole-run statistics against the reference
                                                     workloads, the verdict, and per-step statistics
     A section whose inputs were not supplied reads "_not supplied_", except the stress-bound
@@ -90,7 +103,9 @@
     Folder of RAMQuick runs on the failing profile (criterion 1): ten interleaved runs each of
     Quick, Standard and Exhaustive with Stop on error on. Every *-summary.json in the folder (not
     recursive, *-recovered-summary.json included, *.tmp ignored) is read together with the .log of
-    the same base name.
+    the same base name. A run with Stop on error off, Stop on error not recorded, or a plan other
+    than the full-length production plan of its type is not criterion-1 evidence: it is listed
+    below the per-run table with its reason and excluded from criterion 1's medians and counts.
 
     Supplied evidence that cannot be used stops the script rather than being left out, because
     leaving a run out could let the rest meet a criterion. Each summary must be a schema-1 RAMQuick
@@ -100,7 +115,9 @@
     <base>-summary.json that fails them beside a <base>-recovered-summary.json: crash recovery
     publishes the rebuilt summary under that name, so the failing file is skipped with a warning.
     In the .log, a PREPARED, STEP_START, STEP_END, PROGRESS, STOP_REQUESTED or COMPLETED line that
-    does not parse or lacks a field this script reads is an input error naming the file and line.
+    does not parse, or lacks or damages a field this script reads, is an input error naming the
+    file and line; STOP_REQUESTED time_into_test_ms and COMPLETED elapsed_ms may be absent but are
+    judged where present.
     A last line without a line terminator, a write cut short by a crash, is ignored with a warning.
     A missing .log leaves the checks that need it indeterminate.
 
@@ -200,7 +217,8 @@
     reads errors.records: error detail may be capped or absent, so only run.verdict, the run.*
     timing fields and steps[].errors are used.
 
-    Compatible with Windows PowerShell 5.1. The source is ASCII-only because Windows PowerShell
+    Compatible with Windows PowerShell 5.1. The source is saved as UTF-8 with a byte order
+    mark, as .editorconfig requires, and stays ASCII-only, because Windows PowerShell 5.1
     reads a BOM-less script as ANSI; non-ASCII output characters are built from [char] codes.
 #>
 [CmdletBinding(DefaultParameterSetName = 'Summarize')]
@@ -349,6 +367,9 @@ $StopTrialsRequired = 5
 # The STOP_REQUESTED reason a Stop press logs. Only those requests are trials of the Stop procedure:
 # Thermal and HostFault stops are requested by RAMQuick itself, so they say nothing about Stop.
 $UserStopReason = 'UserStop'
+# The STOP_REQUESTED reason of the engine's own stop at the first error with Stop on error on: no
+# trial either, and stamped only when RAMQuick learns of it, so it is timed on the engine clock.
+$FirstErrorReason = 'FirstError'
 
 # Stress bound: 10-s rolling means over 1-s samples; HWiNFO polling must be 1 s +- 10 %, by the
 # median interval and for at least 90 % of the intervals. A window, like any measured interval,
@@ -909,7 +930,10 @@ function Get-RunLogRecordProblem {
     # Pure. A repeated key of any name is one: which of its values the product wrote cannot be told.
     # Beyond that, only the fields the readers consume are judged: the step number that places
     # STEP_START, STEP_END and PROGRESS, the step name, the PROGRESS values of the time-remaining
-    # gate, the stop reason and the end reason. PREPARED is used only for its timestamp.
+    # gate, the stop reason and the end reason. PREPARED is used only for its timestamp. The two
+    # values that time an engine-decided stop, STOP_REQUESTED time_into_test_ms and COMPLETED
+    # elapsed_ms, are judged wherever they appear: only an engine-decided stop's line carries the
+    # first, so neither can be required, but a damaged one would misstate that stop's latency.
     param([Parameter(Mandatory = $true)][object]$Record)
 
     $problems = New-Object 'System.Collections.Generic.List[string]'
@@ -925,13 +949,25 @@ function Get-RunLogRecordProblem {
         }
     }
     $rules = @()
+    $optionalRules = @()
     switch -CaseSensitive ($eventName) {
         'STEP_START' { $rules = @(, @('name', 'Text')) }
         'PROGRESS' { $rules = @(@('elapsed_ms', 'Count'), @('remaining_ms', 'Remaining'), @('coverage', 'Percent'), @('errors', 'Count')) }
-        'STOP_REQUESTED' { $rules = @(, @('reason', 'Text')) }
-        'COMPLETED' { $rules = @(, @('end_reason', 'EndReason')) }
+        'STOP_REQUESTED' {
+            $rules = @(, @('reason', 'Text'))
+            $optionalRules = @(, @('time_into_test_ms', 'Count'))
+        }
+        'COMPLETED' {
+            $rules = @(, @('end_reason', 'EndReason'))
+            $optionalRules = @(, @('elapsed_ms', 'Count'))
+        }
     }
     foreach ($rule in $rules) {
+        $problem = Get-LogFieldProblem -Fields $fields -Name $rule[0] -Kind $rule[1]
+        if ($null -ne $problem) { $problems.Add($problem) }
+    }
+    foreach ($rule in $optionalRules) {
+        if (-not $fields.ContainsKey($rule[0])) { continue }
         $problem = Get-LogFieldProblem -Fields $fields -Name $rule[0] -Kind $rule[1]
         if ($null -ne $problem) { $problems.Add($problem) }
     }
@@ -961,13 +997,17 @@ function Import-TextLine {
 
 function ConvertFrom-RunLogText {
     # The events of the lines of one .log this script uses: PREPARED, STEP_START/STEP_END (step
-    # windows), PROGRESS (time-remaining samples), and the first STOP_REQUESTED and COMPLETED, with
-    # Exists $true. Pure, so whole logs can be checked in memory; -Path only labels messages, and
+    # windows), PROGRESS (time-remaining samples), every STOP_REQUESTED in log order
+    # (StopRequests) and the first COMPLETED, with Exists $true. Every stop line is kept because a
+    # run can log two: the controller's first request and, when the engine had already stopped on
+    # the first error, the engine's own FirstError stop, which the first alone would hide. Pure,
+    # so whole logs can be checked in memory; -Path only labels messages, and
     # -Terminated says whether the text ended with a line terminator. A line of one of those events
     # (as Get-RunLogLineEvent judges it, so a damaged, missing or fused timestamp, or an event fused
     # to its first key, does not hide one) that does not parse, whose event token is not exactly
-    # that event, that repeats a key, or that lacks a field its readers use, is supplied evidence
-    # that cannot be used and throws "<path>:<line>: <EVENT>: <problem>" rather than being dropped.
+    # that event, that repeats a key, or that lacks or damages a field its readers use
+    # (Get-RunLogRecordProblem), is supplied evidence that cannot be used and throws
+    # "<path>:<line>: <EVENT>: <problem>" rather than being dropped.
     # Lines of every other event are not parsed.
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -982,7 +1022,7 @@ function ConvertFrom-RunLogText {
         StepStarts    = (New-Object 'System.Collections.Generic.List[object]')
         StepEnds      = (New-Object 'System.Collections.Generic.List[object]')
         Progress      = (New-Object 'System.Collections.Generic.List[object]')
-        StopRequested = $null
+        StopRequests  = (New-Object 'System.Collections.Generic.List[object]')
         Completed     = $null
     }
     $lineCount = $Lines.Count
@@ -1008,7 +1048,7 @@ function ConvertFrom-RunLogText {
             'STEP_START' { $log.StepStarts.Add($record) }
             'STEP_END' { $log.StepEnds.Add($record) }
             'PROGRESS' { $log.Progress.Add((ConvertFrom-ProgressRecord -Record $record)) }
-            'STOP_REQUESTED' { if ($null -eq $log.StopRequested) { $log.StopRequested = $record } }
+            'STOP_REQUESTED' { $log.StopRequests.Add($record) }
             'COMPLETED' { if ($null -eq $log.Completed) { $log.Completed = $record } }
         }
     }
@@ -1088,12 +1128,13 @@ function Import-JsonDocument {
 # The schema-1 summary fields this script reads, with the rule each must meet (see
 # Get-JsonFieldProblem). Types and nullability follow RunSummary.cs; nulls are legitimate where a
 # recovered Unfinished summary carries them for values its journal never captured, such as the plan
-# targets and the coverage of a run whose plan was lost. RunSummary.cs also lets such a summary hold a
-# null run.id or run.testType; this script still requires both, because a run it cannot identify can
-# neither be counted under its type nor left out (see -FailingProfileRuns).
+# targets, the coverage of a run whose plan was lost and run.stopOnError. RunSummary.cs also lets such
+# a summary hold a null run.id or run.testType; this script still requires both, because a run it
+# cannot identify can neither be counted under its type nor left out (see -FailingProfileRuns).
 $SummaryFieldRules = @(
     @{ Section = 'run'; Name = 'id'; Kind = 'RunId' }
     @{ Section = 'run'; Name = 'testType'; Kind = 'Name'; Allowed = $TestTypes }
+    @{ Section = 'run'; Name = 'stopOnError'; Kind = 'OptionalFlag' }
     @{ Section = 'run'; Name = 'verdict'; Kind = 'Name'; Allowed = $Verdicts }
     @{ Section = 'run'; Name = 'endReason'; Kind = 'Name'; Allowed = $RunEndReasons }
     @{ Section = 'run'; Name = 'startRequestedUtc'; Kind = 'Timestamp' }
@@ -1342,6 +1383,7 @@ function ConvertFrom-RunSummaryDocument {
         Ordinal               = 0
         Id                    = (Get-JsonString $Document 'run.id')
         TestType              = (Get-JsonString $Document 'run.testType')
+        StopOnError           = (Get-JsonBool $Document 'run.stopOnError')
         Verdict               = (Get-JsonString $Document 'run.verdict')
         EndReason             = (Get-JsonString $Document 'run.endReason')
         StartRequestedUtc     = (ConvertFrom-JsonTimestamp (Get-JsonValue $Document 'run.startRequestedUtc'))
@@ -2891,7 +2933,10 @@ function Get-Criterion1Result {
     # Criterion 1 from the failing-profile runs and the fastest baseline median. While the baseline
     # evidence has gaps (Get-BaselineEvidenceGap), B is not established, so every "at least 5x
     # faster" check stays indeterminate, never met or not met; its ratio interval is still shown and
-    # the gaps are returned as BaselineGaps.
+    # the gaps are returned as BaselineGaps. A run that is not criterion-1 evidence
+    # (Get-FailingProfileIneligibility) is not a row: it is listed in Ineligible with the reason and
+    # stays out of the medians and counts, so a type left with fewer than 10 runs is decided by the
+    # too-few-runs rule of Get-WithinFiveMinutesDecision.
     param(
         [AllowEmptyCollection()][object[]]$Runs,
         [AllowNull()][object]$Fastest,
@@ -2899,8 +2944,14 @@ function Get-Criterion1Result {
     )
 
     $runRows = New-Object 'System.Collections.Generic.List[object]'
+    $ineligible = New-Object 'System.Collections.Generic.List[object]'
     foreach ($run in @($Runs)) {
         if ($TestTypes -notcontains [string]$run.TestType) { continue }
+        $reason = Get-FailingProfileIneligibility -Run $run
+        if ($null -ne $reason) {
+            $ineligible.Add([pscustomobject]@{ Run = $run; Reason = $reason })
+            continue
+        }
         $observation = Get-FailTimeObservation -Run $run
         if ($observation.Kind -ceq 'excluded') {
             Write-Warning ('{0} ({1}) has no verdict time; it is excluded from the medians and counted as a miss.' -f (Format-RunLabel $run), $run.FileName)
@@ -2947,6 +2998,7 @@ function Get-Criterion1Result {
     if ($null -ne $Fastest -and $null -ne $Fastest.DecidingTool) { $decidingTool = $Fastest.DecidingTool }
     return [pscustomobject]@{
         RunRows      = $runRows.ToArray()
+        Ineligible   = $ineligible.ToArray()
         Types        = $types.ToArray()
         Overall      = (Get-OverallDecision -Decisions $checks.ToArray())
         DecidingTool = $decidingTool
@@ -2995,6 +3047,21 @@ function Get-FullLengthIneligibility {
         }
     }
     return $null
+}
+
+function Get-FailingProfileIneligibility {
+    # $null when a failing-profile run is criterion-1 evidence; otherwise the reason it is not.
+    # Criterion 1 is defined over runs with Stop on error on: a run with it off keeps testing past
+    # its first error and reports FAIL only at the plan's end, so its time to verdict measures the
+    # plan length, not how fast the plan finds the error. A run that did not record the setting
+    # cannot be shown to be one. The plan must be the full-length production plan of its type, as
+    # for criteria 2, 5 and 6, because a scaled plan reaches each step sooner than the plan
+    # under test does.
+    param([Parameter(Mandatory = $true)][object]$Run)
+
+    if ($null -eq $Run.StopOnError) { return 'run.stopOnError is not recorded; criterion 1 counts only runs with Stop on error on' }
+    if ($Run.StopOnError -ne $true) { return 'run.stopOnError is false; criterion 1 counts only runs with Stop on error on' }
+    return (Get-FullLengthIneligibility -Run $Run)
 }
 
 function Get-Criterion2Result {
@@ -3108,11 +3175,23 @@ function Get-CleanRunResult {
 }
 
 function Get-StopLatencyResult {
-    # Criterion 7: stop request to Completed for every clean run whose .log has a STOP_REQUESTED
-    # event, and the release time of every clean run (reported, not gated). Only user Stop requests
-    # are Trials and decide the check; a stop RAMQuick requested itself (Thermal, HostFault) or one
-    # without a logged reason is returned in OtherStops, reported only, so it can never stand in
-    # for a Stop press.
+    # Criterion 7: stop to Completed for every STOP_REQUESTED line of every clean run's .log, and
+    # the release time of every clean run (reported, not gated). Only user Stop requests are Trials
+    # and decide the check; every other line (a Thermal or HostFault stop RAMQuick requested itself,
+    # the engine's own FirstError stop, or a line without a logged reason) is returned in
+    # OtherStops, reported only, so it can never stand in for a Stop press. Clock says how Latency
+    # was measured, because the two kinds of line are stamped at different moments:
+    #   Request  a requested stop is stamped when it is made, so the latency is the difference of
+    #            its and COMPLETED's timestamps.
+    #   Engine   an engine-decided stop is stamped only when RAMQuick learns of it, at the error
+    #            report or at Completed with COMPLETED's stamp, so a timestamp difference would
+    #            understate the interval, down to 0. Its time_into_test_ms is the decision's test
+    #            time on the clock of COMPLETED elapsed_ms, so the latency is elapsed_ms minus it.
+    #   Notice   an engine-decided stop (time_into_test_ms or reason FirstError) without both of
+    #            those values keeps the timestamp difference, which starts at RAMQuick's notice and
+    #            so understates the interval.
+    # StopPoint is read at PointUtc: the line's stamp, or for an Engine stop the decision's
+    # estimated time, Completed's stamp less the latency, because the notice can come later.
     param([Parameter(Mandatory = $true)][object[]]$Profiles)
 
     $trials = New-Object 'System.Collections.Generic.List[object]'
@@ -3122,24 +3201,47 @@ function Get-StopLatencyResult {
         foreach ($run in @($cleanProfile.Runs)) {
             if ($null -eq $run) { continue }
             $releases.Add($run)
-            $stop = $run.Log.StopRequested
-            if ($null -eq $stop) { continue }
             $completedUtc = $null
-            if ($null -ne $run.Log.Completed) { $completedUtc = $run.Log.Completed.Utc }
-            $latency = Get-SecondsBetween -From $stop.Utc -To $completedUtc
-            $within = $null
-            if ($null -ne $latency) { $within = ($latency -le $StopLatencyLimitSeconds) }
-            $item = [pscustomobject]@{
-                Run          = $run
-                Reason       = $stop.Fields['reason']
-                StopPoint    = (Get-StopPoint -Run $run -StopUtc $stop.Utc)
-                StopUtc      = $stop.Utc
-                CompletedUtc = $completedUtc
-                Latency      = $latency
-                Within       = $within
+            $elapsedMs = $null
+            if ($null -ne $run.Log.Completed) {
+                $completedUtc = $run.Log.Completed.Utc
+                $elapsedMs = ConvertFrom-InvariantNumber $run.Log.Completed.Fields['elapsed_ms']
             }
-            if ([string]$stop.Fields['reason'] -ceq $UserStopReason) { $trials.Add($item) }
-            else { $otherStops.Add($item) }
+            # Enumerated directly: Windows PowerShell 5.1 cannot wrap a List held in a property in @().
+            foreach ($stop in $run.Log.StopRequests) {
+                $reason = $stop.Fields['reason']
+                $decidedMs = ConvertFrom-InvariantNumber $stop.Fields['time_into_test_ms']
+                $latency = Get-SecondsBetween -From $stop.Utc -To $completedUtc
+                $pointUtc = $stop.Utc
+                if ($null -ne $decidedMs -and $null -ne $elapsedMs) {
+                    $clock = 'Engine'
+                    $latency = ($elapsedMs - $decidedMs) / 1000.0
+                    $pointUtc = ([DateTimeOffset]$completedUtc).AddSeconds(-$latency)
+                }
+                elseif ($null -ne $decidedMs -or [string]$reason -ceq $FirstErrorReason) { $clock = 'Notice' }
+                else { $clock = 'Request' }
+                $within = $null
+                if ($null -ne $latency) { $within = ($latency -le $StopLatencyLimitSeconds) }
+                $decidedSeconds = $null
+                if ($null -ne $decidedMs) { $decidedSeconds = $decidedMs / 1000.0 }
+                $elapsedSeconds = $null
+                if ($null -ne $elapsedMs) { $elapsedSeconds = $elapsedMs / 1000.0 }
+                $item = [pscustomobject]@{
+                    Run            = $run
+                    Reason         = $reason
+                    Clock          = $clock
+                    StopPoint      = (Get-StopPoint -Run $run -StopUtc $pointUtc)
+                    PointUtc       = $pointUtc
+                    StopUtc        = $stop.Utc
+                    CompletedUtc   = $completedUtc
+                    DecidedSeconds = $decidedSeconds
+                    ElapsedSeconds = $elapsedSeconds
+                    Latency        = $latency
+                    Within         = $within
+                }
+                if ([string]$reason -ceq $UserStopReason) { $trials.Add($item) }
+                else { $otherStops.Add($item) }
+            }
         }
     }
 
@@ -3333,8 +3435,13 @@ function Write-Criterion1Section {
         if ($null -ne $run.FirstErrorStep) { $step = ('{0} ({1})' -f $run.FirstErrorStep.Index, $run.FirstErrorStep.Name) }
         $rows.Add([object[]]@($run.TestType, [string]$run.Ordinal, $run.Verdict, $time, (Format-Number $run.FirstErrorSeconds 1), $step, $flag))
     }
-    if ($rows.Count -eq 0) { $Lines.Add('_no Quick, Standard or Exhaustive summary found_') }
-    else { Write-TableLines -Lines $Lines -Header $Headers.Criterion1Runs -Rows $rows.ToArray() }
+    if ($rows.Count -gt 0) { Write-TableLines -Lines $Lines -Header $Headers.Criterion1Runs -Rows $rows.ToArray() }
+    elseif (@($Result.Ineligible).Count -gt 0) { $Lines.Add('_no Quick, Standard or Exhaustive run is criterion-1 evidence_') }
+    else { $Lines.Add('_no Quick, Standard or Exhaustive summary found_') }
+    foreach ($excluded in @($Result.Ineligible)) {
+        $Lines.Add('')
+        $Lines.Add(('Note: {0} ({1}) is not criterion-1 evidence ({2}), so it is not counted in the medians or the counts.' -f (Format-RunLabel $excluded.Run), $excluded.Run.FileName, $excluded.Reason))
+    }
     $Lines.Add('')
 
     $Lines.Add($Headings.Criterion1Checks)
@@ -3519,14 +3626,25 @@ function Write-Criterion7Section {
     else { Write-TableLines -Lines $Lines -Header $Headers.StopLatency -Rows $rows.ToArray() }
     $Lines.Add('')
     $Lines.Add(('Stop-latency check: {0} (five trials are required, one during Preparing and one during a hold step, each completed within 2 s of the stop request).' -f $Result.Decision))
+    $Lines.Add('')
+    $Lines.Add('A user Stop trial is read from the controller''s request line (STOP_REQUESTED reason=UserStop, stamped when Stop was pressed) to COMPLETED; when the engine had already stopped on the first error, that run''s FirstError line is reported separately, timed from the decision to Completed on the engine clock (COMPLETED elapsed_ms minus time_into_test_ms).')
     if (@($Result.OtherStops).Count -gt 0) {
         $Lines.Add('')
         $Lines.Add('Stops requested by RAMQuick itself are not Stop trials and are reported only:')
         foreach ($item in $Result.OtherStops) {
             $reason = [string]$item.Reason
             if ([string]::IsNullOrEmpty($reason)) { $reason = 'reason not logged' }
-            $Lines.Add(('- {0}, {1}: {2}, stop request {3}, Completed {4}, latency {5} s' -f (Format-RunLabel $item.Run), $reason, $item.StopPoint,
-                    (Format-Timestamp $item.StopUtc), (Format-Timestamp $item.CompletedUtc), (Format-Number $item.Latency 2)))
+            # Test times to the millisecond the .log holds, so the two values and their difference agree.
+            if ($item.Clock -ceq 'Engine') {
+                $Lines.Add(('- {0}, {1}: {2}, decided at {3} s of test time, Completed at {4} s, decision to Completed {5} s (COMPLETED elapsed_ms minus time_into_test_ms; logged {6}, when RAMQuick learned of it)' -f
+                        (Format-RunLabel $item.Run), $reason, $item.StopPoint, (Format-Number $item.DecidedSeconds 3), (Format-Number $item.ElapsedSeconds 3),
+                        (Format-Number $item.Latency 2), (Format-Timestamp $item.StopUtc)))
+                continue
+            }
+            $bullet = ('- {0}, {1}: {2}, stop request {3}, Completed {4}, latency {5} s' -f (Format-RunLabel $item.Run), $reason, $item.StopPoint,
+                (Format-Timestamp $item.StopUtc), (Format-Timestamp $item.CompletedUtc), (Format-Number $item.Latency 2))
+            if ($item.Clock -ceq 'Notice') { $bullet += ', measured from RAMQuick''s notice of the stop, which understates the interval' }
+            $Lines.Add($bullet)
         }
     }
     $Lines.Add('')
@@ -3968,11 +4086,23 @@ function Get-TestRun {
 }
 
 function Get-TestFailingProfileRun {
-    # A synthetic failing-profile run of one type, as far as Get-Criterion1Result reads it.
-    param([string]$Type, [string]$Verdict, [AllowNull()][object]$Seconds, [int]$Ordinal)
+    # A synthetic failing-profile run of one type, as far as Get-Criterion1Result and
+    # Write-Criterion1Section read it; by default criterion-1 evidence: Stop on error on, the
+    # full-length plan of its type, and a FAIL's coverage short of the target.
+    param(
+        [string]$Type,
+        [string]$Verdict,
+        [AllowNull()][object]$Seconds,
+        [int]$Ordinal,
+        [AllowNull()][object]$StopOnError = $true,
+        [AllowNull()][object]$TargetSeconds = $FullLengthPlans[$Type].Seconds,
+        [AllowNull()][object]$CoverageTargetPercent = $FullLengthPlans[$Type].CoveragePercent
+    )
 
     return [pscustomobject]@{
-        TestType = $Type; Verdict = $Verdict; TimeToVerdictSeconds = $Seconds
+        TestType = $Type; Verdict = $Verdict; TimeToVerdictSeconds = $Seconds; StopOnError = $StopOnError
+        FirstErrorSeconds = $null; FirstErrorStep = $null
+        TargetSeconds = $TargetSeconds; CoveragePercent = 10.0; CoverageTargetPercent = $CoverageTargetPercent; CoverageTargetReached = $false
         FileName = ('{0}-{1}.summary.json' -f $Type, $Ordinal); Profile = 'failing'; Ordinal = $Ordinal
     }
 }
@@ -4118,6 +4248,8 @@ function Get-TestStopRun {
     # A synthetic clean-profile Quick run with one STOP_REQUESTED, as far as the stop-latency rules
     # read it. Step 1 has no hold and step 2 holds 5 s; 'mid' stops in step 1, 'hold' in step 2 and
     # 'Preparing' before PREPARED. An empty Reason leaves the reason field out of the stop record.
+    # COMPLETED carries elapsed_ms, as every COMPLETED line does: the engine's test time from
+    # Running, 0 for a run stopped while preparing.
     param(
         [Parameter(Mandatory = $true)][int]$Ordinal,
         [AllowEmptyString()][string]$Reason,
@@ -4145,6 +4277,8 @@ function Get-TestStopRun {
     $stopFields = @{}
     if (-not [string]::IsNullOrEmpty($Reason)) { $stopFields['reason'] = $Reason }
     $completedUtc = $stopUtc.AddSeconds($LatencySeconds)
+    $elapsedMs = 0
+    if ($null -ne $startedUtc) { $elapsedMs = [long][Math]::Round(($completedUtc - $startedUtc).TotalMilliseconds) }
 
     return [pscustomobject]@{
         TestType          = 'Quick'
@@ -4165,8 +4299,8 @@ function Get-TestStopRun {
             Prepared      = $prepared
             StepStarts    = $stepStarts.ToArray()
             StepEnds      = $stepEnds.ToArray()
-            StopRequested = [pscustomobject]@{ Utc = $stopUtc; Fields = $stopFields }
-            Completed     = [pscustomobject]@{ Utc = $completedUtc }
+            StopRequests  = @([pscustomobject]@{ Utc = $stopUtc; Fields = $stopFields })
+            Completed     = [pscustomobject]@{ Utc = $completedUtc; Fields = @{ elapsed_ms = $elapsedMs.ToString($Invariant) } }
         }
     }
 }
@@ -4367,6 +4501,67 @@ function Invoke-SelfTest {
         }
         Assert-Equal $nonDefaultResult.Overall 'indeterminate' 'Karhu non-default settings: overall'
         Assert-Equal (@($nonDefaultResult.BaselineGaps) -join ' | ') 'Karhu RAM Test runs use configuration "Non-default settings", not default settings.' 'Karhu non-default settings: gap carried'
+    }
+
+    $cases['criterion 1: Stop-on-error-off and scaled runs are listed, not counted'] = {
+        $offsets = @{ Quick = 60; Standard = 50; Exhaustive = 40 }
+        $conforming = @(foreach ($i in 1..10) {
+                foreach ($type in $TestTypes) { Get-TestFailingProfileRun -Type $type -Verdict 'FAIL' -Seconds ($offsets[$type] + $i) -Ordinal $i }
+            })
+        # A Stop-on-error-off run FAILs only at the plan end; an unrecorded setting and a scaled plan
+        # are both fast, so counting any of them would move the Quick interval or its counts.
+        $extras = @(
+            (Get-TestFailingProfileRun -Type 'Quick' -Verdict 'FAIL' -Seconds 306.5 -Ordinal 11 -StopOnError $false)
+            (Get-TestFailingProfileRun -Type 'Quick' -Verdict 'FAIL' -Seconds 40 -Ordinal 12 -StopOnError $null)
+            (Get-TestFailingProfileRun -Type 'Quick' -Verdict 'FAIL' -Seconds 25 -Ordinal 13 -TargetSeconds 30.0 -CoverageTargetPercent 20.0)
+        )
+        $expectedReasons = @(
+            'run.stopOnError is false; criterion 1 counts only runs with Stop on error on'
+            'run.stopOnError is not recorded; criterion 1 counts only runs with Stop on error on'
+            'plan.targetSeconds is 30 s, not the 300 s of the full-length Quick plan'
+        )
+        $reference = Get-Criterion1Result -Runs $conforming -Fastest $null -BaselineGaps @()
+        $mixed = Get-Criterion1Result -Runs ($conforming + $extras) -Fastest $null -BaselineGaps @()
+        Assert-Equal -Actual @($mixed.RunRows).Count -Expected 30 -What 'conforming runs are rows'
+        Assert-Equal -Actual @($mixed.Ineligible).Count -Expected 3 -What 'ineligible runs listed'
+        for ($i = 0; $i -lt 3; $i++) {
+            Assert-Equal -Actual $mixed.Ineligible[$i].Run.Ordinal -Expected (11 + $i) -What ('ineligible run {0}' -f $i)
+            Assert-Equal -Actual $mixed.Ineligible[$i].Reason -Expected $expectedReasons[$i] -What ('reason for Quick #{0}' -f (11 + $i))
+        }
+        for ($t = 0; $t -lt $TestTypes.Count; $t++) {
+            $entry = $mixed.Types[$t]
+            $expected = $reference.Types[$t]
+            Assert-Equal -Actual $entry.Within.N -Expected 10 -What ($entry.Type + ': runs counted')
+            Assert-Equal -Actual $entry.Within.K -Expected 10 -What ($entry.Type + ': FAIL within 300 s')
+            Assert-Equal -Actual $entry.Within.Decision -Expected 'met' -What ($entry.Type + ': within 5 minutes')
+            Assert-Near -Actual $entry.Interval.L -Expected $expected.Interval.L -What ($entry.Type + ': L unchanged by the listed runs')
+            Assert-Near -Actual $entry.Interval.U -Expected $expected.Interval.U -What ($entry.Type + ': U unchanged by the listed runs')
+            Assert-Equal -Actual $entry.NoLater -Expected $expected.NoLater -What ($entry.Type + ': no-later decision unchanged')
+        }
+        Assert-Near -Actual $mixed.Types[0].Interval.L -Expected 65.5 -What 'Quick L of the ten conforming runs'
+        Assert-Equal -Actual $mixed.Types[1].NoLater -Expected 'met' -What 'Standard no later than Quick'
+
+        $lines = New-Object 'System.Collections.Generic.List[string]'
+        Write-Criterion1Section -Lines $lines -Result $mixed
+        for ($i = 0; $i -lt 3; $i++) {
+            $note = 'Note: Quick (failing #{0}) (Quick-{0}.summary.json) is not criterion-1 evidence ({1}), so it is not counted in the medians or the counts.' -f (11 + $i), $expectedReasons[$i]
+            Assert-True -Condition ($lines.Contains($note)) -What ('note line for Quick #{0}' -f (11 + $i))
+            Assert-Equal -Actual @($lines | Where-Object { $_ -clike ('| Quick | {0} |*' -f (11 + $i)) }).Count -Expected 0 -What ('Quick #{0} is not a per-run row' -f (11 + $i))
+        }
+        Assert-True -Condition ($lines.Contains(('| Quick | 10 | 10 of 10 | [65.5, 65.5] | {0} | met | indeterminate | {0} |' -f [char]0x2014))) -What 'Quick fail-fast row'
+
+        # Eight conforming Quick runs: the two Stop-on-error-off misses do not complete the ten.
+        $short = @($conforming | Where-Object { -not ($_.TestType -ceq 'Quick' -and $_.Ordinal -ge 9) }) + $extras + @(
+            (Get-TestFailingProfileRun -Type 'Quick' -Verdict 'FAIL' -Seconds 306.5 -Ordinal 14 -StopOnError $false))
+        $eight = Get-Criterion1Result -Runs $short -Fastest $null -BaselineGaps @()
+        Assert-Equal -Actual $eight.Types[0].Within.N -Expected 8 -What 'eight conforming Quick runs counted'
+        Assert-Equal -Actual $eight.Types[0].Within.Decision -Expected 'indeterminate' -What 'eight conforming Quick runs: within 5 minutes'
+        Assert-True -Condition ($eight.Overall -cne 'met') -What 'eight conforming Quick runs: overall never met'
+        Assert-Equal -Actual @($eight.Ineligible).Count -Expected 4 -What 'eight conforming Quick runs: ineligible listed'
+
+        $lines = New-Object 'System.Collections.Generic.List[string]'
+        Write-Criterion1Section -Lines $lines -Result (Get-Criterion1Result -Runs $extras -Fastest $null -BaselineGaps @())
+        Assert-True -Condition ($lines.Contains('_no Quick, Standard or Exhaustive run is criterion-1 evidence_')) -What 'only ineligible runs'
     }
 
     $cases['ratio: at least 5x faster against B = 720 s'] = {
@@ -5013,6 +5208,104 @@ function Invoke-SelfTest {
         Assert-Equal $notMet.Decision 'not met' 'a user Stop completed 2.5 s after the request'
     }
 
+    $cases['criterion 7: both stop lines are read and engine first-error stops are timed on the engine clock'] = {
+        $label = 'synthetic.log'
+        $prepared = ' PREPARED tested_bytes=1073741824 workers=16 page_mode=Standard isa=AVX2 address_kind=virtual prepare_ms=5000'
+        $sweep = ' STEP_START step=1/2 name="Sweep"'
+        # Run 6: the engine stopped itself at 50.000 s of test time and RAMQuick learned of it only at
+        # Completed (51.250 s), so the stop line carries COMPLETED's stamp and only the engine clock
+        # shows the interval.
+        $engineLines = [string[]]@(
+            ('2026-11-14T06:00:05.000Z' + $prepared)
+            ('2026-11-14T06:00:05.000Z' + $sweep)
+            '2026-11-14T06:00:56.250Z STOP_REQUESTED reason=FirstError time_into_test_ms=50000'
+            '2026-11-14T06:00:56.250Z COMPLETED end_reason=FirstError total_errors=1 verified_bytes=1073741824 elapsed_ms=51250 first_error_ms=50000 detail=""'
+        )
+        # Run 7: a FirstError line logged at Completed without the decision's test time.
+        $noticeLines = [string[]]@(
+            ('2026-11-14T07:00:05.000Z' + $prepared)
+            ('2026-11-14T07:00:05.000Z' + $sweep)
+            '2026-11-14T07:00:40.600Z STOP_REQUESTED reason=FirstError'
+            '2026-11-14T07:00:40.600Z COMPLETED end_reason=FirstError total_errors=1 verified_bytes=1073741824 elapsed_ms=35600 first_error_ms=-1 detail=""'
+        )
+        # Run 8: Stop pressed after the engine had already stopped on the first error at 49.000 s.
+        $bothLines = [string[]]@(
+            ('2026-11-14T08:00:05.000Z' + $prepared)
+            ('2026-11-14T08:00:05.000Z' + $sweep)
+            '2026-11-14T08:00:54.500Z STOP_REQUESTED reason=UserStop'
+            '2026-11-14T08:00:54.900Z STOP_REQUESTED reason=FirstError time_into_test_ms=49000'
+            '2026-11-14T08:00:54.900Z COMPLETED end_reason=FirstError total_errors=1 verified_bytes=1073741824 elapsed_ms=49900 first_error_ms=49000 detail=""'
+        )
+        $bothLog = ConvertFrom-RunLogText -Path $label -Lines $bothLines -Terminated $true
+        Assert-Equal $bothLog.StopRequests.Count 2 'both STOP_REQUESTED lines are kept'
+        Assert-Equal $bothLog.StopRequests[0].Fields['reason'] 'UserStop' 'the controller''s request first'
+        Assert-Equal $bothLog.StopRequests[1].Fields['reason'] 'FirstError' 'the engine''s stop second'
+
+        $engineRun = Get-TestStopRun -Ordinal 6 -Reason 'FirstError' -StopPoint 'mid' -LatencySeconds 0
+        $engineRun.Log = ConvertFrom-RunLogText -Path $label -Lines $engineLines -Terminated $true
+        $noticeRun = Get-TestStopRun -Ordinal 7 -Reason 'FirstError' -StopPoint 'mid' -LatencySeconds 0
+        $noticeRun.Log = ConvertFrom-RunLogText -Path $label -Lines $noticeLines -Terminated $true
+        $bothRun = Get-TestStopRun -Ordinal 8 -Reason 'UserStop' -StopPoint 'mid' -LatencySeconds 0
+        $bothRun.Log = $bothLog
+        $result = Get-StopLatencyResult -Profiles @([pscustomobject]@{ Display = 'Known-passing'; Runs = @($engineRun, $noticeRun, $bothRun) })
+        Assert-Equal @($result.Trials).Count 1 'only the UserStop line is a trial'
+        Assert-Equal $result.Decision 'indeterminate' 'one trial of five'
+        Assert-Equal $result.Trials[0].Clock 'Request' 'a user Stop is timed from its stamp'
+        Assert-Near $result.Trials[0].Latency 0.4 'user Stop latency of the two-line run'
+        Assert-Equal @($result.OtherStops).Count 3 'every FirstError line is reported'
+        $engine = $result.OtherStops[0]
+        Assert-Equal $engine.Clock 'Engine' 'a FirstError line with time_into_test_ms'
+        Assert-Near $engine.Latency 1.25 'COMPLETED elapsed_ms minus time_into_test_ms'
+        Assert-Equal (Format-Timestamp $engine.PointUtc) '2026-11-14T06:00:55.000Z' 'stop point read at the decision''s estimated time'
+        Assert-Equal $engine.StopPoint 'step 1 (Sweep)' 'engine stop point'
+        Assert-Equal $result.OtherStops[1].Clock 'Notice' 'a FirstError line without time_into_test_ms'
+        Assert-Near $result.OtherStops[1].Latency 0 'timed from RAMQuick''s notice'
+        Assert-Equal $result.OtherStops[2].Clock 'Engine' 'the FirstError line of the two-line run'
+        Assert-Near $result.OtherStops[2].Latency 0.9 'FirstError latency of the two-line run'
+
+        $lines = New-Object 'System.Collections.Generic.List[string]'
+        Write-Criterion7Section -Lines $lines -Result $result
+        Assert-True ($lines.Contains('| 1: Quick (known-passing #8), UserStop | step 1 (Sweep) | 2026-11-14T08:00:54.500Z | 2026-11-14T08:00:54.900Z | 0.40 | yes |')) 'user Stop trial row of the two-line run'
+        Assert-True ($lines.Contains('- Quick (known-passing #6), FirstError: step 1 (Sweep), decided at 50.000 s of test time, Completed at 51.250 s, decision to Completed 1.25 s (COMPLETED elapsed_ms minus time_into_test_ms; logged 2026-11-14T06:00:56.250Z, when RAMQuick learned of it)')) 'engine-clock bullet'
+        Assert-True ($lines.Contains('- Quick (known-passing #7), FirstError: step 1 (Sweep), stop request 2026-11-14T07:00:40.600Z, Completed 2026-11-14T07:00:40.600Z, latency 0.00 s, measured from RAMQuick''s notice of the stop, which understates the interval')) 'notice bullet'
+        Assert-True ($lines.Contains('- Quick (known-passing #8), FirstError: step 1 (Sweep), decided at 49.000 s of test time, Completed at 49.900 s, decision to Completed 0.90 s (COMPLETED elapsed_ms minus time_into_test_ms; logged 2026-11-14T08:00:54.900Z, when RAMQuick learned of it)')) 'two-line run FirstError bullet'
+        Assert-Equal @($lines | Where-Object { $_ -clike 'A user Stop trial is read from the controller''s request line *' }).Count 1 'which stop line is used'
+
+        # Without COMPLETED elapsed_ms the engine clock is unknown, so the stamp difference is kept.
+        $noElapsedRun = Get-TestStopRun -Ordinal 6 -Reason 'FirstError' -StopPoint 'mid' -LatencySeconds 0
+        $noElapsedRun.Log = ConvertFrom-RunLogText -Path $label -Terminated $true `
+            -Lines ([string[]]@($engineLines[0], $engineLines[1], $engineLines[2], '2026-11-14T06:00:56.250Z COMPLETED end_reason=FirstError total_errors=1'))
+        $noElapsed = Get-StopLatencyResult -Profiles @([pscustomobject]@{ Display = 'Known-passing'; Runs = @($noElapsedRun) })
+        Assert-Equal $noElapsed.OtherStops[0].Clock 'Notice' 'time_into_test_ms without COMPLETED elapsed_ms'
+
+        # A slow engine stop is reported, never gated.
+        $midRuns = @(foreach ($ordinal in 1..3) { Get-TestStopRun -Ordinal $ordinal -Reason 'UserStop' -StopPoint 'mid' -LatencySeconds 0.8 })
+        $userHold = Get-TestStopRun -Ordinal 4 -Reason 'UserStop' -StopPoint 'hold' -LatencySeconds 0.8
+        $userPreparing = Get-TestStopRun -Ordinal 5 -Reason 'UserStop' -StopPoint 'Preparing' -LatencySeconds 0.8
+        $slowEngineRun = Get-TestStopRun -Ordinal 6 -Reason 'FirstError' -StopPoint 'mid' -LatencySeconds 0
+        $slowEngineRun.Log = ConvertFrom-RunLogText -Path $label -Terminated $true `
+            -Lines ([string[]]@($engineLines[0], $engineLines[1], '2026-11-14T06:00:56.250Z STOP_REQUESTED reason=FirstError time_into_test_ms=47000', $engineLines[3]))
+        $withSlowEngine = Get-StopLatencyResult -Profiles @([pscustomobject]@{ Display = 'Known-passing'; Runs = ($midRuns + @($userHold, $userPreparing, $slowEngineRun)) })
+        Assert-Near $withSlowEngine.OtherStops[0].Latency 4.25 'slow engine stop latency'
+        Assert-Equal $withSlowEngine.Decision 'met' 'a 4.25 s engine stop is reported, not gated'
+
+        # A damaged stop-timing value is an input error naming the file and line.
+        $damagedStop = [string[]]$engineLines.Clone()
+        $damagedStop[2] = '2026-11-14T06:00:56.250Z STOP_REQUESTED reason=FirstError time_into_test_ms=abc'
+        $damagedCompleted = [string[]]$engineLines.Clone()
+        $damagedCompleted[3] = '2026-11-14T06:00:56.250Z COMPLETED end_reason=FirstError total_errors=1 verified_bytes=1073741824 elapsed_ms=-5 first_error_ms=50000 detail=""'
+        $damaged = @(
+            @{ Lines = $damagedStop; Expected = 'synthetic.log:3: STOP_REQUESTED: time_into_test_ms=abc is not a whole number >= 0' }
+            @{ Lines = $damagedCompleted; Expected = 'synthetic.log:4: COMPLETED: elapsed_ms=-5 is not a whole number >= 0' }
+        )
+        foreach ($case in $damaged) {
+            $message = $null
+            try { [void](ConvertFrom-RunLogText -Path $label -Lines $case.Lines -Terminated $true) }
+            catch { $message = $_.Exception.Message }
+            Assert-Equal -Actual $message -Expected $case.Expected -What 'damaged stop-timing value'
+        }
+    }
+
     $cases['json access: ConvertFrom-Json and JavaScriptSerializer shapes'] = {
         $json = '{"schemaVersion":1,"run":{"verdict":"FAIL","timeToVerdictSeconds":95.5,"firstErrorSeconds":null,"recovered":false,"startRequestedUtc":"2026-10-28T14:00:00.250Z"},"steps":[{"index":1,"errors":0},{"index":2,"errors":3}]}'
         $fromCmdlet = $json | ConvertFrom-Json
@@ -5055,6 +5348,7 @@ function Invoke-SelfTest {
         # An Unfinished recovery: FAIL, PreviousRunUnfinished, null for what the journal never captured.
         $recovered = $text
         $edits = [ordered]@{
+            '"stopOnError": false'                    = '"stopOnError": null'
             '"verdict": "PASS"'                       = '"verdict": "FAIL"'
             '"endReason": "Completed"'                = '"endReason": "PreviousRunUnfinished"'
             '"endedUtc": "2026-10-30T02:15:54.641Z"'   = '"endedUtc": null'
@@ -5097,6 +5391,7 @@ function Invoke-SelfTest {
             @{ Find = '"testType": "Quick"'; Replace = '"testType": null'; Problem = 'run.testType: expected one of Quick, Standard, Exhaustive, found null' }
             @{ Find = '"id": "13ae3ce49e4046f4a7e9789c7f9355fe"'; Replace = '"id": null'; Problem = 'run.id: expected a run id of 32 hex digits, found null' }
             @{ Find = '"targetReached": true'; Replace = '"targetReached": "yes"'; Problem = 'coverage.targetReached: expected null, true or false' }
+            @{ Find = '"stopOnError": false'; Replace = '"stopOnError": "yes"'; Problem = 'run.stopOnError: expected null, true or false' }
             @{ Find = '"targetSeconds": 24,'; Replace = '"targetSeconds": -24,'; Problem = 'plan.targetSeconds: expected null or a finite number >= 0' }
             @{ Find = '{ "index": 1, '; Replace = '{ '; Problem = 'steps[0].index: missing' }
             @{ Find = '"startRequestedUtc": "2026-10-30T02:15:29.828Z"'; Replace = '"startRequestedUtc": "2026-10-30T02:15:29.828"'; Problem = 'run.startRequestedUtc: expected null or an ISO 8601 UTC timestamp' }
@@ -5240,7 +5535,7 @@ function Invoke-SelfTest {
         Assert-Equal -Actual $log.StepEnds.Count -Expected 2 -What 'STEP_END records'
         Assert-Equal -Actual $log.Progress.Count -Expected 2 -What 'PROGRESS samples'
         Assert-Near -Actual $log.Progress[1].RemainingMs -Expected 3937 -What 'last remaining_ms'
-        Assert-Equal -Actual $log.StopRequested -Expected $null -What 'no STOP_REQUESTED'
+        Assert-Equal -Actual $log.StopRequests.Count -Expected 0 -What 'no STOP_REQUESTED'
         Assert-Equal -Actual $log.Completed.Fields['end_reason'] -Expected 'Completed' -What 'COMPLETED end_reason'
 
         $torn = '2026-10-30T02:15:54.750Z PROGRESS step=2/2 elap'

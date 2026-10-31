@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Scans the source tree for forbidden API use and fails when any is found.
 
@@ -109,8 +109,9 @@
     two native-layer folders for the NativeCalls group; a legitimate exception
     needs a deliberate edit of the rule table below.
 
-    Compatible with Windows PowerShell 5.1. The source is ASCII-only because
-    Windows PowerShell reads a BOM-less script as ANSI.
+    Compatible with Windows PowerShell 5.1. The source is saved as UTF-8 with a
+    byte order mark, as .editorconfig requires, and stays ASCII-only, because
+    Windows PowerShell 5.1 reads a BOM-less script as ANSI.
 #>
 #Requires -Version 5.1
 [CmdletBinding()]

@@ -840,6 +840,49 @@ public sealed class InteropMarshallingTests
         AssertNoLiveSessions();
     }
 
+    // The caller's list answers every read after its first full read with a list no session may configure the engine
+    // with, as a list another thread changes between two reads would. A session that validated one read and marshalled
+    // another would build 1,025 step definitions before the engine's rejection, fail on a null step with a
+    // NullReferenceException, or configure the engine with a name the managed copy does not hold.
+    [Theory]
+    [InlineData("MoreStepsThanTheLimit")]
+    [InlineData("NullStep")]
+    [InlineData("NameWithUnpairedSurrogate")]
+    public unsafe void CreateSession_StepListChangesAfterItsFirstRead_SessionValidatesAndMarshalsTheStepsItRead(
+        string laterReadCase)
+    {
+        StepAttributes[] firstRead = DistinctSteps(2);
+        var steps = new StepListChangingAfterItsFirstRead(firstRead, LaterStepRead(laterReadCase, firstRead));
+        uint configuredCount = 0;
+        var configuredNames = new List<string>();
+        var engine = new NativeEngine((config, callbacks, nativeSession) =>
+        {
+            configuredCount = config->StepCount;
+            for (uint i = 0; i < config->StepCount; i++)
+            {
+                configuredNames.Add(FixedUtf8.Read(config->Steps[i].Name, NativeConstants.NameSize));
+            }
+
+            return TestEngineNative.SessionCreate(config, callbacks, null, nativeSession);
+        });
+        EngineSessionOptions options = CreateOptions(engine.QuerySystem(), steps);
+
+        EngineSession session = Assert.IsType<EngineSession>(engine.CreateSession(options));
+        try
+        {
+            Assert.True(steps.FirstReadComplete, "The session did not read every step of the caller's list.");
+            Assert.Equal<StepAttributes>(firstRead, session.Steps);
+            Assert.Equal((uint)firstRead.Length, configuredCount);
+            Assert.Equal(firstRead.Select(step => step.Name), configuredNames);
+        }
+        finally
+        {
+            session.Dispose();
+        }
+
+        AssertNoLiveSessions();
+    }
+
     // Each case is a Standard step given a hold: on an order other than RandomBlocks, or on a moving-inversion pattern.
     // The first is the plan-data repro, Quick's high-toggle sweep with a 2 s hold.
     [Theory]
@@ -2529,6 +2572,20 @@ public sealed class InteropMarshallingTests
             .ToArray();
     }
 
+    // What a step list changing after its first read answers later: each list breaks a different managed step rule.
+    private static StepAttributes[] LaterStepRead(string laterReadCase, StepAttributes[] firstRead) =>
+        laterReadCase switch
+        {
+            "MoreStepsThanTheLimit" => DistinctSteps(EngineSessionOptions.MaxStepCount + 1),
+            "NullStep" => new StepAttributes[] { firstRead[0], null! },
+            "NameWithUnpairedSurrogate" => new[]
+            {
+                firstRead[0],
+                firstRead[1] with { Name = firstRead[1].Name + " \uD800" },
+            },
+            _ => throw new ArgumentOutOfRangeException(nameof(laterReadCase), laterReadCase, "Unknown later read."),
+        };
+
     private static EngineSessionOptions CreateOptions(
         SystemSnapshot system,
         TestPlan plan,
@@ -2820,6 +2877,60 @@ public sealed class InteropMarshallingTests
             Interlocked.Increment(ref _reads);
             return new InvalidOperationException(
                 $"The step list was read through {member}; a list longer than the limit must be rejected from its count alone.");
+        }
+    }
+
+    // A step list that serves its first content until each of its steps has been read once, through the indexer or an
+    // enumerator, and its later content to every read after that, Count included: a caller's list that changes
+    // between two reads. Whichever second read a session makes, by count, indexer or enumeration, it gets the later
+    // content.
+    private sealed class StepListChangingAfterItsFirstRead : IReadOnlyList<StepAttributes>
+    {
+        private readonly IReadOnlyList<StepAttributes> _firstRead;
+        private readonly IReadOnlyList<StepAttributes> _laterReads;
+        private readonly bool[] _served;
+        private int _unserved;
+
+        public StepListChangingAfterItsFirstRead(
+            IReadOnlyList<StepAttributes> firstRead,
+            IReadOnlyList<StepAttributes> laterReads)
+        {
+            _firstRead = firstRead;
+            _laterReads = laterReads;
+            _served = new bool[firstRead.Count];
+            _unserved = firstRead.Count;
+        }
+
+        public bool FirstReadComplete => _unserved == 0;
+
+        public int Count => FirstReadComplete ? _laterReads.Count : _firstRead.Count;
+
+        public StepAttributes this[int index] => FirstReadComplete ? _laterReads[index] : ServeFirst(index);
+
+        // The content an enumeration yields is chosen when it starts.
+        public IEnumerator<StepAttributes> GetEnumerator() =>
+            FirstReadComplete ? _laterReads.GetEnumerator() : EnumerateFirstRead();
+
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+        private IEnumerator<StepAttributes> EnumerateFirstRead()
+        {
+            for (int index = 0; index < _firstRead.Count; index++)
+            {
+                yield return ServeFirst(index);
+            }
+        }
+
+        private StepAttributes ServeFirst(int index)
+        {
+            StepAttributes step = _firstRead[index];
+            if (!_served[index])
+            {
+                _served[index] = true;
+                _unserved--;
+            }
+
+            return step;
         }
     }
 

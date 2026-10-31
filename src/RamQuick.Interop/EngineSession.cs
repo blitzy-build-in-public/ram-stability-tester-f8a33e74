@@ -134,8 +134,8 @@ internal sealed class EngineSession : IEngineSession
     public event EventHandler<EngineReleased>? Released;
 
     /// <summary>
-    /// Gets the session's immutable copy of the plan's steps, taken once the options were validated. It is the list the
-    /// engine was configured with, and the source of every step name and attribute the session reports.
+    /// Gets the session's immutable copy of the plan's steps: the caller's list read once, and that read validated. It
+    /// is the list the engine was configured with, and the source of every step name and attribute the session reports.
     /// </summary>
     internal IReadOnlyList<StepAttributes> Steps => _steps;
 
@@ -177,7 +177,7 @@ internal sealed class EngineSession : IEngineSession
     /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="options"/> or <paramref name="factory"/> is null.</exception>
     /// <exception cref="ArgumentException">
-    /// <see cref="EngineSessionOptions.Validate"/> rejected the options, or the engine returned
+    /// The options fail a check of <see cref="EngineSessionOptions.Validate"/>, or the engine returned
     /// <c>RQ_E_INVALID_ARGUMENT</c>, for example for a worker count above the logical processor count.
     /// </exception>
     /// <exception cref="EngineException">The engine returned another failure code, such as <c>RQ_E_INTERNAL</c>.</exception>
@@ -189,8 +189,8 @@ internal sealed class EngineSession : IEngineSession
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(factory);
 
-        options.Validate();
-        ReadOnlyCollection<StepAttributes> steps = Array.AsReadOnly(options.Steps.ToArray());
+        // One read of the caller's list, validated as read: a second read could return steps no rule has checked.
+        ReadOnlyCollection<StepAttributes> steps = options.ValidateAndCopySteps();
         SynchronizationContext context = SynchronizationContext.Current ?? new SynchronizationContext();
 
         var stopEvent = new ManualResetEvent(initialState: false);
@@ -578,8 +578,8 @@ internal sealed class EngineSession : IEngineSession
         }
     }
 
-    // The managed and native enum numberings are equal (NativeConstants), and Validate has range-checked every value, so
-    // the conversions below are plain casts.
+    // The managed and native enum numberings are equal (NativeConstants), and the options' validation range-checked
+    // every value of the steps written here, so the conversions below are plain casts.
     private static unsafe void WriteStepDef(StepAttributes step, RqStepDef* def)
     {
         _ = FixedUtf8.Write(step.Name, def->Name, NativeConstants.NameSize);

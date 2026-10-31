@@ -577,7 +577,7 @@ Status values are `pending`, `met`, `not met` and `indeterminate`; the stress bo
 
 #### RAMQuick runs on the failing profile
 
-Ten runs each of Quick, Standard and Exhaustive, all with Stop on error on, interleaved (Q, S, E, Q, S, E, …) so that all three types see the same conditions.
+Ten runs each of Quick, Standard and Exhaustive, all with Stop on error on, interleaved (Q, S, E, Q, S, E, …) so that all three types see the same conditions. `Summarize-ValidationRuns.ps1` lists a run with Stop on error off or not recorded, or of a plan other than the full-length plan of its type, below the table with its reason and leaves it out of the medians and the counts.
 
 | Type | Run | Verdict | Time to verdict (s) | First error (s) | First-error step | Censored |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -699,9 +699,9 @@ Release time (`memory.releaseSeconds`) at the full region size is reported, not 
 
 Status: pending
 
-Allowed values: `satisfied` (every metric within the bound), `exceeded` (at least one metric above it) and `unverified` (a metric could not be logged; the missing metric is named).
+Allowed values: `satisfied` (every metric within the bound), `exceeded` (at least one metric above it) and `unverified` (a metric is missing from any log, the logs are not comparable in 1-s polling and sensors, or the summary does not show a completed full-length Exhaustive run; the Status line names the missing metric and every other gap).
 
-Logging: HWiNFO64 at 1 s polling, with the same tool and sensors for the two references and the RAMQuick Exhaustive run: DRAM read and write bandwidth, CPU package power and the DIMM (SPD) temperature sensors. Another logger may supply a metric HWiNFO64 lacks, provided it samples both sides the same way. Tool, sensors and log files used: _pending_
+Logging: HWiNFO64 at 1 s polling, with the same tool and sensors for the two references and the RAMQuick Exhaustive run: DRAM read and write bandwidth, CPU package power and the DIMM (SPD) temperature sensors. Another logger may supply a metric HWiNFO64 lacks, provided it samples both sides the same way. `Summarize-ValidationRuns.ps1` reads only the HWiNFO64 CSV logs, one per reference workload and one for the Exhaustive run, so a metric taken from another logger is not read by it, and its Status line then reports that metric missing and the bound `unverified`. `Summarize-ValidationRuns.ps1` reads each log's sensors from the sensor-name row that HWiNFO64 writes at the end of the log only when logging is stopped normally, so stop each of the three logs normally. All three logs must hold the same sensor columns, from the same sensors with the same column names and units, polled at 1 s (at least 90 % of the intervals within 1 s ±10 %, and a numeric sample of each metric in at least 90 % of the seconds measured). Supply the `-summary.json` of the completed full-length Exhaustive run the stress log was recorded during, with its `.log` beside it for the step windows: `run.testType` `Exhaustive`, `run.endReason` `Completed`, `plan.targetSeconds` 3600, neither recovered nor partial, at least 3060 s by `run.durationSeconds` and by the run window, and all 19 steps listed in `steps[]` and finished. Tool, sensors and log files used: _pending_
 
 | Metric | Statistic | llama.cpp inference | 7-Zip benchmark | Bound (larger reference) | RAMQuick Exhaustive | Within bound |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -715,7 +715,7 @@ Logging: HWiNFO64 at 1 s polling, with the same tool and sensors for the two ref
 | --- | --- | --- | --- | --- | --- |
 | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ | pending |
 
-If any of the three metrics cannot be logged, the bound is recorded as `unverified`, naming the missing metric; it is never judged on the remaining metrics. A step that exceeds the bound is retuned in `src/RamQuick.Plans/TestPlans.cs` only and re-measured.
+If any of the three metrics cannot be logged, the bound is recorded as `unverified`, naming the missing metric; it is never judged on the remaining metrics. The bound is also `unverified` when the logs are not comparable (not polled at 1 s, or not the same sensors) or the summary does not show a completed full-length Exhaustive run. A step that exceeds the bound is retuned in `src/RamQuick.Plans/TestPlans.cs` only and re-measured.
 
 ### Product constraint checks
 
