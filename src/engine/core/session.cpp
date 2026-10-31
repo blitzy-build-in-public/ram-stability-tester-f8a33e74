@@ -22,10 +22,10 @@
  *
  * @par Exceptions
  * A C++ exception anywhere in preparation or the steps becomes RQ_END_INTERNAL_FAULT with its
- * what() text, and the tail still runs. SEH faults are deliberately neither caught nor
- * translated (no __try, no SE translator, no vectored handler): under unstable memory such a
- * fault may itself be a symptom, so the process terminates and the host reports the unfinished
- * run through journal recovery at its next launch.
+ * what() text, recorded as UTF-8, and the tail still runs. SEH faults are deliberately neither
+ * caught nor translated (no __try, no SE translator, no vectored handler): under unstable memory
+ * such a fault may itself be a symptom, so the process terminates and the host reports the
+ * unfinished run through journal recovery at its next launch.
  */
 #include <windows.h>
 #include <algorithm>
@@ -125,56 +125,18 @@ void debug_log(_Printf_format_string_ const wchar_t* format, ...) noexcept {
 
 /**
  * True when text[0, length) is well-formed UTF-8 (Unicode table 3-7): no stray continuation
- * byte, no overlong form, no surrogate code point and nothing above U+10FFFF.
+ * byte, no overlong form, no surrogate code point and nothing above U+10FFFF. The rules are
+ * utf8_sequence_length's, which copy_utf8_truncated applies too, so an accepted name reaches
+ * every payload unchanged.
  */
 bool is_valid_utf8(const unsigned char* text, std::size_t length) noexcept {
     std::size_t i = 0;
     while (i < length) {
-        const unsigned char lead = text[i];
-        if (lead < 0x80) {
-            ++i;
-            continue;
-        }
-        // Continuation bytes are 0x80-0xBF; the first one's range is narrowed where the lead
-        // alone would admit an overlong form, a surrogate or a code point above U+10FFFF.
-        std::size_t tail = 0;
-        unsigned char first_low = 0x80;
-        unsigned char first_high = 0xBF;
-        if (lead >= 0xC2 && lead <= 0xDF) {
-            tail = 1;
-        } else if (lead == 0xE0) {
-            tail = 2;
-            first_low = 0xA0;
-        } else if ((lead >= 0xE1 && lead <= 0xEC) || lead == 0xEE || lead == 0xEF) {
-            tail = 2;
-        } else if (lead == 0xED) {
-            tail = 2;
-            first_high = 0x9F;
-        } else if (lead == 0xF0) {
-            tail = 3;
-            first_low = 0x90;
-        } else if (lead >= 0xF1 && lead <= 0xF3) {
-            tail = 3;
-        } else if (lead == 0xF4) {
-            tail = 3;
-            first_high = 0x8F;
-        } else {
-            // 0x80-0xBF: a stray continuation byte; 0xC0-0xC1: an overlong two-byte form;
-            // 0xF5-0xFF: never valid.
+        const std::size_t sequence = utf8_sequence_length(text + i, length - i);
+        if (sequence == 0) {
             return false;
         }
-        if (length - i - 1 < tail) {
-            return false;
-        }
-        if (text[i + 1] < first_low || text[i + 1] > first_high) {
-            return false;
-        }
-        for (std::size_t k = 2; k <= tail; ++k) {
-            if ((text[i + k] & 0xC0u) != 0x80u) {
-                return false;
-            }
-        }
-        i += tail + 1;
+        i += sequence;
     }
     return true;
 }

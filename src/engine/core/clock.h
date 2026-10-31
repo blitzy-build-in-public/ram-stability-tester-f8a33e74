@@ -1,8 +1,8 @@
 /**
  * @file clock.h
  * @brief The engine's clock seam (IClock and the QPC clock), the session stop signal, the
- *        UTF-8 truncation helper for fixed char[] payload fields and the checked CloseHandle
- *        that every engine handle owner closes through.
+ *        UTF-8 well-formedness and truncation helpers for fixed char[] payload fields and the
+ *        checked CloseHandle that every engine handle owner closes through.
  *
  * Every engine timing reads the session's IClock, and every blocking wait that must honour a
  * stop waits through IClock::wait_for_stop on the session's stop_signal. The signal lives here
@@ -30,22 +30,91 @@
 namespace rq::engine {
 
 /**
- * Copies a NUL-terminated UTF-8 string into a fixed char array, truncating at a UTF-8
- * character boundary.
+ * Byte length of the well-formed UTF-8 sequence that begins at text[0] (Unicode table 3-7), or 0
+ * when none does within available bytes: a stray continuation byte, an overlong form, a surrogate
+ * code point, a code point above U+10FFFF or a sequence cut short.
+ *
+ * The one definition of well-formedness behind every string the C API defines as UTF-8: step-name
+ * validation (session.cpp) and copy_utf8_truncated apply it alike, so a name that validation
+ * accepts is copied unchanged.
+ *
+ * Each byte after the lead is read only once the bytes before it continue the sequence, and no
+ * sequence contains a NUL, so a NUL-terminated string is never read past its terminator, whatever
+ * available says.
+ *
+ * @param text First byte of the candidate sequence; read only when available is nonzero.
+ * @param available Bytes at text that may be read.
+ * @return 1 to 4, or 0 when text does not begin a well-formed sequence.
+ */
+inline size_t utf8_sequence_length(const unsigned char* text, size_t available) noexcept {
+    if (available == 0) {
+        return 0;
+    }
+    const unsigned char lead = text[0];
+    if (lead < 0x80) {
+        return 1;
+    }
+    // Continuation bytes are 0x80-0xBF; the first one's range is narrowed where the lead alone
+    // would admit an overlong form, a surrogate or a code point above U+10FFFF.
+    size_t length = 0;
+    unsigned char first_low = 0x80;
+    unsigned char first_high = 0xBF;
+    if (lead >= 0xC2 && lead <= 0xDF) {
+        length = 2;
+    } else if (lead == 0xE0) {
+        length = 3;
+        first_low = 0xA0;
+    } else if ((lead >= 0xE1 && lead <= 0xEC) || lead == 0xEE || lead == 0xEF) {
+        length = 3;
+    } else if (lead == 0xED) {
+        length = 3;
+        first_high = 0x9F;
+    } else if (lead == 0xF0) {
+        length = 4;
+        first_low = 0x90;
+    } else if (lead >= 0xF1 && lead <= 0xF3) {
+        length = 4;
+    } else if (lead == 0xF4) {
+        length = 4;
+        first_high = 0x8F;
+    } else {
+        // 0x80-0xBF: a stray continuation byte; 0xC0-0xC1: an overlong two-byte form;
+        // 0xF5-0xFF: never valid.
+        return 0;
+    }
+    if (available < 2 || text[1] < first_low || text[1] > first_high) {
+        return 0;
+    }
+    for (size_t k = 2; k < length; ++k) {
+        if (k >= available || (text[k] & 0xC0u) != 0x80u) {
+            return 0;
+        }
+    }
+    return length;
+}
+
+/**
+ * Copies a NUL-terminated string into a fixed char array as well-formed UTF-8, truncating at a
+ * UTF-8 character boundary.
  *
  * Used for rq_run_result.end_detail (through stop_signal::request), rq_system_info.cpu_name
  * (system_info.cpp) and step names (session.cpp), all of which the C API defines as UTF-8,
  * NUL-terminated within their fixed size, with longer text truncated at a character boundary.
  *
- * At most dst_size - 1 bytes of src are copied. When the cut would leave the first dropped byte
- * a continuation byte (10xxxxxx), the cut moves back to the lead byte of that sequence, so no
- * partial character remains. It moves back at most three bytes, the longest UTF-8 tail, so
- * malformed input never costs more than that. The rest of dst is zero-filled, so a payload field
+ * Each well-formed sequence of src is copied whole while it fits in the first dst_size - 1
+ * bytes, and the first one that does not fit ends the copy, so no partial character remains.
+ * Each byte that begins no well-formed sequence becomes one '?', so the copy never outgrows src:
+ * an end detail can carry the what() text of a std::system_error, which the standard library
+ * formats in the process's ANSI code page, while the C API defines these fields as UTF-8.
+ * Well-formed text is copied unchanged. The rest of dst is zero-filled, so a payload field
  * carries no stale bytes across the boundary.
+ *
+ * Never throws, allocates or takes a lock, which stop_signal::request relies on.
  *
  * @param dst Destination array; may be null only when dst_size is 0. Must not overlap src.
  * @param dst_size Size of dst in bytes, including the NUL terminator; 0 makes the call a no-op.
- * @param src NUL-terminated UTF-8 text; null is copied as the empty string.
+ * @param src NUL-terminated text in any encoding; null is copied as the empty string. Nothing
+ *        past its terminator is read.
  */
 inline void copy_utf8_truncated(char* dst, size_t dst_size, const char* src) noexcept {
     if (dst == nullptr || dst_size == 0) {
@@ -53,16 +122,23 @@ inline void copy_utf8_truncated(char* dst, size_t dst_size, const char* src) noe
     }
     size_t length = 0;
     if (src != nullptr) {
+        const auto* const text = reinterpret_cast<const unsigned char*>(src);
         const size_t limit = dst_size - 1;
-        while (length < limit && src[length] != '\0') {
-            ++length;
+        // A '?' replaces exactly one byte, so src and dst advance together.
+        while (length < limit && text[length] != 0) {
+            // A sequence may extend past the cut, so up to its longest form, four bytes, may be
+            // read; never past the terminator, which continues no sequence.
+            const size_t sequence = utf8_sequence_length(text + length, 4);
+            if (sequence == 0) {
+                dst[length] = '?';
+                ++length;
+            } else if (sequence <= limit - length) {
+                std::memcpy(dst + length, text + length, sequence);
+                length += sequence;
+            } else {
+                break;
+            }
         }
-        // src[length] is readable here: it is either the terminator or the first dropped byte.
-        const size_t min_length = length > 3 ? length - 3 : 0;
-        while (length > min_length && (static_cast<unsigned char>(src[length]) & 0xC0u) == 0x80u) {
-            --length;
-        }
-        std::memcpy(dst, src, length);
     }
     std::memset(dst + length, 0, dst_size - length);
 }
@@ -201,8 +277,9 @@ public:
      * @param end_reason An RQ_END_* value. 0 or a value above RQ_END_INTERNAL_FAULT is ignored:
      *        nothing is recorded or raised.
      * @param os_error Windows error code to record with the reason, or 0.
-     * @param detail UTF-8 diagnostic, truncated to RQ_END_DETAIL_SIZE - 1 bytes; null records an
-     *        empty detail.
+     * @param detail Diagnostic in any encoding, a caught exception's what() text included; it is
+     *        recorded as UTF-8 through copy_utf8_truncated, each ill-formed byte as '?', within
+     *        RQ_END_DETAIL_SIZE - 1 bytes. Null records an empty detail.
      * @return true only for the call that recorded the reason.
      */
     bool request(uint32_t end_reason, uint32_t os_error = 0,

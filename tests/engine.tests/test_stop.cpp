@@ -78,6 +78,16 @@
  * nor elevation, so the 2 GiB precondition does not apply to them. Their events are held by
  * test_event_owner, which lifts close protection and closes on every exit, so a failing case
  * leaves no protected handle open in the process the rest of the suite runs in.
+ *
+ * CopyUtf8Truncated/utf8_detail and StopSignalDetail/utf8_detail hold the end detail to the C
+ * API's string rule, UTF-8 cut at a character boundary within the 128-byte field, for any input:
+ * copy_utf8_truncated directly, and stop_signal::request through snapshot(), which records every
+ * end detail. Each case gives the exact bytes expected, and Windows' decoder (MultiByteToWideChar
+ * with MB_ERR_INVALID_CHARS) judges both the input and the field independently of the engine's
+ * rules. StopSignalDetailSession throws a std::system_error carrying Windows-1252 text from the
+ * session clock's wait on the coordinator, as a failed WaitForSingleObject on a localized Windows
+ * would, and checks the end_detail that on_completed and session_get_result deliver. None of them
+ * needs the 2 GiB precondition: the session locks 128 MiB.
  */
 #include <gtest/gtest.h>
 #include <windows.h>
@@ -90,6 +100,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -387,6 +398,8 @@ struct run_record {
 
     std::uint32_t completed_calls = 0;
     std::uint64_t completed_ns = 0;
+    /** Thread that raised on_completed: the session's coordinator. */
+    DWORD completed_thread = 0;
     /** The on_completed payload; step_results is cleared, its pointer was valid for the call. */
     rq_run_result result{};
     /** The single step's result, when step_result_count is 1. */
@@ -518,6 +531,7 @@ private:
             run_record& record = recorder.record_;
             recorder.completed_calls_.fetch_add(1U, std::memory_order_relaxed);
             record.completed_ns = now;
+            record.completed_thread = GetCurrentThreadId();
             record.result = *result;
             record.result.step_results = nullptr;
             const bool has_step_result = result->step_result_count == 1U;
@@ -791,18 +805,20 @@ public:
     stop_session& operator=(const stop_session&) = delete;
 
     /**
-     * Production seams a case replaces. A null affinity pins through win32_thread_affinity and
-     * an empty free_override frees with VirtualFree; both are shared with the session, which
-     * keeps them as long as session_dependencies requires.
+     * Production seams a case replaces. A null affinity pins through win32_thread_affinity, an
+     * empty free_override frees with VirtualFree and a null clock is qpc_clock; each is shared
+     * with the session, which keeps it as long as session_dependencies requires.
      */
     struct seams {
         std::shared_ptr<thread_affinity> affinity;
         std::function<bool(void* address)> free_override;
+        std::shared_ptr<IClock> clock;
     };
 
-    /** session_create with the production clock, the given seams and a counting layer. */
+    /** session_create with the given seams, production ones otherwise, and a counting layer. */
     rq_result create(seams overrides = {}) {
         session_dependencies dependencies;
+        dependencies.clock = std::move(overrides.clock);
         dependencies.affinity = std::move(overrides.affinity);
         dependencies.free_override = std::move(overrides.free_override);
         dependencies.wrap_memory_access =
@@ -831,6 +847,9 @@ public:
         handle_ = nullptr;
         return result;
     }
+
+    /** session_get_result into out, whose struct_size the caller sets. */
+    rq_result get_result(rq_run_result* out) const { return session_get_result(handle_, out); }
 
     const rq_session_config& config() const noexcept { return config_; }
     run_recorder& recorder() noexcept { return recorder_; }
@@ -2169,6 +2188,274 @@ const auto k_failure_cases =
 
 INSTANTIATE_TEST_SUITE_P(Descriptions, close_handle_checked_failure, k_failure_cases,
                          failure_case_name);
+
+/* ---------------------------------------------------------------------------------------------
+ * End detail as UTF-8
+ * ------------------------------------------------------------------------------------------- */
+
+static_assert(sizeof(stop_signal::end_info::detail) == RQ_END_DETAIL_SIZE,
+              "the recorded detail is copied into rq_run_result.end_detail whole");
+
+/**
+ * The independent judge of well-formedness: Windows' own UTF-8 decoder, which with
+ * MB_ERR_INVALID_CHARS fails on stray continuation bytes, overlong forms, surrogates, code
+ * points above U+10FFFF and sequences cut short. The empty text is well-formed.
+ */
+bool windows_accepts_utf8(const char* bytes, std::size_t length) {
+    if (length == 0U) {
+        return true;
+    }
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes, static_cast<int>(length),
+                               nullptr, 0) > 0;
+}
+
+/**
+ * Succeeds when field, an RQ_END_DETAIL_SIZE-byte payload string, has a NUL terminator, only
+ * zeros after it, and text before it that Windows' decoder accepts as UTF-8. text receives that
+ * text.
+ */
+::testing::AssertionResult is_utf8_payload(const char* field, std::string& text) {
+    const char* const end = field + RQ_END_DETAIL_SIZE;
+    const char* const nul = std::find(field, end, '\0');
+    if (nul == end) {
+        return ::testing::AssertionFailure()
+               << "no NUL terminator within " << RQ_END_DETAIL_SIZE << " bytes";
+    }
+    text.assign(field, nul);
+    const auto stale = std::find_if(nul, end, [](char byte) { return byte != '\0'; });
+    if (stale != end) {
+        return ::testing::AssertionFailure()
+               << "byte " << (stale - field)
+               << " after the terminator is not zero: " << ::testing::PrintToString(text);
+    }
+    if (!windows_accepts_utf8(text.data(), text.size())) {
+        return ::testing::AssertionFailure()
+               << "MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS) rejects "
+               << ::testing::PrintToString(text);
+    }
+    return ::testing::AssertionSuccess();
+}
+
+/** Where a detail is recorded: the copy itself, or the stop signal that records end details. */
+enum class detail_sink {
+    copy_utf8_truncated,
+    stop_signal_request,
+};
+
+/**
+ * One text a detail may carry, behind pad bytes of 'a' that move it towards the cut: 127 - pad
+ * bytes remain for it in the 128-byte field.
+ */
+struct utf8_detail_case {
+    const char* name;
+    std::size_t pad;
+    const char* text;
+    /** What the field holds after the pad. */
+    const char* expected;
+    /** Whether the input is well-formed UTF-8, as Windows' decoder judges it. */
+    bool well_formed;
+};
+
+void PrintTo(const utf8_detail_case& value, std::ostream* os) {
+    *os << value.name;
+}
+
+void PrintTo(detail_sink sink, std::ostream* os) {
+    *os << (sink == detail_sink::copy_utf8_truncated ? "copy_utf8_truncated"
+                                                     : "stop_signal::request");
+}
+
+using utf8_detail_param = std::tuple<detail_sink, utf8_detail_case>;
+
+class utf8_detail : public ::testing::TestWithParam<utf8_detail_param> {};
+
+TEST_P(utf8_detail, KeepsWellFormedTextReplacesEachIllFormedByteAndCutsAtACharacter) {
+    const auto& [sink, param] = GetParam();
+    const std::string pad(param.pad, 'a');
+    const std::string input = pad + param.text;
+    const std::string expected = pad + param.expected;
+    ASSERT_LT(expected.size(), RQ_END_DETAIL_SIZE) << "the case expects more than the field holds";
+    ASSERT_EQ(windows_accepts_utf8(input.data(), input.size()), param.well_formed)
+        << "the case mislabels its input " << ::testing::PrintToString(input);
+
+    std::array<char, RQ_END_DETAIL_SIZE> field{};
+    if (sink == detail_sink::copy_utf8_truncated) {
+        // Stale bytes, which the copy must overwrite or zero.
+        field.fill('\x7F');
+        copy_utf8_truncated(field.data(), field.size(), input.c_str());
+    } else {
+        stop_signal signal;
+        ASSERT_TRUE(signal.request(RQ_END_INTERNAL_FAULT, 0U, input.c_str()));
+        const stop_signal::end_info end = signal.snapshot();
+        EXPECT_EQ(end.reason, RQ_END_INTERNAL_FAULT);
+        EXPECT_EQ(end.os_error, 0U);
+        std::memcpy(field.data(), end.detail, sizeof(end.detail));
+    }
+
+    std::string text;
+    ASSERT_TRUE(is_utf8_payload(field.data(), text));
+    EXPECT_EQ(text, expected);
+}
+
+/** Test-name suffix: the case's name, for example Cp1252InAsciiText. */
+std::string utf8_detail_case_name(const ::testing::TestParamInfo<utf8_detail_param>& info) {
+    return std::get<1>(info.param).name;
+}
+
+const auto k_utf8_detail_cases = ::testing::Values(
+    utf8_detail_case{"Empty", 0U, "", "", true},
+    utf8_detail_case{"AsciiUnchanged", 0U, "WaitForSingleObject on the stop event failed",
+                     "WaitForSingleObject on the stop event failed", true},
+    utf8_detail_case{"Cp1252InAsciiText", 0U, "Erreur syst\xE8me", "Erreur syst?me", false},
+    utf8_detail_case{"StrayContinuation", 0U, "x\x80y", "x?y", false},
+    utf8_detail_case{"OverlongTwoByteForm", 0U, "x\xC0\xAFy", "x??y", false},
+    utf8_detail_case{"OverlongThreeByteForm", 0U, "x\xE0\x80\xAFy", "x???y", false},
+    utf8_detail_case{"Surrogate", 0U, "x\xED\xA0\x80y", "x???y", false},
+    utf8_detail_case{"AboveTheLastCodePoint", 0U, "x\xF4\x90\x80\x80y", "x????y", false},
+    utf8_detail_case{"LeadF5", 0U, "x\xF5\x80\x80\x80y", "x????y", false},
+    utf8_detail_case{"LeadFF", 0U, "x\xFFy", "x?y", false},
+    utf8_detail_case{"ThreeByteCutShortByTheTerminator", 0U, "xy\xE2\x82", "xy??", false},
+    utf8_detail_case{"FourByteCutShortByTheTerminator", 0U, "xy\xF0\x9F\x98", "xy???", false},
+    utf8_detail_case{"TwoByteKept", 0U, "Caf\xC3\xA9", "Caf\xC3\xA9", true},
+    utf8_detail_case{"ThreeByteKept", 0U, "5 \xE2\x82\xAC", "5 \xE2\x82\xAC", true},
+    utf8_detail_case{"FourByteKept", 0U, "x\xF0\x9F\x98\x80y", "x\xF0\x9F\x98\x80y", true},
+    // U+0080, U+07FF, U+0800, U+D7FF, U+E000, U+FFFF, U+10000 and U+10FFFF.
+    utf8_detail_case{"EdgeCodePointsKept", 0U,
+                     "\xC2\x80\xDF\xBF\xE0\xA0\x80\xED\x9F\xBF\xEE\x80\x80\xEF\xBF\xBF"
+                     "\xF0\x90\x80\x80\xF4\x8F\xBF\xBF",
+                     "\xC2\x80\xDF\xBF\xE0\xA0\x80\xED\x9F\xBF\xEE\x80\x80\xEF\xBF\xBF"
+                     "\xF0\x90\x80\x80\xF4\x8F\xBF\xBF",
+                     true},
+    utf8_detail_case{"AsciiCutAtTheLastByte", 127U, "bcd", "", true},
+    utf8_detail_case{"TwoByteThatDoesNotFitIsDropped", 126U, "\xC3\xA9", "", true},
+    utf8_detail_case{"ThreeByteThatDoesNotFitIsDropped", 125U, "\xE2\x82\xAC", "", true},
+    utf8_detail_case{"FourByteThatDoesNotFitIsDropped", 124U, "\xF0\x9F\x98\x80", "", true},
+    utf8_detail_case{"FourByteThatFitsExactlyIsKept", 123U, "\xF0\x9F\x98\x80", "\xF0\x9F\x98\x80",
+                     true},
+    utf8_detail_case{"ReplacementFillsTheLastByte", 126U, "\xE8xyz", "?", false},
+    utf8_detail_case{"ReplacementsRunToTheLastByte", 125U, "\xE0\x80\xAF", "??", false});
+
+INSTANTIATE_TEST_SUITE_P(CopyUtf8Truncated, utf8_detail,
+                         ::testing::Combine(::testing::Values(detail_sink::copy_utf8_truncated),
+                                            k_utf8_detail_cases),
+                         utf8_detail_case_name);
+
+INSTANTIATE_TEST_SUITE_P(StopSignalDetail, utf8_detail,
+                         ::testing::Combine(::testing::Values(detail_sink::stop_signal_request),
+                                            k_utf8_detail_cases),
+                         utf8_detail_case_name);
+
+/**
+ * what_arg of the failing wait: "Échec de l'attente sur l'évènement d'arrêt" in Windows-1252, as
+ * a French Windows formats system messages for the ANSI code page; not UTF-8. Two literals, so
+ * the escape \xC9 ends before the hex digit c.
+ */
+constexpr char k_cp1252_wait_failure[] = "\xC9"
+                                         "chec de l'attente sur l'\xE9v\xE8nement d'arr\xEAt";
+
+/** k_cp1252_wait_failure as an end detail carries it: each Windows-1252 byte one '?'. */
+constexpr char k_sanitised_wait_failure[] = "?chec de l'attente sur l'?v?nement d'arr?t";
+
+/** Workers and region of the engine-fault session: enough for one pinned hold, no more. */
+constexpr std::size_t k_fault_session_workers = 2U;
+constexpr std::uint64_t k_fault_session_region_bytes = 128U * k_mib;
+constexpr std::uint64_t k_fault_session_seed = 0xE7D0DE7A11F00D5EULL;
+
+/**
+ * The engine-fault session's clock: qpc_clock's time, and a wait_for_stop that throws what
+ * qpc_clock's throws when WaitForSingleObject fails, a std::system_error of the system category,
+ * carrying k_cp1252_wait_failure. Workers never wait on the clock, so only the coordinator meets
+ * the throw, at the first wait of the step's hold. Each wait records its thread.
+ */
+class failing_wait_clock final : public IClock {
+public:
+    std::uint64_t now_ns() const noexcept override { return clock_.now_ns(); }
+
+    bool wait_for_stop(const stop_signal&, std::uint64_t) override {
+        waits_.fetch_add(1U, std::memory_order_relaxed);
+        wait_thread_.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        throw std::system_error(static_cast<int>(ERROR_ACCESS_DENIED), std::system_category(),
+                                k_cp1252_wait_failure);
+    }
+
+    /** Calls of wait_for_stop; final once the session has raised Completed. */
+    std::uint32_t waits() const noexcept { return waits_.load(std::memory_order_relaxed); }
+
+    /** Thread of the last wait_for_stop call; 0 before the first. */
+    DWORD wait_thread() const noexcept { return wait_thread_.load(std::memory_order_relaxed); }
+
+private:
+    qpc_clock clock_;
+    std::atomic<std::uint32_t> waits_{0};
+    std::atomic<DWORD> wait_thread_{0};
+};
+
+TEST(StopSignalDetailSession, CoordinatorExceptionTextReachesTheRunResultAsUtf8) {
+    // The text the coordinator catches is not UTF-8, so a verbatim copy fails the checks below.
+    const std::system_error thrown(static_cast<int>(ERROR_ACCESS_DENIED), std::system_category(),
+                                   k_cp1252_wait_failure);
+    const std::string what = thrown.what();
+    ASSERT_EQ(what.rfind(k_cp1252_wait_failure, 0), 0U) << ::testing::PrintToString(what);
+    ASSERT_LT(what.size(), RQ_END_DETAIL_SIZE) << "the whole what() text must fit the detail";
+    ASSERT_FALSE(windows_accepts_utf8(what.data(), what.size()));
+
+    const std::uint32_t workers = static_cast<std::uint32_t>(
+        std::min(enumerate_logical_processors().size(), k_fault_session_workers));
+    ASSERT_GT(workers, 0U);
+    const auto clock = std::make_shared<failing_wait_clock>();
+    // The hold case's step: a random-blocks write, its pre-hold flush, then the hold, which the
+    // coordinator waits out through the session clock.
+    stop_session run(spec_for(stop_case::hold), workers, k_fault_session_seed,
+                     k_fault_session_region_bytes);
+    stop_session::seams overrides;
+    overrides.clock = clock;
+    ASSERT_EQ(run.create(std::move(overrides)), RQ_OK);
+    ASSERT_EQ(run.start(), RQ_OK);
+
+    ASSERT_TRUE(run.recorder().wait_completed(k_completed_timeout))
+        << "no Completed within 10 s of the start; " << run.recorder().snapshot().describe();
+    ASSERT_TRUE(run.recorder().wait_released(k_released_timeout))
+        << "no Released; " << run.recorder().snapshot().describe();
+    const run_record record = run.recorder().snapshot();
+    rq_run_result fetched{};
+    fetched.struct_size = sizeof(rq_run_result);
+    const rq_result fetched_status = run.get_result(&fetched);
+    ASSERT_EQ(run.destroy(), RQ_OK);
+
+    // The hold's first wait threw on the coordinator, inside the step, and nothing else did.
+    EXPECT_EQ(record.result.end_reason, RQ_END_INTERNAL_FAULT) << record.describe();
+    EXPECT_EQ(record.result.os_error, 0U);
+    EXPECT_EQ(clock->waits(), 1U);
+    EXPECT_EQ(clock->wait_thread(), record.completed_thread)
+        << "the wait that threw did not run on the coordinator";
+    EXPECT_TRUE(record.prepared());
+    EXPECT_EQ(record.gates, 1U);
+    ASSERT_TRUE(record.has_step_result) << record.describe();
+    EXPECT_EQ(record.step_result.completed, 0U) << "the exception did not cut the step short";
+    EXPECT_EQ(record.completed_calls, 1U);
+    EXPECT_EQ(record.released_calls, 1U);
+
+    std::string completed_detail;
+    ASSERT_TRUE(is_utf8_payload(record.result.end_detail, completed_detail));
+    EXPECT_EQ(completed_detail.rfind(k_sanitised_wait_failure, 0), 0U)
+        << ::testing::PrintToString(completed_detail);
+    // The rest is the system message, whose language is the host's: kept byte for byte where it
+    // is already UTF-8, each other byte one '?', so the detail keeps the whole what() length.
+    ASSERT_EQ(completed_detail.size(), what.size()) << ::testing::PrintToString(completed_detail);
+    for (std::size_t i = 0; i < what.size(); ++i) {
+        const bool kept = completed_detail[i] == what[i];
+        const bool replaced =
+            completed_detail[i] == '?' && static_cast<unsigned char>(what[i]) >= 0x80U;
+        EXPECT_TRUE(kept || replaced) << "byte " << i << " of " << ::testing::PrintToString(what)
+                                      << " became " << ::testing::PrintToString(completed_detail);
+    }
+
+    ASSERT_EQ(fetched_status, RQ_OK);
+    EXPECT_EQ(fetched.end_reason, RQ_END_INTERNAL_FAULT);
+    std::string fetched_detail;
+    ASSERT_TRUE(is_utf8_payload(fetched.end_detail, fetched_detail));
+    EXPECT_EQ(fetched_detail, completed_detail);
+}
 
 }  // namespace
 }  // namespace rq::engine::test
