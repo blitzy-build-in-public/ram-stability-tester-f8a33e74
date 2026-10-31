@@ -28,8 +28,11 @@ namespace RamQuick.Interop;
 /// than continuing with lost events. A faulted step gate also returns Abort, so the step starts no memory traffic.
 /// </para>
 /// <para>
-/// Every callback runs on the session's coordinator thread and returns as soon as its handler does: only the step gate
-/// may block, for at most its journal-acknowledgment timeout.
+/// Every callback runs on the session's coordinator thread and returns as soon as its handler does. The event handlers
+/// copy their payloads into records and post them to the session's captured context. When that context queues its
+/// posts, as the application's dispatcher and the thread-pool fallback do, only the step gate may block, for at most
+/// its journal-acknowledgment timeout. A context whose <see cref="SynchronizationContext.Post"/> runs inline instead
+/// raises the event subscribers within the callback, so they hold up the coordinator as well and must not block.
 /// </para>
 /// </remarks>
 internal static unsafe class CallbackThunks
@@ -148,9 +151,9 @@ internal static unsafe class CallbackThunks
         }
         catch (Exception)
         {
-            // Deliberately discarded: nothing may unwind into the engine. ReportCallbackFault already swallows the
-            // fault sink's exceptions, so only its stop request can land here, and a faulted step gate still returns
-            // Abort, which the engine ends as host_fault.
+            // Deliberately discarded: nothing may unwind into the engine. ReportCallbackFault already contains the
+            // fault sink's exceptions and reports a stop the engine refuses, so only a failure beyond those lands here,
+            // and a faulted step gate still returns Abort, which the engine ends as host_fault.
         }
     }
 

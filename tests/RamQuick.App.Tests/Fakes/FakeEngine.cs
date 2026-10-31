@@ -625,7 +625,8 @@ public sealed record GateInvocation(
 /// subscriber that throws is reported through <see cref="InvokeCallbackFault"/> and stops the run with a
 /// host fault, and the other subscribers still receive the event. The step gate and the progress sink
 /// run synchronously on the calling thread, which plays the coordinator. <see cref="RequestStop"/>
-/// records its reason before it sets <see cref="StopEvent"/>, and the first recorded reason wins.
+/// records its reason before it sets <see cref="StopEvent"/>, and the first recorded reason wins; a stop
+/// refused through <see cref="RequestStopException"/> records nothing and leaves the event unset.
 /// </para>
 /// <para>
 /// <b>Disposal.</b> Events raised after <see cref="Dispose"/>, or posted before it and delivered after
@@ -650,6 +651,7 @@ public sealed class FakeEngineSession : IEngineSession
     private const string ReleasedHandlerName = "Released handler";
     private const string StepStartingCallbackName = "on_step_starting";
     private const string ProgressCallbackName = "on_progress";
+    private const string StopFunctionName = "rq_session_stop";
     private const string CoordinatorThreadName = "FakeEngine coordinator";
 
     private static readonly TimeSpan _defaultReleaseTime = TimeSpan.FromMilliseconds(100);
@@ -674,6 +676,7 @@ public sealed class FakeEngineSession : IEngineSession
 
     // Read and written with Volatile or Interlocked.
     private Exception? _startException;
+    private Exception? _requestStopException;
     private Exception? _lastGateException;
     private int _startCount;
     private int _started;
@@ -748,6 +751,21 @@ public sealed class FakeEngineSession : IEngineSession
     {
         get => Volatile.Read(ref _startException);
         set => Volatile.Write(ref _startException, value);
+    }
+
+    /// <summary>
+    /// Gets or sets an exception every <see cref="RequestStop"/> before disposal throws while it is set, the stand-in
+    /// for a stop the engine refuses, such as an <see cref="EngineException"/> with
+    /// <see cref="EngineResultCode.Internal"/>. A refused request adds no entry to <see cref="StopRequests"/>,
+    /// records no end reason and leaves <see cref="StopEvent"/> unset. The host-fault stops the session requests
+    /// itself, for an aborted gate, a reported fault or disposal before Completed, are refused too and, as the
+    /// wrapper reports them, reach <see cref="CallbackFaults"/> and the options' fault sink once each as
+    /// <c>rq_session_stop</c> instead of being thrown.
+    /// </summary>
+    public Exception? RequestStopException
+    {
+        get => Volatile.Read(ref _requestStopException);
+        set => Volatile.Write(ref _requestStopException, value);
     }
 
     /// <summary>Gets the number of <see cref="Start"/> calls made before disposal, failed ones included.</summary>
@@ -831,7 +849,8 @@ public sealed class FakeEngineSession : IEngineSession
 
     /// <summary>
     /// Gets a snapshot of every fault reported through <see cref="InvokeCallbackFault"/>, in report order:
-    /// gate and progress-sink exceptions and exceptions thrown by event subscribers.
+    /// gate and progress-sink exceptions, exceptions thrown by event subscribers, and the session's own
+    /// host-fault stops refused through <see cref="RequestStopException"/>, as <c>rq_session_stop</c>.
     /// </summary>
     public IReadOnlyList<(string CallbackName, Exception Exception)> CallbackFaults
     {
@@ -882,7 +901,8 @@ public sealed class FakeEngineSession : IEngineSession
     /// <inheritdoc/>
     /// <remarks>
     /// Records the request and the first reason before setting <see cref="StopEvent"/>, the order the
-    /// wrapper guarantees. Does nothing after disposal.
+    /// wrapper guarantees. Throws <see cref="RequestStopException"/> while it is set, recording nothing.
+    /// Does nothing after disposal.
     /// </remarks>
     public void RequestStop(StopReason reason)
     {
@@ -894,6 +914,11 @@ public sealed class FakeEngineSession : IEngineSession
         if (IsDisposed)
         {
             return;
+        }
+
+        if (RequestStopException is { } refusal)
+        {
+            throw refusal;
         }
 
         RunEndReason endReason = reason switch
@@ -943,7 +968,9 @@ public sealed class FakeEngineSession : IEngineSession
     /// Like the wrapper, disposing before <see cref="Completed"/> has been raised stops the run: it records
     /// <see cref="RunEndReason.HostFault"/> as the engine's reason, first writer winning, and then sets
     /// <see cref="StopEvent"/> so a waiting gate wakes. That stop is the engine's, so
-    /// <see cref="StopRequests"/> is unchanged.
+    /// <see cref="StopRequests"/> is unchanged. While <see cref="RequestStopException"/> is set, the
+    /// wrapper's stop before destruction is refused instead: the refusal is reported through the fault sink as
+    /// <c>rq_session_stop</c>, the event stays unset, and the destruction still stops the run.
     /// </para>
     /// <para>
     /// After <see cref="BlockDispose"/>, the first call is counted and its thread recorded, then it blocks
@@ -967,7 +994,14 @@ public sealed class FakeEngineSession : IEngineSession
         if (Volatile.Read(ref _completedRaised) == 0)
         {
             RecordEndReason(RunEndReason.HostFault);
-            _stopEvent.Set();
+            if (RequestStopException is { } refusal)
+            {
+                ReportToFaultSink(StopFunctionName, refusal);
+            }
+            else
+            {
+                _stopEvent.Set();
+            }
         }
     }
 
@@ -1354,7 +1388,7 @@ public sealed class FakeEngineSession : IEngineSession
             decision = StepGateDecision.Abort;
             if (!_stopEvent.WaitOne(0))
             {
-                RequestStop(StopReason.HostFault);
+                RequestHostFaultStop();
             }
         }
 
@@ -1428,7 +1462,9 @@ public sealed class FakeEngineSession : IEngineSession
     /// <summary>
     /// Reports a managed exception caught in a callback or an event subscriber as the wrapper does: records
     /// it in <see cref="CallbackFaults"/>, hands it to the options' fault sink, discarding anything the sink
-    /// throws because no exception may unwind into the engine, and then requests a host-fault stop.
+    /// throws because no exception may unwind into the engine, and then requests a host-fault stop. A stop
+    /// refused through <see cref="RequestStopException"/> is reported in turn, as <c>rq_session_stop</c>, so
+    /// nothing is thrown.
     /// </summary>
     /// <param name="callbackName">The callback or event, such as <c>on_progress</c> or <c>Completed handler</c>.</param>
     /// <param name="exception">The exception that was caught.</param>
@@ -1437,6 +1473,27 @@ public sealed class FakeEngineSession : IEngineSession
     {
         ArgumentNullException.ThrowIfNull(callbackName);
         ArgumentNullException.ThrowIfNull(exception);
+        ReportToFaultSink(callbackName, exception);
+        RequestHostFaultStop();
+    }
+
+    // The session's own host-fault stop, requested where the wrapper lets no exception unwind: a refused
+    // stop is reported, once, under the engine function's name, as the wrapper reports it.
+    private void RequestHostFaultStop()
+    {
+        try
+        {
+            RequestStop(StopReason.HostFault);
+        }
+        catch (Exception exception)
+        {
+            ReportToFaultSink(StopFunctionName, exception);
+        }
+    }
+
+    // Records a fault and hands it to the options' fault sink, as the wrapper does.
+    private void ReportToFaultSink(string callbackName, Exception exception)
+    {
         lock (_gate)
         {
             _callbackFaults.Add((callbackName, exception));
@@ -1449,10 +1506,8 @@ public sealed class FakeEngineSession : IEngineSession
         catch (Exception)
         {
             // Deliberately discarded, as the wrapper's thunk discards it: the sink must not throw, and its
-            // failure must not hide the original fault, which the stop below still reports.
+            // failure must not hide the original fault or cancel the stop that follows it.
         }
-
-        RequestStop(StopReason.HostFault);
     }
 
     // The wrapper's EngineEventMapper.FormatEndDetail, which is internal to RamQuick.Interop.

@@ -984,6 +984,48 @@ internal static unsafe class SessionProbe
         }
     }
 
+    /// <summary>
+    /// Calls the session's own <c>on_step_starting</c> thunk, through the callback table the session gave the engine,
+    /// for the step at <paramref name="index"/>, so a test can run the step gate without starting a run. The call
+    /// runs on the calling thread, which stands in for the coordinator.
+    /// </summary>
+    /// <param name="session">A native engine session that has not been disposed, such as one never started.</param>
+    /// <param name="index">The zero-based index of a step of the session's plan.</param>
+    /// <returns>The thunk's <c>RQ_ACTION_*</c> decision, as the engine would receive it.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// The session is not a native engine session, or has been disposed (<see cref="ObjectDisposedException"/>).
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> is not a step of the plan.</exception>
+    public static uint RaiseStepStarting(IEngineSession session, int index)
+    {
+        EngineSession engineSession = AsEngineSession(session);
+        IReadOnlyList<StepAttributes> steps = engineSession.Steps;
+        ArgumentOutOfRangeException.ThrowIfNegative(index);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(index, steps.Count);
+
+        RqStepStart info = default;
+        info.StructSize = RqStepStart.Size;
+        info.Index = (uint)index;
+        info.Count = (uint)steps.Count;
+        _ = FixedUtf8.Write(steps[index].Name, info.Name, NativeConstants.NameSize);
+
+        SafeSessionHandle handle = engineSession.Handle;
+        bool added = false;
+        try
+        {
+            handle.DangerousAddRef(ref added);
+            RqCallbacks callbacks = CallbackThunks.CreateTable(handle.CallbackUserData);
+            return callbacks.OnStepStarting(callbacks.UserData, &info);
+        }
+        finally
+        {
+            if (added)
+            {
+                handle.DangerousRelease();
+            }
+        }
+    }
+
     private static EngineSession AsEngineSession(IEngineSession session)
     {
         ArgumentNullException.ThrowIfNull(session);

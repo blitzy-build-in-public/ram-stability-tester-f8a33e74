@@ -627,6 +627,174 @@ public sealed class InteropMarshallingTests
         Assert.Equal(liveBefore, SessionProbe.LiveSessionCount());
     }
 
+    // The engine refuses a stop only on a C++ exception that nothing outside it can provoke, so the session's stop call
+    // is replaced, on a session that is never started and locks nothing.
+    [Theory]
+    [InlineData((int)EngineResultCode.Internal, typeof(EngineException))]
+    [InlineData(-12345, typeof(EngineException))]
+    [InlineData((int)EngineResultCode.InvalidArgument, typeof(ArgumentException))]
+    public unsafe void RequestStop_EngineRefusesTheStop_ThrowsMappedFailureAndDisposeReportsItAndStillDestroys(
+        int refusal,
+        Type expectedType)
+    {
+        var resultCode = (EngineResultCode)refusal;
+        string nativeText = EngineResults.Describe(resultCode);
+        NativeEngine engine = TestEngines.Create();
+        SystemSnapshot system = engine.QuerySystem();
+        var faults = new ConcurrentQueue<(string CallbackName, Exception Exception)>();
+        var stopCalls = new ConcurrentQueue<(SafeSessionHandle Handle, uint Reason)>();
+        NativeSessionStop stop = (handle, stopReason) =>
+        {
+            stopCalls.Enqueue((handle, stopReason));
+            return refusal;
+        };
+        EngineSessionOptions options = CreateOptions(
+            system,
+            OneStepPlan(),
+            faultSink: (callbackName, exception) => faults.Enqueue((callbackName, exception)));
+
+        EngineSession session = EngineSession.Create(options, CreateNativeSession, stop);
+        ManualResetEvent stopEvent = session.CallbackState.StopEvent;
+        Exception? disposeFailure;
+        try
+        {
+            Exception refused = Assert.ThrowsAny<Exception>(() => session.RequestStop(StopReason.User));
+            _output.WriteLine($"rq_session_stop -> {refusal}: {refused.GetType().Name}: {refused.Message}");
+
+            // Exact type, mapped by EngineResults with the engine's own text.
+            Assert.IsType(expectedType, refused);
+            if (refused is EngineException engineException)
+            {
+                Assert.Equal(resultCode, engineException.Code);
+                Assert.Equal(nativeText, engineException.NativeMessage);
+                Assert.StartsWith("rq_session_stop failed (", engineException.Message, StringComparison.Ordinal);
+                Assert.EndsWith($"): {nativeText}", engineException.Message, StringComparison.Ordinal);
+            }
+            else
+            {
+                Assert.StartsWith($"rq_session_stop: {nativeText}", refused.Message, StringComparison.Ordinal);
+            }
+
+            // Nothing was recorded, so the event that would release a waiting gate into Abort stays unset, and the
+            // caller, not the fault sink, receives the refusal.
+            Assert.False(stopEvent.WaitOne(0), "The stop event was set although the engine refused the stop.");
+            Assert.Equal(SessionProbe.NoPendingReason, SessionProbe.GetPendingStopReason(session));
+            Assert.Empty(faults);
+        }
+        finally
+        {
+            disposeFailure = Record.Exception(session.Dispose);
+        }
+
+        // Dispose's own stop is refused as well: it is reported once rather than thrown, and the session is destroyed.
+        Assert.Null(disposeFailure);
+        (string callbackName, Exception reported) = Assert.Single(faults);
+        Assert.Equal("rq_session_stop", callbackName);
+        Assert.IsType(expectedType, reported);
+        Assert.Equal(
+            new[] { NativeConstants.StopUser, NativeConstants.StopHostFault },
+            stopCalls.Select(call => call.Reason));
+        Assert.All(stopCalls, call => Assert.Same(session.Handle, call.Handle));
+        Assert.True(session.Handle.IsClosed, "Dispose left the session handle open.");
+        Assert.Throws<ObjectDisposedException>(() => stopEvent.WaitOne(0));
+        AssertNoLiveSessions();
+    }
+
+    [Fact]
+    public unsafe void RequestStop_EngineNoLongerKnowsTheSession_IsToleratedWithoutSettingTheStopEvent()
+    {
+        NativeEngine engine = TestEngines.Create();
+        SystemSnapshot system = engine.QuerySystem();
+        var faults = new ConcurrentQueue<(string CallbackName, Exception Exception)>();
+        int stopCalls = 0;
+        NativeSessionStop stop = (_, _) =>
+        {
+            Interlocked.Increment(ref stopCalls);
+            return (int)EngineResultCode.InvalidHandle;
+        };
+        EngineSessionOptions options = CreateOptions(
+            system,
+            OneStepPlan(),
+            faultSink: (callbackName, exception) => faults.Enqueue((callbackName, exception)));
+
+        EngineSession session = EngineSession.Create(options, CreateNativeSession, stop);
+        ManualResetEvent stopEvent = session.CallbackState.StopEvent;
+        Exception? stopFailure;
+        Exception? disposeFailure;
+        try
+        {
+            // RQ_E_INVALID_HANDLE names a session already destroyed, whose run is stopped and whose gate waits no more.
+            stopFailure = Record.Exception(() => session.RequestStop(StopReason.Thermal));
+            Assert.False(stopEvent.WaitOne(0), "The stop event was set for a session the engine reported destroyed.");
+        }
+        finally
+        {
+            disposeFailure = Record.Exception(session.Dispose);
+        }
+
+        Assert.Null(stopFailure);
+        Assert.Null(disposeFailure);
+        Assert.Equal(2, stopCalls);
+        Assert.Empty(faults);
+        AssertNoLiveSessions();
+    }
+
+    // The session's own host-fault stops run where no exception may unwind into the engine: a refusal reaches the fault
+    // sink once, after any fault that caused the stop, and the gate still aborts the step, which the engine then ends
+    // as host_fault because no reason was recorded.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public unsafe void StepGate_EngineRefusesTheHostFaultStop_RefusalReportedOnceAndStepAborted(bool gateThrows)
+    {
+        NativeEngine engine = TestEngines.Create();
+        SystemSnapshot system = engine.QuerySystem();
+        var gateFailure = new InvalidOperationException("Step gate failure injected by the test.");
+        var faults = new ConcurrentQueue<(string CallbackName, Exception Exception)>();
+        var stopReasons = new ConcurrentQueue<uint>();
+        NativeSessionStop stop = (_, stopReason) =>
+        {
+            stopReasons.Enqueue(stopReason);
+            return (int)EngineResultCode.Internal;
+        };
+        StepGate gate = (_, _) => gateThrows ? throw gateFailure : StepGateDecision.Abort;
+        EngineSessionOptions options = CreateOptions(
+            system,
+            OneStepPlan(),
+            gate: gate,
+            faultSink: (callbackName, exception) => faults.Enqueue((callbackName, exception)));
+
+        EngineSession session = EngineSession.Create(options, CreateNativeSession, stop);
+        ManualResetEvent stopEvent = session.CallbackState.StopEvent;
+        try
+        {
+            uint action = SessionProbe.RaiseStepStarting(session, 0);
+            _output.WriteLine(string.Join("; ", faults.Select(fault => $"{fault.CallbackName}: {fault.Exception.Message}")));
+
+            Assert.Equal(NativeConstants.ActionAbort, action);
+            Assert.Equal(new[] { NativeConstants.StopHostFault }, stopReasons);
+            Assert.False(stopEvent.WaitOne(0), "The stop event was set although the engine refused the stop.");
+            string[] expectedNames = gateThrows ? new[] { "on_step_starting", "rq_session_stop" } : new[] { "rq_session_stop" };
+            Assert.Equal(expectedNames, faults.Select(fault => fault.CallbackName));
+            if (gateThrows)
+            {
+                Assert.Same(gateFailure, faults.First().Exception);
+            }
+
+            EngineException refused = Assert.IsType<EngineException>(faults.Last().Exception);
+            Assert.Equal(EngineResultCode.Internal, refused.Code);
+            Assert.Equal(EngineResults.Describe(EngineResultCode.Internal), refused.NativeMessage);
+        }
+        finally
+        {
+            // The run never started, so Completed never arrives and Dispose requests one more stop of its own.
+            session.Dispose();
+        }
+
+        Assert.Equal(new[] { NativeConstants.StopHostFault, NativeConstants.StopHostFault }, stopReasons);
+        AssertNoLiveSessions();
+    }
+
     [Fact]
     public void CreateSession_MaxStepCountSteps_AcceptedByValidateAndTheEngine()
     {
@@ -2238,6 +2406,11 @@ public sealed class InteropMarshallingTests
             CallbackFault = faultSink,
         };
     }
+
+    // The production rq_session_create, which the bound test library exports too, for a session created through
+    // EngineSession.Create with a substitute stop call.
+    private static unsafe int CreateNativeSession(RqSessionConfig* config, RqCallbacks* callbacks, nint* session) =>
+        NativeMethods.RqSessionCreate(config, callbacks, session);
 
     // Options for sessions whose factory never reaches the engine; optionally with one option the engine cannot take.
     private static EngineSessionOptions UnallocatedOptions(

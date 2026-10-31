@@ -47,9 +47,16 @@ public enum StopReason : uint
 /// <remarks>
 /// <para>
 /// <b>Threading.</b> <see cref="Start"/> and <see cref="RequestStop"/> never block and may be called from any thread.
-/// Every event is raised on the <see cref="SynchronizationContext"/> captured when the session was created, the UI
-/// thread in the application, and never on the engine's coordinator or worker threads. Only the step gate and the
-/// progress sink of the session options run synchronously on the coordinator.
+/// Every event is copied into an immutable record and delivered through <see cref="SynchronizationContext.Post"/> of
+/// the <see cref="SynchronizationContext"/> captured when the session was created, one event at a time and in the
+/// order the engine raised it; an event still awaiting delivery holds the session only weakly, so it never keeps an
+/// abandoned session alive. The session itself calls only the step gate and the progress sink of the session options
+/// synchronously on the engine's coordinator thread, so the captured context decides where subscribers run. The
+/// application's WPF dispatcher context raises them on the UI thread, and the thread-pool context used when none is
+/// current raises them on a pool thread: neither ever raises an event on the coordinator or on a worker. A custom or
+/// test context whose Post runs its work inline instead raises subscribers synchronously on the coordinator, inside
+/// the engine callback. Such subscribers must not block, because the engine waits for them, and cannot dispose the
+/// session, which is refused inside a callback.
 /// </para>
 /// <para>
 /// <b>Event order.</b> A started session raises
@@ -152,7 +159,8 @@ public interface IEngineSession : IDisposable
     /// <para>
     /// Ordering is binding: the native reason is recorded, and <c>rq_session_stop</c> has returned, before the managed
     /// stop event that releases a waiting step gate is set. A gate woken by that event therefore always finds its
-    /// reason already recorded and can never return Abort before the reason exists.
+    /// reason already recorded and can never return Abort before the reason exists. A stop the engine refuses records
+    /// no reason and leaves the event unset.
     /// </para>
     /// <para>
     /// While a run is in progress, the engine reports the stop through <see cref="Completed"/> within 2 seconds of the
@@ -162,6 +170,10 @@ public interface IEngineSession : IDisposable
     /// <param name="reason">Why the host is stopping the run.</param>
     /// <exception cref="ArgumentOutOfRangeException">
     /// <paramref name="reason"/> is not a defined <see cref="StopReason"/> value.
+    /// </exception>
+    /// <exception cref="EngineException">
+    /// The engine could not record the stop, for example with <see cref="EngineResultCode.Internal"/>. The stop event
+    /// is not set and the run is not stopped; the caller treats it as <see cref="RunEndReason.EngineFault"/>.
     /// </exception>
     void RequestStop(StopReason reason);
 }

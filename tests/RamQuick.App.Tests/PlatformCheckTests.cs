@@ -3,6 +3,7 @@ using System.IO;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
+using System.Windows.Threading;
 using RamQuick.App.Services;
 using RamQuick.App.Tests.Fakes;
 using Xunit;
@@ -167,15 +168,34 @@ public sealed class PlatformCheckTests
 /// since it would launch an elevated process.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Every mutex name is unique to its test and never <see cref="SingleInstanceGuard.MutexName"/>, so a
 /// running RAMQuick cannot interfere. Mutex ownership is thread-affine and re-entrant for its owner, so
-/// each test stays on its own thread throughout, with no await, and probes contention from dedicated
-/// threads that it joins.
+/// each <see cref="SingleInstanceGuard.TryAcquire"/> test stays on its own thread throughout, with no
+/// await, and probes contention from dedicated threads that it joins.
+/// </para>
+/// <para>
+/// The <see cref="SingleInstanceGuard.TryAcquireAsync"/> tests await, so they can resume on any thread
+/// and own no mutex themselves. A contending owner is a dedicated thread that also releases what it
+/// holds, and each acquisition runs against a dispatcher of its own on a background STA thread, as the
+/// application's runs on its UI thread.
+/// </para>
 /// </remarks>
 public sealed class HostServiceTests
 {
     private static readonly TimeSpan _contendedTimeout = TimeSpan.FromMilliseconds(100);
     private static readonly TimeSpan _threadJoinTimeout = TimeSpan.FromSeconds(30);
+
+    // Far longer than any acquisition these tests let run, so a guard that blocked its dispatcher in a
+    // mutex wait would hold a posted work item far beyond _dispatcherProbeTimeout.
+    private static readonly TimeSpan _pollingTimeout = TimeSpan.FromSeconds(30);
+
+    // Several of the guard's 100 ms retry intervals.
+    private static readonly TimeSpan _pollingWindow = TimeSpan.FromMilliseconds(300);
+
+    // Generous for work items on a loaded host, yet a sixth of _pollingTimeout.
+    private static readonly TimeSpan _dispatcherProbeTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan _dispatcherProbeInterval = TimeSpan.FromMilliseconds(25);
 
     // Thread.Join can return before Windows has ended the joined OS thread and abandoned the mutexes
     // it owns, so a successor waits this long for the abandonment instead of testing once. The owner
@@ -333,6 +353,144 @@ public sealed class HostServiceTests
         Assert.Equal("mutexName", exception.ParamName);
     }
 
+    [Theory]
+    // A single attempt, and a long wait that an uncontended name never needs.
+    [InlineData(0)]
+    [InlineData(30_000)]
+    public async Task TryAcquireAsync_Uncontended_ReturnsGuardOwnedByDispatcherThreadAsync(int timeoutMilliseconds)
+    {
+        string name = UniqueMutexName();
+        using DispatcherThread ui = await DispatcherThread.StartAsync();
+
+        SingleInstanceGuard? guard = await SingleInstanceGuard
+            .TryAcquireAsync(ui.Dispatcher, TimeSpan.FromMilliseconds(timeoutMilliseconds), name)
+            .WaitAsync(_threadJoinTimeout, TestContext.Current.CancellationToken);
+
+        await AssertOwnedByDispatcherThreadAndReleasedThereAsync(ui.Dispatcher, guard, name);
+    }
+
+    [Fact]
+    public async Task TryAcquireAsync_ReleasedWhilePolling_KeepsDispatcherResponsiveThenReturnsGuardOwnedByItAsync()
+    {
+        string name = UniqueMutexName();
+        using DispatcherThread ui = await DispatcherThread.StartAsync();
+        using MutexHolder holder = await MutexHolder.StartAsync(name);
+
+        Task<SingleInstanceGuard?> acquisition =
+            SingleInstanceGuard.TryAcquireAsync(ui.Dispatcher, _pollingTimeout, name);
+        await AssertDispatcherResponsiveAsync(ui.Dispatcher, _pollingWindow);
+        Assert.False(acquisition.IsCompleted, "The acquisition ended while another thread held the mutex.");
+
+        holder.Release();
+        SingleInstanceGuard? guard =
+            await acquisition.WaitAsync(_threadJoinTimeout, TestContext.Current.CancellationToken);
+
+        await AssertOwnedByDispatcherThreadAndReleasedThereAsync(ui.Dispatcher, guard, name);
+    }
+
+    [Theory]
+    // A single attempt, and polling through several retry intervals to the deadline.
+    [InlineData(0)]
+    [InlineData(300)]
+    public async Task TryAcquireAsync_HeldThroughDeadline_KeepsDispatcherResponsiveThenReturnsNullAsync(
+        int timeoutMilliseconds)
+    {
+        string name = UniqueMutexName();
+        var timeout = TimeSpan.FromMilliseconds(timeoutMilliseconds);
+        using DispatcherThread ui = await DispatcherThread.StartAsync();
+        using MutexHolder holder = await MutexHolder.StartAsync(name);
+
+        long startedAt = Stopwatch.GetTimestamp();
+        Task<SingleInstanceGuard?> acquisition = SingleInstanceGuard.TryAcquireAsync(ui.Dispatcher, timeout, name);
+        await AssertDispatcherResponsiveAsync(ui.Dispatcher, timeout);
+        SingleInstanceGuard? guard =
+            await acquisition.WaitAsync(_threadJoinTimeout, TestContext.Current.CancellationToken);
+        TimeSpan elapsed = Stopwatch.GetElapsedTime(startedAt);
+
+        Assert.Null(guard);
+
+        // The guard starts its clock inside the call, after startedAt, so it never gives up earlier.
+        Assert.True(elapsed >= timeout, $"The acquisition gave up after {elapsed}, before its {timeout} deadline.");
+    }
+
+    [Theory]
+    // The dispatcher shut down before the first attempt, and while the acquisition polls a held mutex.
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TryAcquireAsync_DispatcherShutDown_ThrowsTaskCanceledAsync(bool whilePolling)
+    {
+        string name = UniqueMutexName();
+        using DispatcherThread ui = await DispatcherThread.StartAsync();
+        using MutexHolder? holder = whilePolling ? await MutexHolder.StartAsync(name) : null;
+
+        Task<SingleInstanceGuard?> acquisition;
+        if (whilePolling)
+        {
+            acquisition = SingleInstanceGuard.TryAcquireAsync(ui.Dispatcher, _pollingTimeout, name);
+            await AssertDispatcherResponsiveAsync(ui.Dispatcher, _pollingWindow);
+            Assert.True(ui.Stop(), "The dispatcher thread did not end.");
+        }
+        else
+        {
+            Assert.True(ui.Stop(), "The dispatcher thread did not end.");
+            acquisition = SingleInstanceGuard.TryAcquireAsync(ui.Dispatcher, _pollingTimeout, name);
+        }
+
+        await Assert.ThrowsAsync<TaskCanceledException>(
+            () => acquisition.WaitAsync(_threadJoinTimeout, TestContext.Current.CancellationToken));
+    }
+
+    [Theory]
+    [MemberData(nameof(MalformedNames))]
+    public async Task TryAcquireAsync_MalformedName_ThrowsIOExceptionAsync(string mutexName)
+    {
+        using DispatcherThread ui = await DispatcherThread.StartAsync();
+
+        await Assert.ThrowsAnyAsync<IOException>(
+            () => SingleInstanceGuard.TryAcquireAsync(ui.Dispatcher, TimeSpan.Zero, mutexName));
+    }
+
+    [Fact]
+    public async Task TryAcquireAsync_NullDispatcher_ThrowsArgumentNullAsync()
+    {
+        ArgumentNullException exception = await Assert.ThrowsAsync<ArgumentNullException>(
+            () => SingleInstanceGuard.TryAcquireAsync(null!, TimeSpan.Zero, UniqueMutexName()));
+
+        Assert.Equal("dispatcher", exception.ParamName);
+    }
+
+    [Theory]
+    // Timeout.InfiniteTimeSpan (-1 ms), which TryAcquire accepts but a polled wait never needs, and
+    // another negative interval.
+    [InlineData(-1.0)]
+    [InlineData(-2.0)]
+    public async Task TryAcquireAsync_NegativeTimeout_ThrowsArgumentOutOfRangeAsync(double timeoutMilliseconds)
+    {
+        using DispatcherThread ui = await DispatcherThread.StartAsync();
+
+        ArgumentOutOfRangeException exception = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => SingleInstanceGuard.TryAcquireAsync(
+                ui.Dispatcher,
+                TimeSpan.FromMilliseconds(timeoutMilliseconds),
+                UniqueMutexName()));
+
+        Assert.Equal("timeout", exception.ParamName);
+    }
+
+    [Theory]
+    [InlineData(null, typeof(ArgumentNullException))]
+    [InlineData("", typeof(ArgumentException))]
+    public async Task TryAcquireAsync_MissingName_ThrowsArgumentAsync(string? mutexName, Type expectedException)
+    {
+        using DispatcherThread ui = await DispatcherThread.StartAsync();
+
+        var exception = (ArgumentException)await Assert.ThrowsAsync(
+            expectedException,
+            () => SingleInstanceGuard.TryAcquireAsync(ui.Dispatcher, TimeSpan.Zero, mutexName!));
+
+        Assert.Equal("mutexName", exception.ParamName);
+    }
+
     [Fact]
     public void IsElevated_ReadTwice_MatchesAdministratorRoleOfCurrentToken()
     {
@@ -385,6 +543,169 @@ public sealed class HostServiceTests
         Assert.True(thread.Join(_threadJoinTimeout), "The dedicated test thread did not finish.");
         failure?.Throw();
         return result;
+    }
+
+    // The owner alone re-enters an owned mutex, so the dispatcher's thread succeeding where a dedicated
+    // thread is refused shows that it owns the guard; disposing the guard there must then free the
+    // mutex. The extra handle keeps the kernel object alive throughout: without it, a guard disposed
+    // off its owning thread would close the last handle and destroy the mutex, and the final probe
+    // would succeed on a fresh one.
+    private static async Task AssertOwnedByDispatcherThreadAndReleasedThereAsync(
+        Dispatcher dispatcher,
+        SingleInstanceGuard? guard,
+        string mutexName)
+    {
+        Assert.NotNull(guard);
+        using var keepAlive = new Mutex(initiallyOwned: false, mutexName);
+
+        Assert.False(AcquiresOnAnotherThread(mutexName, _contendedTimeout));
+        bool reenteredOnDispatcherThread = await dispatcher
+            .InvokeAsync(() =>
+            {
+                using SingleInstanceGuard? reentered = SingleInstanceGuard.TryAcquire(TimeSpan.Zero, mutexName);
+                return reentered is not null;
+            })
+            .Task.WaitAsync(_dispatcherProbeTimeout, TestContext.Current.CancellationToken);
+        Assert.True(reenteredOnDispatcherThread);
+
+        await dispatcher
+            .InvokeAsync(guard.Dispose)
+            .Task.WaitAsync(_dispatcherProbeTimeout, TestContext.Current.CancellationToken);
+        Assert.True(AcquiresOnAnotherThread(mutexName, TimeSpan.Zero));
+    }
+
+    // Posts work items to the dispatcher until window has elapsed, at least once, each awaited within
+    // _dispatcherProbeTimeout: a dispatcher blocked in a mutex wait would leave one queued far longer.
+    private static async Task AssertDispatcherResponsiveAsync(Dispatcher dispatcher, TimeSpan window)
+    {
+        long startedAt = Stopwatch.GetTimestamp();
+        do
+        {
+            await dispatcher
+                .InvokeAsync(() => { })
+                .Task.WaitAsync(_dispatcherProbeTimeout, TestContext.Current.CancellationToken);
+            await Task.Delay(_dispatcherProbeInterval, TestContext.Current.CancellationToken);
+        }
+        while (Stopwatch.GetElapsedTime(startedAt) < window);
+    }
+
+    // A dispatcher running on a background STA thread of its own, as the application's runs on its UI
+    // thread.
+    private sealed class DispatcherThread : IDisposable
+    {
+        private readonly Thread _thread;
+
+        private DispatcherThread(Dispatcher dispatcher, Thread thread)
+        {
+            Dispatcher = dispatcher;
+            _thread = thread;
+        }
+
+        public Dispatcher Dispatcher { get; }
+
+        public static async Task<DispatcherThread> StartAsync()
+        {
+            // Continuations run asynchronously, so the awaiting test never runs on the new thread ahead of
+            // its dispatcher loop.
+            var started = new TaskCompletionSource<Dispatcher>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var thread = new Thread(() =>
+            {
+                started.SetResult(Dispatcher.CurrentDispatcher);
+                Dispatcher.Run();
+            })
+            {
+                IsBackground = true,
+                Name = nameof(HostServiceTests) + " dispatcher",
+            };
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.Start();
+
+            Dispatcher dispatcher =
+                await started.Task.WaitAsync(_threadJoinTimeout, TestContext.Current.CancellationToken);
+            return new DispatcherThread(dispatcher, thread);
+        }
+
+        // Queued rather than invoked, so a hung dispatcher cannot hang the test, and joined within a
+        // bound: a background thread that never ends cannot keep the test process alive. Once the
+        // thread has ended, the dispatcher has finished shutting down.
+        public bool Stop()
+        {
+            Dispatcher.BeginInvokeShutdown(DispatcherPriority.Send);
+            return _thread.Join(_threadJoinTimeout);
+        }
+
+        public void Dispose() => Stop();
+    }
+
+    // Holds a mutex on a thread of its own and disposes the guard on that thread, so ownership is
+    // released where it is held whichever thread the awaiting test resumes on.
+    private sealed class MutexHolder : IDisposable
+    {
+        private readonly ManualResetEventSlim _release;
+        private readonly Thread _thread;
+
+        private MutexHolder(ManualResetEventSlim release, Thread thread)
+        {
+            _release = release;
+            _thread = thread;
+        }
+
+        public static async Task<MutexHolder> StartAsync(string mutexName)
+        {
+            var acquired = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new ManualResetEventSlim();
+            var thread = new Thread(() =>
+            {
+                try
+                {
+                    using SingleInstanceGuard? guard = SingleInstanceGuard.TryAcquire(TimeSpan.Zero, mutexName);
+                    acquired.SetResult(guard is not null);
+                    if (guard is not null)
+                    {
+                        release.Wait();
+                    }
+                }
+                catch (Exception exception)
+                {
+                    acquired.TrySetException(exception);
+                }
+            })
+            {
+                IsBackground = true,
+                Name = nameof(HostServiceTests) + " mutex holder",
+            };
+            thread.Start();
+
+            var holder = new MutexHolder(release, thread);
+            try
+            {
+                Assert.True(
+                    await acquired.Task.WaitAsync(_threadJoinTimeout, TestContext.Current.CancellationToken),
+                    "The holder thread did not acquire the mutex.");
+                return holder;
+            }
+            catch
+            {
+                holder.Dispose();
+                throw;
+            }
+        }
+
+        public void Release()
+        {
+            _release.Set();
+            Assert.True(_thread.Join(_threadJoinTimeout), "The holder thread did not release the mutex.");
+        }
+
+        // The event is disposed only once the thread that waits on it has ended.
+        public void Dispose()
+        {
+            _release.Set();
+            if (_thread.Join(_threadJoinTimeout))
+            {
+                _release.Dispose();
+            }
+        }
     }
 }
 

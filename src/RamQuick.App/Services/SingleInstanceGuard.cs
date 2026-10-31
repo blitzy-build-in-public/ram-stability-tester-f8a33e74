@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.IO;
+using System.Windows.Threading;
 
 namespace RamQuick.App.Services;
 
@@ -9,9 +11,9 @@ namespace RamQuick.App.Services;
 /// <remarks>
 /// <para>
 /// Mutex ownership is thread-affine. The application acquires the guard on the UI thread in
-/// <c>OnStartup</c> and disposes it on the same thread in <c>OnExit</c>. Disposed on any other thread,
-/// the guard closes its handle without releasing ownership, which lasts until the owning thread or the
-/// process ends.
+/// <c>OnStartup</c>, through <see cref="TryAcquireAsync"/>, whose every attempt runs on that thread, and
+/// disposes it on the same thread in <c>OnExit</c>. Disposed on any other thread, the guard closes its
+/// handle without releasing ownership, which lasts until the owning thread or the process ends.
 /// </para>
 /// <para>
 /// The mutex is re-entrant for its owner, so a second <see cref="TryAcquire"/> on the owning thread
@@ -43,6 +45,10 @@ public sealed class SingleInstanceGuard : IDisposable
     // the mutex is opened means a bad argument never leaves an unowned handle behind.
     private static readonly TimeSpan _maxTimeout = TimeSpan.FromMilliseconds(int.MaxValue);
 
+    // Short beside the 5-second takeover window, so an elevated restart starts within a tenth of a second
+    // of the old instance's release, yet rare enough that polling costs the dispatcher nothing it shows.
+    private static readonly TimeSpan _retryInterval = TimeSpan.FromMilliseconds(100);
+
     private readonly Mutex _mutex;
 
     // The owning Thread itself is kept rather than its managed thread id: ids are recycled once a
@@ -59,10 +65,10 @@ public sealed class SingleInstanceGuard : IDisposable
     }
 
     /// <summary>
-    /// Tries to make this process the single running instance, waiting up to
-    /// <paramref name="timeout"/> for a previous instance to release the mutex. The application passes
-    /// 5 seconds, which covers an elevated restart: the non-elevated instance holds the mutex until its
-    /// window has closed.
+    /// Tries to make this process the single running instance, blocking the calling thread for up to
+    /// <paramref name="timeout"/> while a previous instance still holds the mutex. The application does
+    /// not wait here: it calls <see cref="TryAcquireAsync"/>, which makes zero-time attempts through this
+    /// method until its deadline, so the UI thread never blocks.
     /// </summary>
     /// <param name="timeout">
     /// How long to wait: <see cref="TimeSpan.Zero"/> to test without waiting, a positive interval of at
@@ -147,6 +153,78 @@ public sealed class SingleInstanceGuard : IDisposable
         }
 
         return acquired ? new SingleInstanceGuard(mutex) : null;
+    }
+
+    /// <summary>
+    /// Tries to make this process the single running instance without blocking the thread of
+    /// <paramref name="dispatcher"/>: it makes zero-time attempts on that thread, a tenth of a second
+    /// apart, until one succeeds or <paramref name="timeout"/> has elapsed, and the last attempt falls at
+    /// the deadline. The application passes 5 seconds, which covers an elevated restart: the
+    /// non-elevated instance holds the mutex until its window has closed.
+    /// </summary>
+    /// <remarks>
+    /// Every attempt runs on the thread of <paramref name="dispatcher"/>, whichever thread the caller
+    /// resumes on, so that thread owns the returned guard and is the one to dispose it. The dispatcher
+    /// services its queue between attempts.
+    /// </remarks>
+    /// <param name="dispatcher">The dispatcher whose thread acquires, and later disposes, the guard.</param>
+    /// <param name="timeout">
+    /// How long to keep trying: <see cref="TimeSpan.Zero"/> for a single attempt, or a positive interval.
+    /// </param>
+    /// <param name="mutexName">
+    /// The mutex name. The application uses the default, <see cref="MutexName"/>; tests pass a unique
+    /// name so they never contend with a running RAMQuick.
+    /// </param>
+    /// <returns>
+    /// A task whose result is a guard whose mutex is owned by the thread of
+    /// <paramref name="dispatcher"/>, or <see langword="null"/> when this process cannot become the
+    /// single instance: another instance still holds the mutex at the deadline, or any other refusal
+    /// <see cref="TryAcquire"/> describes persists until then.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="dispatcher"/> or <paramref name="mutexName"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException"><paramref name="mutexName"/> is empty.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="timeout"/> is negative, <see cref="Timeout.InfiniteTimeSpan"/> included.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// <paramref name="mutexName"/> is not a valid kernel object name, as for <see cref="TryAcquire"/>.
+    /// </exception>
+    /// <exception cref="TaskCanceledException">
+    /// <paramref name="dispatcher"/> has shut down, or shuts down before an attempt runs on it. A caller
+    /// awaiting on that dispatcher's own thread is never resumed once it has shut down, as with any
+    /// await there.
+    /// </exception>
+    public static async Task<SingleInstanceGuard?> TryAcquireAsync(
+        Dispatcher dispatcher,
+        TimeSpan timeout,
+        string mutexName = MutexName)
+    {
+        ArgumentNullException.ThrowIfNull(dispatcher);
+        ArgumentException.ThrowIfNullOrEmpty(mutexName);
+        ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero);
+
+        long startedAt = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            // Dispatched even when the caller is already on the dispatcher's thread: a continuation after
+            // the delay resumes on whatever context the caller had, and ownership must land on the thread
+            // that releases it.
+            SingleInstanceGuard? guard = await dispatcher.InvokeAsync(() => TryAcquire(TimeSpan.Zero, mutexName));
+            if (guard is not null)
+            {
+                return guard;
+            }
+
+            TimeSpan remaining = timeout - Stopwatch.GetElapsedTime(startedAt);
+            if (remaining <= TimeSpan.Zero)
+            {
+                return null;
+            }
+
+            await Task.Delay(remaining < _retryInterval ? remaining : _retryInterval);
+        }
     }
 
     /// <summary>

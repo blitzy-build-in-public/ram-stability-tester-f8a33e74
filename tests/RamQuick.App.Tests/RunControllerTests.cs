@@ -2317,6 +2317,70 @@ public sealed class RunControllerTests
         Assert.EndsWith(" STOP_REQUESTED reason=UserStop", stop, StringComparison.Ordinal);
     }
 
+    // A stop the engine refuses records no reason, so no Completed answers it: the run ends at once as the engine
+    // fault, and the teardown's disposal, which stops the engine and releases the memory, alone gates the next Start.
+    [Fact]
+    public void Stop_EngineRefusesTheUserStop_AbortsAsEngineFaultAndOffersStartOnlyAfterDisposal()
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+        var refusal = new EngineException(
+            EngineResultCode.Internal,
+            "rq_session_stop failed (Internal, -99): Internal engine error",
+            "Internal engine error");
+        session.RequestStopException = refusal;
+        session.BlockDispose();
+        try
+        {
+            // Called with the harness context installed, as the Stop command is, so the conclusion it begins
+            // resumes on the "UI thread".
+            _ = harness.OnUiThread(() =>
+            {
+                harness.Controller.RequestStop();
+                return true;
+            });
+
+            Assert.Equal(RunState.Aborted, harness.StateMachine.State);
+            Assert.Equal(RunEndReason.EngineFault, harness.StateMachine.EndReason);
+            Assert.Equal(refusal.Message, harness.StateMachine.EndDetail);
+            Assert.Equal(UiText.EngineError(refusal.Message), harness.Controller.ResultMessage);
+            Assert.Empty(session.StopRequests);
+            Assert.False(session.StopEvent.WaitOne(0), "The stop event was set although the engine refused the stop.");
+
+            // A disposed session raises no Released, so the summaries are published without waiting for one, and
+            // Start stays unavailable while the disposal is still running.
+            harness.RunUntil(() => session.DisposeCount == 1);
+            Assert.Single(harness.SummaryJsonPaths());
+            harness.Pump();
+            Assert.False(harness.Controller.CanStart);
+        }
+        finally
+        {
+            session.ReleaseDispose();
+        }
+
+        harness.WaitForPublication();
+        Assert.True(session.IsDisposed);
+        using (JsonDocument summary = harness.ReadSummary())
+        {
+            JsonElement run = summary.RootElement.GetProperty("run");
+            Assert.Equal("ABORTED", run.GetProperty("verdict").GetString());
+            Assert.Equal(nameof(RunEndReason.EngineFault), run.GetProperty("endReason").GetString());
+        }
+
+        // The disposal's own stop was refused too and reported, not thrown. Neither refusal was a recorded stop, so the
+        // .log has no STOP_REQUESTED line; app-errors.log has both.
+        (string callbackName, Exception reported) = Assert.Single(session.CallbackFaults);
+        Assert.Equal("rq_session_stop", callbackName);
+        Assert.Same(refusal, reported);
+        Assert.DoesNotContain(RunLogLines(harness), line => EventOf(line) == "STOP_REQUESTED");
+        harness.RunUntil(() => harness.AppErrorsLogText().Contains("source=\"RunController.RequestEngineStop\"", StringComparison.Ordinal)
+            && harness.AppErrorsLogText().Contains("source=\"EngineCallback:rq_session_stop\"", StringComparison.Ordinal)
+            && harness.AppErrorsLogText().Contains(refusal.Message, StringComparison.Ordinal));
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -2906,6 +2970,64 @@ public sealed class RunControllerTests
         harness.Release(TimeSpan.FromMilliseconds(100));
         AssertPublishedEndDetail(harness, UiText.HostFault(fault.Message));
         AssertFaultLogged(harness, "EngineCallback:on_progress", fault);
+    }
+
+    // A host-fault stop the engine refuses on the coordinator is only recorded there; the UI thread answers it on the
+    // next session event, as the engine fault, unless the engine's own Completed comes first and settles the run.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CallbackFault_EngineRefusesItsHostFaultStop_AnsweredOnTheNextEventUnlessCompletedComesFirst(bool completedFirst)
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+        var fault = new InvalidOperationException("progress sink failed");
+        var refusal = new EngineException(
+            EngineResultCode.Internal,
+            "rq_session_stop failed (Internal, -99): Internal engine error",
+            "Internal engine error");
+        session.RequestStopException = refusal;
+
+        // The test thread plays the coordinator: the controller's sink and then the session ask for a host-fault stop,
+        // and the engine refuses both.
+        session.InvokeCallbackFault("on_progress", fault);
+
+        Assert.Equal(RunState.Running, harness.StateMachine.State);
+        Assert.Empty(session.StopRequests);
+        Assert.Equal(new[] { "on_progress", "rq_session_stop" }, session.CallbackFaults.Select(reported => reported.CallbackName));
+
+        if (completedFirst)
+        {
+            harness.Complete(RunEndReason.HostFault);
+            Assert.Equal(RunEndReason.HostFault, harness.StateMachine.EndReason);
+            Assert.Equal(UiText.HostFault(fault.Message), harness.Controller.ResultMessage);
+            harness.Release(TimeSpan.FromMilliseconds(100));
+        }
+        else
+        {
+            StepAttributes step = session.Options.Steps[0];
+            session.PublishProgress(FakeEngineData.Progress(
+                step.Index,
+                session.Options.Steps.Count,
+                step.Name,
+                TimeSpan.FromSeconds(5),
+                TimeSpan.FromSeconds(295),
+                GiB,
+                session.Options.RegionBytes,
+                0));
+            harness.AwaitVerdict();
+            Assert.Equal(RunEndReason.EngineFault, harness.StateMachine.EndReason);
+            Assert.Equal(UiText.EngineError(refusal.Message), harness.Controller.ResultMessage);
+            harness.WaitForPublication();
+        }
+
+        Assert.Equal(RunState.Aborted, harness.StateMachine.State);
+        Assert.True(session.IsDisposed);
+        Assert.DoesNotContain(RunLogLines(harness), line => EventOf(line) == "STOP_REQUESTED");
+        harness.RunUntil(() => harness.AppErrorsLogText().Contains("source=\"RunController.RequestEngineStop\"", StringComparison.Ordinal)
+            && harness.AppErrorsLogText().Contains("source=\"EngineCallback:rq_session_stop\"", StringComparison.Ordinal));
     }
 
     // A host-fault stop with no cause recorded by the controller, such as a step gate whose session was already

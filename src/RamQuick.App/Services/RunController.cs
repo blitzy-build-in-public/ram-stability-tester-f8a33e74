@@ -742,7 +742,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
     /// While an accepted Start has not yet entered Preparing, for example while its <c>begin</c> record is being made
     /// durable, the Start is withdrawn with the state unchanged (<see cref="StartResult.Withdrawn"/>). In Preparing,
     /// including a step's journal wait, and in Running, the engine is asked to stop and the run ends ABORTED with
-    /// "Stopped by user" within 2 s. Otherwise nothing happens.
+    /// "Stopped by user" within 2 s; if the engine refuses the stop, the run ends ABORTED at once with
+    /// <see cref="UiText.EngineError(string)"/>, and the session's disposal stops the engine and releases the memory.
+    /// Otherwise nothing happens.
     /// </remarks>
     public void RequestStop()
     {
@@ -755,6 +757,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         if (_run is { Concluded: false } run && StateMachine.IsRunInProgress)
         {
             RequestEngineStop(run, StopReason.User);
+            AnswerStopFailure(run);
         }
     }
 
@@ -766,7 +769,8 @@ public sealed partial class RunController : ObservableObject, IDisposable
     /// <para>
     /// A pending Start is withdrawn. A run in progress is stopped with the user-stop reason, and Completed is awaited
     /// for at most <see cref="RunControllerOptions.ShutdownCompletedTimeout"/> (3 s); if it never arrives, the run is
-    /// finalised as ABORTED from the controller's own totals. Released is then awaited for at most
+    /// finalised as ABORTED from the controller's own totals, and a stop the engine refuses finalises it so at once,
+    /// as an engine fault. Released is then awaited for at most
     /// <see cref="RunControllerOptions.ShutdownReleasedTimeout"/> (10 s) after the conclusion, and the summaries are
     /// published with <c>memory.releaseSeconds: null</c> if it has not arrived.
     /// </para>
@@ -938,6 +942,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
             if (StateMachine.IsRunInProgress)
             {
                 RequestEngineStop(run, StopReason.User);
+                AnswerStopFailure(run);
             }
 
             bool completed = await CompletesWithinAsync(
@@ -945,7 +950,10 @@ public sealed partial class RunController : ObservableObject, IDisposable
                 RemainingUntil(shutdownStart, _options.ShutdownCompletedTimeout));
             if (!completed && !run.Concluded)
             {
-                BeginConclusion(run, ConclusionFromOwnTotals(run), releaseExpected: run.SessionStarted);
+                BeginConclusion(
+                    run,
+                    ConclusionFromOwnTotals(run, RunEndReason.UserStop, endDetail: null),
+                    releaseExpected: run.SessionStarted);
             }
         }
 
@@ -1489,8 +1497,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
         return StepGateDecision.Abort;
     }
 
-    // Runs on the engine coordinator or the UI thread; non-blocking: the app-error write goes to the thread pool and
-    // the .log lines are only enqueued. CALLBACK_FAULT records the cause of the host-fault stop that follows it.
+    // Runs on the engine coordinator, the UI thread, or the pool thread disposing the session, which reports a stop the
+    // engine refused there; non-blocking: the app-error write goes to the thread pool and the .log lines are only
+    // enqueued. CALLBACK_FAULT records the cause of the host-fault stop that follows it.
     private static void RecordCallbackFault(RunContext run, string callbackName, Exception exception)
     {
         string source = EngineCallbackSourcePrefix + callbackName;
@@ -1561,6 +1570,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
             TestedBytes = e.TestedBytes;
             IsReducedInstructionSet = e.IsReducedInstructionSet;
             _ = StateMachine.TryTransition(RunState.Running);
+            AnswerStopFailure(run);
         }
         catch (Exception exception)
         {
@@ -1578,6 +1588,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         try
         {
             run.Log.LogStepStarted(e.Index, e.Count, e.Name);
+            AnswerStopFailure(run);
         }
         catch (Exception exception)
         {
@@ -1597,6 +1608,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
             run.Log.LogStepFinished(e.Outcome, run.Request.Steps.Count);
             run.Journal.RecordStepFinished(e.Outcome);
             run.RecordOutcome(e.Outcome);
+            AnswerStopFailure(run);
         }
         catch (Exception exception)
         {
@@ -1626,6 +1638,8 @@ public sealed partial class RunController : ObservableObject, IDisposable
             {
                 ReportLogFailure(run);
             }
+
+            AnswerStopFailure(run);
         }
         catch (Exception exception)
         {
@@ -1667,6 +1681,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
             }
 
             UpdateTruncation(run);
+            AnswerStopFailure(run);
         }
         catch (Exception exception)
         {
@@ -1724,6 +1739,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         if (!run.Concluded && StateMachine.IsRunInProgress)
         {
             RequestEngineStop(run, StopReason.HostFault);
+            AnswerStopFailure(run);
         }
     }
 
@@ -1781,10 +1797,22 @@ public sealed partial class RunController : ObservableObject, IDisposable
     // Every stop the controller asks for, from the UI or the coordinator thread: the engine records the reason before
     // this returns, and the controller's first request gets its STOP_REQUESTED line, stamped at the request, unless a
     // reported first-error stop was logged before it; later requests, which the engine ignores, add none. Logging
-    // only enqueues, so the coordinator performs no I/O.
+    // only enqueues, so the coordinator performs no I/O. A stop the engine refuses recorded no reason, so it gets no
+    // line: it is kept as the run's engine fault, which AnswerStopFailure concludes the run with.
     private static void RequestEngineStop(RunContext run, StopReason reason)
     {
-        if (run.RequestStop(reason))
+        bool claimed;
+        try
+        {
+            claimed = run.RequestStop(reason);
+        }
+        catch (EngineException exception)
+        {
+            RecordStopFailure(run, exception);
+            return;
+        }
+
+        if (claimed)
         {
             string reasonName = reason switch
             {
@@ -1794,6 +1822,41 @@ public sealed partial class RunController : ObservableObject, IDisposable
             };
             run.Log.LogStopRequested(run.TimeProvider.GetUtcNow(), reasonName);
         }
+    }
+
+    // Runs on the coordinator or the UI thread, so it only records and enqueues: the first refusal is kept for
+    // AnswerStopFailure, and its app-errors.log entry is written on the thread pool. A later refusal is the same
+    // engine fault and adds nothing.
+    private static void RecordStopFailure(RunContext run, EngineException exception)
+    {
+        if (run.TryRecordStopFailure(exception))
+        {
+            run.BackgroundWork.QueueAppError(
+                run.Request.DataDirectory,
+                AppErrorSourceOf(nameof(RequestEngineStop)),
+                exception,
+                run.TimeProvider.GetUtcNow(),
+                run.Log.RunId);
+        }
+    }
+
+    // A stop the engine refused leaves it running with no reason recorded, so no Completed will answer the request:
+    // the run is concluded here, as the engine fault the refusal is, from the controller's own totals. The teardown's
+    // disposal then has rq_session_destroy stop the engine, join its threads and release the memory, and Start stays
+    // unavailable until it has returned; a disposed session raises no Released, so none is awaited. Runs on the UI
+    // thread, at once after a request made there and on the next session event after one the coordinator made. A
+    // Completed that arrives first concludes the run with the engine's own outcome instead.
+    private void AnswerStopFailure(RunContext run)
+    {
+        if (run.Concluded || !StateMachine.IsRunInProgress || run.StopFailure is not { } failure)
+        {
+            return;
+        }
+
+        BeginConclusion(
+            run,
+            ConclusionFromOwnTotals(run, RunEndReason.EngineFault, failure.Message),
+            releaseExpected: false);
     }
 
     private void UpdateTruncation(RunContext run)
@@ -1811,6 +1874,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
             if (run is { Concluded: false } && StateMachine.IsRunInProgress)
             {
                 ObserveReadings(run, readings, evaluateThermal: StateMachine.State == RunState.Running);
+                AnswerStopFailure(run);
             }
         }
         catch (Exception exception)
@@ -1934,10 +1998,11 @@ public sealed partial class RunController : ObservableObject, IDisposable
         exception.Message,
         _timeProvider.GetUtcNow());
 
-    // Used only when the engine stays silent past the shutdown bound: the run ends ABORTED as a user stop with what
-    // the controller itself observed. No step result arrives with that end, so the step the gate let start without a
-    // StepFinished is carried as unfinished, keeping one summary entry per started step.
-    private Conclusion ConclusionFromOwnTotals(RunContext run)
+    // Used only when no Completed will settle the run: past the shutdown bound it ends as a user stop, and after a stop
+    // the engine refused as an engine fault, ABORTED either way with what the controller itself observed. No step
+    // result arrives with that end, so the step the gate let start without a StepFinished is carried as unfinished,
+    // keeping one summary entry per started step.
+    private Conclusion ConclusionFromOwnTotals(RunContext run, RunEndReason endReason, string? endDetail)
     {
         RunProgress? progress = CurrentProgress;
         IReadOnlyList<StepOutcome> outcomes = run.OutcomesSnapshot();
@@ -1946,7 +2011,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
                 ? new JournalStepStart { Index = started.Index + 1, Count = started.Count, Name = started.Name }
                 : null;
         return new Conclusion(
-            RunEndReason.UserStop,
+            endReason,
             TotalErrors,
             progress?.VerifiedBytes ?? 0,
             progress?.Elapsed ?? TimeSpan.Zero,
@@ -1954,7 +2019,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
             outcomes.Count(outcome => outcome.Completed),
             outcomes,
             0,
-            null,
+            endDetail,
             _timeProvider.GetUtcNow(),
             unfinishedStep);
     }
@@ -2630,8 +2695,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
     /// <summary>
     /// The state of one accepted run, from Preparing until its session is disposed. The session, journal-failure,
-    /// callback-fault and last-started-step fields are published atomically, and the stop decision is taken under a
-    /// lock, because the coordinator thread reads or writes them; everything else belongs to the UI thread.
+    /// callback-fault, stop-failure and last-started-step fields are published atomically, and the stop decision is
+    /// taken under a lock, because the coordinator thread reads or writes them; everything else belongs to the UI
+    /// thread.
     /// </summary>
     private sealed class RunContext
     {
@@ -2642,6 +2708,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
         private IEngineSession? _session;
         private string? _journalFailureText;
         private string? _callbackFaultText;
+        private EngineException? _stopFailure;
         private EngineStepStarted? _lastStartedStep;
         private int _journalFailureLogged;
         private bool _stopDecisionLogged;
@@ -2682,6 +2749,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
         public string? JournalFailureText => Volatile.Read(ref _journalFailureText);
 
         public string? CallbackFaultText => Volatile.Read(ref _callbackFaultText);
+
+        // The first stop the engine refused, from whichever thread requested it.
+        public EngineException? StopFailure => Volatile.Read(ref _stopFailure);
 
         public EngineStepStarted? LastStartedStep => Volatile.Read(ref _lastStartedStep);
 
@@ -2747,12 +2817,19 @@ public sealed partial class RunController : ObservableObject, IDisposable
         // stop the controller requests or sees reported. The engine keeps the first reason it records; requests are
         // made under one lock, so the first claim is always the request the engine received first among the
         // controller's, whichever thread made it. The engine's RequestStop never blocks, so the coordinator waits at
-        // most for another one.
+        // most for another one. Neither a run whose session has been taken for disposal, with no engine left to ask,
+        // nor a stop the engine refuses, which records nothing and throws, makes a stop decision, so neither claims
+        // the line.
         public bool RequestStop(StopReason reason)
         {
             lock (_stopGate)
             {
-                Session?.RequestStop(reason);
+                if (Session is not { } session)
+                {
+                    return false;
+                }
+
+                session.RequestStop(reason);
                 return ClaimStopDecision();
             }
         }
@@ -2797,6 +2874,10 @@ public sealed partial class RunController : ObservableObject, IDisposable
 
         public void TryRecordCallbackFault(string failure) =>
             Interlocked.CompareExchange(ref _callbackFaultText, failure, null);
+
+        // True for the first refusal only: the coordinator and the UI thread can both meet one.
+        public bool TryRecordStopFailure(EngineException failure) =>
+            Interlocked.CompareExchange(ref _stopFailure, failure, null) is null;
 
         public void RecordStepStarted(EngineStepStarted step) => Volatile.Write(ref _lastStartedStep, step);
 

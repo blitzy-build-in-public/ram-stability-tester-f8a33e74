@@ -40,7 +40,7 @@ namespace RamQuick.App;
 /// <see cref="RestoresKeyboardFocusProperty"/>.
 /// </para>
 /// </remarks>
-public partial class App : Application
+public sealed partial class App : Application
 {
     /// <summary>
     /// Identifies the <c>LiveRegion</c> attached property: the <see cref="LiveRegion"/> whose text a
@@ -321,9 +321,9 @@ public partial class App : Application
             return;
         }
 
-        // Acquired on the UI thread, which also releases it in OnExit. No window exists yet, so the wait blocks
-        // nothing the user can see.
-        _guard = SingleInstanceGuard.TryAcquire(_singleInstanceWait);
+        // Polled rather than waited for, so the UI thread never blocks; every attempt runs on it, the thread that
+        // releases the guard in OnExit, because mutex ownership is thread-affine.
+        _guard = await SingleInstanceGuard.TryAcquireAsync(Dispatcher, _singleInstanceWait);
         if (_guard is null)
         {
             prompt.Inform(UiText.AppTitle, UiText.AlreadyRunningMessage);

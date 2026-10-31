@@ -57,10 +57,12 @@ public interface IEngine
     /// Preparing.
     /// </para>
     /// <para>
-    /// The session captures <see cref="SynchronizationContext.Current"/> of the calling thread and raises every one of
-    /// its events there, so the application calls this method on the UI thread. Only the
-    /// <see cref="EngineSessionOptions.StepGate"/> and <see cref="EngineSessionOptions.ProgressSink"/> run
-    /// synchronously on the engine's coordinator thread instead.
+    /// The session captures <see cref="SynchronizationContext.Current"/> of the calling thread and posts every one of
+    /// its events there, so the application calls this method on the UI thread, whose dispatcher raises them. The
+    /// session itself calls only the <see cref="EngineSessionOptions.StepGate"/> and
+    /// <see cref="EngineSessionOptions.ProgressSink"/> synchronously on the engine's coordinator thread; a context
+    /// whose <see cref="SynchronizationContext.Post"/> runs inline raises the events there too, as
+    /// <see cref="IEngineSession"/> describes.
     /// </para>
     /// <para>
     /// The caller owns the returned session and must dispose it, normally after

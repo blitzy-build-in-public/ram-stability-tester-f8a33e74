@@ -19,6 +19,19 @@ namespace RamQuick.Interop;
 internal unsafe delegate int NativeSessionFactory(RqSessionConfig* config, RqCallbacks* callbacks, nint* session);
 
 /// <summary>
+/// Requests a stop of the native session for <see cref="EngineSession"/>: the production value calls
+/// <c>rq_session_stop</c>, and the integration tests supply one that returns a chosen failure code, because the engine
+/// fails a stop only on a C++ exception that no test can provoke through the public API.
+/// </summary>
+/// <param name="session">The session's handle, reference-counted for the duration of a native call.</param>
+/// <param name="stopReason">The native <c>RQ_STOP_*</c> reason.</param>
+/// <returns>
+/// The engine's <c>rq_result</c>: <c>RQ_OK</c> once the reason is recorded, or a negative <c>RQ_E_*</c> code.
+/// </returns>
+/// <exception cref="ObjectDisposedException"><paramref name="session"/> is already closed.</exception>
+internal delegate int NativeSessionStop(SafeSessionHandle session, uint stopReason);
+
+/// <summary>
 /// The production <see cref="IEngineSession"/>: one native engine session behind a <see cref="SafeSessionHandle"/>,
 /// with its events copied into managed records and posted to the <see cref="SynchronizationContext"/> captured at
 /// creation.
@@ -28,18 +41,23 @@ internal unsafe delegate int NativeSessionFactory(RqSessionConfig* config, RqCal
 /// <b>Ownership.</b> The only object native code can reach is the <see cref="Interop.CallbackState"/>, through the
 /// <see cref="GCHandle"/> whose address the engine holds as <c>user_data</c>; it refers back to this session only
 /// weakly. Every edge of the session points outward: to its handle, its callback state, its options (which hold the
-/// step gate, progress sink and fault sink), its delivery queue and its event subscribers. Queued events, and the
-/// work item that drains them, carry the weak reference and the event record, never the session. The only strong
-/// edge into a session is therefore its owner's field, so a session its owner abandons undisposed becomes unreachable,
-/// and its handle's critical finalizer destroys the native session, releases the locked memory and frees the GCHandle,
-/// even when a step gate's target holds the session.
+/// step gate, progress sink and fault sink), its native stop call, its delivery queue and its event subscribers.
+/// Queued events, and the work item that drains them, carry the weak reference and the event record, never the
+/// session. The only strong edge into a session is therefore its owner's field, so a session its owner abandons
+/// undisposed becomes unreachable, and its handle's critical finalizer destroys the native session, releases the
+/// locked memory and frees the GCHandle, even when a step gate's target holds the session.
 /// </para>
 /// <para>
 /// <b>Threading.</b> The <c>OnNative*</c> handlers run on the engine's coordinator thread, called by
-/// <see cref="CallbackThunks"/>, which contains every exception they throw. Only the step gate and the progress sink run
-/// there synchronously; everything else is posted, and raised one event at a time in the order the engine raised it,
-/// whatever the captured context. <see cref="Start"/>, <see cref="RequestStop"/> and
-/// <see cref="Dispose"/> may be called from any thread except that <see cref="Dispose"/> is refused inside a callback.
+/// <see cref="CallbackThunks"/>, which contains every exception they throw. The session itself calls only the step gate
+/// and the progress sink there synchronously. Every event is copied into an immutable record and queued in the
+/// session's delivery queue, which drains through <see cref="SynchronizationContext.Post"/> of the captured context and
+/// raises the events one at a time in the order the engine raised them, whatever the context. The context decides the
+/// thread: the application's dispatcher context runs subscribers on the UI thread, and the thread-pool fallback on a
+/// pool thread, both off the coordinator and never on a worker. A context whose Post runs inline drains on the
+/// coordinator, inside the callback, so its subscribers hold up the engine and must not block. <see cref="Start"/>,
+/// <see cref="RequestStop"/> and <see cref="Dispose"/> may be called from any thread except that
+/// <see cref="Dispose"/> is refused inside a callback.
 /// </para>
 /// </remarks>
 internal sealed class EngineSession : IEngineSession
@@ -52,9 +70,14 @@ internal sealed class EngineSession : IEngineSession
     private const string CompletedHandlerName = "Completed handler";
     private const string ReleasedHandlerName = "Released handler";
     private const string CompletedCallbackName = "on_completed";
+    private const string StopFunctionName = "rq_session_stop";
+
+    // Cached, so a production session allocates no delegate for its stop call.
+    private static readonly NativeSessionStop _nativeStop = NativeMethods.RqSessionStop;
 
     private readonly SafeSessionHandle _handle;
     private readonly CallbackState _state;
+    private readonly NativeSessionStop _stop;
 
     // Holds StepGate, ProgressSink and CallbackFault. The session holds the delegates, never the CallbackState, so a
     // delegate whose target holds the session cannot be rooted through the GCHandle.
@@ -78,12 +101,14 @@ internal sealed class EngineSession : IEngineSession
         SafeSessionHandle handle,
         CallbackState state,
         EngineSessionOptions options,
-        ReadOnlyCollection<StepAttributes> steps)
+        ReadOnlyCollection<StepAttributes> steps,
+        NativeSessionStop stop)
     {
         _handle = handle;
         _state = state;
         _options = options;
         _steps = steps;
+        _stop = stop;
         _deliveries = new DeliveryQueue(state.Context);
     }
 
@@ -131,6 +156,10 @@ internal sealed class EngineSession : IEngineSession
     /// </summary>
     /// <param name="options">The session's configuration and hooks.</param>
     /// <param name="factory">The native creation call: <c>rq_session_create</c>, or a test substitute.</param>
+    /// <param name="stop">
+    /// The native stop call of <see cref="RequestStop"/> and <see cref="Dispose"/>: <c>rq_session_stop</c> when
+    /// <see langword="null"/>, or a test substitute.
+    /// </param>
     /// <returns>The session, owned by the caller, who disposes it once <see cref="Released"/> has been raised.</returns>
     /// <remarks>
     /// <para>
@@ -152,7 +181,10 @@ internal sealed class EngineSession : IEngineSession
     /// <c>RQ_E_INVALID_ARGUMENT</c>, for example for a worker count above the logical processor count.
     /// </exception>
     /// <exception cref="EngineException">The engine returned another failure code, such as <c>RQ_E_INTERNAL</c>.</exception>
-    internal static EngineSession Create(EngineSessionOptions options, NativeSessionFactory factory)
+    internal static EngineSession Create(
+        EngineSessionOptions options,
+        NativeSessionFactory factory,
+        NativeSessionStop? stop = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(factory);
@@ -193,7 +225,7 @@ internal sealed class EngineSession : IEngineSession
         nint nativeSession;
         try
         {
-            session = new EngineSession(handle, state, options, steps);
+            session = new EngineSession(handle, state, options, steps, stop ?? _nativeStop);
 
             // Attached before the engine receives user_data, so the first callback already resolves the session.
             state.AttachSession(session);
@@ -260,7 +292,8 @@ internal sealed class EngineSession : IEngineSession
     /// <summary>
     /// Releases the native session: stops a run still in progress, waits for in-flight callbacks, joins every engine
     /// thread, releases the locked memory, then disposes the stop event and frees the GCHandle. Idempotent; blocks until
-    /// the release finishes, so callers dispose after <see cref="Released"/>.
+    /// the release finishes, so callers dispose after <see cref="Released"/>. A stop the engine refuses is reported to
+    /// the options' fault sink as <c>rq_session_stop</c> rather than thrown, and the session is destroyed regardless.
     /// </summary>
     /// <exception cref="InvalidOperationException">
     /// Called from inside an engine callback, such as the step gate or the progress sink, where
@@ -280,10 +313,19 @@ internal sealed class EngineSession : IEngineSession
         }
 
         // A run still in progress is stopped first, which also sets the stop event, so a step gate waiting on its
-        // journal acknowledgment wakes at once instead of holding rq_session_destroy for its full timeout.
+        // journal acknowledgment wakes at once instead of holding rq_session_destroy for its full timeout. A refused
+        // stop recorded no reason, so it leaves the event unset, and it must not keep the session alive:
+        // rq_session_destroy stops the run itself.
         if (Volatile.Read(ref _completed) == 0)
         {
-            StopCore(StopReason.HostFault);
+            try
+            {
+                StopCore(StopReason.HostFault);
+            }
+            catch (Exception exception)
+            {
+                InvokeFaultSink(StopFunctionName, exception);
+            }
         }
 
         _handle.Dispose();
@@ -314,8 +356,10 @@ internal sealed class EngineSession : IEngineSession
     /// <remarks>
     /// The gate may block, for at most its journal-acknowledgment timeout. An Abort the stop event did not cause is
     /// preceded by a host-fault stop request, so the run never ends on an Abort without a recorded reason; the first
-    /// recorded reason wins, so a gate that requested a stop itself keeps its reason. <see cref="StepStarted"/> is posted
-    /// only for a step allowed to run, so the UI never shows a step that started no traffic.
+    /// recorded reason wins, so a gate that requested a stop itself keeps its reason. A request the engine refuses is
+    /// reported to the fault sink, and the Abort still ends the run, which the engine records as <c>host_fault</c>
+    /// when no reason exists. <see cref="StepStarted"/> is posted only for a step allowed to run, so the UI never
+    /// shows a step that started no traffic.
     /// </remarks>
     internal uint OnNativeStepStarting(in RqStepStart info)
     {
@@ -328,7 +372,7 @@ internal sealed class EngineSession : IEngineSession
         {
             if (!_state.StopEvent.WaitOne(0))
             {
-                RequestStop(StopReason.HostFault);
+                RequestHostFaultStop();
             }
 
             return NativeConstants.ActionAbort;
@@ -447,22 +491,14 @@ internal sealed class EngineSession : IEngineSession
     /// <param name="callbackName">The callback or event in which the fault was caught, such as <c>on_progress</c>.</param>
     /// <param name="exception">The exception that was caught.</param>
     /// <remarks>
-    /// The sink's owner writes the fault to <c>&lt;data&gt;\logs\app-errors.log</c>. An exception the sink throws is
-    /// discarded, because this runs where no exception may unwind: inside a callback thunk or a posted event delivery.
+    /// The sink's owner writes the fault to <c>&lt;data&gt;\logs\app-errors.log</c>. This runs where no exception may
+    /// unwind, inside a callback thunk or a posted event delivery, so nothing is thrown: an exception the sink throws
+    /// is discarded, and a stop the engine refuses is reported to the sink in turn, as <c>rq_session_stop</c>.
     /// </remarks>
     internal void ReportCallbackFault(string callbackName, Exception exception)
     {
-        try
-        {
-            _options.CallbackFault?.Invoke(callbackName, exception);
-        }
-        catch (Exception)
-        {
-            // Deliberately discarded: the fault sink must not throw, and its failure must not hide the original fault,
-            // which the stop below still reports as a host fault.
-        }
-
-        RequestStop(StopReason.HostFault);
+        InvokeFaultSink(callbackName, exception);
+        RequestHostFaultStop();
     }
 
     /// <summary>
@@ -572,14 +608,16 @@ internal sealed class EngineSession : IEngineSession
     }
 
     // Records the native reason first and only then sets the managed stop event: a step gate woken by the event must
-    // find its reason already recorded, so it can never return Abort before the reason exists. Shared by RequestStop and
-    // by Dispose, which has already marked the session disposed.
+    // find its reason already recorded, so it can never return Abort before the reason exists. The event is therefore
+    // set only once the engine has returned RQ_OK. A stop it refuses recorded no reason and stopped nothing, so it is
+    // thrown as its mapped exception, with the event left unset. Shared by RequestStop and by Dispose, which has
+    // already marked the session disposed.
     private void StopCore(StopReason reason)
     {
         int result;
         try
         {
-            result = NativeMethods.RqSessionStop(_handle, (uint)reason);
+            result = _stop(_handle, (uint)reason);
         }
         catch (ObjectDisposedException)
         {
@@ -587,11 +625,16 @@ internal sealed class EngineSession : IEngineSession
             return;
         }
 
-        // Stop is idempotent: RQ_E_INVALID_HANDLE after destruction or any later engine refusal changes nothing the
-        // caller can act on. Only an invalid reason is a programming error, which RequestStop's enum check excludes.
-        if (result == (int)EngineResultCode.InvalidArgument)
+        // The native session is already destroyed, which stopped its run, and no gate can be waiting on the event of a
+        // destroyed session, so there is nothing left to stop or to wake.
+        if (result == (int)EngineResultCode.InvalidHandle)
         {
-            EngineResults.ThrowIfFailed(result, "rq_session_stop");
+            return;
+        }
+
+        if (result != (int)EngineResultCode.Ok)
+        {
+            throw EngineResults.CreateException(result, StopFunctionName);
         }
 
         try
@@ -601,6 +644,35 @@ internal sealed class EngineSession : IEngineSession
         catch (ObjectDisposedException)
         {
             // The handle released the event after rq_session_destroy returned; no gate can be waiting on it any more.
+        }
+    }
+
+    // The host-fault stop of a callback or event fault, requested where no exception may unwind. A stop the engine
+    // refuses is reported to the fault sink instead, once, under the engine function's name; RequestStop throws rather
+    // than reporting, so the sink's own stop request cannot bring the report back here.
+    private void RequestHostFaultStop()
+    {
+        try
+        {
+            RequestStop(StopReason.HostFault);
+        }
+        catch (Exception exception)
+        {
+            InvokeFaultSink(StopFunctionName, exception);
+        }
+    }
+
+    // Hands a fault to the options' fault sink, whose owner writes it to app-errors.log.
+    private void InvokeFaultSink(string callbackName, Exception exception)
+    {
+        try
+        {
+            _options.CallbackFault?.Invoke(callbackName, exception);
+        }
+        catch (Exception)
+        {
+            // Deliberately discarded: the fault sink must not throw, and its failure must neither hide the fault it was
+            // given nor cancel the stop or the destruction its caller still has to complete.
         }
     }
 
@@ -642,8 +714,9 @@ internal sealed class EngineSession : IEngineSession
         }
     }
 
-    // Reports a fault of on_completed. The handler must still deliver the run's only Completed afterwards, so not even
-    // the stop request, the one part of ReportCallbackFault that can throw, may end it early.
+    // Reports a fault of on_completed. The handler must still deliver the run's only Completed afterwards, so nothing
+    // the report meets may end it early: ReportCallbackFault already contains the sink's exceptions and reports a
+    // refused stop, and this guard contains any failure beyond those.
     private void ReportCompletedFault(Exception exception)
     {
         try
@@ -652,8 +725,8 @@ internal sealed class EngineSession : IEngineSession
         }
         catch (Exception)
         {
-            // Deliberately discarded: the native run has already ended, so a failed stop request changes nothing, and
-            // the fault itself has reached the sink.
+            // Deliberately discarded: the native run has already ended, so a failed report changes nothing the run
+            // could act on, and Completed must still be delivered.
         }
     }
 
@@ -702,8 +775,9 @@ internal sealed class EngineSession : IEngineSession
                 catch (Exception)
                 {
                     // Deliberately discarded: an exception escaping a posted delivery would terminate the process on
-                    // the thread pool. ReportCallbackFault swallows the sink's exceptions, so only a failed stop
-                    // request can land here, and the remaining subscribers still receive the event.
+                    // the thread pool. ReportCallbackFault already contains the sink's exceptions and reports a
+                    // refused stop, so only a failure beyond those lands here, and the remaining subscribers still
+                    // receive the event.
                 }
             }
         }
