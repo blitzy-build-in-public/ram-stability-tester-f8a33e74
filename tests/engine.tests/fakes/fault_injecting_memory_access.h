@@ -276,17 +276,23 @@ private:
     /** The hold-entered event, or empty. */
     hold_event_handle hold_entered_;
 
-    /** Guards the counting and arming state below; never held across a wait. */
+    /**
+     * Guards the counting and arming state below, atomics included: every member is read and
+     * written only under it, so the atomics' operations are relaxed. Never held across a wait.
+     */
     std::mutex arm_mutex_;
     /** Whether counting_key_ names a (step, pass) yet. */
-    bool counting_ = false;
-    /** The (step, pass) whose pre-hold fences are being counted. */
+    std::atomic<bool> counting_{false};
+    /**
+     * The (step, pass) whose pre-hold fences are being counted; recorded data, kept plain under
+     * arm_mutex_.
+     */
     std::uint64_t counting_key_ = 0;
     /** Pre-hold fences counted for counting_key_. */
-    std::uint64_t fence_count_ = 0;
+    std::atomic<std::uint64_t> fence_count_{0};
     /** Set when fence_count_ reaches fences_per_hold_, cleared by the next wait_for_stop. */
-    bool armed_ = false;
-    /** The step the armed hold belongs to. */
+    std::atomic<bool> armed_{false};
+    /** The step the armed hold belongs to; recorded data, kept plain under arm_mutex_. */
     std::uint32_t armed_step_ = 0;
 
     /** Guards timeline_: shared for ages, exclusive to append an entry. */

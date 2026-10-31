@@ -26,7 +26,8 @@ namespace RamQuick.Logging;
 /// Rendering is pure and deterministic: no clock, environment or current culture is read. Numbers, dates and
 /// times use the invariant culture and every line ends with <c>"\r\n"</c>, so equal summaries give
 /// byte-identical text on every machine. Free text taken from the summary, such as a step name or an end
-/// detail, stays on its own line: control characters in it are written as spaces.
+/// detail, stays on its own line as plain text: <see cref="SummaryFormat.PlainText"/> writes its control, format
+/// (bidirectional controls included) and line or paragraph separator characters as spaces.
 /// </para>
 /// <para>
 /// The cause hints are always written below <see cref="SummaryCauseHints.HintLabel"/>, as the UI and the JSON
@@ -622,45 +623,11 @@ public static class TextSummaryFormatter
         return (whole / 60).ToString("00", Invariant) + ":" + (whole % 60).ToString("00", Invariant);
     }
 
-    // Free text is written on one line: a line break in a step name or an end detail would otherwise split
-    // its field, or start a line that reads as another field, such as a second run id line.
-    private static string OneLine(string? value)
-    {
-        if (string.IsNullOrEmpty(value))
-        {
-            return string.Empty;
-        }
-
-        bool clean = true;
-        foreach (char character in value)
-        {
-            if (BreaksLine(character))
-            {
-                clean = false;
-                break;
-            }
-        }
-
-        if (clean)
-        {
-            return value;
-        }
-
-        return string.Create(
-            value.Length,
-            value,
-            static (destination, source) =>
-            {
-                for (int i = 0; i < source.Length; i++)
-                {
-                    destination[i] = BreaksLine(source[i]) ? ' ' : source[i];
-                }
-            });
-    }
-
-    // Every control character, and the two Unicode separators that line readers also treat as line breaks.
-    private static bool BreaksLine(char character) =>
-        char.IsControl(character) || character == '\u2028' || character == '\u2029';
+    // Free text is written on one line of plain text: a line break in a step name or an end detail would otherwise
+    // split its field, or start a line that reads as another field, such as a second run id line, and a format
+    // character such as a bidirectional override would reorder what the reader sees.
+    private static string OneLine(string? value) =>
+        string.IsNullOrEmpty(value) ? string.Empty : SummaryFormat.PlainText(value);
 
     private static string TextOrNotCaptured(string? value)
     {

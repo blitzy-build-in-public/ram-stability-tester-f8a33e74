@@ -4,9 +4,9 @@
  *        contract, the time-remaining formula, and the flush-before-verification rule asserted
  *        from the recorded primitive sequence of every phase kind.
  *
- * - StepRunnerHelpers, StepRunnerPlannedPasses and StepRunnerClassify: the pure helpers
+ * - StepRunnerHelpers, step_runner_planned_passes and step_runner_classify: the pure helpers
  *   planned_passes, classify_step, verify_access_type and step_pattern_seed.
- * - StepRunnerStable and StepRunnerScheduling: step_runner::run_step over a real locked region
+ * - step_runner_stable and StepRunnerScheduling: step_runner::run_step over a real locked region
  *   with a fake_clock whose pass durations are scripted. Stable passes end within half a mean
  *   pass of the budget, +/-30 % jittered passes within one longest pass, an oversized pass (30 s
  *   against a 10 s budget) runs alone and reports its 20 s overrun, and the coverage budget never
@@ -14,9 +14,9 @@
  * - StepRunnerObserver: no schedule is reported before the first pass completes, the schedule is
  *   planned_passes of the measured mean afterwards, elapsed time never decreases, and holds tick
  *   once per wait slice.
- * - RemainingTimeFormula and RemainingTimeStable: compute_remaining_ms as a pure function, and
+ * - remaining_time_formula and RemainingTimeStable: compute_remaining_ms as a pure function, and
  *   against the actual remaining time of a stable two-step run.
- * - StepRunnerFlushRule: at least three passes of every phase kind (windowed in four orders,
+ * - step_runner_flush_rule: at least three passes of every phase kind (windowed in four orders,
  *   hold, moving inversion, turnaround, and Half mode on one worker and on up to two, as many as
  *   the host has logical processors), each with two injected mismatches so the log carries
  *   re-reads. counting_memory_access records every primitive in issue order, and the checker
@@ -30,17 +30,17 @@
  *   excludes. No flush call covers more than one 1 MiB work group, the unit after which workers
  *   check the stop flag. A BankStride pass issues exactly one strided stream and one strided
  *   verification per 1 MiB, whose lines expand to order_cursor's BankStride sequence.
- * - StepRunnerFlushStop: a stop that lands during the first 1 MiB of every window or slice
+ * - step_runner_flush_stop: a stop that lands during the first 1 MiB of every window or slice
  *   flush (windowed in two orders, pre-hold, post-hold, moving-inversion base write and sweep),
  *   or during a window's final write group, ends the phase within one work group of flushing,
  *   with its closing fence, no verification after the stop and no coverage for the cut window
  *   or slice.
  * - StepRunnerBankStrideStop: a stop during a BankStride window's verification ends it after
  *   the 1 MiB strided verification in flight, whose bytes alone are counted.
- * - StepRunnerFlushChecker and StepRunnerHoldBracketChecker: the checker reports a log with a
- *   dropped or duplicated fence or flush, and a hold log whose pre-hold flush is moved after
- *   the wait or whose post-hold flush is moved before it, in time only, with order and counts
- *   unchanged.
+ * - step_runner_flush_checker and step_runner_hold_bracket_checker: the checker reports a log
+ *   with a dropped or duplicated fence or flush, and a hold log whose pre-hold flush is moved
+ *   after the wait or whose post-hold flush is moved before it, in time only, with order and
+ *   counts unchanged.
  *
  * Holds of 5 s finish instantly in fake time, while real worker threads still stream, flush and
  * verify real memory, so regions stay at 16 MiB or less. No test depends on an instruction set
@@ -524,7 +524,7 @@ private:
     stop_signal stop_;
     memory_region region_;
     std::vector<slice_view> slices_;
-    std::shared_ptr<IThreadAffinity> affinity_;
+    std::shared_ptr<thread_affinity> affinity_;
     std::unique_ptr<counting_memory_access> memory_;
     std::unique_ptr<coverage_counter> coverage_;
     std::unique_ptr<error_collector> errors_;
@@ -1561,15 +1561,15 @@ constexpr planned_case k_planned_cases[] = {
     {"HugeMeanGivesOne", UINT64_MAX, UINT64_MAX, 1},
 };
 
-class StepRunnerPlannedPasses : public ::testing::TestWithParam<planned_case> {};
+class step_runner_planned_passes : public ::testing::TestWithParam<planned_case> {};
 
-TEST_P(StepRunnerPlannedPasses, RoundsTheBudgetOverTheMeanHalfUp) {
+TEST_P(step_runner_planned_passes, RoundsTheBudgetOverTheMeanHalfUp) {
     const planned_case& c = GetParam();
     EXPECT_EQ(planned_passes(c.budget_ns, c.mean_pass_ns), c.expected)
         << "budget " << c.budget_ns << " ns, mean " << c.mean_pass_ns << " ns";
 }
 
-INSTANTIATE_TEST_SUITE_P(StepRunnerSchedules, StepRunnerPlannedPasses,
+INSTANTIATE_TEST_SUITE_P(StepRunnerSchedules, step_runner_planned_passes,
                          ::testing::ValuesIn(k_planned_cases),
                          [](const ::testing::TestParamInfo<planned_case>& info) {
                              return std::string(info.param.name);
@@ -1612,9 +1612,9 @@ constexpr classify_case k_classify_cases[] = {
      RQ_ACCESS_VERIFY_AFTER_WRITE},
 };
 
-class StepRunnerClassify : public ::testing::TestWithParam<classify_case> {};
+class step_runner_classify : public ::testing::TestWithParam<classify_case> {};
 
-TEST_P(StepRunnerClassify, SelectsTheKindAndItsVerificationAccessType) {
+TEST_P(step_runner_classify, SelectsTheKindAndItsVerificationAccessType) {
     const classify_case& c = GetParam();
     const rq_step_def step = make_step(c.pattern, c.order, RQ_THREADS_ALL, c.hold_ms, 10'000);
     const step_kind kind = classify_step(step);
@@ -1622,7 +1622,8 @@ TEST_P(StepRunnerClassify, SelectsTheKindAndItsVerificationAccessType) {
     EXPECT_EQ(verify_access_type(kind), c.access_type);
 }
 
-INSTANTIATE_TEST_SUITE_P(StepRunnerKinds, StepRunnerClassify, ::testing::ValuesIn(k_classify_cases),
+INSTANTIATE_TEST_SUITE_P(StepRunnerKinds, step_runner_classify,
+                         ::testing::ValuesIn(k_classify_cases),
                          [](const ::testing::TestParamInfo<classify_case>& info) {
                              return std::string(info.param.name);
                          });
@@ -1672,9 +1673,9 @@ constexpr stable_case k_stable_cases[] = {
     {"FourSecondPassesEndHalfAPassLate", 10'000, 4 * k_ns_per_s, 3},
 };
 
-class StepRunnerStable : public ::testing::TestWithParam<stable_case> {};
+class step_runner_stable : public ::testing::TestWithParam<stable_case> {};
 
-TEST_P(StepRunnerStable, EndsWithinHalfAMeanPassOfTheBudget) {
+TEST_P(step_runner_stable, EndsWithinHalfAMeanPassOfTheBudget) {
     const stable_case& c = GetParam();
     runner_fixture fixture(harness_options{});
     ASSERT_TRUE(fixture.ready()) << fixture.setup_error();
@@ -1696,7 +1697,7 @@ TEST_P(StepRunnerStable, EndsWithinHalfAMeanPassOfTheBudget) {
     expect_outcome_accounting(fixture, outcome, 0, budget_ns);
 }
 
-INSTANTIATE_TEST_SUITE_P(StepRunnerStablePasses, StepRunnerStable,
+INSTANTIATE_TEST_SUITE_P(StepRunnerStablePasses, step_runner_stable,
                          ::testing::ValuesIn(k_stable_cases),
                          [](const ::testing::TestParamInfo<stable_case>& info) {
                              return std::string(info.param.name);
@@ -1929,9 +1930,9 @@ constexpr remaining_case k_remaining_cases[] = {
      static_cast<std::int64_t>(UINT64_MAX / k_ns_per_ms)},
 };
 
-class RemainingTimeFormula : public ::testing::TestWithParam<remaining_case> {};
+class remaining_time_formula : public ::testing::TestWithParam<remaining_case> {};
 
-TEST_P(RemainingTimeFormula, ComputesTheRunningTermPlusLaterBudgets) {
+TEST_P(remaining_time_formula, ComputesTheRunningTermPlusLaterBudgets) {
     const remaining_case& c = GetParam();
     remaining_inputs in{};
     in.steps = remaining_plan();
@@ -1943,7 +1944,7 @@ TEST_P(RemainingTimeFormula, ComputesTheRunningTermPlusLaterBudgets) {
     EXPECT_EQ(compute_remaining_ms(in), c.expected_ms);
 }
 
-INSTANTIATE_TEST_SUITE_P(RemainingTimeCases, RemainingTimeFormula,
+INSTANTIATE_TEST_SUITE_P(RemainingTimeCases, remaining_time_formula,
                          ::testing::ValuesIn(k_remaining_cases),
                          [](const ::testing::TestParamInfo<remaining_case>& info) {
                              return std::string(info.param.name);
@@ -2044,9 +2045,9 @@ constexpr flush_case k_flush_cases[] = {
      RQ_THREADS_HALF, 0, 1, k_flush_region_bytes},
 };
 
-class StepRunnerFlushRule : public ::testing::TestWithParam<flush_case> {};
+class step_runner_flush_rule : public ::testing::TestWithParam<flush_case> {};
 
-TEST_P(StepRunnerFlushRule, EveryVerifiedLineFollowsFenceFlushFenceOnEveryPass) {
+TEST_P(step_runner_flush_rule, EveryVerifiedLineFollowsFenceFlushFenceOnEveryPass) {
     const flush_case& c = GetParam();
     // A supported host may have a single logical processor; the case then runs on the workers it
     // has, and its Half step on one worker is the even worker without a partner.
@@ -2154,7 +2155,7 @@ TEST_P(StepRunnerFlushRule, EveryVerifiedLineFollowsFenceFlushFenceOnEveryPass) 
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(StepRunnerPhaseKinds, StepRunnerFlushRule,
+INSTANTIATE_TEST_SUITE_P(StepRunnerPhaseKinds, step_runner_flush_rule,
                          ::testing::ValuesIn(k_flush_cases),
                          [](const ::testing::TestParamInfo<flush_case>& info) {
                              return std::string(info.param.name);
@@ -2272,9 +2273,9 @@ constexpr flush_stop_case k_flush_stop_cases[] = {
      0, primitive_kind::flush, phase_kind::sweep, 1, phase_kind::sweep, k_work_group_bytes, 1},
 };
 
-class StepRunnerFlushStop : public ::testing::TestWithParam<flush_stop_case> {};
+class step_runner_flush_stop : public ::testing::TestWithParam<flush_stop_case> {};
 
-TEST_P(StepRunnerFlushStop, EndsThePhaseWithinOneWorkGroupAndVerifiesNothingAfter) {
+TEST_P(step_runner_flush_stop, EndsThePhaseWithinOneWorkGroupAndVerifiesNothingAfter) {
     const flush_stop_case& c = GetParam();
     // One worker, one 16 MiB chunk and window: a flush issued whole would run 16 work groups
     // past the stop.
@@ -2332,7 +2333,7 @@ TEST_P(StepRunnerFlushStop, EndsThePhaseWithinOneWorkGroupAndVerifiesNothingAfte
     EXPECT_EQ(outcome.verified_bytes, expected_verified);
 }
 
-INSTANTIATE_TEST_SUITE_P(StepRunnerFlushStops, StepRunnerFlushStop,
+INSTANTIATE_TEST_SUITE_P(StepRunnerFlushStops, step_runner_flush_stop,
                          ::testing::ValuesIn(k_flush_stop_cases),
                          [](const ::testing::TestParamInfo<flush_stop_case>& info) {
                              return std::string(info.param.name);
@@ -2399,9 +2400,9 @@ constexpr mutation_case k_mutation_cases[] = {
      "2 flushes, expected exactly 1"},
 };
 
-class StepRunnerFlushChecker : public ::testing::TestWithParam<mutation_case> {};
+class step_runner_flush_checker : public ::testing::TestWithParam<mutation_case> {};
 
-TEST_P(StepRunnerFlushChecker, ReportsWhatAMutatedSequenceIsMissing) {
+TEST_P(step_runner_flush_checker, ReportsWhatAMutatedSequenceIsMissing) {
     const mutation_case& c = GetParam();
     runner_fixture fixture(harness_options{1, k_schedule_region_bytes, true});
     ASSERT_TRUE(fixture.ready()) << fixture.setup_error();
@@ -2442,7 +2443,7 @@ TEST_P(StepRunnerFlushChecker, ReportsWhatAMutatedSequenceIsMissing) {
     EXPECT_NE(report.find(c.reported), std::string::npos) << report;
 }
 
-INSTANTIATE_TEST_SUITE_P(StepRunnerMutations, StepRunnerFlushChecker,
+INSTANTIATE_TEST_SUITE_P(StepRunnerMutations, step_runner_flush_checker,
                          ::testing::ValuesIn(k_mutation_cases),
                          [](const ::testing::TestParamInfo<mutation_case>& info) {
                              return std::string(info.param.name);
@@ -2474,11 +2475,11 @@ constexpr hold_mutation_case k_hold_mutation_cases[] = {
      "expected the post-hold sequence to start after the hold"},
 };
 
-class StepRunnerHoldBracketChecker : public ::testing::TestWithParam<hold_mutation_case> {};
+class step_runner_hold_bracket_checker : public ::testing::TestWithParam<hold_mutation_case> {};
 
 // A flush moved across the wait keeps the log's order and counts, so only the clock brackets
 // can show that dirty cached data could have outlived the start of the hold.
-TEST_P(StepRunnerHoldBracketChecker, ReportsAFlushMovedAcrossTheHold) {
+TEST_P(step_runner_hold_bracket_checker, ReportsAFlushMovedAcrossTheHold) {
     const hold_mutation_case& c = GetParam();
     constexpr std::uint32_t k_hold_ms = 5'000;
     constexpr std::uint64_t k_hold_ns = std::uint64_t{k_hold_ms} * k_ns_per_ms;
@@ -2545,7 +2546,7 @@ TEST_P(StepRunnerHoldBracketChecker, ReportsAFlushMovedAcrossTheHold) {
     EXPECT_EQ(report.find("hold pass 2 "), std::string::npos) << report;
 }
 
-INSTANTIATE_TEST_SUITE_P(StepRunnerHoldMutations, StepRunnerHoldBracketChecker,
+INSTANTIATE_TEST_SUITE_P(StepRunnerHoldMutations, step_runner_hold_bracket_checker,
                          ::testing::ValuesIn(k_hold_mutation_cases),
                          [](const ::testing::TestParamInfo<hold_mutation_case>& info) {
                              return std::string(info.param.name);

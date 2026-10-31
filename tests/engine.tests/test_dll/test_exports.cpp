@@ -49,9 +49,9 @@ namespace {
  * construction and never modified, and the real affinity is stateless, so no synchronisation is
  * needed.
  */
-class failing_thread_affinity final : public rq::engine::IThreadAffinity {
+class failing_thread_affinity final : public rq::engine::thread_affinity {
 public:
-    failing_thread_affinity(std::shared_ptr<rq::engine::IThreadAffinity> real,
+    failing_thread_affinity(std::shared_ptr<rq::engine::thread_affinity> real,
                             std::uint32_t fail_worker, std::uint32_t fail_error) noexcept
         : real_(std::move(real)), fail_worker_(fail_worker), fail_error_(fail_error) {}
 
@@ -64,7 +64,7 @@ public:
     }
 
 private:
-    std::shared_ptr<rq::engine::IThreadAffinity> real_;
+    std::shared_ptr<rq::engine::thread_affinity> real_;
     std::uint32_t fail_worker_;
     std::uint32_t fail_error_;
 };

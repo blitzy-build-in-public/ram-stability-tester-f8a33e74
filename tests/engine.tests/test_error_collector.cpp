@@ -14,7 +14,7 @@
  *   on its own thread, before on_mismatch returns and without any drain or callback; racing
  *   workers record it once, an earlier stop keeps its reason, and Stop on error off requests
  *   nothing.
- * - ErrorCollectorFirstErrorDetail: the exact text of that stop's end detail, which numbers the
+ * - error_collector_first_error_detail: the exact text of that stop's end detail, which numbers the
  *   step and pass from 1, as the results log does, and the worker from 0, and names the word.
  * - ErrorCollectorRecord: every field of a stored rq_error_record.
  * - ErrorCollectorSession: a real 256 MiB session of two workers, or one on a single-processor
@@ -22,9 +22,9 @@
  *   most every 100 ms, on the coordinator only, with an exact, non-decreasing total and at most
  *   the capped detail. A host stop mid-step may bring in early only the run's final batch, which
  *   still precedes Completed with every stored record and the true total, within 2 s of the stop.
- * - ErrorCollectorSessionCap: cap exhaustion apart from that real-clock cadence, at one worker on
- *   every host and two where the host has them. An address-region injector at 32,768 targets per
- *   pass, Stop on error off, spends its whole 20,000-injection cap in pass 0, past 15,000
+ * - error_collector_session_cap: cap exhaustion apart from that real-clock cadence, at one worker
+ *   on every host and two where the host has them. An address-region injector at 32,768 targets
+ *   per pass, Stop on error off, spends its whole 20,000-injection cap in pass 0, past 15,000
  *   corruptions at any host speed: exactly the first 10,000 records arrive, once each, the true
  *   total passes them, and every total equals the verified-opportunity injections.
  *
@@ -724,9 +724,10 @@ void PrintTo(const first_error_detail_case& detail_case, std::ostream* os) {
         << detail_case.step << ", pass index " << detail_case.pass << ")";
 }
 
-class ErrorCollectorFirstErrorDetail : public ::testing::TestWithParam<first_error_detail_case> {};
+class error_collector_first_error_detail
+    : public ::testing::TestWithParam<first_error_detail_case> {};
 
-TEST_P(ErrorCollectorFirstErrorDetail, NumbersStepAndPassAsTheResultsLogAndNamesTheWord) {
+TEST_P(error_collector_first_error_detail, NumbersStepAndPassAsTheResultsLogAndNamesTheWord) {
     const first_error_detail_case& detail_case = GetParam();
     collector_rig rig(k_detail_cap, true, detail_case.step_count, detail_case.workers);
     ASSERT_TRUE(rig.region.valid());
@@ -747,7 +748,7 @@ TEST_P(ErrorCollectorFirstErrorDetail, NumbersStepAndPassAsTheResultsLogAndNames
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    ErrorCollector, ErrorCollectorFirstErrorDetail,
+    ErrorCollector, error_collector_first_error_detail,
     ::testing::Values(
         first_error_detail_case{"FirstStepFirstPass", 2U, 2U, 1U, 0U, 0U,
                                 "First error: step 1 of 2, pass 1, worker 1, virtual address "},
@@ -809,9 +810,9 @@ void PrintTo(const earlier_stop& stop, std::ostream* os) {
     *os << stop.name << " (end reason " << stop.reason << ")";
 }
 
-class ErrorCollectorEarlierStop : public ::testing::TestWithParam<earlier_stop> {};
+class error_collector_earlier_stop : public ::testing::TestWithParam<earlier_stop> {};
 
-TEST_P(ErrorCollectorEarlierStop, KeepsItsReasonAndErrorsStillCount) {
+TEST_P(error_collector_earlier_stop, KeepsItsReasonAndErrorsStillCount) {
     collector_rig rig(k_detail_cap, true, 1U, 1U);
     ASSERT_TRUE(rig.region.valid());
     rig.collector.begin_run(rig.clock.now_ns());
@@ -830,7 +831,7 @@ TEST_P(ErrorCollectorEarlierStop, KeepsItsReasonAndErrorsStillCount) {
     EXPECT_EQ(rig.collector.stored_count(), 2U);
 }
 
-INSTANTIATE_TEST_SUITE_P(ErrorCollector, ErrorCollectorEarlierStop,
+INSTANTIATE_TEST_SUITE_P(ErrorCollector, error_collector_earlier_stop,
                          ::testing::Values(earlier_stop{"UserStop", RQ_END_USER_STOP},
                                            earlier_stop{"Thermal", RQ_END_THERMAL},
                                            earlier_stop{"HostFault", RQ_END_HOST_FAULT}),
@@ -980,7 +981,7 @@ constexpr std::uint64_t k_session_fault_length = k_session_region_bytes / 32U;
  * Corruptions per pass and in the whole run of the cadence test. The 20,000 injections spread
  * over five passes, so errors keep arriving across several drain intervals rather than in one
  * burst. How many passes the real-clock step runs depends on the host and the build, so the
- * cadence test holds stored detail to min(total, cap) at any speed; ErrorCollectorSessionCap,
+ * cadence test holds stored detail to min(total, cap) at any speed; error_collector_session_cap,
  * whose total does not depend on the pass count, is the cap-exhaustion test.
  */
 constexpr std::uint32_t k_session_per_pass = 4'000U;
@@ -1108,8 +1109,9 @@ struct error_call {
 
 /**
  * What the session's callbacks saw: written on the callback thread under the mutex, read by
- * the test thread once on_released has been raised. A callback whose own bookkeeping throws
- * sets callback_failed instead, since nothing may unwind into the engine.
+ * the test thread once on_released has been raised. The lifecycle flags are atomic, and the
+ * mutex orders them with the recorded values. A callback whose own bookkeeping throws sets
+ * callback_failed instead, since nothing may unwind into the engine.
  */
 struct session_log {
     explicit session_log(const IClock& qpc) : clock(qpc) {
@@ -1125,8 +1127,8 @@ struct session_log {
     std::vector<rq_error_record> records;
     rq_run_result result{};
     std::uint64_t completed_ns = 0;
-    bool completed = false;
-    bool released = false;
+    std::atomic<bool> completed{false};
+    std::atomic<bool> released{false};
     std::atomic<bool> callback_failed{false};
 
     // Stop test only: the session log_progress_and_stop stops, and what that stop saw.
@@ -1195,8 +1197,8 @@ void RQ_CALL log_errors(void* user_data, const rq_error_record* records, std::ui
     // Read before the lock, so the spacing measured is the calls' arrival.
     const std::uint64_t at_ns = static_cast<session_log*>(user_data)->clock.now_ns();
     with_log(user_data, [&](session_log& log) {
-        log.error_calls.push_back(
-            error_call{at_ns, count, records != nullptr, total_errors, log.completed});
+        log.error_calls.push_back(error_call{at_ns, count, records != nullptr, total_errors,
+                                             log.completed.load(std::memory_order_relaxed)});
         if (records != nullptr) {
             log.records.insert(log.records.end(), records, records + count);
         }
@@ -1208,19 +1210,21 @@ void RQ_CALL log_completed(void* user_data, const rq_run_result* result) noexcep
     with_log(user_data, [&](session_log& log) {
         log.result = *result;
         log.completed_ns = at_ns;
-        log.completed = true;
+        log.completed.store(true, std::memory_order_relaxed);
     });
 }
 
 void RQ_CALL log_released(void* user_data, std::uint64_t /*released_bytes*/,
                           std::uint64_t /*release_ms*/) noexcept {
-    with_log(user_data, [](session_log& log) { log.released = true; });
+    with_log(user_data,
+             [](session_log& log) { log.released.store(true, std::memory_order_relaxed); });
 }
 
 /** Waits until on_released has been raised, or the timeout elapses. */
 bool wait_for_release(session_log& log, std::chrono::seconds timeout) {
     std::unique_lock<std::mutex> lock(log.mutex);
-    return log.changed.wait_for(lock, timeout, [&log] { return log.released; });
+    return log.changed.wait_for(lock, timeout,
+                                [&log] { return log.released.load(std::memory_order_relaxed); });
 }
 
 /**
@@ -1382,7 +1386,7 @@ TEST(ErrorCollectorSession, BatchesAtMostTenTimesASecondOnTheCoordinatorWithExac
     // No callback runs after destroy, so the log is stable from here.
     std::lock_guard<std::mutex> lock(log.mutex);
     EXPECT_FALSE(log.callback_failed.load(std::memory_order_relaxed));
-    ASSERT_TRUE(log.completed);
+    ASSERT_TRUE(log.completed.load(std::memory_order_relaxed));
     EXPECT_EQ(result.end_reason, RQ_END_COMPLETED) << result.end_detail;
     EXPECT_EQ(log.result.total_errors, result.total_errors);
     EXPECT_GT(independent_verified_bytes, 0U) << "the step must have verified memory";
@@ -1556,8 +1560,9 @@ TEST(ErrorCollectorSession, HostStopMidStepLeavesOnlyTheFinalBatchEarlyAndAheadO
     bool stopped_mid_step = false;
     {
         std::unique_lock<std::mutex> lock(log.mutex);
-        log.changed.wait_for(lock, k_run_timeout,
-                             [&log] { return log.stop_ns != 0 || log.completed; });
+        log.changed.wait_for(lock, k_run_timeout, [&log] {
+            return log.stop_ns != 0 || log.completed.load(std::memory_order_relaxed);
+        });
         stopped_mid_step = log.stop_ns != 0;
     }
     if (!stopped_mid_step) {
@@ -1578,7 +1583,7 @@ TEST(ErrorCollectorSession, HostStopMidStepLeavesOnlyTheFinalBatchEarlyAndAheadO
     // No callback runs after destroy, so the log is stable from here.
     std::lock_guard<std::mutex> lock(log.mutex);
     EXPECT_FALSE(log.callback_failed.load(std::memory_order_relaxed));
-    ASSERT_TRUE(log.completed);
+    ASSERT_TRUE(log.completed.load(std::memory_order_relaxed));
     EXPECT_EQ(log.stop_result, RQ_OK);
     EXPECT_EQ(result.end_reason, RQ_END_USER_STOP) << result.end_detail;
     EXPECT_EQ(step_result.completed, 0U) << "the stop must land mid-step";
@@ -1643,11 +1648,11 @@ TEST(ErrorCollectorSession, HostStopMidStepLeavesOnlyTheFinalBatchEarlyAndAheadO
  * ------------------------------------------------------------------------------------------- */
 
 /** Parameter: the session's worker count, from cap_worker_counts(). */
-class ErrorCollectorSessionCap : public ::testing::TestWithParam<std::uint32_t> {};
+class error_collector_session_cap : public ::testing::TestWithParam<std::uint32_t> {};
 
 // Cap exhaustion apart from the real-clock cadence test: pass 0, which every step runs in full,
 // spends the whole injection cap, so every total below is exact at any host speed and build.
-TEST_P(ErrorCollectorSessionCap, PassesFifteenThousandCorruptionsAndStoresExactlyTheCap) {
+TEST_P(error_collector_session_cap, PassesFifteenThousandCorruptionsAndStoresExactlyTheCap) {
     const std::uint32_t workers = GetParam();
     RecordProperty("workers", std::to_string(workers));
     const auto clock = std::make_shared<qpc_clock>();
@@ -1741,7 +1746,7 @@ TEST_P(ErrorCollectorSessionCap, PassesFifteenThousandCorruptionsAndStoresExactl
     RecordProperty("error_batches", std::to_string(calls.size()));
 
     EXPECT_FALSE(log.callback_failed.load(std::memory_order_relaxed));
-    ASSERT_TRUE(log.completed);
+    ASSERT_TRUE(log.completed.load(std::memory_order_relaxed));
     EXPECT_EQ(result.end_reason, RQ_END_COMPLETED) << result.end_detail;
     EXPECT_EQ(step_result.completed, 1U);
 
@@ -1814,7 +1819,7 @@ TEST_P(ErrorCollectorSessionCap, PassesFifteenThousandCorruptionsAndStoresExactl
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(ErrorCollector, ErrorCollectorSessionCap,
+INSTANTIATE_TEST_SUITE_P(ErrorCollector, error_collector_session_cap,
                          ::testing::ValuesIn(cap_worker_counts()),
                          [](const ::testing::TestParamInfo<std::uint32_t>& info) {
                              return "Workers" + std::to_string(info.param);

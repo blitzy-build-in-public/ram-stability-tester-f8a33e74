@@ -22,8 +22,13 @@ namespace RamQuick.Analysis;
 /// The UI shows <see cref="Top"/>, the first <see cref="AnalyzerThresholds.DisplayedHintCount"/> items; the text and
 /// JSON summaries list every item. Instances are immutable, so they are safe to share across threads.
 /// </para>
+/// <para>
+/// Two lists are equal when they hold equal hints in the same rank order; every list, <see cref="Empty"/> included,
+/// carries the same label. No property is settable, so a <see langword="with"/> expression can only copy a list and
+/// never bypass the ranking validation.
+/// </para>
 /// </remarks>
-public sealed class CauseHints
+public sealed record CauseHints
 {
     /// <summary>
     /// The label every cause-hint list carries on every channel: "Hint — not a diagnosis", with an em dash (U+2014)
@@ -98,6 +103,34 @@ public sealed class CauseHints
         ArgumentOutOfRangeException.ThrowIfNegative(count);
 
         return count >= _items.Length ? Items : Array.AsReadOnly(_items[..count]);
+    }
+
+    // Generated record equality would compare the item arrays by reference, so the same analysis run
+    // twice would yield unequal results. The label is a constant, so the items alone decide equality.
+
+    /// <summary>
+    /// Returns whether <paramref name="other"/> holds equal <see cref="Items"/>, compared element by element in rank
+    /// order.
+    /// </summary>
+    /// <param name="other">The list to compare with.</param>
+    /// <returns><see langword="true"/> when every item is equal.</returns>
+    public bool Equals(CauseHints? other) =>
+        ReferenceEquals(this, other)
+        || (other is not null && Items.SequenceEqual(other.Items));
+
+    /// <summary>
+    /// Returns a hash code consistent with <see cref="Equals(CauseHints)"/>.
+    /// </summary>
+    /// <returns>The hash code.</returns>
+    public override int GetHashCode()
+    {
+        var hash = default(HashCode);
+        foreach (CauseHint item in Items)
+        {
+            hash.Add(item);
+        }
+
+        return hash.ToHashCode();
     }
 
     private static void ValidateRanking(CauseHint[] items, string paramName)

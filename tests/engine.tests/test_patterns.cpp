@@ -192,8 +192,8 @@ void expect_cursor_sweep(const pattern_spec& spec, std::uint64_t start, int dire
 }
 
 /** Fixtures of the suites parameterised on a kind: all five, and the three alternating kinds. */
-class PatternsEveryKind : public ::testing::TestWithParam<std::uint32_t> {};
-class PatternsPassSensitivity : public ::testing::TestWithParam<std::uint32_t> {};
+class patterns_every_kind : public ::testing::TestWithParam<std::uint32_t> {};
+class patterns_pass_sensitivity : public ::testing::TestWithParam<std::uint32_t> {};
 
 }  // namespace
 
@@ -201,7 +201,7 @@ class PatternsPassSensitivity : public ::testing::TestWithParam<std::uint32_t> {
  * Every kind: determinism, cursor agreement and the complement flag
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(PatternsEveryKind, ReferenceIsDeterministicAndEqualsPatternWord) {
+TEST_P(patterns_every_kind, ReferenceIsDeterministicAndEqualsPatternWord) {
     const std::uint32_t kind = GetParam();
     for (const std::uint64_t seed : k_seeds) {
         for (const std::uint32_t pass : k_passes) {
@@ -217,7 +217,7 @@ TEST_P(PatternsEveryKind, ReferenceIsDeterministicAndEqualsPatternWord) {
     }
 }
 
-TEST_P(PatternsEveryKind, ScalarCursorFollowsReferenceAscendingAndDescending) {
+TEST_P(patterns_every_kind, ScalarCursorFollowsReferenceAscendingAndDescending) {
     constexpr std::uint64_t sweep_words = 4096;
     // A descending sweep from 0 wraps modulo 2^64; one from 4095 ends exactly at word 0.
     constexpr std::uint64_t starts[] = {0ULL, 4095ULL, (1ULL << 37U) + 5ULL};
@@ -235,7 +235,7 @@ TEST_P(PatternsEveryKind, ScalarCursorFollowsReferenceAscendingAndDescending) {
     }
 }
 
-TEST_P(PatternsEveryKind, CursorDirectionIsNormalisedToOneWordUpOrDown) {
+TEST_P(patterns_every_kind, CursorDirectionIsNormalisedToOneWordUpOrDown) {
     constexpr int directions[] = {0, 2, 1000, -2, -1000};
     const std::uint32_t kind = GetParam();
     for (const std::uint32_t pass : {0U, 1U}) {
@@ -246,7 +246,7 @@ TEST_P(PatternsEveryKind, CursorDirectionIsNormalisedToOneWordUpOrDown) {
     }
 }
 
-TEST_P(PatternsEveryKind, ComplementFlagInvertsEveryBit) {
+TEST_P(patterns_every_kind, ComplementFlagInvertsEveryBit) {
     const std::uint32_t kind = GetParam();
     for (const std::uint64_t seed : k_seeds) {
         for (std::uint32_t pass = 0; pass < k_alternation_passes; ++pass) {
@@ -260,7 +260,7 @@ TEST_P(PatternsEveryKind, ComplementFlagInvertsEveryBit) {
     }
 }
 
-TEST_P(PatternsEveryKind, SeekRepositionsLikeAFreshConstruction) {
+TEST_P(patterns_every_kind, SeekRepositionsLikeAFreshConstruction) {
     // A cursor seeked away from wherever it stands, after some advances, must then follow the
     // reference exactly as a cursor constructed at the target: odd and even targets, backwards
     // and forwards, the top of the index range, and a return to its own construction word.
@@ -307,7 +307,7 @@ TEST_P(PatternsEveryKind, SeekRepositionsLikeAFreshConstruction) {
 
 // gtest names an instantiated suite "<prefix>/<suite>", so the prefix keeps the Patterns* filter
 // selecting these tests.
-INSTANTIATE_TEST_SUITE_P(PatternsAllKinds, PatternsEveryKind, ::testing::ValuesIn(k_all_kinds),
+INSTANTIATE_TEST_SUITE_P(PatternsAllKinds, patterns_every_kind, ::testing::ValuesIn(k_all_kinds),
                          kind_test_name);
 
 /* ---------------------------------------------------------------------------------------------
@@ -316,7 +316,7 @@ INSTANTIATE_TEST_SUITE_P(PatternsAllKinds, PatternsEveryKind, ::testing::ValuesI
 
 // Moving inversion over walking bits and the inverted checkerboard rely on each pass rewriting
 // every bit of every word, so consecutive passes must be exact complements, not merely differ.
-TEST_P(PatternsPassSensitivity, ConsecutivePassesAreExactComplements) {
+TEST_P(patterns_pass_sensitivity, ConsecutivePassesAreExactComplements) {
     const std::uint32_t kind = GetParam();
     const std::vector<std::uint64_t> words = sampled_words();
     for (std::uint32_t pass = 0; pass < k_alternation_passes; ++pass) {
@@ -328,7 +328,7 @@ TEST_P(PatternsPassSensitivity, ConsecutivePassesAreExactComplements) {
     }
 }
 
-TEST_P(PatternsPassSensitivity, SeedDoesNotChangeValues) {
+TEST_P(patterns_pass_sensitivity, SeedDoesNotChangeValues) {
     const std::uint32_t kind = GetParam();
     const std::vector<std::uint64_t> words = sampled_words();
     for (const std::uint64_t seed : k_seeds) {
@@ -342,7 +342,7 @@ TEST_P(PatternsPassSensitivity, SeedDoesNotChangeValues) {
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(PatternsAlternatingKinds, PatternsPassSensitivity,
+INSTANTIATE_TEST_SUITE_P(PatternsAlternatingKinds, patterns_pass_sensitivity,
                          ::testing::ValuesIn(k_alternating_kinds), kind_test_name);
 
 /* ---------------------------------------------------------------------------------------------

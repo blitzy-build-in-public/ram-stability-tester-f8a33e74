@@ -1138,6 +1138,8 @@ public sealed class MainViewModelTests
         // The displayed line labels the address as virtual, as the first-error message does.
         Assert.StartsWith(VirtualAddressToken + " 0x0000023A4F7C1D48", item.Text, StringComparison.Ordinal);
         Assert.Equal(item.Text, item.ToString());
+        Assert.Equal(item, new ErrorGroupItem(group with { }));
+        Assert.NotEqual(item, new ErrorGroupItem(group with { Count = 4 }));
     }
 
     [Fact]
@@ -1176,6 +1178,8 @@ public sealed class MainViewModelTests
         Assert.StartsWith(UiText.HintPrefix, item.Text, StringComparison.Ordinal);
         Assert.Equal(Format(UiText.CauseHintFormat, UiText.HintPrefix, item.Title, item.LikelihoodText, item.Suggestion), item.Text);
         Assert.Equal(item.Text, item.ToString());
+        Assert.Equal(item, new CauseHintItem(hint with { }));
+        Assert.NotEqual(item, new CauseHintItem(hint with { LikelihoodPercent = 64.5 }));
     }
 
     [Fact]

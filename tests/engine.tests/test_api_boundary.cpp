@@ -5,23 +5,23 @@
  * - ApiBoundaryAbi: struct sizes and C layout, the noexcept boundary (no C++ exception can
  *   cross it: a throw that escaped an export would terminate the process, never propagate),
  *   the API version a host checks at bind time, and the result-code messages. noexcept alone
- *   cannot show that the exports' handlers exist; ApiBoundaryExceptions does.
+ *   cannot show that the exports' handlers exist; api_boundary_exceptions does.
  * - ApiBoundarySystem: rq_query_system's argument checks and its description of this machine.
- * - ApiBoundaryCreateInvalid and ApiBoundaryCreateValid: each validation rule of
+ * - api_boundary_create_invalid and api_boundary_create_valid: each validation rule of
  *   rq_session_create rejects its case with RQ_E_INVALID_ARGUMENT, leaves the handle null and
  *   registers nothing; configurations at the rules' limits are accepted.
- * - ApiBoundaryHandle: null, never-issued and destroyed handles, unknown stop reasons, double
+ * - api_boundary_handle: null, never-issued and destroyed handles, unknown stop reasons, double
  *   start and get_result before Completed.
- * - ApiBoundaryExceptions: a std::bad_alloc thrown inside rq_query_system and at every
+ * - api_boundary_exceptions: a std::bad_alloc thrown inside rq_query_system and at every
  *   allocation of rq_session_create is translated by the export's handler into RQ_E_INTERNAL
  *   rather than terminating the process; the out struct stays unwritten, the handle is cleared
  *   and no session is registered. The exception comes from the allocation refusal below, which
  *   throws a C++ exception only, never an SEH fault.
- * - ApiBoundaryRun: the event order and payloads of a normal run, the deep copy, destroy from
+ * - api_boundary_run: the event order and payloads of a normal run, the deep copy, destroy from
  *   inside every callback and while running, and the forced instruction set.
- * - ApiBoundaryStopBeforeStart and ApiBoundaryGateAbort: first-writer-wins stop reasons and the
- *   step gate, including an abort with no recorded reason (RQ_END_HOST_FAULT).
- * - ApiBoundaryIsa: select_isa over synthetic CPUID and XCR0 input as the boundary applies it:
+ * - api_boundary_stop_before_start and api_boundary_gate_abort: first-writer-wins stop reasons
+ *   and the step gate, including an abort with no recorded reason (RQ_END_HOST_FAULT).
+ * - api_boundary_isa: select_isa over synthetic CPUID and XCR0 input as the boundary applies it:
  *   without any of AVX-512 F, CD, BW, DQ or VL, or without the opmask and ZMM state, AVX-512 is
  *   not available and a configuration forcing it is invalid. test_kernels.cpp covers the full
  *   selection matrix; this suite covers what that selection means for isa_override.
@@ -54,7 +54,7 @@
 #include "core/system_info.h"
 
 /* ---------------------------------------------------------------------------------------------
- * Allocation refusal: the test-only failure seam of ApiBoundaryExceptions
+ * Allocation refusal: the test-only failure seam of api_boundary_exceptions
  *
  * The exports build their production session_dependencies themselves, so no substitute layer
  * reachable through api.cpp can throw; allocation is the one throwing point every export shares.
@@ -151,7 +151,7 @@ static_assert(sizeof(rq_error_record) == 112 && k_is_c_layout<rq_error_record>);
 static_assert(sizeof(rq_run_result) == 192 && k_is_c_layout<rq_run_result>);
 
 // Every export is noexcept, so no C++ exception can unwind into a host frame. This proves only
-// that an escaping exception would terminate the process; ApiBoundaryExceptions throws one
+// that an escaping exception would terminate the process; api_boundary_exceptions throws one
 // inside the exports at run time and shows their handlers translate it into RQ_E_INTERNAL.
 static_assert(noexcept(rq_api_version()));
 static_assert(noexcept(rq_query_system(nullptr)));
@@ -361,8 +361,8 @@ struct gate_plan {
     std::uint32_t stop_reason = 0;
 };
 
-/** Everything the callbacks of one session observed, copied under the recorder's lock. */
-struct recording {
+/** What the callbacks of one session observed besides the recorder's counters and flags. */
+struct recording_payload {
     std::vector<recorded_event> events;
     std::vector<rq_step_start> step_starts;
     std::vector<rq_step_result> step_results;
@@ -371,9 +371,28 @@ struct recording {
     rq_run_result completed{};
     /** completed.step_results, copied during on_completed, the only time it is valid. */
     std::vector<rq_step_result> completed_step_results;
-    bool released = false;
     std::uint64_t released_bytes = 0;
     std::uint64_t release_ms = 0;
+
+    /** Threads callbacks ran on. */
+    std::set<DWORD> callback_threads;
+
+    /** rq_session_destroy from inside each structural callback, when probing. */
+    std::vector<rq_result> destroy_in_callback;
+    /** rq_session_get_result from inside on_prepared and on_completed, when probing. */
+    rq_result get_result_in_prepared = k_not_called;
+    rq_result get_result_in_completed = k_not_called;
+    /** rq_session_stop from inside the gate or on_prepared, when planned. */
+    rq_result stop_in_gate = k_not_called;
+    rq_result stop_in_prepared = k_not_called;
+};
+
+/**
+ * Everything the callbacks of one session observed, the payload and the recorder's counters and
+ * flags, copied under the recorder's lock.
+ */
+struct recording : recording_payload {
+    bool released = false;
 
     std::uint32_t progress_count = 0;
     /** Progress raised outside an open step, for another step, or with a wrong struct_size. */
@@ -384,21 +403,10 @@ struct recording {
     /** total_errors of the latest error batch. */
     std::uint64_t last_total_errors = 0;
 
-    /** Threads callbacks ran on. */
-    std::set<DWORD> callback_threads;
     /** A callback body threw; the recorder caught it so nothing unwound into the engine. */
     bool callback_threw = false;
-
-    /** rq_session_destroy from inside each structural callback, when probing. */
-    std::vector<rq_result> destroy_in_callback;
-    /** rq_session_get_result from inside on_prepared and on_completed, when probing. */
-    rq_result get_result_in_prepared = k_not_called;
-    rq_result get_result_in_completed = k_not_called;
     /** The header rq_session_get_result copied inside on_completed equals the payload. */
     bool get_result_matches_payload = false;
-    /** rq_session_stop from inside the gate or on_prepared, when planned. */
-    rq_result stop_in_gate = k_not_called;
-    rq_result stop_in_prepared = k_not_called;
 };
 
 /**
@@ -456,7 +464,7 @@ public:
 
     recording snapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return data_;
+        return copy_locked();
     }
 
     /** Structural events in order, for example "prepared start0 end0 completed released". */
@@ -497,7 +505,22 @@ private:
     template <typename Predicate>
     bool wait_for(Predicate done) {
         std::unique_lock<std::mutex> lock(mutex_);
-        return changed_.wait_for(lock, k_event_timeout, [&]() { return done(data_); });
+        return changed_.wait_for(lock, k_event_timeout, [&]() { return done(copy_locked()); });
+    }
+
+    /** The payload with the counters and flags beside it; the caller holds mutex_. */
+    recording copy_locked() const {
+        recording seen{data_};
+        seen.released = released_.load(std::memory_order_relaxed);
+        seen.progress_count = progress_count_.load(std::memory_order_relaxed);
+        seen.misplaced_progress = misplaced_progress_.load(std::memory_order_relaxed);
+        seen.error_batches = error_batches_.load(std::memory_order_relaxed);
+        seen.malformed_error_batches = malformed_error_batches_.load(std::memory_order_relaxed);
+        seen.last_total_errors = last_total_errors_.load(std::memory_order_relaxed);
+        seen.callback_threw = callback_threw_.load(std::memory_order_relaxed);
+        seen.get_result_matches_payload =
+            get_result_matches_payload_.load(std::memory_order_relaxed);
+        return seen;
     }
 
     /**
@@ -517,7 +540,7 @@ private:
                     data_.destroy_in_callback.push_back(rq_session_destroy(handle_));
                 }
             } catch (...) {
-                data_.callback_threw = true;
+                callback_threw_.store(true, std::memory_order_relaxed);
             }
         }
         changed_.notify_all();
@@ -529,7 +552,7 @@ private:
 
     static void RQ_CALL on_prepared(void* user_data, const rq_prepared* info) noexcept {
         callback_recorder& recorder = self(user_data);
-        recorder.record(true, [&](recording& seen) {
+        recorder.record(true, [&](recording_payload& seen) {
             seen.prepared = *info;
             seen.events.push_back({event_kind::prepared, 0});
             if (recorder.prepared_stop_reason_ != 0) {
@@ -548,7 +571,7 @@ private:
                                                   const rq_step_start* info) noexcept {
         callback_recorder& recorder = self(user_data);
         std::uint32_t action = RQ_ACTION_CONTINUE;
-        recorder.record(true, [&](recording& seen) {
+        recorder.record(true, [&](recording_payload& seen) {
             seen.step_starts.push_back(*info);
             seen.events.push_back({event_kind::step_starting, info->index});
             if (info->index == recorder.gate_.abort_step) {
@@ -566,7 +589,7 @@ private:
 
     static void RQ_CALL on_step_finished(void* user_data, const rq_step_result* result) noexcept {
         callback_recorder& recorder = self(user_data);
-        recorder.record(true, [&](recording& seen) {
+        recorder.record(true, [&](recording_payload& seen) {
             seen.step_results.push_back(*result);
             seen.events.push_back({event_kind::step_finished, result->index});
             recorder.open_step_ = -1;
@@ -575,12 +598,12 @@ private:
 
     static void RQ_CALL on_progress(void* user_data, const rq_progress* progress) noexcept {
         callback_recorder& recorder = self(user_data);
-        recorder.record(false, [&](recording& seen) {
-            ++seen.progress_count;
+        recorder.record(false, [&](recording_payload& seen) {
+            recorder.progress_count_.fetch_add(1, std::memory_order_relaxed);
             seen.last_progress = *progress;
             if (progress->struct_size != sizeof(rq_progress) || recorder.open_step_ < 0 ||
                 static_cast<std::int64_t>(progress->step_index) != recorder.open_step_) {
-                ++seen.misplaced_progress;
+                recorder.misplaced_progress_.fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
@@ -588,18 +611,18 @@ private:
     static void RQ_CALL on_errors(void* user_data, const rq_error_record* records,
                                   std::uint32_t count, std::uint64_t total_errors) noexcept {
         callback_recorder& recorder = self(user_data);
-        recorder.record(false, [&](recording& seen) {
-            ++seen.error_batches;
+        recorder.record(false, [&](recording_payload&) {
+            recorder.error_batches_.fetch_add(1, std::memory_order_relaxed);
             if (count != 0 && records == nullptr) {
-                ++seen.malformed_error_batches;
+                recorder.malformed_error_batches_.fetch_add(1, std::memory_order_relaxed);
             }
-            seen.last_total_errors = total_errors;
+            recorder.last_total_errors_.store(total_errors, std::memory_order_relaxed);
         });
     }
 
     static void RQ_CALL on_completed(void* user_data, const rq_run_result* result) noexcept {
         callback_recorder& recorder = self(user_data);
-        recorder.record(true, [&](recording& seen) {
+        recorder.record(true, [&](recording_payload& seen) {
             seen.completed = *result;
             seen.completed_step_results.assign(result->step_results,
                                                result->step_results + result->step_result_count);
@@ -608,8 +631,9 @@ private:
                 rq_run_result copy{};
                 copy.struct_size = sizeof(rq_run_result);
                 seen.get_result_in_completed = rq_session_get_result(recorder.handle_, &copy);
-                seen.get_result_matches_payload =
-                    std::memcmp(&copy, result, sizeof(rq_run_result)) == 0;
+                recorder.get_result_matches_payload_.store(
+                    std::memcmp(&copy, result, sizeof(rq_run_result)) == 0,
+                    std::memory_order_relaxed);
             }
         });
     }
@@ -617,9 +641,9 @@ private:
     static void RQ_CALL on_released(void* user_data, std::uint64_t released_bytes,
                                     std::uint64_t release_ms) noexcept {
         callback_recorder& recorder = self(user_data);
-        recorder.record(true, [&](recording& seen) {
+        recorder.record(true, [&](recording_payload& seen) {
             seen.events.push_back({event_kind::released, 0});
-            seen.released = true;
+            recorder.released_.store(true, std::memory_order_relaxed);
             seen.released_bytes = released_bytes;
             seen.release_ms = release_ms;
         });
@@ -636,8 +660,18 @@ private:
 
     mutable std::mutex mutex_;
     std::condition_variable changed_;
-    recording data_;
+    recording_payload data_;
     std::atomic<std::uint64_t> callback_count_{0};
+
+    // Written and read only under mutex_, which orders them, so every access is relaxed.
+    std::atomic<bool> released_{false};
+    std::atomic<std::uint32_t> progress_count_{0};
+    std::atomic<std::uint32_t> misplaced_progress_{0};
+    std::atomic<std::uint32_t> error_batches_{0};
+    std::atomic<std::uint32_t> malformed_error_batches_{0};
+    std::atomic<std::uint64_t> last_total_errors_{0};
+    std::atomic<bool> callback_threw_{false};
+    std::atomic<bool> get_result_matches_payload_{false};
 };
 
 /* ---------------------------------------------------------------------------------------------
@@ -692,7 +726,7 @@ private:
 }
 
 /** Asserts that no session outlives its test: every handle a test creates is destroyed. */
-class ApiBoundarySession : public ::testing::Test {
+class api_boundary_session : public ::testing::Test {
 protected:
     void SetUp() override { baseline_sessions_ = live_session_count(); }
 
@@ -812,7 +846,7 @@ TEST(ApiBoundarySystem, DescribesThisMachine) {
 }
 
 /* ---------------------------------------------------------------------------------------------
- * ApiBoundaryCreateInvalid and ApiBoundaryCreateValid: rq_session_create validation
+ * api_boundary_create_invalid and api_boundary_create_valid: rq_session_create validation
  * ------------------------------------------------------------------------------------------- */
 
 /** The arguments of one rq_session_create call; a case mutates a valid set. */
@@ -993,10 +1027,10 @@ rq_result create_with(create_arguments& arguments, rq_session_handle* handle) {
                              arguments.pass_out ? handle : nullptr);
 }
 
-class ApiBoundaryCreateInvalid : public ApiBoundarySession,
-                                 public ::testing::WithParamInterface<create_case> {};
+class api_boundary_create_invalid : public api_boundary_session,
+                                    public ::testing::WithParamInterface<create_case> {};
 
-TEST_P(ApiBoundaryCreateInvalid, IsRejectedWithoutRegisteringASession) {
+TEST_P(api_boundary_create_invalid, IsRejectedWithoutRegisteringASession) {
     callback_recorder recorder;
     create_arguments arguments = make_create_arguments(recorder);
     GetParam().mutate(arguments);
@@ -1017,13 +1051,13 @@ TEST_P(ApiBoundaryCreateInvalid, IsRejectedWithoutRegisteringASession) {
     EXPECT_EQ(recorder.callback_count(), 0U);
 }
 
-INSTANTIATE_TEST_SUITE_P(ApiBoundaryEveryRule, ApiBoundaryCreateInvalid,
+INSTANTIATE_TEST_SUITE_P(ApiBoundaryEveryRule, api_boundary_create_invalid,
                          ::testing::ValuesIn(k_invalid_create_cases), case_name<create_case>);
 
-class ApiBoundaryCreateValid : public ApiBoundarySession,
-                               public ::testing::WithParamInterface<create_case> {};
+class api_boundary_create_valid : public api_boundary_session,
+                                  public ::testing::WithParamInterface<create_case> {};
 
-TEST_P(ApiBoundaryCreateValid, IsAcceptedAndRegisteredUntilDestroyed) {
+TEST_P(api_boundary_create_valid, IsAcceptedAndRegisteredUntilDestroyed) {
     callback_recorder recorder;
     create_arguments arguments = make_create_arguments(recorder);
     GetParam().mutate(arguments);
@@ -1040,14 +1074,14 @@ TEST_P(ApiBoundaryCreateValid, IsAcceptedAndRegisteredUntilDestroyed) {
     EXPECT_EQ(recorder.callback_count(), 0U);
 }
 
-INSTANTIATE_TEST_SUITE_P(ApiBoundaryAtTheLimits, ApiBoundaryCreateValid,
+INSTANTIATE_TEST_SUITE_P(ApiBoundaryAtTheLimits, api_boundary_create_valid,
                          ::testing::ValuesIn(k_valid_create_cases), case_name<create_case>);
 
 /* ---------------------------------------------------------------------------------------------
- * ApiBoundaryHandle: handles and session state
+ * api_boundary_handle: handles and session state
  * ------------------------------------------------------------------------------------------- */
 
-class ApiBoundaryHandle : public ApiBoundarySession {};
+class api_boundary_handle : public api_boundary_session {};
 
 /** Expects every handle-taking export to reject handle with RQ_E_INVALID_HANDLE. */
 void expect_handle_rejected(rq_session_handle handle) {
@@ -1062,7 +1096,7 @@ void expect_handle_rejected(rq_session_handle handle) {
     EXPECT_TRUE(returns(rq_session_destroy(handle), RQ_E_INVALID_HANDLE)) << "destroy " << value;
 }
 
-TEST_F(ApiBoundaryHandle, NeverIssuedHandlesAreRejectedWithoutBeingDereferenced) {
+TEST_F(api_boundary_handle, NeverIssuedHandlesAreRejectedWithoutBeingDereferenced) {
     // The registry compares values only, so none of these is ever read through.
     static int unrelated_object = 0;
     expect_handle_rejected(nullptr);
@@ -1071,7 +1105,7 @@ TEST_F(ApiBoundaryHandle, NeverIssuedHandlesAreRejectedWithoutBeingDereferenced)
     expect_handle_rejected(reinterpret_cast<rq_session_handle>(&unrelated_object));
 }
 
-TEST_F(ApiBoundaryHandle, DestroyedHandleIsRejected) {
+TEST_F(api_boundary_handle, DestroyedHandleIsRejected) {
     callback_recorder recorder;
     const std::vector<rq_step_def> steps = valid_steps();
     const rq_session_config config = valid_config(steps);
@@ -1085,7 +1119,7 @@ TEST_F(ApiBoundaryHandle, DestroyedHandleIsRejected) {
     EXPECT_EQ(recorder.callback_count(), 0U);
 }
 
-TEST_F(ApiBoundaryHandle, UnknownStopReasonsAreRejectedAndRecordNothing) {
+TEST_F(api_boundary_handle, UnknownStopReasonsAreRejectedAndRecordNothing) {
     callback_recorder recorder;
     const std::vector<rq_step_def> steps = valid_steps();
     const rq_session_config config = valid_config(steps);
@@ -1110,7 +1144,7 @@ TEST_F(ApiBoundaryHandle, UnknownStopReasonsAreRejectedAndRecordNothing) {
     EXPECT_TRUE(returns(session.destroy(), RQ_OK));
 }
 
-TEST_F(ApiBoundaryHandle, GetResultChecksItsOutParameterBeforeTheHandle) {
+TEST_F(api_boundary_handle, GetResultChecksItsOutParameterBeforeTheHandle) {
     callback_recorder recorder;
     const std::vector<rq_step_def> steps = valid_steps();
     const rq_session_config config = valid_config(steps);
@@ -1135,7 +1169,7 @@ TEST_F(ApiBoundaryHandle, GetResultChecksItsOutParameterBeforeTheHandle) {
     EXPECT_TRUE(returns(session.destroy(), RQ_OK));
 }
 
-TEST_F(ApiBoundaryHandle, StartIsAllowedOnceAndTheResultOnlyAfterCompleted) {
+TEST_F(api_boundary_handle, StartIsAllowedOnceAndTheResultOnlyAfterCompleted) {
     callback_recorder recorder;
     const std::vector<rq_step_def> steps = valid_steps();
     const rq_session_config config = valid_config(steps);
@@ -1163,7 +1197,7 @@ TEST_F(ApiBoundaryHandle, StartIsAllowedOnceAndTheResultOnlyAfterCompleted) {
 }
 
 /* ---------------------------------------------------------------------------------------------
- * ApiBoundaryExceptions: C++ exceptions inside the exports
+ * api_boundary_exceptions: C++ exceptions inside the exports
  *
  * rq_session_start is not swept: its only allocation, std::thread's 8-byte start state, is
  * below k_refusable_bytes, so no refusal can reach it.
@@ -1191,9 +1225,9 @@ public:
 /** Refusal points the create sweep tries; far more than session creation allocates. */
 constexpr std::uint32_t k_max_create_refusal_points = 256;
 
-class ApiBoundaryExceptions : public ApiBoundarySession {};
+class api_boundary_exceptions : public api_boundary_session {};
 
-TEST_F(ApiBoundaryExceptions, QuerySystemTranslatesAThrownExceptionAndLeavesTheStructUnwritten) {
+TEST_F(api_boundary_exceptions, QuerySystemTranslatesAThrownExceptionAndLeavesTheStructUnwritten) {
     rq_system_info info{};
     std::memset(&info, 0xA5, sizeof(info));
     info.struct_size = sizeof(rq_system_info);
@@ -1217,7 +1251,7 @@ TEST_F(ApiBoundaryExceptions, QuerySystemTranslatesAThrownExceptionAndLeavesTheS
     EXPECT_TRUE(returns(rq_query_system(&after), RQ_OK)) << "unarmed, after the refusal";
 }
 
-TEST_F(ApiBoundaryExceptions, CreateTranslatesAThrowAtEveryAllocationAndRegistersNothing) {
+TEST_F(api_boundary_exceptions, CreateTranslatesAThrowAtEveryAllocationAndRegistersNothing) {
     callback_recorder recorder;
     const std::vector<rq_step_def> steps = valid_steps();
     const rq_session_config config = valid_config(steps);
@@ -1270,15 +1304,15 @@ TEST_F(ApiBoundaryExceptions, CreateTranslatesAThrowAtEveryAllocationAndRegister
 }
 
 /* ---------------------------------------------------------------------------------------------
- * ApiBoundaryRun: started sessions
+ * api_boundary_run: started sessions
  * ------------------------------------------------------------------------------------------- */
 
 /** The structural trace of a run in which both steps ran to their schedule. */
 constexpr char k_complete_trace[] = "prepared start0 end0 start1 end1 completed released";
 
-class ApiBoundaryRun : public ApiBoundarySession {};
+class api_boundary_run : public api_boundary_session {};
 
-TEST_F(ApiBoundaryRun, NormalRunFollowsTheDocumentedEventOrderAndPayloads) {
+TEST_F(api_boundary_run, NormalRunFollowsTheDocumentedEventOrderAndPayloads) {
     const std::vector<rq_step_def> steps = valid_steps();
     const rq_session_config config = valid_config(steps);
     callback_recorder recorder;
@@ -1394,7 +1428,7 @@ TEST_F(ApiBoundaryRun, NormalRunFollowsTheDocumentedEventOrderAndPayloads) {
     EXPECT_EQ(recorder.callback_count(), callbacks_at_destroy) << "a callback ran after destroy";
 }
 
-TEST_F(ApiBoundaryRun, CreateDeepCopiesTheConfigurationStepsNamesAndCallbacks) {
+TEST_F(api_boundary_run, CreateDeepCopiesTheConfigurationStepsNamesAndCallbacks) {
     callback_recorder recorder;
     session_guard session;
     std::uint32_t worker_count = 0;
@@ -1430,7 +1464,7 @@ TEST_F(ApiBoundaryRun, CreateDeepCopiesTheConfigurationStepsNamesAndCallbacks) {
     EXPECT_TRUE(returns(session.destroy(), RQ_OK));
 }
 
-TEST_F(ApiBoundaryRun, DestroyFromInsideEveryCallbackIsRefusedAndTheRunContinues) {
+TEST_F(api_boundary_run, DestroyFromInsideEveryCallbackIsRefusedAndTheRunContinues) {
     const std::vector<rq_step_def> steps = valid_steps();
     const rq_session_config config = valid_config(steps);
     callback_recorder recorder;
@@ -1458,7 +1492,7 @@ TEST_F(ApiBoundaryRun, DestroyFromInsideEveryCallbackIsRefusedAndTheRunContinues
     EXPECT_TRUE(returns(session.destroy(), RQ_OK));
 }
 
-TEST_F(ApiBoundaryRun, DestroyWhileRunningReturnsAfterTheLastCallback) {
+TEST_F(api_boundary_run, DestroyWhileRunningReturnsAfterTheLastCallback) {
     const std::vector<rq_step_def> steps = valid_steps();
     const rq_session_config config = valid_config(steps);
     callback_recorder recorder;
@@ -1487,10 +1521,10 @@ const forced_isa_case k_forced_isa_cases[] = {
     {"Avx512", RQ_ISA_AVX512},
 };
 
-class ApiBoundaryForcedIsa : public ApiBoundarySession,
-                             public ::testing::WithParamInterface<forced_isa_case> {};
+class api_boundary_forced_isa : public api_boundary_session,
+                                public ::testing::WithParamInterface<forced_isa_case> {};
 
-TEST_P(ApiBoundaryForcedIsa, IsTheSetThePreparedSessionReports) {
+TEST_P(api_boundary_forced_isa, IsTheSetThePreparedSessionReports) {
     if ((host_isa_mask() & (1U << GetParam().isa)) == 0U) {
         GTEST_SKIP() << "this CPU lacks " << GetParam().name;
     }
@@ -1514,11 +1548,11 @@ TEST_P(ApiBoundaryForcedIsa, IsTheSetThePreparedSessionReports) {
     EXPECT_TRUE(returns(session.destroy(), RQ_OK));
 }
 
-INSTANTIATE_TEST_SUITE_P(ApiBoundaryEverySet, ApiBoundaryForcedIsa,
+INSTANTIATE_TEST_SUITE_P(ApiBoundaryEverySet, api_boundary_forced_isa,
                          ::testing::ValuesIn(k_forced_isa_cases), case_name<forced_isa_case>);
 
 /* ---------------------------------------------------------------------------------------------
- * ApiBoundaryStopBeforeStart, ApiBoundaryGateAbort and ApiBoundaryGateStop: end reasons
+ * api_boundary_stop_before_start, api_boundary_gate_abort and api_boundary_gate_stop: end reasons
  * ------------------------------------------------------------------------------------------- */
 
 /** Two stops before start with different reasons. */
@@ -1534,10 +1568,10 @@ const stop_case k_stop_cases[] = {
     {"HostFaultThenUser", RQ_STOP_HOST_FAULT, RQ_STOP_USER},
 };
 
-class ApiBoundaryStopBeforeStart : public ApiBoundarySession,
-                                   public ::testing::WithParamInterface<stop_case> {};
+class api_boundary_stop_before_start : public api_boundary_session,
+                                       public ::testing::WithParamInterface<stop_case> {};
 
-TEST_P(ApiBoundaryStopBeforeStart, FirstReasonDecidesAndOnlyCompletedAndReleasedFollow) {
+TEST_P(api_boundary_stop_before_start, FirstReasonDecidesAndOnlyCompletedAndReleasedFollow) {
     const std::vector<rq_step_def> steps = valid_steps();
     const rq_session_config config = valid_config(steps);
     callback_recorder recorder;
@@ -1575,7 +1609,7 @@ TEST_P(ApiBoundaryStopBeforeStart, FirstReasonDecidesAndOnlyCompletedAndReleased
     EXPECT_TRUE(returns(session.destroy(), RQ_OK));
 }
 
-INSTANTIATE_TEST_SUITE_P(ApiBoundaryEveryReasonFirst, ApiBoundaryStopBeforeStart,
+INSTANTIATE_TEST_SUITE_P(ApiBoundaryEveryReasonFirst, api_boundary_stop_before_start,
                          ::testing::ValuesIn(k_stop_cases), case_name<stop_case>);
 
 /** A step gate that refuses one step without recording a stop reason. */
@@ -1593,10 +1627,10 @@ const gate_case k_gate_cases[] = {
     {"UnknownActionAtSecondStep", 1, 7},
 };
 
-class ApiBoundaryGateAbort : public ApiBoundarySession,
-                             public ::testing::WithParamInterface<gate_case> {};
+class api_boundary_gate_abort : public api_boundary_session,
+                                public ::testing::WithParamInterface<gate_case> {};
 
-TEST_P(ApiBoundaryGateAbort, WithoutARecordedReasonEndsAsHostFault) {
+TEST_P(api_boundary_gate_abort, WithoutARecordedReasonEndsAsHostFault) {
     const std::uint32_t aborted = GetParam().step;
     const std::vector<rq_step_def> steps = valid_steps();
     const rq_session_config config = valid_config(steps);
@@ -1629,12 +1663,12 @@ TEST_P(ApiBoundaryGateAbort, WithoutARecordedReasonEndsAsHostFault) {
     EXPECT_TRUE(returns(session.destroy(), RQ_OK));
 }
 
-INSTANTIATE_TEST_SUITE_P(ApiBoundaryEveryRefusal, ApiBoundaryGateAbort,
+INSTANTIATE_TEST_SUITE_P(ApiBoundaryEveryRefusal, api_boundary_gate_abort,
                          ::testing::ValuesIn(k_gate_cases), case_name<gate_case>);
 
-class ApiBoundaryGateStop : public ApiBoundarySession {};
+class api_boundary_gate_stop : public api_boundary_session {};
 
-TEST_F(ApiBoundaryGateStop, ReasonRecordedInsideTheGateDecidesTheEndReason) {
+TEST_F(api_boundary_gate_stop, ReasonRecordedInsideTheGateDecidesTheEndReason) {
     const std::vector<rq_step_def> steps = valid_steps();
     const rq_session_config config = valid_config(steps);
     callback_recorder recorder;
@@ -1656,7 +1690,7 @@ TEST_F(ApiBoundaryGateStop, ReasonRecordedInsideTheGateDecidesTheEndReason) {
 }
 
 /* ---------------------------------------------------------------------------------------------
- * ApiBoundaryIsa: instruction-set availability as isa_override validation applies it
+ * api_boundary_isa: instruction-set availability as isa_override validation applies it
  * ------------------------------------------------------------------------------------------- */
 
 /** A highest basic leaf a current CPU reports; any value from 7 up enables leaf 7. */
@@ -1709,9 +1743,9 @@ const missing_requirement_case k_missing_requirement_cases[] = {
     {"WithoutZmmState", 0U, k_xcr0_through_avx},
 };
 
-class ApiBoundaryIsa : public ::testing::TestWithParam<missing_requirement_case> {};
+class api_boundary_isa : public ::testing::TestWithParam<missing_requirement_case> {};
 
-TEST_P(ApiBoundaryIsa, MissingRequirementMakesAvx512UnavailableAndForcingItInvalid) {
+TEST_P(api_boundary_isa, MissingRequirementMakesAvx512UnavailableAndForcingItInvalid) {
     cpu_features features = avx512_full_features();
     features.leaf7_ebx &= ~GetParam().cleared_leaf7_bits;
     features.xcr0 = GetParam().xcr0;
@@ -1731,7 +1765,7 @@ TEST_P(ApiBoundaryIsa, MissingRequirementMakesAvx512UnavailableAndForcingItInval
     EXPECT_TRUE(returns(validate_forcing(RQ_ISA_AUTO, automatic.available_mask), RQ_OK));
 }
 
-INSTANTIATE_TEST_SUITE_P(ApiBoundaryEachRequirement, ApiBoundaryIsa,
+INSTANTIATE_TEST_SUITE_P(ApiBoundaryEachRequirement, api_boundary_isa,
                          ::testing::ValuesIn(k_missing_requirement_cases),
                          case_name<missing_requirement_case>);
 
@@ -1753,7 +1787,7 @@ TEST(ApiBoundaryIsaHost, CreateRejectsForcingASetThisCpuLacks) {
         }
     }
     if (missing.empty()) {
-        GTEST_SKIP() << "this CPU has every set; ApiBoundaryIsa covers the rule synthetically";
+        GTEST_SKIP() << "this CPU has every set; api_boundary_isa covers the rule synthetically";
     }
 
     callback_recorder recorder;

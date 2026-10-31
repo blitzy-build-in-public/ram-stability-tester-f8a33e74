@@ -21,6 +21,8 @@
     <AssemblyName>RamQuick</AssemblyName>
     <RootNamespace>RamQuick.App</RootNamespace>
     <AssemblyTitle>RAMQuick</AssemblyTitle>
+    <!-- An elevated process must not run startup-hook assemblies that DOTNET_STARTUP_HOOKS names from outside the portable folder. -->
+    <StartupHookSupport>false</StartupHookSupport>
   </PropertyGroup>
 
   <ItemGroup>

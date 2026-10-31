@@ -38,6 +38,15 @@ namespace RamQuick.Logging;
 /// on disk needs no rebuild, so it is retired as usual, and the other runs of the journal are recovered.
 /// </para>
 /// <para>
+/// Untrusted text: a journal's text reaches the window and the summaries, so
+/// <see cref="JournalRecovery.LastStepName"/> and the rebuilt summaries' step names pass through
+/// <see cref="SummaryFormat.StepName"/>, and each is one line of plain text of at most
+/// <see cref="SummaryFormat.MaxStepNameUtf8Bytes"/> UTF-8 bytes. A <c>step</c> record whose name that rule
+/// leaves blank is named by the <c>begin</c> record's definition with the same number. A base name holding a
+/// character <see cref="SummaryFormat.PlainText"/> replaces, or one <see cref="ResultsLog"/> refuses as a file
+/// name, is replaced by <c>RamQuick-recovered-&lt;runId&gt;</c>.
+/// </para>
+/// <para>
 /// Crash consistency: the journal is deleted only once every summary it describes is on disk and an <c>end</c>
 /// record has been appended for each run recovered here. When a publication fails, no <c>end</c> is written,
 /// the journal is kept so the next launch retries, and <see cref="JournalRecovery.PublicationError"/> carries
@@ -69,8 +78,9 @@ namespace RamQuick.Logging;
 /// </remarks>
 public static class CrashDetector
 {
-    // ResultsLog refuses a base name that is not a plain file name. A begin record damaged that way still has
-    // its results published, under this prefix followed by the run id, so its journal can be retired.
+    // ResultsLog refuses a base name that is not a plain file name, and recovery refuses one holding a control,
+    // format or separator character. A begin record damaged either way still has its results published, under
+    // this prefix followed by the run id, so its journal can be retired.
     private const string FallbackBaseNamePrefix = "RamQuick-recovered-";
 
     private const string JournalUnreadablePrefix = "The progress journal could not be read: ";
@@ -263,9 +273,17 @@ public static class CrashDetector
         return unfinished with { Summary = json.Kept ?? partial };
     }
 
-    // Probing through the path helper keeps one base-name rule: the one ResultsLog applies to every path.
+    // Probing through the path helper keeps one base-name rule: the one ResultsLog applies to every path. A name
+    // that rule accepts can still hold a character SummaryFormat.PlainText replaces, such as a bidirectional
+    // control, which would reach a published file name and every notice that names the file, so it is refused too.
     private static string UsableBaseName(DataDirectory dataDirectory, JournalBegin begin)
     {
+        string fallback = FallbackBaseNamePrefix + SummaryFormat.RunId(begin.RunId);
+        if (!string.Equals(SummaryFormat.PlainText(begin.LogBaseName), begin.LogBaseName, StringComparison.Ordinal))
+        {
+            return fallback;
+        }
+
         try
         {
             _ = ResultsLog.GetSummaryJsonPath(dataDirectory, begin.LogBaseName);
@@ -273,7 +291,7 @@ public static class CrashDetector
         }
         catch (ArgumentException)
         {
-            return FallbackBaseNamePrefix + SummaryFormat.RunId(begin.RunId);
+            return fallback;
         }
     }
 
@@ -475,10 +493,11 @@ public static class CrashDetector
                     return null;
                 }
 
-                string? name = step.Name.Length > 0
-                    ? step.Name
-                    : Begin.Steps.FirstOrDefault(definition => definition is not null && definition.Number == step.Index)?.Name;
-                return string.IsNullOrEmpty(name) ? null : name;
+                // The window shows this name, so it is held to the summaries' step-name rule, and a name that rule
+                // leaves blank is taken from this journal's own definition of the step.
+                return SummaryFormat.StepName(step.Name)
+                    ?? SummaryFormat.StepName(
+                        Begin.Steps.FirstOrDefault(definition => definition is not null && definition.Number == step.Index)?.Name);
             }
         }
 

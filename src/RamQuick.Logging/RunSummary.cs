@@ -245,7 +245,10 @@ public sealed record RunSummary
     /// <see cref="RunSummarySource.FinishedSteps"/> entry for its number, joined by number to its definition
     /// in the <c>begin</c> record; an entry with no definition is skipped, because the summary cannot
     /// describe a step the plan never held. The running step of an unfinished run follows with
-    /// <see langword="null"/> actuals and <see cref="SummaryStep.Completed"/> <see langword="false"/>.
+    /// <see langword="null"/> actuals and <see cref="SummaryStep.Completed"/> <see langword="false"/>. Every
+    /// step name, in <c>steps[]</c>, the end detail and <see cref="UnfinishedRun"/>, passes through
+    /// <see cref="SummaryFormat.StepName"/>, which leaves a plan's names unchanged; where a <c>step</c> record's
+    /// name is left blank by it, the definition with the same number names the step.
     /// </para>
     /// <para>
     /// Errors: the total is the result's true total. Without a result it is the last heartbeat's total,
@@ -486,9 +489,8 @@ public sealed record RunSummary
     {
         if (unfinishedStep is not null)
         {
-            string? name = unfinishedStep.Name.Length > 0
-                ? unfinishedStep.Name
-                : DefinitionName(definitions, unfinishedStep.Index);
+            string? name = SummaryFormat.StepName(unfinishedStep.Name)
+                ?? DefinitionName(definitions, unfinishedStep.Index);
             return (unfinishedStep.Index, name);
         }
 
@@ -502,7 +504,7 @@ public sealed record RunSummary
     }
 
     private static string? DefinitionName(Dictionary<int, JournalStep> definitions, int number) =>
-        definitions.TryGetValue(number, out JournalStep? definition) ? definition.Name : null;
+        definitions.TryGetValue(number, out JournalStep? definition) ? SummaryFormat.StepName(definition.Name) : null;
 
     private static SummaryStep[] BuildSteps(
         Dictionary<int, JournalStep> definitions,
@@ -540,7 +542,7 @@ public sealed record RunSummary
     private static SummaryStep PlannedStep(JournalStep definition) => new()
     {
         Index = definition.Number,
-        Name = definition.Name,
+        Name = SummaryFormat.StepName(definition.Name) ?? string.Empty,
         Pattern = definition.Pattern.ToString(),
         AccessOrder = definition.AccessOrder.ToString(),
         ThreadMode = definition.ThreadMode.ToString(),
@@ -957,7 +959,9 @@ public sealed record SummaryStep
     public int Index { get; init; }
 
     /// <summary>
-    /// Gets the step's name, exactly as the plan defines it.
+    /// Gets the step's name as the plan defines it. <see cref="RunSummary.Build"/> writes it through
+    /// <see cref="SummaryFormat.StepName"/>, which leaves a plan's names unchanged, and writes an empty name when
+    /// the <c>begin</c> record holds none.
     /// </summary>
     public string Name
     {
@@ -1727,8 +1731,8 @@ public sealed record SummaryUnfinishedRun
     public int? LastStepIndex { get; init; }
 
     /// <summary>
-    /// Gets the name of the step at <see cref="LastStepIndex"/>, or <see langword="null"/> when there is
-    /// none.
+    /// Gets the name of the step at <see cref="LastStepIndex"/>, as <see cref="SummaryFormat.StepName"/> writes
+    /// it, or <see langword="null"/> when there is none.
     /// </summary>
     public string? LastStepName { get; init; }
 
@@ -1755,7 +1759,20 @@ public sealed record SummaryUnfinishedRun
 /// </summary>
 public static class SummaryFormat
 {
+    /// <summary>
+    /// The most UTF-8 bytes a step name may hold, 63: the native <c>rq_step_def.name</c> field is 64 bytes and
+    /// NUL-terminated. <c>RamQuick.Plans.StepDefinition.MaxNameUtf8Bytes</c> states the same limit for the plans,
+    /// which this library does not reference.
+    /// </summary>
+    public const int MaxStepNameUtf8Bytes = 63;
+
     private const string HexPrefix = "0x";
+
+    // Ends a step name StepName cut, so the cut shows: U+2026, three UTF-8 bytes.
+    private const string StepNameCutMarker = "\u2026";
+
+    // What UTF-8 writes for a surrogate without its partner, so PlainText writes the same.
+    private const char UnpairedSurrogateReplacement = '\uFFFD';
 
     // The placeholders RedactPersonalPaths leaves where a personal part of a path stood.
     private const string UserProfileToken = "%USERPROFILE%";
@@ -1765,6 +1782,26 @@ public static class SummaryFormat
     private const string AppFolderToken = "<app folder>";
     private const string UserToken = "<user>";
     private const string MachineToken = "<machine>";
+
+    // The placeholders the results log writes, before these rules run, for its run's data folder and for the current
+    // user name where it is a path segment.
+    internal const string DataFolderToken = "<data>";
+    internal const string UserNameToken = "%USERNAME%";
+
+    // Every placeholder of either family: the profile and computer-name rules leave each one as it stands, so a
+    // second redaction returns the first one's text and a computer named DATA or TEMP corrupts none of them.
+    private static readonly string[] _placeholders =
+    {
+        UserProfileToken,
+        LocalAppDataToken,
+        RoamingAppDataToken,
+        TempToken,
+        AppFolderToken,
+        UserToken,
+        MachineToken,
+        DataFolderToken,
+        UserNameToken,
+    };
 
     // Windows keeps every account's profile folder here, named after the account.
     private const string ProfilesFolderName = "Users";
@@ -1832,6 +1869,123 @@ public static class SummaryFormat
     public static string RunId(Guid id) => id.ToString("N", CultureInfo.InvariantCulture);
 
     /// <summary>
+    /// Returns <paramref name="text"/> as one line of plain text. Every control character (Unicode category Cc,
+    /// line breaks, escape and NUL included), format character (Cf, such as the bidirectional controls U+202A to
+    /// U+202E and U+2066 to U+2069, the zero-width characters U+200B to U+200F and U+FEFF) and line or paragraph
+    /// separator (U+2028, U+2029) becomes one space, and every surrogate without its partner becomes U+FFFD, as
+    /// UTF-8 writes it. Text read back from a journal or a summary file is untrusted: a line break in it would
+    /// start a line that reads as another field or another verdict, an escape or a NUL would hide or cut what
+    /// follows, and a bidirectional control would reorder what the reader sees.
+    /// </summary>
+    /// <param name="text">The text.</param>
+    /// <returns>
+    /// The plain text, in which each replaced character, a surrogate pair counting as one, is one character and
+    /// everything else is kept verbatim; <paramref name="text"/> itself when it holds nothing to replace.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="text"/> is <see langword="null"/>.</exception>
+    public static string PlainText(string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+
+        StringBuilder? plain = null;
+        int index = 0;
+        while (index < text.Length)
+        {
+            char? replacement = PlainTextReplacement(text, index, out int length);
+            if (replacement is { } written)
+            {
+                plain ??= new StringBuilder(text.Length).Append(text, 0, index);
+                plain.Append(written);
+            }
+            else
+            {
+                plain?.Append(text, index, length);
+            }
+
+            index += length;
+        }
+
+        return plain?.ToString() ?? text;
+    }
+
+    /// <summary>
+    /// Returns a step name taken from a journal as the window and the summaries show it: <see cref="PlainText"/>,
+    /// trimmed, and at most <see cref="MaxStepNameUtf8Bytes"/> UTF-8 bytes. A longer name is cut after the last
+    /// whole character that leaves room for a closing "…" (U+2026), so the cut shows, and a surrogate pair is never
+    /// split. A name within the limit that holds none of the characters <see cref="PlainText"/> replaces and no
+    /// white space at either end, as every plan's step name does, is returned unchanged.
+    /// </summary>
+    /// <param name="name">The name as the journal holds it, or <see langword="null"/>.</param>
+    /// <returns>
+    /// The name to show, or <see langword="null"/> when <paramref name="name"/> is <see langword="null"/> or
+    /// holds nothing but white space and the characters <see cref="PlainText"/> replaces.
+    /// </returns>
+    public static string? StepName(string? name)
+    {
+        if (name is null)
+        {
+            return null;
+        }
+
+        string plain = PlainText(name).Trim();
+        if (plain.Length == 0)
+        {
+            return null;
+        }
+
+        if (Encoding.UTF8.GetByteCount(plain) <= MaxStepNameUtf8Bytes)
+        {
+            return plain;
+        }
+
+        // Plain text holds no surrogate without its partner, so every position read here starts a whole scalar.
+        int budget = MaxStepNameUtf8Bytes - Encoding.UTF8.GetByteCount(StepNameCutMarker);
+        int bytes = 0;
+        int end = 0;
+        while (end < plain.Length)
+        {
+            Rune scalar = Rune.GetRuneAt(plain, end);
+            if (bytes + scalar.Utf8SequenceLength > budget)
+            {
+                break;
+            }
+
+            bytes += scalar.Utf8SequenceLength;
+            end += scalar.Utf16SequenceLength;
+        }
+
+        return plain[..end].TrimEnd() + StepNameCutMarker;
+    }
+
+    // What PlainText writes for the scalar at index, whose UTF-16 length, 2 for a surrogate pair and otherwise 1,
+    // is returned in length: null to keep it, a space for a control, format or separator character, and
+    // UnpairedSurrogateReplacement for a surrogate without its partner.
+    private static char? PlainTextReplacement(string text, int index, out int length)
+    {
+        char character = text[index];
+        if (char.IsHighSurrogate(character) && index + 1 < text.Length && char.IsLowSurrogate(text[index + 1]))
+        {
+            length = 2;
+            int scalar = char.ConvertToUtf32(character, text[index + 1]);
+            return IsReplacedCategory(CharUnicodeInfo.GetUnicodeCategory(scalar)) ? ' ' : null;
+        }
+
+        length = 1;
+        if (char.IsSurrogate(character))
+        {
+            return UnpairedSurrogateReplacement;
+        }
+
+        return IsReplacedCategory(CharUnicodeInfo.GetUnicodeCategory(character)) ? ' ' : null;
+    }
+
+    private static bool IsReplacedCategory(UnicodeCategory category) =>
+        category is UnicodeCategory.Control
+            or UnicodeCategory.Format
+            or UnicodeCategory.LineSeparator
+            or UnicodeCategory.ParagraphSeparator;
+
+    /// <summary>
     /// Returns <paramref name="text"/> with the personal parts of the Windows paths it holds replaced by
     /// placeholders. The journal's <c>result</c> record and both summaries persist an end detail through it,
     /// because an end detail can carry an exception message, and an exception message can name a path in the
@@ -1858,44 +2012,69 @@ public static class SummaryFormat
     /// it never runs past a character no file name may hold, such as a line break or a colon. It runs to the
     /// separator after it; where none follows, to the quote that closes a quoted path, or else to the end of the
     /// line, less the spaces and dots Windows drops from the end of a name and a drive letter starting another
-    /// path.
+    /// path. A folder named exactly like a placeholder is left as it stands.
     /// </description></item>
     /// <item><description>
     /// A path segment equal to the current user name, following a separator, becomes <c>&lt;user&gt;</c>.
     /// </description></item>
     /// <item><description>
-    /// The computer name, as a whole word, becomes <c>&lt;machine&gt;</c>.
+    /// The computer name, as a whole word, becomes <c>&lt;machine&gt;</c>, except inside a placeholder.
     /// </description></item>
     /// </list>
     /// <para>
     /// In rules 1 and 3, a name ends at the end of the text, a separator, white space, a quote, a character no
-    /// Windows user name may hold, or a dot that ends a sentence. Everything else is kept verbatim. The result is
-    /// stable: redacting it again returns it unchanged. An environment lookup that fails skips its rule, so no
-    /// text makes this method throw.
+    /// Windows user name may hold, or a dot that ends a sentence. Everything else is kept verbatim. Rule 4 never
+    /// rewrites any part of a placeholder, these or the <c>&lt;data&gt;</c> and <c>%USERNAME%</c> the results log
+    /// writes, so a computer named <c>DATA</c> or <c>TEMP</c> corrupts none of them. The result is stable: redacting
+    /// it again returns it unchanged. An environment lookup that fails skips its rule, so no text makes this method
+    /// throw.
     /// </para>
     /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="text"/> is <see langword="null"/>.</exception>
     public static string RedactPersonalPaths(string text)
     {
         ArgumentNullException.ThrowIfNull(text);
+
+        // The environment is read on every call; an empty text needs none of it.
+        return text.Length == 0 ? text : RedactPersonalPaths(text, PersonalPathSnapshot.Capture());
+    }
+
+    /// <summary>
+    /// Returns <paramref name="text"/> redacted by the rules of <see cref="RedactPersonalPaths(string)"/>, with
+    /// the folders and names they replace taken from <paramref name="snapshot"/> instead of the environment.
+    /// </summary>
+    /// <param name="text">The text.</param>
+    /// <param name="snapshot">The folders and names to redact, as <see cref="PersonalPathSnapshot.Capture"/> read them.</param>
+    /// <returns>
+    /// The redacted text; <paramref name="text"/> itself when it holds nothing to redact.
+    /// </returns>
+    /// <remarks>
+    /// For a caller that redacts many texts, such as the results log with one free-text value per error line: the
+    /// environment is read once, not per text. Like the public overload, it never throws for any text.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">An argument is <see langword="null"/>.</exception>
+    internal static string RedactPersonalPaths(string text, PersonalPathSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        ArgumentNullException.ThrowIfNull(snapshot);
         if (text.Length == 0)
         {
             return text;
         }
 
         string redacted = text;
-        foreach ((string folder, string token) in PersonalFolders())
+        foreach ((string folder, string token) in snapshot.Folders)
         {
             redacted = ReplaceFolder(redacted, folder, token);
         }
 
         redacted = RedactProfileFolderNames(redacted);
-        if (EnvironmentValue(static () => Environment.UserName) is { } userName)
+        if (snapshot.UserName is { } userName)
         {
             redacted = ReplaceUserSegments(redacted, userName);
         }
 
-        if (EnvironmentValue(static () => Environment.MachineName) is { } machineName)
+        if (snapshot.MachineName is { } machineName)
         {
             redacted = ReplaceMachineWords(redacted, machineName);
         }
@@ -2000,10 +2179,11 @@ public static class SummaryFormat
                 && IsSeparator(text[index + prefixLength - 1]))
             {
                 // The placeholder starts with a character that ends a name, so a redacted folder reads as empty
-                // and is left as it is.
+                // and is left as it is. A folder named like a %…% placeholder, such as the %USERNAME% the results
+                // log writes for the current user's name, names no account and is left as well.
                 int nameStart = index + prefixLength;
                 int nameEnd = ProfileFolderNameEnd(text, index, nameStart);
-                if (nameEnd > nameStart)
+                if (nameEnd > nameStart && !IsPlaceholder(text.AsSpan(nameStart, nameEnd - nameStart)))
                 {
                     result ??= new StringBuilder(text.Length);
                     result.Append(text, copied, nameStart - copied).Append(UserToken);
@@ -2057,7 +2237,7 @@ public static class SummaryFormat
             if ((index == 0 || !IsMachineNameCharacter(text[index - 1]))
                 && (end == text.Length || !IsMachineNameCharacter(text[end]))
                 && text.AsSpan(index, machineName.Length).Equals(machineName, StringComparison.OrdinalIgnoreCase)
-                && !IsPlaceholderAt(text, index - 1))
+                && !OverlapsPlaceholder(text, index, end))
             {
                 result ??= new StringBuilder(text.Length);
                 result.Append(text, copied, index - copied).Append(MachineToken);
@@ -2073,10 +2253,37 @@ public static class SummaryFormat
         return Finish(result, text, copied);
     }
 
-    // A computer named like a placeholder's word must not turn the placeholder into another one, which keeps the
-    // redaction stable.
-    private static bool IsPlaceholderAt(string text, int start) =>
-        start >= 0 && (StartsWithAt(text, start, MachineToken) || StartsWithAt(text, start, UserToken));
+    // A computer named like a placeholder's word, such as DATA, TEMP or USER, must not turn the placeholder into
+    // other text, which keeps the redaction stable and every placeholder readable: true when a placeholder written
+    // in text overlaps the characters from start up to end.
+    private static bool OverlapsPlaceholder(string text, int start, int end)
+    {
+        foreach (string placeholder in _placeholders)
+        {
+            for (int at = Math.Max(0, start - placeholder.Length + 1); at < end; at++)
+            {
+                if (StartsWithAt(text, at, placeholder))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsPlaceholder(ReadOnlySpan<char> name)
+    {
+        foreach (string placeholder in _placeholders)
+        {
+            if (name.Equals(placeholder, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     private static bool StartsWithAt(string text, int start, string value) =>
         text.Length - start >= value.Length && text.AsSpan(start, value.Length).Equals(value, StringComparison.OrdinalIgnoreCase);
@@ -2198,6 +2405,60 @@ public static class SummaryFormat
         !char.IsControl(character)
         && character is not ('\u2028' or '\u2029')
         && !InvalidFileNameCharacters.Contains(character);
+
+    /// <summary>
+    /// The folders and names the rules of <see cref="RedactPersonalPaths(string)"/> replace, read from the
+    /// environment at one moment.
+    /// </summary>
+    /// <remarks>
+    /// The public overload reads a new one per call. The results log reads one and reuses it for every value it
+    /// writes, up to one per error line, because the account's folders and the computer's name do not change while
+    /// the process runs.
+    /// </remarks>
+    internal sealed class PersonalPathSnapshot
+    {
+        /// <summary>
+        /// Initializes a new instance of the <see cref="PersonalPathSnapshot"/> class.
+        /// </summary>
+        /// <param name="folders">
+        /// The fully qualified folders, none a bare drive or share root and none ending in a separator, each with its
+        /// placeholder, the longest folder first.
+        /// </param>
+        /// <param name="userName">The current user name, or <see langword="null"/> to skip its rule.</param>
+        /// <param name="machineName">The computer name, or <see langword="null"/> to skip its rule.</param>
+        internal PersonalPathSnapshot((string Folder, string Token)[] folders, string? userName, string? machineName)
+        {
+            Folders = folders;
+            UserName = userName;
+            MachineName = machineName;
+        }
+
+        /// <summary>
+        /// Gets the folders and their placeholders, the longest folder first.
+        /// </summary>
+        internal (string Folder, string Token)[] Folders { get; }
+
+        /// <summary>
+        /// Gets the current user name, or <see langword="null"/> when the environment could not name it.
+        /// </summary>
+        internal string? UserName { get; }
+
+        /// <summary>
+        /// Gets the computer name, or <see langword="null"/> when the environment could not name it.
+        /// </summary>
+        internal string? MachineName { get; }
+
+        /// <summary>
+        /// Reads the current user's profile, local and roaming application data and temporary folders, the
+        /// application's folder, the user name and the computer name. Never throws: a lookup that fails leaves its
+        /// rule out.
+        /// </summary>
+        /// <returns>The snapshot.</returns>
+        internal static PersonalPathSnapshot Capture() => new(
+            PersonalFolders().ToArray(),
+            EnvironmentValue(static () => Environment.UserName),
+            EnvironmentValue(static () => Environment.MachineName));
+    }
 }
 
 /// <summary>

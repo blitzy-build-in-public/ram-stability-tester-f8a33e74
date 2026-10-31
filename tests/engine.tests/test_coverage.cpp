@@ -11,7 +11,7 @@
  * verify_strided, whose call compares only the lines it visits, not its whole span. Agreement
  * between the two is therefore evidence, not a count agreeing with itself.
  *
- * - CoverageMatrix: one step of every pattern in every access order, both moving-inversion
+ * - coverage_matrix: one step of every pattern in every access order, both moving-inversion
  *   patterns included, and a 5 s hold, in All and Half thread mode, on every instruction set the
  *   CPU offers (SKIPPED where it lacks one). The reported totals lie within 99-101 % of the
  *   independent count, and are in fact exact; every byte of every slice is verified once per pass
@@ -19,11 +19,12 @@
  *   moving-inversion step's order, so for each of the five the primitive log must show every
  *   worker writing the base ascending, then sweeping each group it covers once ascending and once
  *   descending.
- * - CoverageReread: mismatches injected before verification are each re-read once, and the
+ * - coverage_reread: mismatches injected before verification are each re-read once, and the
  *   re-reads change neither total.
- * - CoverageStop: a stop in mid-pass ends the step incomplete; what the cut pass verified is
+ * - coverage_stop: a stop in mid-pass ends the step incomplete; what the cut pass verified is
  *   counted, and what it only wrote is not.
- * - CoveragePercent and CoverageCounter: coverage_percent and the counter's publication rules.
+ * - coverage_percent_formula and CoverageCounter: coverage_percent and the counter's
+ *   publication rules.
  * - CoverageSession: a whole session through session_create, with the run result, the step
  *   results and the last progress report held against the count.
  *
@@ -232,7 +233,7 @@ std::vector<step_shape> pattern_order_shapes() {
 /**
  * Both moving-inversion patterns in every access order. The runner must ignore the configured
  * order, because a moving-inversion pass always writes the base ascending and then sweeps
- * ascending and descending. Configuring each order, rather than one, is what lets CoverageMatrix
+ * ascending and descending. Configuring each order, rather than one, is what lets coverage_matrix
  * prove that every accepted value is ignored, not just one of them.
  */
 std::vector<step_shape> moving_inversion_shapes() {
@@ -496,7 +497,7 @@ private:
     std::unique_ptr<counting_memory_access> memory_;
     std::unique_ptr<error_collector> errors_;
     std::unique_ptr<coverage_counter> coverage_;
-    std::shared_ptr<IThreadAffinity> affinity_;
+    std::shared_ptr<thread_affinity> affinity_;
     std::unique_ptr<worker_pool> pool_;
     std::unique_ptr<step_runner> runner_;
     status_recorder status_;
@@ -885,14 +886,14 @@ std::vector<inversion_call> expected_inversion_pass(const step_harness& harness,
 }
 
 /* ---------------------------------------------------------------------------------------------
- * CoverageMatrix: every pattern x order x instruction set x thread mode
+ * coverage_matrix: every pattern x order x instruction set x thread mode
  * ------------------------------------------------------------------------------------------- */
 
 using matrix_param = std::tuple<std::uint32_t, step_shape, std::uint32_t>;
 
-class CoverageMatrix : public ::testing::TestWithParam<matrix_param> {};
+class coverage_matrix : public ::testing::TestWithParam<matrix_param> {};
 
-TEST_P(CoverageMatrix, ReportedTotalsMatchIndependentCount) {
+TEST_P(coverage_matrix, ReportedTotalsMatchIndependentCount) {
     const auto& [isa, shape, thread_mode] = GetParam();
     if (!isa_available(isa)) {
         GTEST_SKIP() << "CPU lacks " << isa_label(isa);
@@ -967,17 +968,17 @@ std::string matrix_case_name(const ::testing::TestParamInfo<matrix_param>& info)
 }
 
 // The prefixes start with "Coverage", so --gtest_filter=Coverage* selects every instantiation.
-INSTANTIATE_TEST_SUITE_P(CoveragePatternOrder, CoverageMatrix,
+INSTANTIATE_TEST_SUITE_P(CoveragePatternOrder, coverage_matrix,
                          ::testing::Combine(::testing::ValuesIn(k_isas),
                                             ::testing::ValuesIn(pattern_order_shapes()),
                                             ::testing::Values(RQ_THREADS_ALL, RQ_THREADS_HALF)),
                          matrix_case_name);
-INSTANTIATE_TEST_SUITE_P(CoverageMovingInversion, CoverageMatrix,
+INSTANTIATE_TEST_SUITE_P(CoverageMovingInversion, coverage_matrix,
                          ::testing::Combine(::testing::ValuesIn(k_isas),
                                             ::testing::ValuesIn(moving_inversion_shapes()),
                                             ::testing::Values(RQ_THREADS_ALL, RQ_THREADS_HALF)),
                          matrix_case_name);
-INSTANTIATE_TEST_SUITE_P(CoverageHold, CoverageMatrix,
+INSTANTIATE_TEST_SUITE_P(CoverageHold, coverage_matrix,
                          ::testing::Combine(::testing::ValuesIn(k_isas),
                                             ::testing::ValuesIn(hold_shapes()),
                                             ::testing::Values(RQ_THREADS_ALL, RQ_THREADS_HALF)),
@@ -988,12 +989,12 @@ std::string shape_case_name(const ::testing::TestParamInfo<step_shape>& info) {
 }
 
 /* ---------------------------------------------------------------------------------------------
- * CoverageReread: re-reads of confirmed mismatches never count
+ * coverage_reread: re-reads of confirmed mismatches never count
  * ------------------------------------------------------------------------------------------- */
 
-class CoverageReread : public ::testing::TestWithParam<step_shape> {};
+class coverage_reread : public ::testing::TestWithParam<step_shape> {};
 
-TEST_P(CoverageReread, RereadsOfInjectedMismatchesAreNotCounted) {
+TEST_P(coverage_reread, RereadsOfInjectedMismatchesAreNotCounted) {
     const step_shape& shape = GetParam();
     const std::string label = shape_label(shape);
     step_harness harness;
@@ -1030,16 +1031,16 @@ TEST_P(CoverageReread, RereadsOfInjectedMismatchesAreNotCounted) {
     EXPECT_EQ(outcome.verified_bytes, counted) << label;
 }
 
-INSTANTIATE_TEST_SUITE_P(CoverageStepKinds, CoverageReread, ::testing::ValuesIn(step_kind_shapes()),
-                         shape_case_name);
+INSTANTIATE_TEST_SUITE_P(CoverageStepKinds, coverage_reread,
+                         ::testing::ValuesIn(step_kind_shapes()), shape_case_name);
 
 /* ---------------------------------------------------------------------------------------------
- * CoverageStop: a stop in mid-pass counts what was verified, never what was only written
+ * coverage_stop: a stop in mid-pass counts what was verified, never what was only written
  * ------------------------------------------------------------------------------------------- */
 
-class CoverageStop : public ::testing::TestWithParam<step_shape> {};
+class coverage_stop : public ::testing::TestWithParam<step_shape> {};
 
-TEST_P(CoverageStop, MidPassStopCountsOnlyVerifiedBytes) {
+TEST_P(coverage_stop, MidPassStopCountsOnlyVerifiedBytes) {
     const step_shape& shape = GetParam();
     const std::string label = shape_label(shape);
     step_harness harness;
@@ -1075,11 +1076,11 @@ TEST_P(CoverageStop, MidPassStopCountsOnlyVerifiedBytes) {
         << label;
 }
 
-INSTANTIATE_TEST_SUITE_P(CoverageStepKinds, CoverageStop, ::testing::ValuesIn(step_kind_shapes()),
+INSTANTIATE_TEST_SUITE_P(CoverageStepKinds, coverage_stop, ::testing::ValuesIn(step_kind_shapes()),
                          shape_case_name);
 
 /* ---------------------------------------------------------------------------------------------
- * CoveragePercent and CoverageCounter: the formula and the publication rules
+ * coverage_percent_formula and CoverageCounter: the formula and the publication rules
  * ------------------------------------------------------------------------------------------- */
 
 struct percent_case {
@@ -1113,14 +1114,15 @@ void PrintTo(const percent_case& c, std::ostream* os) {
     *os << c.verified_bytes << " of " << c.tested_bytes << " bytes";
 }
 
-class CoveragePercent : public ::testing::TestWithParam<percent_case> {};
+class coverage_percent_formula : public ::testing::TestWithParam<percent_case> {};
 
-TEST_P(CoveragePercent, IsHundredTimesVerifiedOverTested) {
+TEST_P(coverage_percent_formula, IsHundredTimesVerifiedOverTested) {
     const percent_case& c = GetParam();
     EXPECT_DOUBLE_EQ(coverage_percent(c.verified_bytes, c.tested_bytes), c.expected_percent);
 }
 
-INSTANTIATE_TEST_SUITE_P(CoverageFormula, CoveragePercent, ::testing::ValuesIn(k_percent_cases));
+INSTANTIATE_TEST_SUITE_P(CoverageFormula, coverage_percent_formula,
+                         ::testing::ValuesIn(k_percent_cases));
 
 TEST(CoverageCounter, PublishesWholeBlocksAndPendingBytesOnPublish) {
     coverage_counter counter(2U);
@@ -1189,21 +1191,24 @@ constexpr std::uint32_t k_session_step_count = 3U;
 constexpr std::uint32_t k_session_progress_interval_ms = 1U;
 constexpr std::chrono::seconds k_session_timeout{120};
 
-/** What the callbacks of one session saw, guarded by mutex; they run on the coordinator. */
+/**
+ * What the callbacks of one session saw; they run on the coordinator. The counters and flags are
+ * atomic, and the mutex orders them with the recorded values and the Released wait.
+ */
 struct session_events {
     std::mutex mutex;
     std::condition_variable released_changed;
-    bool released = false;
-    bool completed = false;
+    std::atomic<bool> released{false};
+    std::atomic<bool> completed{false};
     std::uint32_t prepared_workers = 0;
     std::uint64_t tested_bytes = 0;
-    std::uint32_t steps_started = 0;
-    std::uint32_t steps_finished = 0;
+    std::atomic<std::uint32_t> steps_started{0};
+    std::atomic<std::uint32_t> steps_finished{0};
     std::array<rq_step_result, k_session_step_count> finished{};
-    std::uint64_t progress_reports = 0;
+    std::atomic<std::uint64_t> progress_reports{0};
     std::uint64_t last_progress_bytes = 0;
     std::uint64_t progress_region_bytes = 0;
-    bool progress_went_back = false;
+    std::atomic<bool> progress_went_back{false};
     std::uint64_t error_total = 0;
 };
 
@@ -1221,28 +1226,29 @@ void RQ_CALL record_prepared(void* user_data, const rq_prepared* info) noexcept 
 std::uint32_t RQ_CALL continue_step(void* user_data, const rq_step_start*) noexcept {
     session_events& events = events_of(user_data);
     const std::lock_guard<std::mutex> lock(events.mutex);
-    ++events.steps_started;
+    events.steps_started.fetch_add(1U, std::memory_order_relaxed);
     return RQ_ACTION_CONTINUE;
 }
 
 void RQ_CALL record_step_finished(void* user_data, const rq_step_result* result) noexcept {
     session_events& events = events_of(user_data);
     const std::lock_guard<std::mutex> lock(events.mutex);
-    if (events.steps_finished < events.finished.size()) {
-        events.finished[events.steps_finished] = *result;
+    const std::uint32_t index = events.steps_finished.fetch_add(1U, std::memory_order_relaxed);
+    if (index < events.finished.size()) {
+        events.finished[index] = *result;
     }
-    ++events.steps_finished;
 }
 
 void RQ_CALL record_progress(void* user_data, const rq_progress* progress) noexcept {
     session_events& events = events_of(user_data);
     const std::lock_guard<std::mutex> lock(events.mutex);
-    if (events.progress_reports > 0U && progress->verified_bytes < events.last_progress_bytes) {
-        events.progress_went_back = true;
+    if (events.progress_reports.load(std::memory_order_relaxed) > 0U &&
+        progress->verified_bytes < events.last_progress_bytes) {
+        events.progress_went_back.store(true, std::memory_order_relaxed);
     }
     events.last_progress_bytes = progress->verified_bytes;
     events.progress_region_bytes = progress->region_bytes;
-    ++events.progress_reports;
+    events.progress_reports.fetch_add(1U, std::memory_order_relaxed);
 }
 
 void RQ_CALL record_errors(void* user_data, const rq_error_record*, std::uint32_t,
@@ -1255,21 +1261,22 @@ void RQ_CALL record_errors(void* user_data, const rq_error_record*, std::uint32_
 void RQ_CALL record_completed(void* user_data, const rq_run_result*) noexcept {
     session_events& events = events_of(user_data);
     const std::lock_guard<std::mutex> lock(events.mutex);
-    events.completed = true;
+    events.completed.store(true, std::memory_order_relaxed);
 }
 
 void RQ_CALL record_released(void* user_data, std::uint64_t, std::uint64_t) noexcept {
     session_events& events = events_of(user_data);
     {
         const std::lock_guard<std::mutex> lock(events.mutex);
-        events.released = true;
+        events.released.store(true, std::memory_order_relaxed);
     }
     events.released_changed.notify_all();
 }
 
 bool wait_released(session_events& events, std::chrono::seconds timeout) {
     std::unique_lock<std::mutex> lock(events.mutex);
-    return events.released_changed.wait_for(lock, timeout, [&events] { return events.released; });
+    return events.released_changed.wait_for(
+        lock, timeout, [&events] { return events.released.load(std::memory_order_relaxed); });
 }
 
 /** Destroys a registered session on every exit path of the test, joining its coordinator. */
@@ -1393,18 +1400,19 @@ TEST(CoverageSession, RunStepAndProgressTotalsMatchIndependentCount) {
     EXPECT_TRUE(within_band("sum of rq_step_result.verified_bytes", step_sum, counted));
 
     const std::lock_guard<std::mutex> lock(events.mutex);
-    EXPECT_TRUE(events.completed);
+    EXPECT_TRUE(events.completed.load(std::memory_order_relaxed));
     EXPECT_EQ(events.prepared_workers, workers);
     EXPECT_EQ(events.tested_bytes, expected_tested_bytes);
-    EXPECT_EQ(events.steps_started, k_session_step_count);
-    ASSERT_EQ(events.steps_finished, k_session_step_count);
+    EXPECT_EQ(events.steps_started.load(std::memory_order_relaxed), k_session_step_count);
+    ASSERT_EQ(events.steps_finished.load(std::memory_order_relaxed), k_session_step_count);
     for (std::uint32_t i = 0; i < k_session_step_count; ++i) {
         // on_step_finished carried the values rq_session_get_result reports afterwards.
         EXPECT_EQ(events.finished[i].verified_bytes, result.step_results[i].verified_bytes)
             << "step " << i;
     }
-    ASSERT_GT(events.progress_reports, 0U);
-    EXPECT_FALSE(events.progress_went_back) << "rq_progress.verified_bytes decreased";
+    ASSERT_GT(events.progress_reports.load(std::memory_order_relaxed), 0U);
+    EXPECT_FALSE(events.progress_went_back.load(std::memory_order_relaxed))
+        << "rq_progress.verified_bytes decreased";
     EXPECT_EQ(events.progress_region_bytes, events.tested_bytes);
     EXPECT_TRUE(
         within_band("last rq_progress.verified_bytes", events.last_progress_bytes, counted));

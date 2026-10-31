@@ -9,7 +9,7 @@
  * - kernels_traced*: the instructions the built full_fence, flush_range and reread helpers
  *   execute, called directly and through real_memory_access's fence, flush and reread_word,
  *   recorded by an in-process single-step trace.
- * - KernelsStrided*: the BankStride entries of every set against expected_value and, for the
+ * - kernels_strided*: the BankStride entries of every set against expected_value and, for the
  *   AVX sets, against SSE2, over every kind, the three strides, 2 MiB, 6 MiB and 64 MiB spans
  *   and calls that start or end mid-sweep; and the identity of their visit sequence with
  *   order_cursor's BankStride ranges.
@@ -573,7 +573,7 @@ std::string kernel_param_name(const ::testing::TestParamInfo<kernel_param>& info
  * One kernel set and one pattern kind. SetUp skips the test before its body can execute a
  * kernel the host lacks; the buffers are committed but not touched until then.
  */
-class KernelsEquivalence : public ::testing::TestWithParam<kernel_param> {
+class kernels_equivalence : public ::testing::TestWithParam<kernel_param> {
 protected:
     void SetUp() override {
         require_isa(isa());
@@ -659,7 +659,7 @@ std::string isa_param_name(const ::testing::TestParamInfo<std::uint32_t>& info) 
 constexpr std::size_t k_page_words = 4096U / sizeof(std::uint64_t);
 
 /** One flush and re-read pair. CLFLUSHOPT is executed only where CPUID reports it. */
-class KernelsFlushHelpers : public ::testing::TestWithParam<flush_helpers> {
+class kernels_flush_helpers : public ::testing::TestWithParam<flush_helpers> {
 protected:
     void SetUp() override {
         if (GetParam().needs_clflushopt && !host_selection().clflushopt) {
@@ -672,7 +672,7 @@ protected:
 };
 
 /** The raw kernel sets, one per RQ_ISA_* value; only their data is read. */
-class KernelsRawTable : public ::testing::TestWithParam<std::uint32_t> {};
+class kernels_raw_table : public ::testing::TestWithParam<std::uint32_t> {};
 
 /** (isa_selection.selected, isa_selection.clflushopt) of a synthetic selection. */
 using tables_for_param = std::tuple<std::uint32_t, bool>;
@@ -682,7 +682,7 @@ std::string tables_for_param_name(const ::testing::TestParamInfo<tables_for_para
            (std::get<1>(info.param) ? "_Clflushopt" : "_Clflush");
 }
 
-class IsaDispatchTablesFor : public ::testing::TestWithParam<tables_for_param> {};
+class isa_dispatch_tables_for : public ::testing::TestWithParam<tables_for_param> {};
 
 /* ---------------------------------------------------------------------------------------------
  * Strided kernels: spans, visit slices and reports
@@ -933,7 +933,7 @@ private:
  * body can execute a kernel the host lacks. The spans sit k_guard_words into committed, unlocked
  * buffers, 64-byte aligned, with guard words on both sides.
  */
-class KernelsStrided : public ::testing::TestWithParam<kernel_param> {
+class kernels_strided : public ::testing::TestWithParam<kernel_param> {
 protected:
     void SetUp() override {
         require_isa(isa());
@@ -994,7 +994,7 @@ std::vector<strided_start> strided_starts_of(std::uint32_t kind) {
 }
 
 /** One kernel set for the visit-order identity test. */
-class KernelsStridedOrder : public ::testing::TestWithParam<std::uint32_t> {
+class kernels_strided_order : public ::testing::TestWithParam<std::uint32_t> {
 protected:
     void SetUp() override {
         require_isa(GetParam());
@@ -1013,7 +1013,7 @@ protected:
  * Kernel equivalence: every set against expected_value, the AVX sets also against SSE2
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(KernelsEquivalence, FillStreamMatchesExpectedValueAndSse2) {
+TEST_P(kernels_equivalence, FillStreamMatchesExpectedValueAndSse2) {
     std::vector<std::uint64_t> expected;
     for (const pattern_spec& spec : specs_of(kind())) {
         for (const std::uint64_t first : k_first_word_indices) {
@@ -1042,7 +1042,7 @@ TEST_P(KernelsEquivalence, FillStreamMatchesExpectedValueAndSse2) {
     }
 }
 
-TEST_P(KernelsEquivalence, VerifyAcceptsCorrectDataWithoutCallingTheSink) {
+TEST_P(kernels_equivalence, VerifyAcceptsCorrectDataWithoutCallingTheSink) {
     std::vector<std::uint64_t> expected;
     for (const pattern_spec& spec : specs_of(kind())) {
         for (const std::uint64_t first : k_first_word_indices) {
@@ -1073,7 +1073,7 @@ TEST_P(KernelsEquivalence, VerifyAcceptsCorrectDataWithoutCallingTheSink) {
     }
 }
 
-TEST_P(KernelsEquivalence, VerifyReportsInjectedCorruptionsLikeSse2) {
+TEST_P(kernels_equivalence, VerifyReportsInjectedCorruptionsLikeSse2) {
     std::vector<std::uint64_t> expected;
     for (const pattern_spec& spec : specs_of(kind())) {
         for (const std::uint64_t first : k_first_word_indices) {
@@ -1107,7 +1107,7 @@ TEST_P(KernelsEquivalence, VerifyReportsInjectedCorruptionsLikeSse2) {
     }
 }
 
-TEST_P(KernelsEquivalence, VerifyAndStreamReportsBeforeOverwritingAndWritesNext) {
+TEST_P(kernels_equivalence, VerifyAndStreamReportsBeforeOverwritingAndWritesNext) {
     std::vector<std::uint64_t> expected;
     std::vector<std::uint64_t> next_values;
     for (const pattern_spec& spec : specs_of(kind())) {
@@ -1154,7 +1154,7 @@ TEST_P(KernelsEquivalence, VerifyAndStreamReportsBeforeOverwritingAndWritesNext)
     }
 }
 
-TEST_P(KernelsEquivalence, EveryNegativeDirectionTraversesDescending) {
+TEST_P(kernels_equivalence, EveryNegativeDirectionTraversesDescending) {
     constexpr int negative_directions[] = {-2, -1000, std::numeric_limits<int>::min()};
     constexpr range_layout layout{1023U, 1U};
     constexpr std::uint64_t first = 4097U;
@@ -1197,7 +1197,7 @@ TEST_P(KernelsEquivalence, EveryNegativeDirectionTraversesDescending) {
     }
 }
 
-TEST_P(KernelsEquivalence, EmptyRangesAreNoOps) {
+TEST_P(kernels_equivalence, EmptyRangesAreNoOps) {
     const pattern_spec spec{kind(), k_seed, 0U, false};
     const pattern_spec next = next_spec_for(spec);
     for (const std::size_t offset : k_long_offsets) {
@@ -1220,7 +1220,7 @@ TEST_P(KernelsEquivalence, EmptyRangesAreNoOps) {
 
 // gtest names an instantiated suite "<prefix>/<suite>", so the prefix keeps the Kernels* filter
 // selecting these tests.
-INSTANTIATE_TEST_SUITE_P(KernelsAllSetsAndKinds, KernelsEquivalence,
+INSTANTIATE_TEST_SUITE_P(KernelsAllSetsAndKinds, kernels_equivalence,
                          ::testing::Combine(::testing::ValuesIn(k_all_isas),
                                             ::testing::ValuesIn(k_all_kinds)),
                          kernel_param_name);
@@ -1229,7 +1229,7 @@ INSTANTIATE_TEST_SUITE_P(KernelsAllSetsAndKinds, KernelsEquivalence,
  * Strided kernels: every set against expected_value, the AVX sets also against SSE2
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(KernelsStrided, FillStreamStridedWritesExactlyTheVisitedLines) {
+TEST_P(kernels_strided, FillStreamStridedWritesExactlyTheVisitedLines) {
     // Every start, stride and slice over the 2 MiB and 6 MiB spans, with the SSE2 result
     // compared byte for byte; the 64 MiB window once per stride, whole phase.
     for (const strided_start& start : strided_starts_of(kind())) {
@@ -1262,7 +1262,7 @@ TEST_P(KernelsStrided, FillStreamStridedWritesExactlyTheVisitedLines) {
     }
 }
 
-TEST_P(KernelsStrided, VerifyStridedAcceptsCorrectDataWithoutCallingTheSink) {
+TEST_P(kernels_strided, VerifyStridedAcceptsCorrectDataWithoutCallingTheSink) {
     std::uint64_t* const s = span(tested_buffer_);
     for (const strided_start& start : strided_starts_of(kind())) {
         for (const std::uint64_t span_bytes : k_small_strided_spans) {
@@ -1286,7 +1286,7 @@ TEST_P(KernelsStrided, VerifyStridedAcceptsCorrectDataWithoutCallingTheSink) {
     }
 }
 
-TEST_P(KernelsStrided, VerifyStridedReportsCorruptionsInVisitOrderLikeSse2) {
+TEST_P(kernels_strided, VerifyStridedReportsCorruptionsInVisitOrderLikeSse2) {
     std::uint64_t* const s = span(tested_buffer_);
     const auto run = [&](const strided_case& c) {
         write_visited_lines(s, c);
@@ -1321,7 +1321,7 @@ TEST_P(KernelsStrided, VerifyStridedReportsCorruptionsInVisitOrderLikeSse2) {
     }
 }
 
-TEST_P(KernelsStrided, ZeroVisitsAreANoOpWhateverTheOtherFields) {
+TEST_P(kernels_strided, ZeroVisitsAreANoOpWhateverTheOtherFields) {
     const pattern_spec spec{kind(), k_seed, 0U, false};
     constexpr std::size_t words = k_line_words * 4U;
     const strided_visits empty_calls[] = {
@@ -1345,7 +1345,7 @@ TEST_P(KernelsStrided, ZeroVisitsAreANoOpWhateverTheOtherFields) {
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(KernelsStridedSetsAndKinds, KernelsStrided,
+INSTANTIATE_TEST_SUITE_P(KernelsStridedSetsAndKinds, kernels_strided,
                          ::testing::Combine(::testing::ValuesIn(k_all_isas),
                                             ::testing::ValuesIn(k_all_kinds)),
                          kernel_param_name);
@@ -1353,7 +1353,7 @@ INSTANTIATE_TEST_SUITE_P(KernelsStridedSetsAndKinds, KernelsStrided,
 // The strided kernels' visit sequence is the BankStride order itself: issued work group by work
 // group as the step runner issues it, over a span in which every word mismatches, the line
 // sequence the reports reveal must equal order_cursor's BankStride ranges, in order.
-TEST_P(KernelsStridedOrder, VisitSequenceEqualsTheBankStrideCursor) {
+TEST_P(kernels_strided_order, VisitSequenceEqualsTheBankStrideCursor) {
     const kernel_table& table = table_of(GetParam());
     std::uint64_t* const s = buffer_.data() + k_guard_words;
     constexpr std::uint64_t spans[] = {2U * k_strided_mib, 6U * k_strided_mib,
@@ -1402,14 +1402,14 @@ TEST_P(KernelsStridedOrder, VisitSequenceEqualsTheBankStrideCursor) {
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(KernelsStridedAllSets, KernelsStridedOrder,
+INSTANTIATE_TEST_SUITE_P(KernelsStridedAllSets, kernels_strided_order,
                          ::testing::ValuesIn(k_all_isas), isa_param_name);
 
 /* ---------------------------------------------------------------------------------------------
  * Raw tables: tags, baseline helpers and distinct vector entries
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(KernelsRawTable, IsTaggedWithItsSetAndUsesTheBaselineHelpers) {
+TEST_P(kernels_raw_table, IsTaggedWithItsSetAndUsesTheBaselineHelpers) {
     const std::uint32_t isa = GetParam();
     const kernel_table& table = table_of(isa);
     EXPECT_EQ(table.isa, isa);
@@ -1424,7 +1424,7 @@ TEST_P(KernelsRawTable, IsTaggedWithItsSetAndUsesTheBaselineHelpers) {
     EXPECT_EQ(table.reread, &reread_clflushopt);
 }
 
-INSTANTIATE_TEST_SUITE_P(KernelsAllSets, KernelsRawTable, ::testing::ValuesIn(k_all_isas),
+INSTANTIATE_TEST_SUITE_P(KernelsAllSets, kernels_raw_table, ::testing::ValuesIn(k_all_isas),
                          isa_param_name);
 
 // The equivalence tests would pass vacuously if a set reused another set's vector kernels.
@@ -1450,7 +1450,7 @@ TEST(KernelsTables, VectorEntriesAreDistinctPerSet) {
  * Flush and re-read helpers
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(KernelsFlushHelpers, RereadReturnsWordsJustStreamedWithoutAnExternalFence) {
+TEST_P(kernels_flush_helpers, RereadReturnsWordsJustStreamedWithoutAnExternalFence) {
     // Three lines' worth of words starting one word past a line boundary, streamed with the
     // baseline set's non-temporal stores and left unfenced: the re-read's own leading MFENCE
     // must make them visible before its flush and load.
@@ -1466,7 +1466,7 @@ TEST_P(KernelsFlushHelpers, RereadReturnsWordsJustStreamedWithoutAnExternalFence
     }
 }
 
-TEST_P(KernelsFlushHelpers, RereadReturnsAWordStillDirtyInTheCache) {
+TEST_P(kernels_flush_helpers, RereadReturnsAWordStillDirtyInTheCache) {
     // An ordinary store leaves the line dirty in the cache; the flush writes it back first.
     constexpr std::uint64_t value = 0x5A3C96E1F00F7EC3ULL;
     std::uint64_t* const word = page_.data() + 5U * k_line_words + 3U;
@@ -1474,7 +1474,7 @@ TEST_P(KernelsFlushHelpers, RereadReturnsAWordStillDirtyInTheCache) {
     EXPECT_EQ(GetParam().reread(word), value) << GetParam().name;
 }
 
-TEST_P(KernelsFlushHelpers, FlushRangeLeavesDataIntactForUnalignedStartAndLength) {
+TEST_P(kernels_flush_helpers, FlushRangeLeavesDataIntactForUnalignedStartAndLength) {
     constexpr std::size_t words = 5U * k_line_words;
     const pattern_spec spec{RQ_PATTERN_HIGH_TOGGLE, k_seed, 1U, false};
     std::uint64_t* const range = page_.data() + 8U * k_line_words;
@@ -1495,7 +1495,7 @@ TEST_P(KernelsFlushHelpers, FlushRangeLeavesDataIntactForUnalignedStartAndLength
     EXPECT_TRUE(words_equal(range, expected.data(), words)) << GetParam().name;
 }
 
-INSTANTIATE_TEST_SUITE_P(KernelsBaselineHelpers, KernelsFlushHelpers,
+INSTANTIATE_TEST_SUITE_P(KernelsBaselineHelpers, kernels_flush_helpers,
                          ::testing::ValuesIn(k_flush_helpers), param_name<flush_helpers>);
 
 /* ---------------------------------------------------------------------------------------------
@@ -2141,7 +2141,7 @@ TEST_F(kernels_traced, RealAccessRereadWordFencesFlushesTheLineFencesThenLoadsOn
  * tables_for: the selected set, with CLFLUSH patched in where CLFLUSHOPT is absent
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(IsaDispatchTablesFor, CopiesTheSelectedSetAndPatchesFlushesWithoutClflushopt) {
+TEST_P(isa_dispatch_tables_for, CopiesTheSelectedSetAndPatchesFlushesWithoutClflushopt) {
     const auto [selected, clflushopt] = GetParam();
     // Synthetic: tables_for reads only selected and clflushopt, and copying a table executes
     // nothing, so the AVX sets are inspected on any CPU.
@@ -2167,7 +2167,7 @@ TEST_P(IsaDispatchTablesFor, CopiesTheSelectedSetAndPatchesFlushesWithoutClflush
     EXPECT_EQ(table.reread, clflushopt ? &reread_clflushopt : &reread_clflush);
 }
 
-INSTANTIATE_TEST_SUITE_P(IsaDispatchSelections, IsaDispatchTablesFor,
+INSTANTIATE_TEST_SUITE_P(IsaDispatchSelections, isa_dispatch_tables_for,
                          ::testing::Combine(::testing::Values(RQ_ISA_AUTO, RQ_ISA_SSE2, RQ_ISA_AVX2,
                                                               RQ_ISA_AVX512, 7U),
                                             ::testing::Bool()),
@@ -2336,10 +2336,10 @@ constexpr xcr0_case k_xcr0_cases[] = {
     {"Zero", 0x0U, RQ_ISA_SSE2},
 };
 
-class IsaDispatchProfile : public ::testing::TestWithParam<isa_profile> {};
-class IsaDispatchAvx512Requirement : public ::testing::TestWithParam<required_bit> {};
-class IsaDispatchAvx2Requirement : public ::testing::TestWithParam<required_bit> {};
-class IsaDispatchXcr0 : public ::testing::TestWithParam<xcr0_case> {};
+class isa_dispatch_profile : public ::testing::TestWithParam<isa_profile> {};
+class isa_dispatch_avx512_requirement : public ::testing::TestWithParam<required_bit> {};
+class isa_dispatch_avx2_requirement : public ::testing::TestWithParam<required_bit> {};
+class isa_dispatch_xcr0 : public ::testing::TestWithParam<xcr0_case> {};
 
 }  // namespace
 
@@ -2366,7 +2366,7 @@ TEST(IsaDispatchBits, ConstantsAreTheDocumentedCpuidAndXcr0Bits) {
                                                k_cpuid7_ebx_avx512bw | k_cpuid7_ebx_avx512vl);
 }
 
-TEST_P(IsaDispatchProfile, AutoSelectsTheBestAvailableSet) {
+TEST_P(isa_dispatch_profile, AutoSelectsTheBestAvailableSet) {
     const isa_profile& profile = GetParam();
     const isa_selection selection = select_isa(profile.features, RQ_ISA_AUTO);
     EXPECT_TRUE(selection_invariants_hold(selection));
@@ -2377,7 +2377,7 @@ TEST_P(IsaDispatchProfile, AutoSelectsTheBestAvailableSet) {
     EXPECT_FALSE(selection.clflushopt);
 }
 
-TEST_P(IsaDispatchProfile, ClflushoptFollowsLeafSevenBit23Only) {
+TEST_P(isa_dispatch_profile, ClflushoptFollowsLeafSevenBit23Only) {
     const isa_profile& profile = GetParam();
     cpu_features features = profile.features;
     features.leaf7_ebx |= k_cpuid7_ebx_clflushopt;
@@ -2393,7 +2393,7 @@ TEST_P(IsaDispatchProfile, ClflushoptFollowsLeafSevenBit23Only) {
     EXPECT_EQ(without_bit.best, profile.best);
 }
 
-TEST_P(IsaDispatchProfile, OverrideSelectsAnAvailableSetAndRejectsAnyOther) {
+TEST_P(isa_dispatch_profile, OverrideSelectsAnAvailableSetAndRejectsAnyOther) {
     const isa_profile& profile = GetParam();
     for (const std::uint32_t isa : k_all_isas) {
         const isa_selection selection = select_isa(profile.features, isa);
@@ -2416,10 +2416,10 @@ TEST_P(IsaDispatchProfile, OverrideSelectsAnAvailableSetAndRejectsAnyOther) {
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(IsaDispatchProfiles, IsaDispatchProfile, ::testing::ValuesIn(k_profiles),
+INSTANTIATE_TEST_SUITE_P(IsaDispatchProfiles, isa_dispatch_profile, ::testing::ValuesIn(k_profiles),
                          param_name<isa_profile>);
 
-TEST_P(IsaDispatchAvx512Requirement, ClearingTheBitFallsBackToAvx2) {
+TEST_P(isa_dispatch_avx512_requirement, ClearingTheBitFallsBackToAvx2) {
     cpu_features features = avx512_full_features();
     features.*(GetParam().field) &= ~GetParam().bit;
     const isa_selection selection = select_isa(features, RQ_ISA_AUTO);
@@ -2429,10 +2429,10 @@ TEST_P(IsaDispatchAvx512Requirement, ClearingTheBitFallsBackToAvx2) {
     EXPECT_EQ(selection.available_mask, mask_up_to(RQ_ISA_AVX2));
 }
 
-INSTANTIATE_TEST_SUITE_P(IsaDispatchAvx512Bits, IsaDispatchAvx512Requirement,
+INSTANTIATE_TEST_SUITE_P(IsaDispatchAvx512Bits, isa_dispatch_avx512_requirement,
                          ::testing::ValuesIn(k_avx512_bits), param_name<required_bit>);
 
-TEST_P(IsaDispatchAvx2Requirement, ClearingTheBitFallsBackToSse2) {
+TEST_P(isa_dispatch_avx2_requirement, ClearingTheBitFallsBackToSse2) {
     // AVX-512 requires the whole AVX2 condition, so the full AVX-512 input falls back too.
     for (const cpu_features& base : {avx2_full_features(), avx512_full_features()}) {
         cpu_features features = base;
@@ -2446,10 +2446,10 @@ TEST_P(IsaDispatchAvx2Requirement, ClearingTheBitFallsBackToSse2) {
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(IsaDispatchAvx2Bits, IsaDispatchAvx2Requirement,
+INSTANTIATE_TEST_SUITE_P(IsaDispatchAvx2Bits, isa_dispatch_avx2_requirement,
                          ::testing::ValuesIn(k_avx2_bits), param_name<required_bit>);
 
-TEST_P(IsaDispatchXcr0, RequiresTheOsToSaveEveryStateComponentTheSetUses) {
+TEST_P(isa_dispatch_xcr0, RequiresTheOsToSaveEveryStateComponentTheSetUses) {
     cpu_features features = avx512_full_features();
     features.xcr0 = GetParam().xcr0;
     const isa_selection selection = select_isa(features, RQ_ISA_AUTO);
@@ -2459,8 +2459,8 @@ TEST_P(IsaDispatchXcr0, RequiresTheOsToSaveEveryStateComponentTheSetUses) {
     EXPECT_EQ(selection.available_mask, mask_up_to(GetParam().best));
 }
 
-INSTANTIATE_TEST_SUITE_P(IsaDispatchXcr0Values, IsaDispatchXcr0, ::testing::ValuesIn(k_xcr0_cases),
-                         param_name<xcr0_case>);
+INSTANTIATE_TEST_SUITE_P(IsaDispatchXcr0Values, isa_dispatch_xcr0,
+                         ::testing::ValuesIn(k_xcr0_cases), param_name<xcr0_case>);
 
 TEST(IsaDispatchSelect, LeafSevenIsReadOnlyFromAHighestBasicLeafOfSeven) {
     cpu_features features = avx512_full_features();

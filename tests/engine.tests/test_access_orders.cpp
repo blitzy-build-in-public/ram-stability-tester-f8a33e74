@@ -4,15 +4,15 @@
  *        per phase, the turnaround schedule's start-up, steady state and drain at window and pass
  *        boundaries, and the write times behind turnaround time_since_write_us.
  *
- * - AccessOrderSequential, AccessOrderBankStride and AccessOrderRandomBlocks: the documented
- *   range sequence of each order_cursor order.
- * - AccessOrderCursor: for every cursor order, window size and pass, every 64-byte line of the
+ * - access_order_sequential, access_order_bank_stride and access_order_random_blocks: the
+ *   documented range sequence of each order_cursor order.
+ * - access_order_cursor: for every cursor order, window size and pass, every 64-byte line of the
  *   window is visited exactly once per phase; reset() and a second cursor built from the same
  *   parameters replay the phase, as the runner's verify phase does; and no line recurs within 64
  *   visits, across the write and verify phases as well.
- * - AccessOrderBlockPermutation and AccessOrderPermutationKey: the stateless keyed bijection
+ * - access_order_block_permutation and AccessOrderPermutationKey: the stateless keyed bijection
  *   behind RandomBlocks, and its key.
- * - AccessOrderTurnaroundSchedule and AccessOrderWindowAndPassBoundaries: the 4n + 1 actions of
+ * - access_order_turnaround_schedule and AccessOrderWindowAndPassBoundaries: the 4n + 1 actions of
  *   a window of n blocks, each block streamed, flushed and verified once per pass, the fence,
  *   flush, fence cycle before every verification, and a fresh start-up for every window of
  *   every pass.
@@ -594,7 +594,7 @@ std::string permutation_size_name(const ::testing::TestParamInfo<std::uint64_t>&
 }
 
 /** Parameters: a cursor order, a window size and a pass. */
-class AccessOrderCursor : public ::testing::TestWithParam<cursor_param> {
+class access_order_cursor : public ::testing::TestWithParam<cursor_param> {
 protected:
     const order_case& order_under_test() const { return std::get<0>(GetParam()); }
     std::uint64_t span() const { return std::get<1>(GetParam()); }
@@ -604,19 +604,19 @@ protected:
 };
 
 /** Parameters: a sequential order and a window size. */
-class AccessOrderSequential : public ::testing::TestWithParam<sequential_param> {};
+class access_order_sequential : public ::testing::TestWithParam<sequential_param> {};
 
 /** Parameters: a window size and a pass. */
-class AccessOrderBankStride : public ::testing::TestWithParam<span_pass_param> {};
+class access_order_bank_stride : public ::testing::TestWithParam<span_pass_param> {};
 
 /** Parameters: a window size and a pass. */
-class AccessOrderRandomBlocks : public ::testing::TestWithParam<span_pass_param> {};
+class access_order_random_blocks : public ::testing::TestWithParam<span_pass_param> {};
 
 /** Parameter: the permutation's domain size. */
-class AccessOrderBlockPermutation : public ::testing::TestWithParam<std::uint64_t> {};
+class access_order_block_permutation : public ::testing::TestWithParam<std::uint64_t> {};
 
 /** Parameter: the window size; the schedule has span / 4096 blocks. */
-class AccessOrderTurnaroundSchedule : public ::testing::TestWithParam<std::uint64_t> {};
+class access_order_turnaround_schedule : public ::testing::TestWithParam<std::uint64_t> {};
 
 }  // namespace
 
@@ -628,7 +628,7 @@ static_assert(std::is_trivially_copyable_v<block_permutation> && sizeof(block_pe
  * Sequential orders: 1 MiB ranges tiling the window, low to high or high to low
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(AccessOrderSequential, RangesTileTheWindowContiguouslyInTheirDirectionInEveryPass) {
+TEST_P(access_order_sequential, RangesTileTheWindowContiguouslyInTheirDirectionInEveryPass) {
     const auto& [order, span] = GetParam();
     const bool ascending = order.order == RQ_ORDER_SEQUENTIAL_ASCENDING;
     std::vector<order_range> pass_zero;
@@ -675,7 +675,7 @@ TEST_P(AccessOrderSequential, RangesTileTheWindowContiguouslyInTheirDirectionInE
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(AccessOrderSequentialOrders, AccessOrderSequential,
+INSTANTIATE_TEST_SUITE_P(AccessOrderSequentialOrders, access_order_sequential,
                          ::testing::Combine(::testing::ValuesIn(k_sequential_orders),
                                             ::testing::ValuesIn(k_test_spans)),
                          sequential_param_name);
@@ -694,7 +694,7 @@ TEST(AccessOrderBankStrideCycle, StrideCyclesThrough8KiB64KiBAnd256KiBWithThePas
     EXPECT_EQ(bank_stride_bytes(UINT32_MAX), k_bank_strides[UINT32_MAX % 3]);
 }
 
-TEST_P(AccessOrderBankStride, SweepsVisitLinesOneStrideApartAndStartOneLineFurtherEachSweep) {
+TEST_P(access_order_bank_stride, SweepsVisitLinesOneStrideApartAndStartOneLineFurtherEachSweep) {
     const auto& [span, pass] = GetParam();
     const std::string where = describe_phase("BankStride", span, pass);
     const std::uint64_t stride = bank_stride_bytes(pass);
@@ -730,7 +730,7 @@ TEST_P(AccessOrderBankStride, SweepsVisitLinesOneStrideApartAndStartOneLineFurth
     EXPECT_FALSE(cursor.next(range)) << where << ": ranges beyond the documented sweeps";
 }
 
-INSTANTIATE_TEST_SUITE_P(AccessOrderBankStrideWindows, AccessOrderBankStride,
+INSTANTIATE_TEST_SUITE_P(AccessOrderBankStrideWindows, access_order_bank_stride,
                          ::testing::Combine(::testing::ValuesIn(k_test_spans),
                                             ::testing::Range(0U, k_test_passes)),
                          span_pass_param_name);
@@ -739,7 +739,7 @@ INSTANTIATE_TEST_SUITE_P(AccessOrderBankStrideWindows, AccessOrderBankStride,
  * RandomBlocks: the keyed permutation of the window's 4 KiB blocks
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(AccessOrderRandomBlocks, VisitsBlocksInTheOrderOfTheirKeyedPermutation) {
+TEST_P(access_order_random_blocks, VisitsBlocksInTheOrderOfTheirKeyedPermutation) {
     const auto& [span, pass] = GetParam();
     const std::string where = describe_phase("RandomBlocks", span, pass);
     const std::uint64_t blocks = span / k_block_bytes;
@@ -764,7 +764,7 @@ TEST_P(AccessOrderRandomBlocks, VisitsBlocksInTheOrderOfTheirKeyedPermutation) {
     EXPECT_FALSE(cursor.next(range)) << where << ": ranges beyond the window's blocks";
 }
 
-INSTANTIATE_TEST_SUITE_P(AccessOrderRandomBlocksWindows, AccessOrderRandomBlocks,
+INSTANTIATE_TEST_SUITE_P(AccessOrderRandomBlocksWindows, access_order_random_blocks,
                          ::testing::Combine(::testing::ValuesIn(k_test_spans),
                                             ::testing::Range(0U, k_test_passes)),
                          span_pass_param_name);
@@ -773,7 +773,7 @@ INSTANTIATE_TEST_SUITE_P(AccessOrderRandomBlocksWindows, AccessOrderRandomBlocks
  * Every cursor order: exactly once per phase, a replayable phase, no small-set alternation
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(AccessOrderCursor, VisitsEveryLineOfTheWindowExactlyOncePerPhase) {
+TEST_P(access_order_cursor, VisitsEveryLineOfTheWindowExactlyOncePerPhase) {
     const std::uint64_t range_bytes = order_under_test().range_bytes;
     order_cursor cursor(params());
     ASSERT_EQ(cursor.total_ranges(), span() / range_bytes) << where();
@@ -816,7 +816,7 @@ TEST_P(AccessOrderCursor, VisitsEveryLineOfTheWindowExactlyOncePerPhase) {
     EXPECT_TRUE(same_range(untouched, sentinel)) << where() << ": next() wrote past the phase";
 }
 
-TEST_P(AccessOrderCursor, ResetAndAnIdenticalCursorReplayThePhase) {
+TEST_P(access_order_cursor, ResetAndAnIdenticalCursorReplayThePhase) {
     // The runner's verify phase revisits its write phase through reset() (windowed steps) or a
     // cursor rebuilt from the same parameters (hold steps); both must yield the same sequence.
     order_cursor cursor(params());
@@ -841,7 +841,7 @@ TEST_P(AccessOrderCursor, ResetAndAnIdenticalCursorReplayThePhase) {
     }
 }
 
-TEST_P(AccessOrderCursor, NoLineRecursWithinSixtyFourVisitsAcrossTheWriteAndVerifyPhases) {
+TEST_P(access_order_cursor, NoLineRecursWithinSixtyFourVisitsAcrossTheWriteAndVerifyPhases) {
     // A2 at the virtual level. A windowed step writes and then verifies each window in the same
     // order, so two consecutive phases are walked line by line, in each range's direction: no
     // line may recur within a phase, nor within k_alternation_window visits across the phase
@@ -877,7 +877,7 @@ TEST_P(AccessOrderCursor, NoLineRecursWithinSixtyFourVisitsAcrossTheWriteAndVeri
     EXPECT_EQ(ordinal, 2 * (span() / k_line_bytes)) << where();
 }
 
-INSTANTIATE_TEST_SUITE_P(AccessOrderAllCursorOrders, AccessOrderCursor,
+INSTANTIATE_TEST_SUITE_P(AccessOrderAllCursorOrders, access_order_cursor,
                          ::testing::Combine(::testing::ValuesIn(k_cursor_orders),
                                             ::testing::ValuesIn(k_test_spans),
                                             ::testing::Range(0U, k_test_passes)),
@@ -887,7 +887,7 @@ INSTANTIATE_TEST_SUITE_P(AccessOrderAllCursorOrders, AccessOrderCursor,
  * The RandomBlocks permutation and its key
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(AccessOrderBlockPermutation, IsABijectionOnItsDomain) {
+TEST_P(access_order_block_permutation, IsABijectionOnItsDomain) {
     const std::uint64_t n = GetParam();
     const block_permutation perm(n, permutation_key(k_seed, k_step_index, 0, k_salt));
     ASSERT_EQ(perm.size(), n);
@@ -904,7 +904,7 @@ TEST_P(AccessOrderBlockPermutation, IsABijectionOnItsDomain) {
     }
 }
 
-TEST_P(AccessOrderBlockPermutation, IsAStatelessFunctionOfItsKey) {
+TEST_P(access_order_block_permutation, IsAStatelessFunctionOfItsKey) {
     const std::uint64_t n = GetParam();
     const std::uint64_t key = permutation_key(k_seed, k_step_index, 1, k_salt);
     const block_permutation perm(n, key);
@@ -921,7 +921,7 @@ TEST_P(AccessOrderBlockPermutation, IsAStatelessFunctionOfItsKey) {
     }
 }
 
-TEST_P(AccessOrderBlockPermutation, EveryKeyInputGivesAnUnrelatedOrder) {
+TEST_P(access_order_block_permutation, EveryKeyInputGivesAnUnrelatedOrder) {
     const std::uint64_t n = GetParam();
     const std::vector<std::uint64_t> base =
         images_of(block_permutation(n, permutation_key(k_seed, k_step_index, 0, k_salt)));
@@ -950,7 +950,7 @@ TEST_P(AccessOrderBlockPermutation, EveryKeyInputGivesAnUnrelatedOrder) {
         << n << " blocks: " << fixed * 100.0 << " % of blocks stay in their sequential position";
 }
 
-INSTANTIATE_TEST_SUITE_P(AccessOrderPermutationSizes, AccessOrderBlockPermutation,
+INSTANTIATE_TEST_SUITE_P(AccessOrderPermutationSizes, access_order_block_permutation,
                          ::testing::ValuesIn(k_permutation_sizes), permutation_size_name);
 
 TEST(AccessOrderPermutationKey, IsReproducibleAndDistinctWheneverAnyInputDiffers) {
@@ -979,7 +979,7 @@ TEST(AccessOrderPermutationKey, IsReproducibleAndDistinctWheneverAnyInputDiffers
  * The turnaround schedule of one window
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(AccessOrderTurnaroundSchedule, HasFourNPlusOneActionsInStartupSteadyAndDrainOrder) {
+TEST_P(access_order_turnaround_schedule, HasFourNPlusOneActionsInStartupSteadyAndDrainOrder) {
     const std::uint64_t span = GetParam();
     const std::uint64_t n = span / k_block_bytes;
     turnaround_schedule schedule(span);
@@ -1007,7 +1007,7 @@ TEST_P(AccessOrderTurnaroundSchedule, HasFourNPlusOneActionsInStartupSteadyAndDr
         << span_name(span) << ": next() wrote past the schedule";
 }
 
-TEST_P(AccessOrderTurnaroundSchedule, StreamsFlushesAndVerifiesEveryBlockExactlyOnce) {
+TEST_P(access_order_turnaround_schedule, StreamsFlushesAndVerifiesEveryBlockExactlyOnce) {
     const std::uint64_t span = GetParam();
     const std::uint64_t n = span / k_block_bytes;
     turnaround_schedule schedule(span);
@@ -1047,7 +1047,7 @@ TEST_P(AccessOrderTurnaroundSchedule, StreamsFlushesAndVerifiesEveryBlockExactly
         << span_name(span) << ", verifications: block " << describe_first_not_once(verified);
 }
 
-TEST_P(AccessOrderTurnaroundSchedule, EveryVerificationFollowsFenceFlushFenceAfterItsStream) {
+TEST_P(access_order_turnaround_schedule, EveryVerificationFollowsFenceFlushFenceAfterItsStream) {
     const std::uint64_t span = GetParam();
     turnaround_schedule schedule(span);
     flush_rule_checker checker(schedule.block_count());
@@ -1065,7 +1065,7 @@ TEST_P(AccessOrderTurnaroundSchedule, EveryVerificationFollowsFenceFlushFenceAft
         << span_name(span) << ": blocks streamed but never verified";
 }
 
-TEST_P(AccessOrderTurnaroundSchedule, ResetReplaysTheIdenticalSchedule) {
+TEST_P(access_order_turnaround_schedule, ResetReplaysTheIdenticalSchedule) {
     const std::uint64_t span = GetParam();
     turnaround_schedule schedule(span);
     const std::vector<turnaround_action> first = collect_actions(schedule);
@@ -1080,7 +1080,7 @@ TEST_P(AccessOrderTurnaroundSchedule, ResetReplaysTheIdenticalSchedule) {
     }
 }
 
-TEST_P(AccessOrderTurnaroundSchedule, NoBlockRecursWithinSixtyFourStreamsFlushesOrVerifies) {
+TEST_P(access_order_turnaround_schedule, NoBlockRecursWithinSixtyFourStreamsFlushesOrVerifies) {
     // A2 for turnaround, whose reads deliberately trail its writes by four blocks: each
     // operation's own sequence (streams, flushes, verifications) touches distinct blocks, within
     // a pass and across the boundary to the next pass, which builds a fresh schedule.
@@ -1123,7 +1123,7 @@ TEST_P(AccessOrderTurnaroundSchedule, NoBlockRecursWithinSixtyFourStreamsFlushes
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(AccessOrderTurnaroundWindows, AccessOrderTurnaroundSchedule,
+INSTANTIATE_TEST_SUITE_P(AccessOrderTurnaroundWindows, access_order_turnaround_schedule,
                          ::testing::ValuesIn(k_test_spans), span_param_name);
 
 /* ---------------------------------------------------------------------------------------------
@@ -1262,7 +1262,7 @@ TEST(AccessOrderTurnaroundMetadata, EveryVerificationCarriesItsOwnBlocksStreamTi
     const std::array<slice_view, 1> slices = {
         slice_view{whole.worker_index, whole.logical_offset, whole.bytes, views}};
 
-    const std::shared_ptr<IThreadAffinity> affinity = make_win32_thread_affinity();
+    const std::shared_ptr<thread_affinity> affinity = make_win32_thread_affinity();
     worker_pool pool;
     const pool_start_result started = pool.start(processors, 1, *affinity, stop);
     ASSERT_EQ(started.outcome, pool_start_result::status::ok)

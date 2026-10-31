@@ -108,7 +108,10 @@ public sealed record JournalRecovery
 
     /// <summary>
     /// Gets the name of the step at <see cref="LastStepNumber"/>, the name of "did not finish at step n of N
-    /// (name)"; <see langword="null"/> when <see cref="LastStepNumber"/> is.
+    /// (name)": one line of plain text of at most <see cref="SummaryFormat.MaxStepNameUtf8Bytes"/> UTF-8 bytes,
+    /// as <see cref="SummaryFormat.StepName"/> makes the journal's name. <see langword="null"/> when
+    /// <see cref="LastStepNumber"/> is, or when neither the <c>step</c> record nor the <c>begin</c> record's
+    /// definition of that step holds a name.
     /// </summary>
     public string? LastStepName { get; init; }
 

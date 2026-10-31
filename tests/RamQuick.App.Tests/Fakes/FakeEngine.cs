@@ -1417,7 +1417,7 @@ public sealed class FakeEngineSession : IEngineSession
     /// exception that escaped the gate emulation.
     /// </returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> is not a step of the plan.</exception>
-    public Task<StepGateDecision> InvokeStepGateOnBackgroundThread(int index)
+    public Task<StepGateDecision> InvokeStepGateOnBackgroundThreadAsync(int index)
     {
         _ = StepAt(index);
         var completion = new TaskCompletionSource<StepGateDecision>(TaskCreationOptions.RunContinuationsAsynchronously);

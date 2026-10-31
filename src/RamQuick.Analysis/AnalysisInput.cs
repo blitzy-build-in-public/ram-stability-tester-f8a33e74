@@ -20,17 +20,19 @@ namespace RamQuick.Analysis;
 /// <see cref="StepAttributes"/> and are matched as they are, with no offset.
 /// </para>
 /// <para>
-/// This is a class rather than a record because value equality over its collections would be misleading.
+/// Two inputs are equal when they hold equal error records and equal step outcomes, each in the same order, and the
+/// same tested bytes, worker count and memory type. No property is settable, so a <see langword="with"/> expression
+/// can only copy an input and never bypass the constructor's checks.
 /// </para>
 /// </remarks>
-public sealed class AnalysisInput
+public sealed record AnalysisInput
 {
     private readonly ErrorRecord[] _errors;
     private readonly StepOutcome[] _steps;
     private readonly Dictionary<int, StepAttributes> _stepsByIndex;
 
     /// <summary>
-    /// Initializes a new instance of the <see cref="AnalysisInput"/> class from a run's stored error records and step
+    /// Initializes a new instance of the <see cref="AnalysisInput"/> record from a run's stored error records and step
     /// outcomes.
     /// </summary>
     /// <param name="errors">
@@ -301,5 +303,46 @@ public sealed class AnalysisInput
         }
 
         return count;
+    }
+
+    // Generated record equality would compare the copied arrays and the step lookup by reference, so two inputs built
+    // from equal sequences would read as different. The lookup is derived from the step outcomes, so it is left out.
+
+    /// <summary>
+    /// Returns whether <paramref name="other"/> holds the same values, comparing <see cref="Errors"/> and
+    /// <see cref="Steps"/> element by element in the order they were passed.
+    /// </summary>
+    /// <param name="other">The input to compare with.</param>
+    /// <returns><see langword="true"/> when every value is equal.</returns>
+    public bool Equals(AnalysisInput? other) =>
+        ReferenceEquals(this, other)
+        || (other is not null
+            && TestedBytes == other.TestedBytes
+            && WorkerCount == other.WorkerCount
+            && MemoryType == other.MemoryType
+            && Errors.SequenceEqual(other.Errors)
+            && Steps.SequenceEqual(other.Steps));
+
+    /// <summary>
+    /// Returns a hash code consistent with <see cref="Equals(AnalysisInput)"/>.
+    /// </summary>
+    /// <returns>The hash code.</returns>
+    public override int GetHashCode()
+    {
+        var hash = default(HashCode);
+        foreach (ErrorRecord error in Errors)
+        {
+            hash.Add(error);
+        }
+
+        foreach (StepOutcome outcome in Steps)
+        {
+            hash.Add(outcome);
+        }
+
+        hash.Add(TestedBytes);
+        hash.Add(WorkerCount);
+        hash.Add(MemoryType);
+        return hash.ToHashCode();
     }
 }

@@ -10,7 +10,7 @@
  *
  * Pinning is explicit, by processor group, because a group holds at most 64 logical processors
  * and Windows 10 does not spread a process's threads across groups. Every worker pins itself
- * through IThreadAffinity before it can run any task, and start() fails on any failed pin, so no
+ * through thread_affinity before it can run any task, and start() fails on any failed pin, so no
  * unpinned worker ever issues memory traffic.
  *
  * Free of <windows.h>: thread handles and synchronization objects live in worker_pool.cpp behind
@@ -40,13 +40,10 @@ class stop_signal;
  * Production uses win32_thread_affinity. The test DLL (rq_fault_spec.affinity_fail_worker and
  * affinity_fail_error) and tests/engine.tests/test_worker_pool.cpp substitute it to fail one
  * worker with a chosen Windows error, for example 87 (ERROR_INVALID_PARAMETER).
- *
- * The PascalCase, I-prefixed name departs from the engine's snake_case convention to match the
- * plan's other seams, IClock and IMemoryAccess.
  */
-class IThreadAffinity {
+class thread_affinity {
 public:
-    virtual ~IThreadAffinity() = default;
+    virtual ~thread_affinity() = default;
 
     /**
      * Pins the calling thread to one logical processor.
@@ -72,7 +69,7 @@ public:
  *
  * Stateless, so one instance serves every worker of every session concurrently.
  */
-class win32_thread_affinity final : public IThreadAffinity {
+class win32_thread_affinity final : public thread_affinity {
 public:
     /**
      * Pins the calling thread through SetThreadGroupAffinity(GetCurrentThread(), ...).
@@ -89,7 +86,7 @@ public:
  *
  * @throws std::bad_alloc when the object cannot be allocated.
  */
-std::shared_ptr<IThreadAffinity> make_win32_thread_affinity();
+std::shared_ptr<thread_affinity> make_win32_thread_affinity();
 
 /** Which workers run a posted phase. */
 enum class active_set : uint32_t {
@@ -160,7 +157,7 @@ struct pool_start_result {
     /** Processor number within the group of failed_worker's placement. 0 for ok and stopped. */
     uint8_t processor = 0;
     /**
-     * Windows error of the failing pin (IThreadAffinity::pin) or CreateThread call; nonzero for
+     * Windows error of the failing pin (thread_affinity::pin) or CreateThread call; nonzero for
      * affinity_failed and thread_create_failed, 0 for ok and stopped.
      */
     uint32_t os_error = 0;
@@ -181,7 +178,7 @@ struct pool_start_result {
  * @par Lifecycle
  * Construct, start(), then (post_phase(), wait_phase() until it returns true) for every phase,
  * then shutdown() or destruction. The destructor calls shutdown(), so every thread is joined and
- * every handle and event is closed on every exit path. The IThreadAffinity and stop_signal passed
+ * every handle and event is closed on every exit path. The thread_affinity and stop_signal passed
  * to start() must outlive the pool.
  *
  * @par Threading
@@ -244,7 +241,7 @@ public:
      *         running when start throws.
      */
     pool_start_result start(std::span<const logical_processor> placements, uint32_t worker_count,
-                            IThreadAffinity& affinity, stop_signal& stop);
+                            thread_affinity& affinity, stop_signal& stop);
 
     /**
      * Hands one phase task to the workers in set and wakes them.

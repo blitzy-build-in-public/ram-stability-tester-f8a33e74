@@ -2,12 +2,8 @@ using RamQuick.Core;
 
 namespace RamQuick.Plans;
 
-// TestPlans and TestPlanValidator are named with <c> rather than <see cref>, so this class keeps
+// TestPlans and TestPlanValidator are named with <c> rather than <see cref>, so this record keeps
 // no compile-time reference to the types built on it.
-//
-// A class rather than a record: generated record equality would compare Steps by list reference,
-// so two plans with identical steps would read as different. Plans are compared through their
-// Steps, element by element, using StepDefinition's value equality.
 
 /// <summary>
 /// One test type's ordered list of steps, in the fail-fast order the engine runs them, together
@@ -27,8 +23,13 @@ namespace RamQuick.Plans;
 /// <c>TestPlanValidator.Validate</c>, and tests can build scaled or shortened plans from the
 /// built-in steps with <see langword="with"/> expressions.
 /// </para>
+/// <para>
+/// Plans are equal when they implement the same type with equal steps in the same order. Every
+/// property is get-only, so a <see langword="with"/> expression on a plan can only copy it, never
+/// pair steps with targets that are not their sums.
+/// </para>
 /// </remarks>
-public sealed class TestPlan
+public sealed record TestPlan
 {
     /// <summary>
     /// Initializes a new plan from a snapshot of <paramref name="steps"/> and computes its targets.
@@ -113,4 +114,40 @@ public sealed class TestPlan
     /// </returns>
     public IReadOnlyList<StepAttributes> ToStepAttributes() =>
         Array.AsReadOnly(Steps.Select((step, index) => step.ToAttributes(index)).ToArray());
+
+    // Generated record equality would compare Steps by list reference, so two plans built from
+    // equal steps would read as different. The targets are sums of the steps, but comparing them
+    // first rejects most unequal plans before the step-by-step walk.
+
+    /// <summary>
+    /// Returns whether <paramref name="other"/> implements the same test type with the same targets
+    /// and equal <see cref="Steps"/>, compared element by element in run order.
+    /// </summary>
+    /// <param name="other">The plan to compare with.</param>
+    /// <returns><see langword="true"/> when every value is equal.</returns>
+    public bool Equals(TestPlan? other) =>
+        ReferenceEquals(this, other)
+        || (other is not null
+            && Type == other.Type
+            && TargetDuration == other.TargetDuration
+            && TargetCoveragePercent == other.TargetCoveragePercent
+            && Steps.SequenceEqual(other.Steps));
+
+    /// <summary>
+    /// Returns a hash code consistent with <see cref="Equals(TestPlan)"/>.
+    /// </summary>
+    /// <returns>The hash code.</returns>
+    public override int GetHashCode()
+    {
+        var hash = default(HashCode);
+        hash.Add(Type);
+        hash.Add(TargetDuration);
+        hash.Add(TargetCoveragePercent);
+        foreach (StepDefinition step in Steps)
+        {
+            hash.Add(step);
+        }
+
+        return hash.ToHashCode();
+    }
 }

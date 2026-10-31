@@ -15,7 +15,8 @@ namespace RamQuick.Logging.Tests;
 /// whose summaries are missing, kept, or blocked by foreign files, an unfinished run (in a step, while
 /// preparing, behind a torn last line, recorded on another machine), a journal holding two runs, journal
 /// values out of range and summary files with null array elements, and the failures that keep the journal so
-/// the next launch retries.
+/// the next launch retries. Untrusted step and base names are covered too, with the
+/// <see cref="SummaryFormat.PlainText"/> and <see cref="SummaryFormat.StepName"/> rules recovery holds them to.
 /// </summary>
 /// <remarks>
 /// Every test roots its own <see cref="TestDataRoot"/>, so tests run in parallel. A journal is either a file
@@ -41,6 +42,9 @@ public sealed class CrashDetectorTests
     // The largest integer quantity the summary schema allows, 2^53 - 1.
     private const long MaxQuantity = 9_007_199_254_740_991;
 
+    // The most UTF-8 bytes a step name may hold: the native rq_step_def.name field is 64 bytes and NUL-terminated.
+    private const int MaxStepNameUtf8Bytes = 63;
+
     private static readonly Guid _runId = JournalSamples.RunIdA;
     private static readonly Guid _otherRunId = JournalSamples.RunIdB;
     private static readonly IReadOnlyList<StepAttributes> _steps = JournalSamples.QuickSteps(StepCount);
@@ -57,6 +61,7 @@ public sealed class CrashDetectorTests
     // The next launch, an hour later: the instant that stamps the end records recovery appends.
     private static readonly DateTimeOffset _recoveryUtc = _startRequestedUtc + TimeSpan.FromHours(1);
     private static readonly UTF8Encoding _utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
+    private static readonly UTF8Encoding _strictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
     private static CancellationToken Cancellation => TestContext.Current.CancellationToken;
 
@@ -892,18 +897,22 @@ public sealed class CrashDetectorTests
     }
 
     [Theory]
-    [InlineData(2, RandomBankThrash)]
-    [InlineData(9, null)]
-    public void Detect_StepRecordWithoutName_TakesNameFromPlan(int stepNumber, string? expectedName)
+    [InlineData(2, false, RandomBankThrash)]
+    [InlineData(2, true, RandomBankThrash)]
+    [InlineData(9, false, null)]
+    [InlineData(9, true, null)]
+    public void Detect_StepRecordWithoutName_TakesNameFromPlan(int stepNumber, bool onlyInvisibleCharacters, string? expectedName)
     {
         using var root = new TestDataRoot();
         JournalRecord[] journal = UnfinishedJournal();
 
         // A begin record without a test type and a step record without a name still parse; the name comes from
-        // the plan's definition for that step number, and there is none for a number outside the plan.
+        // the plan's definition for that step number, and there is none for a number outside the plan. A name of
+        // nothing but line breaks, escape, NUL, format characters and spaces shows nothing, so it is as blank.
         journal[0] = (JournalBegin)journal[0] with { TestType = string.Empty };
         int stepIndex = Array.FindLastIndex(journal, record => record is JournalStepStart);
-        journal[stepIndex] = (JournalStepStart)journal[stepIndex] with { Index = stepNumber, Name = string.Empty };
+        string name = onlyInvisibleCharacters ? "\r\n\u001b\u0000\u202E\u200B \u2066\uFEFF" : string.Empty;
+        journal[stepIndex] = (JournalStepStart)journal[stepIndex] with { Index = stepNumber, Name = name };
         WriteJournal(root, journal);
 
         JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
@@ -913,6 +922,7 @@ public sealed class CrashDetectorTests
         Assert.Equal(stepNumber, recovery.LastStepNumber);
         Assert.Equal(StepCount, recovery.StepCount);
         Assert.Equal(expectedName, recovery.LastStepName);
+        Assert.Equal(expectedName, recovery.Summary?.UnfinishedRun?.LastStepName);
         Assert.Equal(FinalPathList(root, _runId), recovery.PublishedFiles);
         Assert.False(File.Exists(root.Data.JournalPath));
     }
@@ -944,16 +954,27 @@ public sealed class CrashDetectorTests
         Assert.False(File.Exists(root.Data.JournalPath));
     }
 
-    [Fact]
-    public async Task Detect_UnusableBaseName_PublishesUnderFallbackNameAsync()
+    [Theory]
+    [InlineData("ParentFolder")]
+    [InlineData("BidiOverride")]
+    [InlineData("NextLineControl")]
+    public async Task Detect_UnusableBaseName_PublishesUnderFallbackNameAsync(string baseNameCase)
     {
         using var root = new TestDataRoot();
-        const string DamagedBaseName = "..\\escaped";
-        WriteJournal(root, UnfinishedJournal(baseName: DamagedBaseName));
+        string damagedBaseName = baseNameCase switch
+        {
+            "ParentFolder" => "..\\escaped",
+            "BidiOverride" => BaseNameOf(_runId) + "\u202Etxt.exe",
+            "NextLineControl" => BaseNameOf(_runId) + "\u0085escaped",
+            _ => throw new ArgumentOutOfRangeException(nameof(baseNameCase), baseNameCase, "Unknown base name case."),
+        };
+        WriteJournal(root, UnfinishedJournal(baseName: damagedBaseName));
 
         JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
 
-        // A base name that is not a plain file name must never reach outside the logs folder.
+        // A base name that is not a plain file name must never reach outside the logs folder, and one holding a
+        // control or format character, which Windows accepts in a file name, must never reach a published file
+        // name or a notice that names the file.
         string fallback = FallbackBaseNamePrefix + SummaryFormat.RunId(_runId);
         Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
         Assert.Equal(fallback, recovery.LogBaseName);
@@ -969,6 +990,199 @@ public sealed class CrashDetectorTests
         Assert.Null(recovery.PublicationError);
         Assert.False(File.Exists(root.Data.JournalPath));
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // Untrusted step names: one line of plain text within the 63-byte limit
+    // ---------------------------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("LineInjection", false)]
+    [InlineData("LineInjection", true)]
+    [InlineData("SpoofedPass", false)]
+    [InlineData("SpoofedPass", true)]
+    [InlineData("InvisibleCharacters", false)]
+    [InlineData("InvisibleCharacters", true)]
+    [InlineData("TenThousandCharacters", false)]
+    [InlineData("TenThousandCharacters", true)]
+    public async Task Detect_UntrustedStepName_RecoveredAsOnePlainLineWithinTheLimitAsync(string nameCase, bool onlyInDefinition)
+    {
+        using var root = new TestDataRoot();
+        (string planted, string expected) = UntrustedStepName(nameCase);
+        JournalRecord[] journal = UnfinishedJournal();
+
+        // The killed step's definition holds the name as well, so steps[] names the step with it; when the step
+        // record holds no name, the definition alone names the step.
+        journal[0] = WithStep((JournalBegin)journal[0], 1, step => step with { Name = planted });
+        int stepIndex = Array.FindLastIndex(journal, record => record is JournalStepStart);
+        journal[stepIndex] = (JournalStepStart)journal[stepIndex] with { Name = onlyInDefinition ? string.Empty : planted };
+        WriteJournal(root, journal);
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Equal(2, recovery.LastStepNumber);
+        Assert.Equal(expected, recovery.LastStepName);
+        AssertPlainText(expected);
+        Assert.InRange(Encoding.UTF8.GetByteCount(expected), 1, MaxStepNameUtf8Bytes);
+        Assert.Null(recovery.PublicationError);
+        (string jsonPath, string textPath) = FinalPaths(root, _runId);
+        Assert.Equal(new[] { jsonPath, textPath }, recovery.PublishedFiles);
+
+        // The JSON escapes every character, so its values are compared as read back.
+        string json = await File.ReadAllTextAsync(jsonPath, Cancellation);
+        using JsonDocument document = JsonDocument.Parse(json);
+        JsonElement summary = document.RootElement;
+        string position = "did not finish at step 2 of 3 (" + expected + ")";
+        Assert.Equal(expected, StringAt(summary, "unfinishedRun.lastStepName"));
+        Assert.Equal(expected, StringAt(summary, "steps.1.name"));
+        string endDetail = StringAt(summary, "run.endDetail");
+        Assert.StartsWith("The previous test " + position + ", which likely indicates severe instability.", endDetail, StringComparison.Ordinal);
+        AssertPlainText(endDetail);
+
+        string text = await File.ReadAllTextAsync(textPath, Cancellation);
+        Assert.Equal(TextSummaryFormatter.Format(ParseSummary(json)), text);
+        string[] lines = text.Split("\r\n");
+        Assert.Contains("Detail: " + endDetail, lines);
+        Assert.Contains("The previous test " + position + ", which likely indicates severe instability.", lines);
+        Assert.Single(lines, line => line.Contains(expected, StringComparison.Ordinal) && line.TrimStart().StartsWith("2 ", StringComparison.Ordinal));
+        foreach (string line in lines)
+        {
+            AssertPlainText(line);
+        }
+
+        Assert.False(File.Exists(root.Data.JournalPath));
+    }
+
+    [Fact]
+    public async Task Detect_KeptSummaryHoldsControlAndFormatCharacters_RendersMissingTextAsPlainLinesAsync()
+    {
+        using var root = new TestDataRoot();
+        WriteJournal(root, UnfinishedJournal());
+        (string jsonPath, string textPath) = FinalPaths(root, _runId);
+
+        // A kept summary is not rebuilt, so only the text renderer keeps its free text to one plain line: neither
+        // the forged line nor the bidirectional and zero-width characters may reach the text.
+        const string Forged = "Random\u202E bank\r\nSPOOFED: PASS\u2066 thrash\u200B";
+        RunSummary sentinel = SentinelSummary(_runId);
+        RunSummary kept = sentinel with
+        {
+            Run = sentinel.Run with { EndDetail = "Engine error\u202E: " + Forged },
+            Steps = sentinel.Steps.Select(step => step with { Name = Forged }).ToArray(),
+        };
+        Assert.NotEmpty(kept.Steps);
+        File.WriteAllText(jsonPath, RunSummaryJson.Serialize(kept), _utf8NoBom);
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.None, recovery.Kind);
+        Assert.Equal(kept, recovery.Summary);
+        Assert.Equal(textPath, Assert.Single(recovery.PublishedFiles));
+        string[] lines = (await File.ReadAllTextAsync(textPath, Cancellation)).Split("\r\n");
+        Assert.DoesNotContain(lines, line => line.StartsWith("SPOOFED", StringComparison.Ordinal));
+        Assert.Contains("Detail: Engine error : Random  bank  SPOOFED: PASS  thrash", lines);
+        Assert.Equal(
+            kept.Steps.Count,
+            lines.Count(line => line.Contains("  Random  bank  SPOOFED: PASS  thrash  ", StringComparison.Ordinal)));
+        foreach (string line in lines)
+        {
+            AssertPlainText(line);
+        }
+    }
+
+    [Theory]
+    [InlineData("NulEscapeAndLineBreaks", "a b c  d e")]
+    [InlineData("C1Controls", "a b c")]
+    [InlineData("BidiControls", " a b c d e f g h ")]
+    [InlineData("ZeroWidthAndSoftHyphen", "a b c d e f g h i")]
+    [InlineData("Separators", "a b c")]
+    [InlineData("SupplementaryFormat", "a b")]
+    [InlineData("UnpairedHighSurrogate", "a\uFFFDb")]
+    [InlineData("HighSurrogateAtEnd", "a\uFFFD")]
+    [InlineData("UnpairedLowSurrogate", "\uFFFDa")]
+    public void SummaryFormat_PlainText_ReplacesEachControlFormatAndSeparatorCharacter(string textCase, string expected)
+    {
+        string text = textCase switch
+        {
+            "NulEscapeAndLineBreaks" => "a\u0000b\u001bc\r\nd\te",
+            "C1Controls" => "a\u0085b\u009bc",
+            "BidiControls" => "\u202Aa\u202Bb\u202Cc\u202Dd\u202Ee\u2066f\u2067g\u2068h\u2069",
+            "ZeroWidthAndSoftHyphen" => "a\u200Bb\u200Cc\u200Dd\u200Ee\u200Ff\u2060g\uFEFFh\u00ADi",
+            "Separators" => "a\u2028b\u2029c",
+
+            // U+E0041, a tag character: one format character written as a surrogate pair becomes one space.
+            "SupplementaryFormat" => "a\U000E0041b",
+            "UnpairedHighSurrogate" => "a\uD800b",
+            "HighSurrogateAtEnd" => "a\uD83D",
+            "UnpairedLowSurrogate" => "\uDC00a",
+            _ => throw new ArgumentOutOfRangeException(nameof(textCase), textCase, "Unknown text case."),
+        };
+
+        string plain = SummaryFormat.PlainText(text);
+
+        Assert.Equal(expected, plain);
+        AssertPlainText(plain);
+    }
+
+    [Theory]
+    [MemberData(nameof(LegitimateStepNames))]
+    public void SummaryFormat_StepName_LegitimateName_IsUnchanged(string name)
+    {
+        Assert.Same(name, SummaryFormat.PlainText(name));
+        Assert.Equal(name, SummaryFormat.StepName(name));
+    }
+
+    [Theory]
+    [MemberData(nameof(LongStepNames))]
+    public void SummaryFormat_StepName_LongName_IsCutOnAWholeCharacterWithAMarker(string name, string expected)
+    {
+        string? cut = SummaryFormat.StepName(name);
+
+        Assert.NotNull(cut);
+        Assert.Equal(expected, cut);
+        Assert.EndsWith("\u2026", cut, StringComparison.Ordinal);
+        Assert.InRange(Encoding.UTF8.GetByteCount(cut), 1, MaxStepNameUtf8Bytes);
+        AssertPlainText(cut);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SummaryFormat_StepName_NullOrNothingVisible_IsNull(bool nothingVisible)
+    {
+        Assert.Equal(MaxStepNameUtf8Bytes, SummaryFormat.MaxStepNameUtf8Bytes);
+        Assert.Null(SummaryFormat.StepName(nothingVisible ? " \r\n\u0000\u001b\u202E\u2069\u200B\uFEFF\u2028 " : null));
+    }
+
+    public static TheoryData<string> LegitimateStepNames()
+    {
+        var names = new TheoryData<string>();
+        foreach (StepAttributes step in JournalSamples.QuickSteps())
+        {
+            names.Add(step.Name);
+        }
+
+        // Exactly the limit, in 1-, 2- and 4-byte characters.
+        names.Add(new string('x', MaxStepNameUtf8Bytes));
+        names.Add(string.Concat(Enumerable.Repeat("\u00E9", 31)) + "x");
+        names.Add(string.Concat(Enumerable.Repeat("\U0001F600", 15)) + "abc");
+        return names;
+    }
+
+    public static TheoryData<string, string> LongStepNames() => new()
+    {
+        // 64 bytes: 60 of them leave room for the 3-byte marker.
+        { new string('a', MaxStepNameUtf8Bytes + 1), new string('a', 60) + "\u2026" },
+
+        // 2-byte characters: 30 of them fill the 60 bytes before the marker.
+        { string.Concat(Enumerable.Repeat("\u00E9", 40)), string.Concat(Enumerable.Repeat("\u00E9", 30)) + "\u2026" },
+
+        // 4-byte characters after a 1-byte one: a 15th would need bytes 58 to 61, so the cut falls before it and
+        // never between the halves of its surrogate pair.
+        { "a" + string.Concat(Enumerable.Repeat("\U0001F600", 16)), "a" + string.Concat(Enumerable.Repeat("\U0001F600", 14)) + "\u2026" },
+
+        // White space before the cut is dropped, so the marker follows the last visible character.
+        { new string('a', 58) + "  " + new string('b', 10), new string('a', 58) + "\u2026" },
+    };
 
     // ---------------------------------------------------------------------------------------------
     // Damaged data: journal values out of range, summary files with null array elements
@@ -1405,6 +1619,23 @@ public sealed class CrashDetectorTests
         Assert.False(storage.Exists());
     }
 
+    // Plain text holds no control, format, line separator or paragraph separator character, and no surrogate
+    // without its partner, which a strict UTF-8 round trip would refuse.
+    private static void AssertPlainText(string text)
+    {
+        Assert.Equal(text, _strictUtf8.GetString(_strictUtf8.GetBytes(text)));
+        foreach (Rune scalar in text.EnumerateRunes())
+        {
+            UnicodeCategory category = Rune.GetUnicodeCategory(scalar);
+            Assert.False(
+                category is UnicodeCategory.Control
+                    or UnicodeCategory.Format
+                    or UnicodeCategory.LineSeparator
+                    or UnicodeCategory.ParagraphSeparator,
+                string.Create(CultureInfo.InvariantCulture, $"U+{scalar.Value:X4} ({category}) is not plain text."));
+        }
+    }
+
     private static void AssertLogsEmpty(TestDataRoot root) =>
         Assert.Empty(Directory.EnumerateFileSystemEntries(root.Data.LogsDirectory));
 
@@ -1700,6 +1931,25 @@ public sealed class CrashDetectorTests
             _ => record,
         }).ToArray();
     }
+
+    // A step name a damaged or forged journal can hold, and the one line the window and the summaries show for it.
+    private static (string Planted, string Shown) UntrustedStepName(string nameCase) => nameCase switch
+    {
+        // 68 bytes once each control character is a space, so the name is cut after the script tag.
+        "LineInjection" => (
+            "Evil\r\nINJECTED LINE \u001b[31mRED\u001b[0m <script>alert(1)</script> \u0000nul \u202Ertl",
+            "Evil  INJECTED LINE  [31mRED [0m <script>alert(1)</script>\u2026"),
+        "SpoofedPass" => (
+            "Chain\r\nSPOOFED: PASS \u001b[32m<b>ok</b>",
+            "Chain  SPOOFED: PASS  [32m<b>ok</b>"),
+
+        // Isolates, a zero-width space and a tag character (a format character beyond U+FFFF) around the name.
+        "InvisibleCharacters" => ("\u2066Random\u200Bbank thrash\U000E0041\u2069", RandomBankThrash),
+        "TenThousandCharacters" => (
+            string.Concat(Enumerable.Repeat(RandomBankThrash + " ", 527))[..10_000],
+            "Random bank thrash Random bank thrash Random bank thrash Ran\u2026"),
+        _ => throw new ArgumentOutOfRangeException(nameof(nameCase), nameCase, "Unknown step name case."),
+    };
 
     private static JournalBegin WithStep(JournalBegin begin, int position, Func<JournalStep, JournalStep> change)
     {

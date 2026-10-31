@@ -487,30 +487,47 @@ public sealed partial class ResultsLogTests
     [InlineData(FreeTextEvent.JournalFailure, AccountLocation.UserProfile)]
     [InlineData(FreeTextEvent.JournalFailure, AccountLocation.UserNameSegment)]
     [InlineData(FreeTextEvent.JournalFailure, AccountLocation.ProfileSibling)]
+    [InlineData(FreeTextEvent.JournalFailure, AccountLocation.ForeignProfile)]
+    [InlineData(FreeTextEvent.JournalFailure, AccountLocation.ComputerName)]
+    [InlineData(FreeTextEvent.JournalFailure, AccountLocation.Placeholders)]
     [InlineData(FreeTextEvent.Notice, AccountLocation.DataFolder)]
     [InlineData(FreeTextEvent.Notice, AccountLocation.LocalAppData)]
     [InlineData(FreeTextEvent.Notice, AccountLocation.RoamingAppData)]
     [InlineData(FreeTextEvent.Notice, AccountLocation.UserProfile)]
     [InlineData(FreeTextEvent.Notice, AccountLocation.UserNameSegment)]
     [InlineData(FreeTextEvent.Notice, AccountLocation.ProfileSibling)]
+    [InlineData(FreeTextEvent.Notice, AccountLocation.ForeignProfile)]
+    [InlineData(FreeTextEvent.Notice, AccountLocation.ComputerName)]
+    [InlineData(FreeTextEvent.Notice, AccountLocation.Placeholders)]
     [InlineData(FreeTextEvent.CallbackFault, AccountLocation.DataFolder)]
     [InlineData(FreeTextEvent.CallbackFault, AccountLocation.LocalAppData)]
     [InlineData(FreeTextEvent.CallbackFault, AccountLocation.RoamingAppData)]
     [InlineData(FreeTextEvent.CallbackFault, AccountLocation.UserProfile)]
     [InlineData(FreeTextEvent.CallbackFault, AccountLocation.UserNameSegment)]
     [InlineData(FreeTextEvent.CallbackFault, AccountLocation.ProfileSibling)]
+    [InlineData(FreeTextEvent.CallbackFault, AccountLocation.ForeignProfile)]
+    [InlineData(FreeTextEvent.CallbackFault, AccountLocation.ComputerName)]
+    [InlineData(FreeTextEvent.CallbackFault, AccountLocation.Placeholders)]
     public async Task LogFreeText_AccountLocations_WrittenAsPlaceholdersAsync(FreeTextEvent freeTextEvent, AccountLocation location)
     {
         using var root = new TestDataRoot();
         using ResultsLog log = Open(root, CreateTime(), new ScriptedRunIds(JournalSamples.RunIdA));
         (string path, string expectedPath) = AccountLocationText(location, root);
         string message = $"The process cannot access the file '{path}' because it is being used by another process.";
+        string redacted = message.Replace(path, expectedPath, StringComparison.Ordinal);
 
         (string eventName, string key, string valuePrefix) = LogFreeText(log, freeTextEvent, message);
 
-        string line = Assert.Single(await ReadLogLinesAsync(log));
-        Assert.Equal(eventName, EventOf(line));
-        AssertFields(line, key + "=" + Quoted(valuePrefix + message.Replace(path, expectedPath, StringComparison.Ordinal)));
+        // A redacted text redacts to itself: logged a second time, it is written unchanged.
+        _ = LogFreeText(log, freeTextEvent, redacted);
+
+        string[] lines = await ReadLogLinesAsync(log);
+        Assert.Equal(2, lines.Length);
+        Assert.All(lines, line =>
+        {
+            Assert.Equal(eventName, EventOf(line));
+            AssertFields(line, key + "=" + Quoted(valuePrefix + redacted));
+        });
     }
 
     [Fact]
@@ -1800,6 +1817,33 @@ public sealed partial class ResultsLogTests
         Assert.DoesNotContain(@"\" + Environment.UserName + @"\", redacted, StringComparison.OrdinalIgnoreCase);
     }
 
+    // A computer may be named like a word of a placeholder, of the summaries or of the results log; the computer-name
+    // rule still replaces the name wherever it stands as a word, and leaves every placeholder as it stands.
+    [Theory]
+    [InlineData("DATA")]
+    [InlineData("TEMP")]
+    [InlineData("APPDATA")]
+    [InlineData("LOCALAPPDATA")]
+    [InlineData("USERPROFILE")]
+    [InlineData("USERNAME")]
+    [InlineData("APP")]
+    [InlineData("FOLDER")]
+    [InlineData("USER")]
+    [InlineData("MACHINE")]
+    public void SummaryFormat_RedactPersonalPaths_ComputerNamedLikePlaceholderWord_LeavesEveryPlaceholder(string machineName)
+    {
+        const string Placeholders = @"<data>\journal <app folder>\x C:\Users\<user>\x \\<machine>\share %USERPROFILE%\x "
+            + @"%LOCALAPPDATA%\x %APPDATA%\x %TEMP%\x D:\Users\%USERNAME%\x";
+        var snapshot = new SummaryFormat.PersonalPathSnapshot(Array.Empty<(string Folder, string Token)>(), null, machineName);
+
+        string redacted = SummaryFormat.RedactPersonalPaths(
+            Placeholders + " on " + machineName.ToLowerInvariant() + @", \\" + machineName + @"\share",
+            snapshot);
+
+        Assert.Equal(Placeholders + @" on <machine>, \\<machine>\share", redacted);
+        Assert.Equal(redacted, SummaryFormat.RedactPersonalPaths(redacted, snapshot));
+    }
+
     // A result created by the controller is redacted by JournalResult.Create; one read back from a journal an
     // earlier build wrote unredacted is redacted by RunSummary.Build. Either way neither summary names the account.
     [Theory]
@@ -1974,6 +2018,9 @@ public sealed partial class ResultsLogTests
     [InlineData(AccountLocation.UserProfile)]
     [InlineData(AccountLocation.UserNameSegment)]
     [InlineData(AccountLocation.ProfileSibling)]
+    [InlineData(AccountLocation.ForeignProfile)]
+    [InlineData(AccountLocation.ComputerName)]
+    [InlineData(AccountLocation.Placeholders)]
     public async Task AppendAppError_AccountLocationsInExceptionText_WrittenAsPlaceholdersAsync(AccountLocation location)
     {
         using var root = new TestDataRoot();
@@ -2169,9 +2216,31 @@ public sealed partial class ResultsLogTests
                 bool userNameRedacted = !string.IsNullOrWhiteSpace(userName) && userName.AsSpan().IndexOfAny('\\', '/') < 0;
                 return (share, userNameRedacted ? @"\\fileserver\home\%USERNAME%\RamQuick" : share);
             case AccountLocation.ProfileSibling:
-                // A folder whose name merely starts with the profile's is another folder, written as it is.
+                // A folder whose name merely starts with the profile's is another folder, not the profile. Under
+                // <drive>:\Users\ it is another account's profile folder, written <user>; elsewhere it names no
+                // account and is written as it is.
                 string sibling = KnownFolder(Environment.SpecialFolder.UserProfile).Folder + "-archive-7f3c";
-                return (sibling, sibling);
+                return (
+                    sibling,
+                    ProfileFolderPattern().IsMatch(sibling)
+                        ? sibling[..(sibling.AsSpan().LastIndexOfAny('\\', '/') + 1)] + "<user>"
+                        : sibling);
+            case AccountLocation.ForeignProfile:
+                // Another account's profile, such as the Downloads folder of a standard user whose session elevated
+                // the app with an administrator's credentials: its folder is named after that account.
+                return (
+                    @"C:\Users\OtherAccount\Downloads\RamQuick\ramquick_engine.dll",
+                    @"C:\Users\<user>\Downloads\RamQuick\ramquick_engine.dll");
+            case AccountLocation.ComputerName:
+                // A text without a separator still names the computer.
+                string machineName = Environment.MachineName;
+                return (machineName, string.IsNullOrWhiteSpace(machineName) ? machineName : "<machine>");
+            case AccountLocation.Placeholders:
+                // Every placeholder of either family, as a redacted text holds them, stays as it stands.
+                const string Redacted = @"<data>\journal, <app folder>\ramquick_engine.dll, C:\Users\<user>\x, "
+                    + @"\\<machine>\share, %USERPROFILE%\x, %LOCALAPPDATA%\x, %APPDATA%\x, %TEMP%\x, "
+                    + @"D:\Users\%USERNAME%\x, logs\RamQuick-x.log";
+                return (Redacted, Redacted);
             default:
                 throw new ArgumentOutOfRangeException(nameof(location), location, "Not an account location of these tests.");
         }
@@ -2433,6 +2502,10 @@ public sealed partial class ResultsLogTests
     [GeneratedRegex(@"^0x[0-9A-F]{16}$", RegexOptions.CultureInvariant)]
     private static partial Regex Hex64Pattern();
 
+    // A folder directly under <drive>:\Users\, where Windows keeps each account's profile named after the account.
+    [GeneratedRegex(@"^[A-Za-z]:[\\/]Users[\\/][^\\/]+$", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
+    private static partial Regex ProfileFolderPattern();
+
     [GeneratedRegex(@"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,7})?Z$", RegexOptions.CultureInvariant)]
     private static partial Regex IsoUtcPattern();
 
@@ -2458,7 +2531,8 @@ public sealed partial class ResultsLogTests
     }
 
     /// <summary>
-    /// A location that names the Windows account, as it appears in a message.
+    /// A location or name that identifies a Windows account or the computer, as it appears in a message, or one a
+    /// redaction already wrote.
     /// </summary>
     public enum AccountLocation
     {
@@ -2468,6 +2542,9 @@ public sealed partial class ResultsLogTests
         UserProfile,
         UserNameSegment,
         ProfileSibling,
+        ForeignProfile,
+        ComputerName,
+        Placeholders,
     }
 
     /// <summary>

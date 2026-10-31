@@ -979,7 +979,7 @@ public sealed record JournalResult : JournalRecord
     /// <param name="endDetail">
     /// The end reason's diagnostic detail; <see langword="null"/> or empty when there is none, which
     /// <see cref="EndDetail"/> holds as empty. It is recorded through
-    /// <see cref="SummaryFormat.RedactPersonalPaths"/>, because it can quote an exception message naming a
+    /// <see cref="SummaryFormat.RedactPersonalPaths(string)"/>, because it can quote an exception message naming a
     /// path in the user's profile, and the record feeds the shareable summaries.
     /// </param>
     /// <param name="totalErrors">The true error total from the engine's counters.</param>

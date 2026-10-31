@@ -222,6 +222,9 @@ static_assert(std::is_aggregate_v<access_context>,
  * Only reread_word is noexcept (see there). The other primitives may throw, so substitute
  * layers can allocate log storage; the worker thread entry points convert any C++ exception
  * into a stop with RQ_END_INTERNAL_FAULT. real_memory_access never throws.
+ *
+ * The PascalCase, I-prefixed name departs from the engine's snake_case convention because the
+ * plan names the seam IMemoryAccess, alongside IClock.
  */
 class IMemoryAccess {
 public:

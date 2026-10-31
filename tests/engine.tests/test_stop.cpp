@@ -4,7 +4,7 @@
  *        first confirmed error with Stop on error on, on a locked region of at least 1 GiB,
  *        with the release time after it measured and logged.
  *
- * StopAtRandomPoints/StopLatency runs one production session per case through core/session.h
+ * StopAtRandomPoints/stop_latency runs one production session per case through core/session.h
  * (qpc_clock, the real memory-access layer under counting_memory_access, win32 thread affinity)
  * with one worker per logical processor and a single 60 s step of the phase kind under test,
  * so the stop always lands inside that step. Each phase kind runs at three random points:
@@ -15,9 +15,9 @@
  * - moving inversion: MOVING_INVERSION_WALKING sweeps;
  * - turnaround: RANDOM, TURNAROUND.
  *
- * StopLatencyPreparationRelease stops the same 1 GiB run inside preparation with the whole region
- * locked, deterministically, and makes releasing it take longer than the bound. Its affinity seam
- * holds the first worker's pin, which the pool waits for only once allocation has locked every
+ * stop_latency_preparation_release stops the same 1 GiB run inside preparation with the whole
+ * region locked, deterministically, and makes releasing it take longer than the bound. Its affinity
+ * seam holds the first worker's pin, which the pool waits for only once allocation has locked every
  * chunk, until the stop has been requested; its free seam frees each chunk with VirtualFree after
  * a fixed delay, so the release takes at least 3 s. Completed must still arrive within 2 s of the
  * stop, every chunk must be freed after Completed and before Released, and Released must report
@@ -47,11 +47,11 @@
  * the chunks locked before the stop, at most the region, after a stop during preparation.
  * TearDownTestSuite records the largest stop latency of the run.
  *
- * StopOnFirstError/FirstErrorLatency gates the other bound ramquick_engine.h places on the
+ * StopOnFirstError/first_error_latency gates the other bound ramquick_engine.h places on the
  * engine: with Stop on error on, on_completed within 2 s of the first confirmed error. Each run
  * is a production session over fault_injecting_memory_access -> counting_memory_access -> the
  * real layer, the fault layer and the session sharing one qpc_clock, with the region and worker
- * count of StopLatency and a single 60 s step. No host stop is ever requested, so only the
+ * count of stop_latency and a single 60 s step. No host stop is ever requested, so only the
  * confirming worker's own RQ_END_FIRST_ERROR request can end the step early. The fault layer
  * flips bit 17 in a few seeded words of every pass, which the first pass's verification meets in
  * the phase kind under test, three runs each: windowed verify, verification after a 1 s hold,
@@ -72,7 +72,7 @@
  * the default policy permits. The suite fails, rather than skips, when less than 2 GiB of
  * physical memory is available, because the latency it gates is defined on a 1 GiB region.
  *
- * CloseHandleChecked and CloseHandleCheckedFailure cover close_handle_checked, through which the
+ * CloseHandleChecked and close_handle_checked_failure cover close_handle_checked, through which the
  * stop signal and the engine's other handle owners close their handles: a failed close is
  * reported once, to the caller and to the debugger, and never retried. They need neither memory
  * nor elevation, so the 2 GiB precondition does not apply to them. Their events are held by
@@ -375,7 +375,10 @@ std::string end_reason_name(std::uint32_t reason) {
  * Callback recorder
  * ------------------------------------------------------------------------------------------- */
 
-/** What one session's callbacks delivered, with the QPC instant of each lifecycle event. */
+/**
+ * What one session's callbacks delivered, with the QPC instant of each lifecycle event: a plain
+ * copy that run_recorder::snapshot() takes, so its counters and flag need no atomics.
+ */
 struct run_record {
     std::uint32_t gates = 0;
     std::uint32_t prepared_calls = 0;
@@ -422,6 +425,10 @@ struct run_record {
 /**
  * The session's callback set. Every callback runs on the coordinator; each one only stamps the
  * time, copies its payload under the lock and notifies, so none of them delays the engine.
+ *
+ * The counters and the step-result flag the coordinator shares with the test thread are atomics.
+ * They are still changed and read under the lock, which orders them with the payload and with
+ * the waits' predicates, so relaxed ordering suffices and no notification can be missed.
  */
 class run_recorder {
 public:
@@ -447,17 +454,28 @@ public:
 
     bool wait_completed(std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(mutex_);
-        return changed_.wait_for(lock, timeout, [this] { return record_.completed(); });
+        return changed_.wait_for(lock, timeout, [this] {
+            return completed_calls_.load(std::memory_order_relaxed) != 0U;
+        });
     }
 
     bool wait_released(std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(mutex_);
-        return changed_.wait_for(lock, timeout, [this] { return record_.released(); });
+        return changed_.wait_for(lock, timeout, [this] {
+            return released_calls_.load(std::memory_order_relaxed) != 0U;
+        });
     }
 
+    /** The payload and the counters, copied together under the lock. */
     run_record snapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return record_;
+        run_record copy = record_;
+        copy.gates = gates_.load(std::memory_order_relaxed);
+        copy.prepared_calls = prepared_calls_.load(std::memory_order_relaxed);
+        copy.completed_calls = completed_calls_.load(std::memory_order_relaxed);
+        copy.has_step_result = has_step_result_.load(std::memory_order_relaxed);
+        copy.released_calls = released_calls_.load(std::memory_order_relaxed);
+        return copy;
     }
 
 private:
@@ -470,7 +488,7 @@ private:
         run_recorder& recorder = self(user_data);
         {
             std::lock_guard<std::mutex> lock(recorder.mutex_);
-            ++recorder.record_.prepared_calls;
+            recorder.prepared_calls_.fetch_add(1U, std::memory_order_relaxed);
             recorder.record_.prepared_ns = now;
             recorder.record_.prepared_info = *info;
         }
@@ -480,7 +498,7 @@ private:
     static std::uint32_t RQ_CALL on_step_starting(void* user_data, const rq_step_start*) noexcept {
         run_recorder& recorder = self(user_data);
         std::lock_guard<std::mutex> lock(recorder.mutex_);
-        ++recorder.record_.gates;
+        recorder.gates_.fetch_add(1U, std::memory_order_relaxed);
         return RQ_ACTION_CONTINUE;
     }
 
@@ -498,12 +516,13 @@ private:
         {
             std::lock_guard<std::mutex> lock(recorder.mutex_);
             run_record& record = recorder.record_;
-            ++record.completed_calls;
+            recorder.completed_calls_.fetch_add(1U, std::memory_order_relaxed);
             record.completed_ns = now;
             record.result = *result;
             record.result.step_results = nullptr;
-            record.has_step_result = result->step_result_count == 1U;
-            if (record.has_step_result) {
+            const bool has_step_result = result->step_result_count == 1U;
+            recorder.has_step_result_.store(has_step_result, std::memory_order_relaxed);
+            if (has_step_result) {
                 record.step_result = result->step_results[0];
             }
         }
@@ -516,7 +535,7 @@ private:
         run_recorder& recorder = self(user_data);
         {
             std::lock_guard<std::mutex> lock(recorder.mutex_);
-            ++recorder.record_.released_calls;
+            recorder.released_calls_.fetch_add(1U, std::memory_order_relaxed);
             recorder.record_.released_ns = now;
             recorder.record_.released_bytes = released_bytes;
             recorder.record_.release_ms = release_ms;
@@ -526,7 +545,14 @@ private:
 
     mutable std::mutex mutex_;
     std::condition_variable changed_;
+    // The payload only: its counters and has_step_result stay at their defaults here, and
+    // snapshot() fills them in from the atomics below.
     run_record record_;
+    std::atomic<std::uint32_t> gates_{0};
+    std::atomic<std::uint32_t> prepared_calls_{0};
+    std::atomic<std::uint32_t> completed_calls_{0};
+    std::atomic<bool> has_step_result_{false};
+    std::atomic<std::uint32_t> released_calls_{0};
 };
 
 /* ---------------------------------------------------------------------------------------------
@@ -770,7 +796,7 @@ public:
      * keeps them as long as session_dependencies requires.
      */
     struct seams {
-        std::shared_ptr<IThreadAffinity> affinity;
+        std::shared_ptr<thread_affinity> affinity;
         std::function<bool(void* address)> free_override;
     };
 
@@ -831,7 +857,7 @@ private:
 
 using stop_param = std::tuple<stop_case, int>;
 
-class StopLatency : public ::testing::TestWithParam<stop_param> {
+class stop_latency : public ::testing::TestWithParam<stop_param> {
 protected:
     /** Resolves and records the suite seed once for every case. */
     static void SetUpTestSuite() {
@@ -895,8 +921,8 @@ protected:
     std::uint32_t workers_ = 0;
 };
 
-void StopLatency::expect_stopped_within_bound(const run_record& record, std::uint64_t stop_ns,
-                                              const std::string& label) {
+void stop_latency::expect_stopped_within_bound(const run_record& record, std::uint64_t stop_ns,
+                                               const std::string& label) {
     EXPECT_EQ(record.result.end_reason, RQ_END_USER_STOP) << label << ": " << record.describe();
     const std::uint64_t latency_ns = since(record.completed_ns, stop_ns);
     EXPECT_GE(record.completed_ns, stop_ns) << label << ": Completed preceded the stop request";
@@ -912,8 +938,8 @@ void StopLatency::expect_stopped_within_bound(const run_record& record, std::uin
     }
 }
 
-void StopLatency::report(const std::string& label, std::uint32_t delay_ms, std::uint64_t stop_ns,
-                         const run_record& record) {
+void stop_latency::report(const std::string& label, std::uint32_t delay_ms, std::uint64_t stop_ns,
+                          const run_record& record) {
     const std::uint64_t latency_ns = since(record.completed_ns, stop_ns);
     // Release time is measured and logged only: it grows with the region, and the 2 s bound
     // ends at Completed.
@@ -935,8 +961,8 @@ void StopLatency::report(const std::string& label, std::uint32_t delay_ms, std::
     }
 }
 
-void StopLatency::run_preparing_case(const case_spec& spec, const std::string& label,
-                                     std::mt19937_64& rng) {
+void stop_latency::run_preparing_case(const case_spec& spec, const std::string& label,
+                                      std::mt19937_64& rng) {
     std::uint32_t max_delay_ms = spec.max_delay_ms;
     for (std::uint32_t attempt = 0; attempt < k_prepare_attempts; ++attempt) {
         const std::string attempt_label = label + "_attempt" + std::to_string(attempt);
@@ -986,8 +1012,8 @@ void StopLatency::run_preparing_case(const case_spec& spec, const std::string& l
            << " attempts, so no stop met the Preparing state";
 }
 
-void StopLatency::run_traffic_case(const case_spec& spec, const std::string& label,
-                                   std::mt19937_64& rng) {
+void stop_latency::run_traffic_case(const case_spec& spec, const std::string& label,
+                                    std::mt19937_64& rng) {
     const bool hold = spec.target == phase_kind::pre_hold_flush;
     stop_session run(spec, workers_, rng());
     ASSERT_EQ(run.create(), RQ_OK) << label;
@@ -1067,7 +1093,7 @@ void StopLatency::run_traffic_case(const case_spec& spec, const std::string& lab
  * Tests
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(StopLatency, CompletedWithinTwoSecondsOfStop) {
+TEST_P(stop_latency, CompletedWithinTwoSecondsOfStop) {
     const auto& [kind, point] = GetParam();
     const case_spec& spec = spec_for(kind);
     const std::string label = std::string(spec.label) + "_" + std::to_string(point);
@@ -1094,7 +1120,7 @@ const auto k_all_cases =
     ::testing::Values(stop_case::preparing, stop_case::windowed_write, stop_case::windowed_verify,
                       stop_case::hold, stop_case::moving_inversion, stop_case::turnaround);
 
-INSTANTIATE_TEST_SUITE_P(StopAtRandomPoints, StopLatency,
+INSTANTIATE_TEST_SUITE_P(StopAtRandomPoints, stop_latency,
                          ::testing::Combine(k_all_cases, ::testing::Range(0, k_points_per_kind)),
                          case_name);
 
@@ -1346,9 +1372,9 @@ private:
 
 using first_error_param = std::tuple<first_error_phase, int>;
 
-class FirstErrorLatency : public ::testing::TestWithParam<first_error_param> {
+class first_error_latency : public ::testing::TestWithParam<first_error_param> {
 protected:
-    /** Resolves and records this suite's seed once for every run, as StopLatency does its own. */
+    /** Resolves and records this suite's seed once for every run, as stop_latency does its own. */
     static void SetUpTestSuite() {
         suite_seed_ = resolve_suite_seed();
         max_latency_ns_ = 0;
@@ -1375,7 +1401,7 @@ protected:
         std::fflush(stdout);
     }
 
-    /** StopLatency's precondition, for the same 1 GiB region: fails rather than skips. */
+    /** stop_latency's precondition, for the same 1 GiB region: fails rather than skips. */
     void SetUp() override {
         rq_system_info info{};
         info.struct_size = sizeof(rq_system_info);
@@ -1401,8 +1427,8 @@ protected:
     std::uint32_t workers_ = 0;
 };
 
-void FirstErrorLatency::report(const std::string& label, std::uint64_t confirmed_ns,
-                               const run_record& record) {
+void first_error_latency::report(const std::string& label, std::uint64_t confirmed_ns,
+                                 const run_record& record) {
     const std::uint64_t latency_ns = since(record.completed_ns, confirmed_ns);
     // Release time is measured and logged only: it grows with the region, and the 2 s bound
     // ends at Completed.
@@ -1425,7 +1451,7 @@ void FirstErrorLatency::report(const std::string& label, std::uint64_t confirmed
     }
 }
 
-TEST_P(FirstErrorLatency, CompletedWithinTwoSecondsOfTheFirstConfirmedError) {
+TEST_P(first_error_latency, CompletedWithinTwoSecondsOfTheFirstConfirmedError) {
     const auto& [phase, run_index] = GetParam();
     const first_error_spec& spec = first_error_spec_for(phase);
     const std::string label = std::string(spec.label) + "_" + std::to_string(run_index);
@@ -1513,7 +1539,7 @@ const auto k_first_error_phases =
     ::testing::Values(first_error_phase::windowed_verify, first_error_phase::hold_verify,
                       first_error_phase::moving_inversion, first_error_phase::turnaround);
 
-INSTANTIATE_TEST_SUITE_P(StopOnFirstError, FirstErrorLatency,
+INSTANTIATE_TEST_SUITE_P(StopOnFirstError, first_error_latency,
                          ::testing::Combine(k_first_error_phases,
                                             ::testing::Range(0, k_first_error_runs_per_kind)),
                          first_error_case_name);
@@ -1529,7 +1555,7 @@ INSTANTIATE_TEST_SUITE_P(StopOnFirstError, FirstErrorLatency,
  * the run ends as a production one would. Workers call pin() concurrently: the hold is claimed
  * with one atomic exchange, and its outcome is kept in atomics the test thread reads.
  */
-class preparation_gate final : public IThreadAffinity {
+class preparation_gate final : public thread_affinity {
 public:
     /** Opens the gate on every exit from its scope, a failed assertion's early return included. */
     class open_on_exit {
@@ -1692,11 +1718,11 @@ private:
 
 /**
  * A stop during preparation with the whole region locked, and a release slower than the bound.
- * Its own suite, because gtest does not let TEST_F share the parameterised StopLatency fixture.
+ * Its own suite, because gtest does not let TEST_F share the parameterised stop_latency fixture.
  */
-class StopLatencyPreparationRelease : public ::testing::Test {
+class stop_latency_preparation_release : public ::testing::Test {
 protected:
-    /** StopLatency's precondition, as the case locks the same region: a failure, never a skip. */
+    /** stop_latency's precondition, as the case locks the same region: a failure, never a skip. */
     void SetUp() override {
         rq_system_info info{};
         info.struct_size = sizeof(rq_system_info);
@@ -1713,7 +1739,7 @@ protected:
     std::uint32_t workers_ = 0;
 };
 
-TEST_F(StopLatencyPreparationRelease, CompletedWithinTwoSecondsBeforeASlowRelease) {
+TEST_F(stop_latency_preparation_release, CompletedWithinTwoSecondsBeforeASlowRelease) {
     const std::uint64_t region_bytes = region_bytes_for(workers_);
     const region_plan plan = plan_region(region_bytes, workers_);
     const std::uint64_t chunk_count = std::uint64_t{plan.worker_count} * plan.chunks_per_slice;
@@ -2091,9 +2117,9 @@ void PrintTo(const close_failure_case& value, std::ostream* os) {
     return ::testing::AssertionSuccess();
 }
 
-class CloseHandleCheckedFailure : public ::testing::TestWithParam<close_failure_case> {};
+class close_handle_checked_failure : public ::testing::TestWithParam<close_failure_case> {};
 
-TEST_P(CloseHandleCheckedFailure, ReportsOnceAndLeavesTheHandleOpen) {
+TEST_P(close_handle_checked_failure, ReportsOnceAndLeavesTheHandleOpen) {
     if (IsDebuggerPresent()) {
         GTEST_SKIP() << k_debugger_skip;
     }
@@ -2141,7 +2167,7 @@ const auto k_failure_cases =
                       close_failure_case{"undescribed", std::nullopt, false},
                       close_failure_case{"overlong", std::wstring(400, L'w'), true});
 
-INSTANTIATE_TEST_SUITE_P(Descriptions, CloseHandleCheckedFailure, k_failure_cases,
+INSTANTIATE_TEST_SUITE_P(Descriptions, close_handle_checked_failure, k_failure_cases,
                          failure_case_name);
 
 }  // namespace

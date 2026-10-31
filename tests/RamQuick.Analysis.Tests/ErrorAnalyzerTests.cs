@@ -1263,10 +1263,16 @@ public sealed class ErrorAnalyzerTests
     {
         AnalysisInput input = NamedSet(setName);
 
-        IReadOnlyList<CauseHint> first = ErrorAnalyzer.Analyze(input).Items;
+        CauseHints hints = ErrorAnalyzer.Analyze(input);
+        IReadOnlyList<CauseHint> first = hints.Items;
+        AnalysisInput rebuiltInput = NamedSet(setName);
+        CauseHints fromRebuiltInput = ErrorAnalyzer.Analyze(rebuiltInput);
 
+        Assert.Equal(input, rebuiltInput);
         Assert.Equal(first, ErrorAnalyzer.Analyze(input).Items);
-        Assert.Equal(first, ErrorAnalyzer.Analyze(NamedSet(setName)).Items);
+        Assert.Equal(first, fromRebuiltInput.Items);
+        Assert.Equal(hints, fromRebuiltInput);
+        Assert.Equal(hints.GetHashCode(), fromRebuiltInput.GetHashCode());
     }
 
     [Fact]
@@ -1429,6 +1435,50 @@ public sealed class ErrorAnalyzerTests
         Assert.Throws<ArgumentNullException>(() => input.CountStepsRun(null!));
     }
 
+    [Fact]
+    public void AnalysisInput_EqualSequencesInSeparateLists_AreEqualWithEqualHashCodes()
+    {
+        (ErrorRecord[] errors, StepOutcome[] steps) = EqualityBaseline();
+
+        AnalysisInput fromLists = Input(errors.ToList(), steps.ToList());
+        AnalysisInput fromCopies = Input(errors.Select(error => error with { }).ToArray(), steps.Select(step => step with { }).ToArray());
+        AnalysisInput copied = fromLists with { };
+
+        Assert.NotSame(fromLists.Errors[0], fromCopies.Errors[0]);
+        Assert.Equal(fromLists, fromCopies);
+        Assert.Equal(fromLists.GetHashCode(), fromCopies.GetHashCode());
+        Assert.NotSame(fromLists, copied);
+        Assert.Equal(fromLists, copied);
+        Assert.Equal(Input([], []), Input([], []));
+    }
+
+    [Theory]
+    [InlineData("Errors")]
+    [InlineData("ErrorOrder")]
+    [InlineData("Steps")]
+    [InlineData("TestedBytes")]
+    [InlineData("WorkerCount")]
+    [InlineData("MemoryType")]
+    public void AnalysisInput_DifferingInOneValue_AreNotEqual(string difference)
+    {
+        (ErrorRecord[] errors, StepOutcome[] steps) = EqualityBaseline();
+        AnalysisInput input = Input(errors, steps);
+
+        AnalysisInput other = difference switch
+        {
+            "Errors" => Input([errors[0], errors[1] with { Actual = errors[1].Actual ^ 1UL }], steps),
+            "ErrorOrder" => Input([errors[1], errors[0]], steps),
+            "Steps" => Input(errors, [steps[0], Failing(Q2, 2), steps[2]]),
+            "TestedBytes" => Input(errors, steps, testedBytes: 2 * RegionBytes512MiB),
+            "WorkerCount" => Input(errors, steps, workers: DefaultWorkers + 1),
+            "MemoryType" => Input(errors, steps, memoryType: MemoryType.DDR5),
+            _ => throw new ArgumentOutOfRangeException(nameof(difference), difference, "Not an input difference case."),
+        };
+
+        Assert.NotEqual(input, other);
+        Assert.NotEqual(other, input);
+    }
+
     // ---- CauseHint and CauseHints construction ----
 
     [Fact]
@@ -1490,6 +1540,25 @@ public sealed class ErrorAnalyzerTests
         Assert.Equal(CauseHints.HintLabel, hints.Label);
         Assert.Equal(CauseCategory.RankOrDimm, hints.Items[0].Category);
         Assert.Throws<NotSupportedException>(() => ((IList<CauseHint>)hints.Items).Clear());
+    }
+
+    [Fact]
+    public void CauseHints_EqualItemsInSeparateLists_AreEqualWithEqualHashCodes()
+    {
+        CauseHint[] items = [Hint(1, CauseCategory.RankOrDimm, 0.5), Hint(2, CauseCategory.RefreshRetention, 0.4)];
+
+        var fromList = new CauseHints(items.ToList());
+        var fromCopies = new CauseHints(items.Select(item => item with { }).ToArray());
+
+        Assert.NotSame(fromList.Items[0], fromCopies.Items[0]);
+        Assert.Equal(fromList, fromCopies);
+        Assert.Equal(fromList.GetHashCode(), fromCopies.GetHashCode());
+        Assert.Equal(fromList, fromList with { });
+        Assert.Equal(CauseHints.Empty, new CauseHints([]));
+        Assert.Equal(CauseHints.Empty.GetHashCode(), new CauseHints([]).GetHashCode());
+        Assert.NotEqual(fromList, new CauseHints(items[..1]));
+        Assert.NotEqual(fromList, new CauseHints([items[0], items[1] with { Score = 0.3 }]));
+        Assert.NotEqual(CauseHints.Empty, fromList);
     }
 
     // ---- Named sets and helpers ----
@@ -1565,6 +1634,14 @@ public sealed class ErrorAnalyzerTests
 
     private static CauseHint Hint(int rank, CauseCategory category, double score) =>
         new(rank, category, score, 50, Suggestions.For(category), "evidence");
+
+    // Two distinct records and three outcomes, so each equality case can change exactly one value.
+    private static (ErrorRecord[] Errors, StepOutcome[] Steps) EqualityBaseline()
+    {
+        ErrorRecord[] errors = [Error(Q2, 0, [SingleErrorBit]), Error(Q5, WordBytes, [SecondErrorBit], sequence: 1)];
+        StepOutcome[] steps = [Clean(Q1), Failing(Q2, 1), Failing(Q5, 1)];
+        return (errors, steps);
+    }
 
     private static CauseHint HintFor(CauseHints hints, CauseCategory category) =>
         Assert.Single(hints.Items, hint => hint.Category == category);

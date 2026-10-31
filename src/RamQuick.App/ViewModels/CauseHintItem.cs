@@ -22,7 +22,7 @@ namespace RamQuick.App.ViewModels;
 /// <see cref="DisplayFormat"/>, all with the invariant culture.
 /// </para>
 /// </remarks>
-public sealed class CauseHintItem
+public sealed record CauseHintItem
 {
     /// <summary>
     /// Creates the display item for a ranked cause hint.

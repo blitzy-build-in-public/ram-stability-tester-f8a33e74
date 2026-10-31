@@ -10,13 +10,13 @@
  *   session configuration, so a broken harness fails in milliseconds, not after a long run. It
  *   also checks that every host from 1 to 1,024 logical processors gets a power-of-two worker
  *   count whose 2 MiB-rounded slices test the whole 512 MiB, the region's own minimum.
- * - FaultInjection/FaultInjectionTest runs the four classes: single-bit flips (bit 17) spread
+ * - FaultInjection/fault_injection_test runs the four classes: single-bit flips (bit 17) spread
  *   over the region, a stuck bit (bit 5) in one word, an address-region fault inside a contiguous
  *   1/32 of the region, and a delay-dependent fault that only hold verifications can reach.
  * - FaultInjectionLayer drives the fault-injecting layer directly over an unlocked 1 MiB buffer
  *   through 1,000 (step, pass) keys, in milliseconds: once max_injections is spent it builds no
  *   more target sets, its table never holds more than the newest pass's set, and a reclaimed
- *   set asked for again injects the same words and bits. FaultInjectionLayerStrided checks that
+ *   set asked for again injects the same words and bits. fault_injection_layer_strided checks that
  *   a BankStride verify_strided call injects exactly the single-bit-flip targets, or the stuck
  *   word, on the lines it visits and none elsewhere.
  *
@@ -702,22 +702,23 @@ private:
 /**
  * Everything the session reports, copied out of the engine-owned payloads. Callbacks run on the
  * coordinator thread one at a time; the test thread reads under the mutex once Released has
- * arrived. user_data of the session, so it must outlive session_destroy.
+ * arrived. The running total and the lifecycle flags are atomic, and the mutex orders them with
+ * the copied payloads. user_data of the session, so it must outlive session_destroy.
  */
 struct run_recorder {
     std::mutex mutex;
     std::condition_variable changed;
 
     std::vector<rq_error_record> records;
-    std::uint64_t last_batch_total = 0;
+    std::atomic<std::uint64_t> last_batch_total{0};
     std::vector<rq_step_result> finished_steps;
     rq_prepared prepared{};
-    bool prepared_seen = false;
+    std::atomic<bool> prepared_seen{false};
     rq_run_result result{};
     /** Copy of result.step_results, which is valid only during on_completed. */
     std::vector<rq_step_result> result_steps;
-    bool completed = false;
-    bool released = false;
+    std::atomic<bool> completed{false};
+    std::atomic<bool> released{false};
     std::uint64_t released_bytes = 0;
 
     std::atomic<std::uint32_t> gates_raised{0};
@@ -742,7 +743,8 @@ struct run_recorder {
     /** Waits until on_released has been recorded or the timeout elapses. */
     bool wait_released(std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(mutex);
-        return changed.wait_for(lock, timeout, [this] { return released; });
+        return changed.wait_for(lock, timeout,
+                                [this] { return released.load(std::memory_order_relaxed); });
     }
 };
 
@@ -755,7 +757,7 @@ void RQ_CALL record_prepared(void* user_data, const rq_prepared* info) noexcept 
     try {
         const std::lock_guard<std::mutex> lock(recorder.mutex);
         recorder.prepared = *info;
-        recorder.prepared_seen = true;
+        recorder.prepared_seen.store(true, std::memory_order_relaxed);
     } catch (const std::exception& e) {
         recorder.note_failure("on_prepared", e.what());
     }
@@ -789,7 +791,7 @@ void RQ_CALL record_errors(void* user_data, const rq_error_record* records, std:
         if (count != 0) {
             recorder.records.insert(recorder.records.end(), records, records + count);
         }
-        recorder.last_batch_total = total_errors;
+        recorder.last_batch_total.store(total_errors, std::memory_order_relaxed);
     } catch (const std::exception& e) {
         recorder.note_failure("on_errors", e.what());
     }
@@ -803,7 +805,7 @@ void RQ_CALL record_completed(void* user_data, const rq_run_result* result) noex
         recorder.result_steps.assign(result->step_results,
                                      result->step_results + result->step_result_count);
         recorder.result.step_results = nullptr;
-        recorder.completed = true;
+        recorder.completed.store(true, std::memory_order_relaxed);
     } catch (const std::exception& e) {
         recorder.note_failure("on_completed", e.what());
     }
@@ -816,7 +818,7 @@ void RQ_CALL record_released(void* user_data, std::uint64_t released_bytes,
         {
             const std::lock_guard<std::mutex> lock(recorder.mutex);
             recorder.released_bytes = released_bytes;
-            recorder.released = true;
+            recorder.released.store(true, std::memory_order_relaxed);
         }
         recorder.changed.notify_all();
     } catch (const std::exception& e) {
@@ -1002,14 +1004,16 @@ void run_scaled_standard(const rq_fault_spec& raw_spec, run_outcome& out) {
     out.progress_ticks = recorder.progress_ticks.load();
     {
         const std::lock_guard<std::mutex> lock(recorder.mutex);
-        ASSERT_TRUE(recorder.completed) << "Released arrived without Completed";
-        ASSERT_TRUE(recorder.prepared_seen) << "the run was never prepared";
+        ASSERT_TRUE(recorder.completed.load(std::memory_order_relaxed))
+            << "Released arrived without Completed";
+        ASSERT_TRUE(recorder.prepared_seen.load(std::memory_order_relaxed))
+            << "the run was never prepared";
         out.prepared = recorder.prepared;
         out.result = recorder.result;
         out.step_results = recorder.result_steps;
         out.finished_steps = recorder.finished_steps;
         out.records = recorder.records;
-        out.last_batch_total = recorder.last_batch_total;
+        out.last_batch_total = recorder.last_batch_total.load(std::memory_order_relaxed);
         out.released_bytes = recorder.released_bytes;
     }
     ASSERT_EQ(session.destroy(), RQ_OK);
@@ -1623,7 +1627,7 @@ constexpr bool on_visited_line(const strided_visits& v, std::uint64_t offset) no
            visit - v.first_visit < v.visit_count;
 }
 
-class FaultInjectionLayerStrided : public ::testing::TestWithParam<strided_layer_case> {};
+class fault_injection_layer_strided : public ::testing::TestWithParam<strided_layer_case> {};
 
 /* ---------------------------------------------------------------------------------------------
  * Tests
@@ -1699,9 +1703,9 @@ TEST(FaultInjectionPlan, EveryFaultClassSpecIsValidForTheRegion) {
     }
 }
 
-class FaultInjectionTest : public ::testing::TestWithParam<fault_case> {};
+class fault_injection_test : public ::testing::TestWithParam<fault_case> {};
 
-TEST_P(FaultInjectionTest, EveryInjectionIsReportedOnceWithItsWordBitStepAndPass) {
+TEST_P(fault_injection_test, EveryInjectionIsReportedOnceWithItsWordBitStepAndPass) {
     const fault_case& fault = GetParam();
     run_outcome run;
     ASSERT_NO_FATAL_FAILURE(run_scaled_standard(fault.make_spec(), run));
@@ -1787,7 +1791,7 @@ TEST_P(FaultInjectionTest, EveryInjectionIsReportedOnceWithItsWordBitStepAndPass
     fault.check(run, verified);
 }
 
-INSTANTIATE_TEST_SUITE_P(FaultInjection, FaultInjectionTest, ::testing::ValuesIn(k_fault_cases),
+INSTANTIATE_TEST_SUITE_P(FaultInjection, fault_injection_test, ::testing::ValuesIn(k_fault_cases),
                          [](const ::testing::TestParamInfo<fault_case>& info) {
                              return std::string(info.param.name);
                          });
@@ -1895,7 +1899,7 @@ TEST(FaultInjectionLayer, AReclaimedTargetSetIsRebuiltWithTheSameWordsAndBits) {
 // those lines, each once, and none elsewhere: split over two calls, as the step runner splits a
 // window into work groups, the pass injects exactly what a plain verification of the buffer does.
 // Each entry's address is the buffer word that holds its corruption, and its time is its call's.
-TEST_P(FaultInjectionLayerStrided, VerifyStridedInjectsExactlyTheTargetsOnItsVisitedLines) {
+TEST_P(fault_injection_layer_strided, VerifyStridedInjectsExactlyTheTargetsOnItsVisitedLines) {
     const rq_fault_spec spec = GetParam().make_spec();
     const char* reason = nullptr;
     ASSERT_TRUE(validate_fault_spec(spec, k_layer_region_bytes, &reason))
@@ -1964,7 +1968,7 @@ TEST_P(FaultInjectionLayerStrided, VerifyStridedInjectsExactlyTheTargetsOnItsVis
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(FaultInjectionLayerStridedClasses, FaultInjectionLayerStrided,
+INSTANTIATE_TEST_SUITE_P(FaultInjectionLayerStridedClasses, fault_injection_layer_strided,
                          ::testing::ValuesIn(k_strided_layer_cases),
                          [](const ::testing::TestParamInfo<strided_layer_case>& info) {
                              return std::string(info.param.name);

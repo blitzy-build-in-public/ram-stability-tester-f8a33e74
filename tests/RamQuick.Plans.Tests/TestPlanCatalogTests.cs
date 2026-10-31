@@ -419,6 +419,48 @@ public sealed class TestPlanCatalogTests
         Assert.NotEqual(original, copy with { CoverageBudgetPercent = original.CoverageBudgetPercent + 1 });
     }
 
+    [Fact]
+    public void Equals_PlansFromEqualStepsInSeparateLists_AreEqualWithEqualHashCodes()
+    {
+        var fromList = new TestPlan(TestType.Quick, TestPlans.Quick.Steps.ToList());
+        var fromCopies = new TestPlan(TestType.Quick, TestPlans.Quick.Steps.Select(step => step with { }).ToArray());
+        TestPlan copied = TestPlans.Quick with { };
+
+        Assert.NotSame(fromList.Steps, fromCopies.Steps);
+        Assert.NotSame(TestPlans.Quick.Steps[0], fromCopies.Steps[0]);
+        Assert.Equal(fromList, fromCopies);
+        Assert.Equal(fromList.GetHashCode(), fromCopies.GetHashCode());
+        Assert.Equal(TestPlans.Quick, fromCopies);
+        Assert.Equal(TestPlans.Quick.GetHashCode(), fromCopies.GetHashCode());
+        Assert.NotSame(TestPlans.Quick, copied);
+        Assert.Equal(TestPlans.Quick, copied);
+        Assert.Equal(new TestPlan(TestType.Standard, []), new TestPlan(TestType.Standard, []));
+    }
+
+    [Theory]
+    [InlineData("Type")]
+    [InlineData("StepValue")]
+    [InlineData("StepOrder")]
+    [InlineData("StepCount")]
+    public void Equals_PlansDifferingInTypeOrOneStep_AreNotEqual(string difference)
+    {
+        StepDefinition[] steps = [.. TestPlans.Quick.Steps];
+        var plan = new TestPlan(TestType.Quick, steps);
+
+        // Renaming or swapping steps keeps both targets, so only the step-by-step comparison can tell the plans apart.
+        TestPlan other = difference switch
+        {
+            "Type" => new TestPlan(TestType.Standard, steps),
+            "StepValue" => new TestPlan(TestType.Quick, steps.Select((step, index) => index == 2 ? step with { Name = step.Name + " changed" } : step)),
+            "StepOrder" => new TestPlan(TestType.Quick, [steps[1], steps[0], .. steps[2..]]),
+            "StepCount" => new TestPlan(TestType.Quick, steps[..^1]),
+            _ => throw new ArgumentOutOfRangeException(nameof(difference), difference, "Not a plan difference case."),
+        };
+
+        Assert.NotEqual(plan, other);
+        Assert.NotEqual(other, plan);
+    }
+
 
     // ---- Step-to-mechanism map of docs/METHODOLOGY.md ----
 

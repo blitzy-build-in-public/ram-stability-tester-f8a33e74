@@ -42,12 +42,16 @@ public sealed record SummaryPublishResult(bool Succeeded, string? JsonPath, stri
 /// <c>&lt;yyyy-MM-ddTHH:mm:ss.fffZ&gt; &lt;EVENT&gt; key=value key=value …</c>, UTF-8 without a byte-order mark,
 /// ending in <c>\r\n</c>, in the invariant culture. Free-text values (<c>name</c>, <c>detail</c>,
 /// <c>message</c>, <c>outcome</c>, <c>os</c>, <c>cpu</c>, <c>path</c>, <c>error</c>, <c>source</c>) are always
-/// double-quoted, with the locations that name the Windows account written as placeholders: the run's data folder
-/// <c>&lt;data&gt;</c>, the user's folders <c>%LOCALAPPDATA%</c>, <c>%APPDATA%</c> and <c>%USERPROFILE%</c>, and the
-/// user name, where it is a path segment, <c>%USERNAME%</c>. Results files are named relative to the data folder,
-/// as <c>logs\&lt;file&gt;</c>. Any other value is quoted only when it is empty or holds white space, a double
-/// quote or a control character. Inside quotes <c>\"</c> stands for <c>"</c> and <c>\\</c> for <c>\</c>, and
-/// control characters are written as spaces, so an event never spans more lines than it writes. Numbers are plain;
+/// double-quoted, with the locations and names that identify a Windows account or the computer written as
+/// placeholders: the run's data folder <c>&lt;data&gt;</c>, the user's folders <c>%LOCALAPPDATA%</c>,
+/// <c>%APPDATA%</c> and <c>%USERPROFILE%</c>, the user name, where it is a path segment, <c>%USERNAME%</c>; then, by
+/// the summaries' rules (<see cref="SummaryFormat.RedactPersonalPaths(string)"/>), the temporary folder
+/// <c>%TEMP%</c>, the application's folder <c>&lt;app folder&gt;</c>, any other account's profile folder
+/// <c>&lt;drive&gt;:\Users\&lt;user&gt;</c> and the computer name <c>&lt;machine&gt;</c>. Results files are named
+/// relative to the data folder, as <c>logs\&lt;file&gt;</c>. Any other value is quoted only when it is empty or
+/// holds white space, a double quote or a control character. Inside quotes <c>\"</c> stands for <c>"</c> and
+/// <c>\\</c> for <c>\</c>, and control characters are written as spaces, so an event never spans more lines than
+/// it writes. Numbers are plain;
 /// percentages have one decimal, other doubles use the round-trip format. Hex words are <c>0x</c> plus 16 uppercase
 /// digits. A value that was not captured is written <c>unknown</c>. Step and pass numbers are 1-based, as in
 /// <c>step=3/6</c>, the folder-wide rule for persisted indices.
@@ -90,8 +94,8 @@ public sealed record SummaryPublishResult(bool Succeeded, string? JsonPath, stri
 /// The run state is never cached here: <see cref="LogVerdict"/> receives the terminal state as a parameter.
 /// The summaries are the files meant for sharing: they hold memory-test data and hardware descriptors. The
 /// <c>.log</c> and <c>app-errors.log</c> are local diagnostic logs: they can also hold exception text and stack
-/// traces, with the account's locations written as placeholders, so they are inspected before they are shared.
-/// No user or machine name is added to any of them, and nothing leaves the PC.
+/// traces, with every account's locations and the computer name written as the placeholders above, so they are
+/// inspected before they are shared. No user or machine name is added to any of them, and nothing leaves the PC.
 /// </para>
 /// </remarks>
 public sealed class ResultsLog : IDisposable
@@ -965,10 +969,10 @@ public sealed class ResultsLog : IDisposable
     /// Synchronous, for a thread that may block on I/O; the UI thread queues the write with
     /// <see cref="QueueAppError"/> instead, and crash and exit handlers running off the UI thread bound their wait with
     /// <see cref="TryAppendAppError"/>. It runs inside crash handlers, so it never throws for a failure to
-    /// format or write the block: such a failure is swallowed. Only the exception's own text is written, with the
-    /// data folder and the user's folders and name written as <c>&lt;data&gt;</c>, <c>%LOCALAPPDATA%</c>,
-    /// <c>%APPDATA%</c>, <c>%USERPROFILE%</c> and <c>%USERNAME%</c>, as in the <c>.log</c>; no user or machine name
-    /// is added.
+    /// format or write the block: such a failure is swallowed. Only the exception's own text is written, with its
+    /// locations and names written as placeholders, as in the <c>.log</c>: <c>&lt;data&gt;</c>, <c>%LOCALAPPDATA%</c>,
+    /// <c>%APPDATA%</c>, <c>%USERPROFILE%</c>, <c>%USERNAME%</c>, <c>%TEMP%</c>, <c>&lt;app folder&gt;</c>,
+    /// <c>&lt;drive&gt;:\Users\&lt;user&gt;</c> and <c>&lt;machine&gt;</c>; no user or machine name is added.
     /// </remarks>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="dataDirectory"/> or <paramref name="exception"/> is <see langword="null"/>.
@@ -1434,26 +1438,35 @@ public sealed class ResultsLog : IDisposable
     private sealed record ErrorBatch(DateTimeOffset Utc, ErrorRecord[] Records, int StepCount, ulong TotalErrors, bool CapReached);
 
     /// <summary>
-    /// Keeps the Windows account out of free text written to the <c>.log</c> and <c>app-errors.log</c>: the run's
-    /// data folder is written <c>&lt;data&gt;</c>, the user's local and roaming application data folders and
-    /// profile folder <c>%LOCALAPPDATA%</c>, <c>%APPDATA%</c> and <c>%USERPROFILE%</c>, and the user name, where it
-    /// is a whole path segment, <c>%USERNAME%</c>.
+    /// Keeps the Windows accounts and the computer out of free text written to the <c>.log</c> and
+    /// <c>app-errors.log</c>. Its own pass writes the run's data folder <c>&lt;data&gt;</c>, the user's local and
+    /// roaming application data folders and profile folder <c>%LOCALAPPDATA%</c>, <c>%APPDATA%</c> and
+    /// <c>%USERPROFILE%</c>, and the user name, where it is a whole path segment, <c>%USERNAME%</c>. The summaries'
+    /// rules, <see cref="SummaryFormat.RedactPersonalPaths(string)"/>, then write what remains of the temporary
+    /// folder <c>%TEMP%</c> and of the application's folder <c>&lt;app folder&gt;</c>, the folder after any other
+    /// <c>&lt;drive&gt;:\Users\</c>, whichever account's profile it is, as <c>&lt;drive&gt;:\Users\&lt;user&gt;</c>,
+    /// and the computer name, as a whole word, <c>&lt;machine&gt;</c>.
     /// </summary>
     /// <remarks>
-    /// Folders are compared case-insensitively with <c>\</c> and <c>/</c> alike, the longest first, so a data folder
-    /// under the profile is written <c>&lt;data&gt;</c>. A folder or name matches only where its path segment ends,
-    /// at a separator, a quote, white space, punctuation or the end of the text, so <c>C:\Users\ann</c> never
-    /// matches inside <c>C:\Users\anna</c>. A folder Windows reports empty, or as a bare volume root, is skipped.
-    /// Never throws, so it is safe inside the crash handlers' app-error writes.
+    /// The own pass runs first, so the data folder is written <c>&lt;data&gt;</c> wherever it lies and the account's
+    /// own folders keep their placeholders. The summaries' computer-name rule leaves every placeholder of either pass
+    /// intact, and their profile rule a folder named exactly like one, so redacting a redacted text returns it
+    /// unchanged. In the own pass, folders are compared case-insensitively with <c>\</c> and <c>/</c> alike, the
+    /// longest first, so a data folder under the profile is written <c>&lt;data&gt;</c>. A folder or name matches
+    /// only where its path segment ends, at a separator, a quote, white space, punctuation or the end of the text, so
+    /// <c>C:\Users\ann</c> never matches inside <c>C:\Users\anna</c>. A folder Windows reports empty, or as a bare
+    /// volume root, is skipped. Never throws, so it is safe inside the crash handlers' app-error writes.
     /// </remarks>
     private sealed class PersonalDataRedactor
     {
-        private const string DataFolderToken = "<data>";
-        private const string UserNameToken = "%USERNAME%";
+        private const string DataFolderToken = SummaryFormat.DataFolderToken;
+        private const string UserNameToken = SummaryFormat.UserNameToken;
 
-        // The account's folders and name are read once: they do not change while the process runs.
+        // The account's folders and names and the computer's name are read once: they do not change while the
+        // process runs, and a run redacts up to one value per error line.
         private static readonly (string Folder, string Token)[] _userFolders = ReadUserFolders();
         private static readonly string? _userName = ReadUserName();
+        private static readonly SummaryFormat.PersonalPathSnapshot _summaryRules = SummaryFormat.PersonalPathSnapshot.Capture();
 
         private readonly (string Folder, string Token)[] _folders;
 
@@ -1474,16 +1487,19 @@ public sealed class ResultsLog : IDisposable
         }
 
         /// <summary>
-        /// Returns <paramref name="text"/> with every folder and user-name segment replaced by its placeholder.
+        /// Returns <paramref name="text"/> with every folder and user-name segment replaced by its placeholder, then
+        /// redacted by the summaries' rules.
         /// </summary>
         public string Redact(string text)
         {
-            // Every folder and every user-name segment holds or follows a directory separator.
-            if (text.AsSpan().IndexOfAny('\\', '/') < 0)
-            {
-                return text;
-            }
+            // Every folder and user-name segment of the own pass holds or follows a directory separator; the
+            // computer name the summaries' rules replace needs none.
+            string redacted = text.AsSpan().IndexOfAny('\\', '/') < 0 ? text : RedactAccountLocations(text);
+            return SummaryFormat.RedactPersonalPaths(redacted, _summaryRules);
+        }
 
+        private string RedactAccountLocations(string text)
+        {
             var builder = new StringBuilder(text.Length);
             int position = 0;
             while (position < text.Length)

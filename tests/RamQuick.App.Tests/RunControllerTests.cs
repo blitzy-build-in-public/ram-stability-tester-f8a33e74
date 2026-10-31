@@ -404,7 +404,7 @@ internal sealed class ControllerHarness : IDisposable
 
     /// <summary>Calls <see cref="RunController.ShutdownAsync"/> with <see cref="Context"/> installed, without pumping.</summary>
     /// <returns>The shutdown task.</returns>
-    public Task Shutdown() => OnUiThread(Controller.ShutdownAsync);
+    public Task ShutdownAsync() => OnUiThread(Controller.ShutdownAsync);
 
     /// <summary>
     /// Starts the sensor monitor on <see cref="Context"/> and pumps until its first snapshot reached the controller.
@@ -434,7 +434,7 @@ internal sealed class ControllerHarness : IDisposable
     public (StepGateDecision Decision, TimeSpan Elapsed) RunGate(int index, TimeSpan? timeout = null)
     {
         long startedAt = Stopwatch.GetTimestamp();
-        return AwaitGate(Session.InvokeStepGateOnBackgroundThread(index), startedAt, timeout);
+        return AwaitGate(Session.InvokeStepGateOnBackgroundThreadAsync(index), startedAt, timeout);
     }
 
     /// <summary>Pumps until a gate started on a background thread returns.</summary>
@@ -1413,7 +1413,7 @@ public sealed class RunControllerTests
                 break;
             default:
                 // Past its deadline the shutdown disposes the session without waiting for Released.
-                harness.AwaitTask(harness.Shutdown());
+                harness.AwaitTask(harness.ShutdownAsync());
                 break;
         }
 
@@ -2684,7 +2684,7 @@ public sealed class RunControllerTests
         // The engine raises Prepared before step 1's gate; the UI thread has not delivered it yet.
         session.RaisePrepared();
         long firstStartedAt = Stopwatch.GetTimestamp();
-        Task<StepGateDecision> first = session.InvokeStepGateOnBackgroundThread(0);
+        Task<StepGateDecision> first = session.InvokeStepGateOnBackgroundThreadAsync(0);
         Assert.False(
             SpinWait.SpinUntil(() => first.IsCompleted, _undeliveredEventsWindow),
             "Step 1's gate returned while Prepared was still undelivered.");
@@ -2701,7 +2701,7 @@ public sealed class RunControllerTests
         // Likewise step 1's StepFinished before step 2's gate.
         session.RaiseStepFinished(0);
         long secondStartedAt = Stopwatch.GetTimestamp();
-        Task<StepGateDecision> second = session.InvokeStepGateOnBackgroundThread(1);
+        Task<StepGateDecision> second = session.InvokeStepGateOnBackgroundThreadAsync(1);
         Assert.False(
             SpinWait.SpinUntil(() => second.IsCompleted, _undeliveredEventsWindow),
             "Step 2's gate returned while step 1's StepFinished was still undelivered.");
@@ -2729,7 +2729,7 @@ public sealed class RunControllerTests
         FakeEngineSession session = harness.StartAccepted();
         storage.BlockNext("step");
 
-        Task<StepGateDecision> gate = session.InvokeStepGateOnBackgroundThread(0);
+        Task<StepGateDecision> gate = session.InvokeStepGateOnBackgroundThreadAsync(0);
 
         // Pumped, because the gate journals its step only once the UI context has run its barrier.
         harness.RunUntil(() => storage.BlockedCount > 0);
@@ -2759,7 +2759,7 @@ public sealed class RunControllerTests
         harness.Prepare();
 
         // The UI context is not pumped, so the gate's barrier stays queued.
-        Task<StepGateDecision> gate = session.InvokeStepGateOnBackgroundThread(0);
+        Task<StepGateDecision> gate = session.InvokeStepGateOnBackgroundThreadAsync(0);
         Assert.False(
             SpinWait.SpinUntil(() => gate.IsCompleted, _undeliveredEventsWindow),
             "The gate returned while its barrier was still queued.");
@@ -2796,7 +2796,7 @@ public sealed class RunControllerTests
 
         // The UI context is not pumped for the gate's whole real-time bound, so its barrier never runs in time.
         long startedAt = Stopwatch.GetTimestamp();
-        Task<StepGateDecision> gate = session.InvokeStepGateOnBackgroundThread(0);
+        Task<StepGateDecision> gate = session.InvokeStepGateOnBackgroundThreadAsync(0);
         Assert.True(
             SpinWait.SpinUntil(() => gate.IsCompleted, _gateTimeoutWait),
             "The gate never gave up on its undelivered barrier.");
@@ -3211,6 +3211,31 @@ public sealed class RunControllerTests
     }
 
     [Fact]
+    public void InitializeAsync_JournalStepNameHoldsLineBreaksAndControls_ShowsTheReasonOnOneLine()
+    {
+        using var harness = new ControllerHarness();
+        (Guid runId, string baseName) = NewRunIdentity(TestType.Quick);
+        JournalRecord[] journal = UnfinishedJournal(runId, baseName, stepCount: 3, lastStepNumber: 2);
+        int stepIndex = Array.FindLastIndex(journal, record => record is JournalStepStart);
+        journal[stepIndex] = (JournalStepStart)journal[stepIndex] with
+        {
+            Name = "Chain\r\nSPOOFED: PASS \u001b[32m<b>ok</b>\u0000\u202E",
+        };
+        harness.WriteJournal(journal);
+
+        harness.Initialize();
+
+        // A forged line break must not put a "PASS" line beside the FAIL badge, and a NUL must not cut the
+        // reason's automation name short: the step name is shown as one line of plain text.
+        Assert.Equal(RunState.Failed, harness.StateMachine.State);
+        string? reason = harness.Controller.ResultMessage;
+        Assert.Equal(UiText.PreviousRunUnfinished(2, 3, "Chain  SPOOFED: PASS  [32m<b>ok</b>"), reason);
+        Assert.DoesNotContain(
+            reason!,
+            character => CharUnicodeInfo.GetUnicodeCategory(character) is UnicodeCategory.Control or UnicodeCategory.Format);
+    }
+
+    [Fact]
     public void InitializeAsync_JournalEndsBeforeFirstStep_FailsWithPreparingMessage()
     {
         using var harness = new ControllerHarness();
@@ -3261,7 +3286,7 @@ public sealed class RunControllerTests
         FakeEngineSession session = harness.StartAccepted();
         harness.Prepare();
 
-        Task shutdown = harness.Shutdown();
+        Task shutdown = harness.ShutdownAsync();
 
         Assert.Equal(new[] { StopReason.User }, session.StopRequests);
         Assert.False(shutdown.IsCompleted);
@@ -3283,7 +3308,7 @@ public sealed class RunControllerTests
 
         Assert.Equal(1, session.DisposeCount);
         Assert.False(harness.JournalExists);
-        Assert.Same(shutdown, harness.Shutdown());
+        Assert.Same(shutdown, harness.ShutdownAsync());
         Assert.Equal(StartResult.Busy, harness.TryStart());
     }
 
@@ -3300,7 +3325,7 @@ public sealed class RunControllerTests
         session.PublishProgress(progress);
         harness.RunUntil(() => ReferenceEquals(harness.Controller.CurrentProgress, progress));
 
-        Task shutdown = harness.Shutdown();
+        Task shutdown = harness.ShutdownAsync();
         Assert.Equal(new[] { StopReason.User }, session.StopRequests);
 
         // No Completed within 3 s: the controller concludes the run as a user stop from its own totals.
@@ -3361,7 +3386,7 @@ public sealed class RunControllerTests
         harness.RunUntil(() => ReferenceEquals(harness.Controller.CurrentProgress, progress));
 
         // Neither Completed nor Released ever arrives: the controller concludes and publishes the run from its own totals.
-        Task shutdown = harness.Shutdown();
+        Task shutdown = harness.ShutdownAsync();
         harness.Time.Advance(harness.Options.ShutdownCompletedTimeout);
         harness.RunUntil(() => harness.StateMachine.IsTerminal
             && harness.Controller.PostRunActivity == PostRunActivity.ReleasingMemory);
@@ -3401,7 +3426,7 @@ public sealed class RunControllerTests
         using var harness = new ControllerHarness();
         harness.Initialize();
 
-        Task shutdown = harness.Shutdown();
+        Task shutdown = harness.ShutdownAsync();
         harness.AwaitTask(shutdown);
 
         Assert.Equal(StartResult.Busy, harness.TryStart());
@@ -3415,7 +3440,7 @@ public sealed class RunControllerTests
         harness.Initialize();
         Assert.Equal(StartResult.Accepted, harness.TryStart());
 
-        Task shutdown = harness.Shutdown();
+        Task shutdown = harness.ShutdownAsync();
         harness.AwaitTask(shutdown);
 
         Assert.Equal(StartResult.Withdrawn, harness.AwaitResult(harness.Controller.StartTask));
@@ -3438,7 +3463,7 @@ public sealed class RunControllerTests
         harness.RunUntil(() => storage.BlockedCount == 1);
 
         // The withdrawn Start waits for its writer to retire, which a stalled append prevents; the shutdown does not.
-        Task shutdown = harness.Shutdown();
+        Task shutdown = harness.ShutdownAsync();
         harness.Time.Advance(harness.Options.ShutdownReleasedTimeout);
         harness.AwaitTask(shutdown);
 
@@ -3590,7 +3615,7 @@ public sealed class RunControllerTests
         storage.BlockNext("end");
         try
         {
-            Task shutdown = harness.Shutdown();
+            Task shutdown = harness.ShutdownAsync();
             harness.Time.Advance(harness.Options.ShutdownCompletedTimeout);
             harness.RunUntil(() => harness.StateMachine.IsTerminal
                 && harness.Controller.PostRunActivity == PostRunActivity.ReleasingMemory);

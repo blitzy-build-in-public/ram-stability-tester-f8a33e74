@@ -29,6 +29,8 @@
 #include <cwchar>
 #include <cstdarg>
 #include <algorithm>
+#include <atomic>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -278,7 +280,7 @@ public:
      */
     bool add(std::uint64_t contribution, attempt_failure& failure) noexcept {
         const exclusive_lock guard(lock_);
-        if (!baseline_saved_) {
+        if (!baseline_saved_.load(std::memory_order_relaxed)) {
             SIZE_T minimum = 0;
             SIZE_T maximum = 0;
             DWORD flags = 0;
@@ -289,17 +291,18 @@ public:
             baseline_minimum_ = minimum;
             baseline_maximum_ = maximum;
             baseline_flags_ = flags;
-            baseline_saved_ = true;
+            baseline_saved_.store(true, std::memory_order_relaxed);
         }
         // Saturated, so an absurd total fails in SetProcessWorkingSetSizeEx with its own error
         // instead of wrapping to a small minimum.
-        const std::uint64_t total = saturating_add(total_, contribution);
+        const std::uint64_t total =
+            saturating_add(total_.load(std::memory_order_relaxed), contribution);
         if (!set_limits(total)) {
             failure = attempt_failure{"SetProcessWorkingSetSizeEx", GetLastError()};
             return false;
         }
-        total_ = total;
-        ++holders_;
+        total_.store(total, std::memory_order_relaxed);
+        holders_.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
@@ -311,24 +314,28 @@ public:
     void remove(std::uint64_t contribution) noexcept {
         const exclusive_lock guard(lock_);
         // Every withdrawal pairs with an accepted add(), so an empty ledger has nothing to undo.
-        if (holders_ == 0) {
+        const std::uint32_t holders_before = holders_.load(std::memory_order_relaxed);
+        if (holders_before == 0) {
             return;
         }
-        total_ -= std::min(total_, contribution);
-        --holders_;
-        if (holders_ != 0) {
-            if (!set_limits(total_)) {
+        const std::uint64_t total_before = total_.load(std::memory_order_relaxed);
+        const std::uint64_t total = total_before - std::min(total_before, contribution);
+        const std::uint32_t holders = holders_before - 1;
+        total_.store(total, std::memory_order_relaxed);
+        holders_.store(holders, std::memory_order_relaxed);
+        if (holders != 0) {
+            if (!set_limits(total)) {
                 debug_log(L"Lowering the minimum working set to %llu MiB failed (Windows error "
                           L"%lu)",
-                          saturating_add(total_, k_working_set_headroom_bytes) / k_mib,
+                          saturating_add(total, k_working_set_headroom_bytes) / k_mib,
                           GetLastError());
             }
             return;
         }
-        total_ = 0;
+        total_.store(0, std::memory_order_relaxed);
         if (SetProcessWorkingSetSizeEx(GetCurrentProcess(), baseline_minimum_, baseline_maximum_,
                                        baseline_flags_)) {
-            baseline_saved_ = false;
+            baseline_saved_.store(false, std::memory_order_relaxed);
         } else {
             debug_log(L"Restoring the working-set limits failed (Windows error %lu)",
                       GetLastError());
@@ -347,17 +354,23 @@ private:
     }
 
     SRWLOCK lock_ = SRWLOCK_INIT;
-    // Sum of the live contributions, and how many there are. Plain fields guarded by lock_
-    // rather than atomics: each change must stay paired with the SetProcessWorkingSetSizeEx
-    // call that applies it, which no atomic counter could order.
-    std::uint64_t total_ = 0;
-    std::uint32_t holders_ = 0;
-    // The limits read before the first contribution, kept until a restore to them succeeds.
-    bool baseline_saved_ = false;
+    // Sum of the live contributions, and how many there are. Atomic storage, as every shared
+    // counter and flag is, read and written only under lock_: the lock, not the atomics, keeps
+    // each change paired with the SetProcessWorkingSetSizeEx call that applies it, so relaxed
+    // order suffices.
+    std::atomic<std::uint64_t> total_{0};
+    std::atomic<std::uint32_t> holders_{0};
+    // The limits read before the first contribution, kept until a restore to them succeeds. The
+    // flag is atomic like the counters; the saved limits are plain data, used only under lock_.
+    std::atomic<bool> baseline_saved_{false};
     SIZE_T baseline_minimum_ = 0;
     SIZE_T baseline_maximum_ = 0;
     DWORD baseline_flags_ = 0;
 };
+
+// No exit-time destructor runs for the static ledger below, so a static region released during
+// exit still finds it intact.
+static_assert(std::is_trivially_destructible_v<working_set_ledger>);
 
 /** The ledger of this process. */
 working_set_ledger& process_working_set() noexcept {

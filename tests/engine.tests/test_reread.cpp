@@ -3,14 +3,14 @@
  * @brief Error confirmation tests: the flushed re-read of a mismatching word and its
  *        classification.
  *
- * - RereadClassification: classify_reread as a pure function, over value pairs that include 0,
+ * - reread_classification: classify_reread as a pure function, over value pairs that include 0,
  *   UINT64_MAX, single-bit and multi-bit differences.
- * - RereadCollector and RereadCollectorPath: error_collector's mismatch path over a substitute
+ * - reread_collector and RereadCollectorPath: error_collector's mismatch path over a substitute
  *   layer that scripts the re-read value. Each mismatch is re-read exactly once, through the
  *   outermost layer, with the verification's context in which only the phase changes, and the
  *   record keeps the raw expected, actual and re-read values with the inferred outcome. Every
  *   outcome is a confirmed error.
- * - RereadRealLayer and RereadRealPath: real_memory_access::reread_word over the host's kernel
+ * - reread_real_layer and RereadRealPath: real_memory_access::reread_word over the host's kernel
  *   table, alone and under counting_memory_access, including a mismatch found by a real
  *   verification, which re-reads the stored wrong value (RQ_REREAD_REPEATS_ACTUAL). Re-reads
  *   never count as verified bytes.
@@ -70,7 +70,7 @@ constexpr std::size_t k_mismatch_word = 100U;
 constexpr std::uint64_t k_mismatch_offset = k_mismatch_word * sizeof(std::uint64_t);
 
 /**
- * Steps, step and pass of every context. Nonzero step, pass and (in RereadCollector) worker
+ * Steps, step and pass of every context. Nonzero step, pass and (in reread_collector) worker
  * values make "preserved" distinguishable from "zeroed".
  */
 constexpr std::uint32_t k_step_count = 3U;
@@ -446,12 +446,12 @@ std::string clflushopt_name(const ::testing::TestParamInfo<bool>& info) {
     return info.param ? "Clflushopt" : "Clflush";
 }
 
-class RereadClassification : public ::testing::TestWithParam<value_pair> {};
+class reread_classification : public ::testing::TestWithParam<value_pair> {};
 
-class RereadCollector : public ::testing::TestWithParam<collector_param> {};
+class reread_collector : public ::testing::TestWithParam<collector_param> {};
 
 /** Parameter: whether the synthetic selection reports CLFLUSHOPT. */
-class RereadRealLayer : public ::testing::TestWithParam<bool> {};
+class reread_real_layer : public ::testing::TestWithParam<bool> {};
 
 }  // namespace
 
@@ -459,7 +459,7 @@ class RereadRealLayer : public ::testing::TestWithParam<bool> {};
  * classify_reread: which first value the flushed re-read equals
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(RereadClassification, ClassifiesByWhichFirstValueTheRereadEquals) {
+TEST_P(reread_classification, ClassifiesByWhichFirstValueTheRereadEquals) {
     const value_pair& pair = GetParam();
     const std::uint64_t e = pair.expected;
     const std::uint64_t a = pair.actual;
@@ -482,14 +482,14 @@ TEST_P(RereadClassification, ClassifiesByWhichFirstValueTheRereadEquals) {
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(RereadValuePairs, RereadClassification, ::testing::ValuesIn(k_value_pairs),
-                         value_pair_name);
+INSTANTIATE_TEST_SUITE_P(RereadValuePairs, reread_classification,
+                         ::testing::ValuesIn(k_value_pairs), value_pair_name);
 
 /* ---------------------------------------------------------------------------------------------
  * error_collector's mismatch path over a scripted re-read
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(RereadCollector, RereadsOnceThroughTheOutermostLayerAndKeepsTheRawValues) {
+TEST_P(reread_collector, RereadsOnceThroughTheOutermostLayerAndKeepsTheRawValues) {
     const auto& [c, source] = GetParam();
     SCOPED_TRACE(::testing::Message()
                  << c.name << ": expected " << hex64(c.expected) << ", actual " << hex64(c.actual)
@@ -561,7 +561,7 @@ TEST_P(RereadCollector, RereadsOnceThroughTheOutermostLayerAndKeepsTheRawValues)
     EXPECT_EQ(r.sequence, 0U);
 }
 
-INSTANTIATE_TEST_SUITE_P(RereadOutcomes, RereadCollector,
+INSTANTIATE_TEST_SUITE_P(RereadOutcomes, reread_collector,
                          ::testing::Combine(::testing::ValuesIn(k_outcome_cases),
                                             ::testing::ValuesIn(k_source_contexts)),
                          collector_param_name);
@@ -622,7 +622,7 @@ TEST(RereadCollectorPath, CleanVerificationsIssueNoReread) {
  * real_memory_access::reread_word: the fence, flush, fence, load helper of the session's table
  * ------------------------------------------------------------------------------------------- */
 
-TEST_P(RereadRealLayer, KeepsTheRereadHelperItsSelectionNeeds) {
+TEST_P(reread_real_layer, KeepsTheRereadHelperItsSelectionNeeds) {
     const bool clflushopt = GetParam();
     // Synthetic SSE2 selection: constructing the layer copies the table and executes nothing.
     const isa_selection selection{.selected = RQ_ISA_SSE2,
@@ -653,7 +653,7 @@ TEST_P(RereadRealLayer, KeepsTheRereadHelperItsSelectionNeeds) {
     EXPECT_EQ(reread, stored) << "re-read " << hex64(reread) << ", stored " << hex64(stored);
 }
 
-INSTANTIATE_TEST_SUITE_P(RereadHelpers, RereadRealLayer, ::testing::Bool(), clflushopt_name);
+INSTANTIATE_TEST_SUITE_P(RereadHelpers, reread_real_layer, ::testing::Bool(), clflushopt_name);
 
 TEST(RereadRealPath, ReturnsUnfencedStreamedValuesAndNeverCountsAsCoverage) {
     region_buffer region;

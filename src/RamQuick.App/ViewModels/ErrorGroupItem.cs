@@ -21,10 +21,10 @@ namespace RamQuick.App.ViewModels;
 /// <see cref="DisplayFormat"/> and <see cref="UiText"/> with the invariant culture.
 /// </para>
 /// </remarks>
-public sealed class ErrorGroupItem
+public sealed record ErrorGroupItem
 {
     /// <summary>
-    /// Initializes a new instance of the <see cref="ErrorGroupItem"/> class and formats every
+    /// Initializes a new instance of the <see cref="ErrorGroupItem"/> record and formats every
     /// displayed text of the group once.
     /// </summary>
     /// <param name="group">

@@ -4,9 +4,9 @@
  *        sequence, real chunked allocation and locking, and release of the locked region on
  *        every end reason.
  *
- * - MemoryRegionPlan and MemoryRegionRetry: plan_region and next_retry_bytes as pure functions,
+ * - memory_region_plan and memory_region_retry: plan_region and next_retry_bytes as pure functions,
  *   against sizes worked out by hand, plus a whole retry sequence down to the minimum.
- * - MemoryRegionAllocate and MemoryRegionRefusal: memory_region over real memory without
+ * - memory_region_allocate and memory_region_refusal: memory_region over real memory without
  *   elevation. Every chunk is committed, every page is resident and locked (QueryWorkingSetEx),
  *   slices follow worker order in logical offsets, a scripted lock override drives
  *   shrink-and-retry and exhaustion deterministically, a stop before preparation allocates
@@ -15,7 +15,7 @@
  *   with the working-set limits restored.
  * - MemoryRegionLargePages: large-page chunks, skipped when the token lacks
  *   SeLockMemoryPrivilege, which nobody holds by default.
- * - MemoryRegionResponsiveness: while allocate() prepares a 1 GiB region, over one worker and
+ * - memory_region_responsiveness: while allocate() prepares a 1 GiB region, over one worker and
  *   over one per logical processor, another thread that commits, touches and frees fresh memory
  *   every 10 ms keeps completing, and no probe takes longer than the 250 ms within which the UI
  *   must answer throughout a run.
@@ -37,7 +37,7 @@
  *   until a later retry frees it and restores the working-set limits.
  *
  * Regions stay at or below 512 MiB and sessions use at most two workers, except in
- * MemoryRegionResponsiveness, which locks 1 GiB, the application's smallest region. Locking up
+ * memory_region_responsiveness, which locks 1 GiB, the application's smallest region. Locking up
  * to that size needs no elevation once the working set is raised, which memory_region does
  * itself.
  */
@@ -480,26 +480,30 @@ void PrintTo(engine_event event, std::ostream* os) {
     *os << "unknown event";
 }
 
-/** What run_recorder saw, copied under its lock. */
-struct recorded_run {
+/** What run_recorder keeps under its lock besides its counters and flags. */
+struct run_payload {
     /** The ordering callbacks in the order they were raised. */
     std::vector<engine_event> events;
-    bool prepared = false;
     rq_prepared prepared_info{};
-    std::uint32_t gate_calls = 0;
-    std::uint32_t steps_finished = 0;
-    std::uint32_t progress_calls = 0;
-    std::uint64_t error_total = 0;
-    bool completed = false;
     /** The on_completed header; step_results is cleared, the engine owns that array. */
     rq_run_result result{};
-    bool released = false;
     std::uint64_t released_bytes = 0;
     std::uint64_t release_ms = 0;
     /** Commit charge sampled inside on_released. */
     std::uint64_t private_usage_at_release = 0;
     /** One description per captured base that was not MEM_FREE inside on_released. */
     std::vector<std::string> unfreed;
+};
+
+/** What run_recorder saw, its payload and its counters and flags, copied under its lock. */
+struct recorded_run : run_payload {
+    bool prepared = false;
+    std::uint32_t gate_calls = 0;
+    std::uint32_t steps_finished = 0;
+    std::uint32_t progress_calls = 0;
+    std::uint64_t error_total = 0;
+    bool completed = false;
+    bool released = false;
 };
 
 /**
@@ -539,25 +543,36 @@ public:
     void hold_gate_for(run_recorder& partner) noexcept { partner_ = &partner; }
 
     bool wait_for_progress() {
-        return wait_until([this] { return run_.progress_calls > 0 || run_.completed; });
+        return wait_until([this] {
+            return progress_calls_.load(std::memory_order_relaxed) > 0 ||
+                   completed_.load(std::memory_order_relaxed);
+        });
     }
 
     bool wait_for_released() {
-        return wait_until([this] { return run_.released; });
+        return wait_until([this] { return released_.load(std::memory_order_relaxed); });
     }
 
     bool wait_for_completed() {
-        return wait_until([this] { return run_.completed; });
+        return wait_until([this] { return completed_.load(std::memory_order_relaxed); });
     }
 
     /** Waits at most timeout for Released; false when it has not been raised by then. */
     bool released_within(std::chrono::milliseconds timeout) {
-        return wait_until([this] { return run_.released; }, timeout);
+        return wait_until([this] { return released_.load(std::memory_order_relaxed); }, timeout);
     }
 
     recorded_run snapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return run_;
+        recorded_run run{payload_};
+        run.prepared = prepared_.load(std::memory_order_relaxed);
+        run.gate_calls = gate_calls_.load(std::memory_order_relaxed);
+        run.steps_finished = steps_finished_.load(std::memory_order_relaxed);
+        run.progress_calls = progress_calls_.load(std::memory_order_relaxed);
+        run.error_total = error_total_.load(std::memory_order_relaxed);
+        run.completed = completed_.load(std::memory_order_relaxed);
+        run.released = released_.load(std::memory_order_relaxed);
+        return run;
     }
 
 private:
@@ -575,15 +590,16 @@ private:
     void update(Update apply) noexcept {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            apply(run_);
+            apply(payload_);
         }
         changed_.notify_all();
     }
 
     static void RQ_CALL on_prepared(void* user_data, const rq_prepared* info) noexcept {
-        self(user_data).update([info](recorded_run& run) {
+        run_recorder& recorder = self(user_data);
+        recorder.update([&recorder, info](run_payload& run) {
             run.events.push_back(engine_event::prepared);
-            run.prepared = true;
+            recorder.prepared_.store(true, std::memory_order_relaxed);
             run.prepared_info = *info;
         });
     }
@@ -591,40 +607,50 @@ private:
     static std::uint32_t RQ_CALL on_step_starting(void* user_data,
                                                   const rq_step_start* info) noexcept {
         run_recorder& recorder = self(user_data);
-        recorder.update([](recorded_run& run) {
+        recorder.update([&recorder](run_payload& run) {
             run.events.push_back(engine_event::step_starting);
-            ++run.gate_calls;
+            recorder.gate_calls_.fetch_add(1, std::memory_order_relaxed);
         });
         if (recorder.partner_ != nullptr) {
             run_recorder& partner = *recorder.partner_;
-            partner.wait_until(
-                [&partner] { return partner.run_.prepared || partner.run_.completed; });
+            partner.wait_until([&partner] {
+                return partner.prepared_.load(std::memory_order_relaxed) ||
+                       partner.completed_.load(std::memory_order_relaxed);
+            });
         }
         return info->index == recorder.abort_at_ ? RQ_ACTION_ABORT : RQ_ACTION_CONTINUE;
     }
 
     static void RQ_CALL on_step_finished(void* user_data, const rq_step_result*) noexcept {
-        self(user_data).update([](recorded_run& run) {
+        run_recorder& recorder = self(user_data);
+        recorder.update([&recorder](run_payload& run) {
             run.events.push_back(engine_event::step_finished);
-            ++run.steps_finished;
+            recorder.steps_finished_.fetch_add(1, std::memory_order_relaxed);
         });
     }
 
     static void RQ_CALL on_progress(void* user_data, const rq_progress*) noexcept {
-        self(user_data).update([](recorded_run& run) { ++run.progress_calls; });
+        run_recorder& recorder = self(user_data);
+        recorder.update([&recorder](run_payload&) {
+            recorder.progress_calls_.fetch_add(1, std::memory_order_relaxed);
+        });
     }
 
     static void RQ_CALL on_errors(void* user_data, const rq_error_record*, std::uint32_t,
                                   std::uint64_t total_errors) noexcept {
-        self(user_data).update([total_errors](recorded_run& run) {
-            run.error_total = std::max(run.error_total, total_errors);
+        run_recorder& recorder = self(user_data);
+        recorder.update([&recorder, total_errors](run_payload&) {
+            recorder.error_total_.store(
+                std::max(recorder.error_total_.load(std::memory_order_relaxed), total_errors),
+                std::memory_order_relaxed);
         });
     }
 
     static void RQ_CALL on_completed(void* user_data, const rq_run_result* result) noexcept {
-        self(user_data).update([result](recorded_run& run) {
+        run_recorder& recorder = self(user_data);
+        recorder.update([&recorder, result](run_payload& run) {
             run.events.push_back(engine_event::completed);
-            run.completed = true;
+            recorder.completed_.store(true, std::memory_order_relaxed);
             run.result = *result;
             run.result.step_results = nullptr;
         });
@@ -645,9 +671,9 @@ private:
                 unfreed.emplace_back(freed.message());
             }
         }
-        recorder.update([&](recorded_run& run) {
+        recorder.update([&](run_payload& run) {
             run.events.push_back(engine_event::released);
-            run.released = true;
+            recorder.released_.store(true, std::memory_order_relaxed);
             run.released_bytes = released_bytes;
             run.release_ms = release_ms;
             run.private_usage_at_release = private_usage;
@@ -660,7 +686,15 @@ private:
     run_recorder* partner_ = nullptr;
     mutable std::mutex mutex_;
     std::condition_variable changed_;
-    recorded_run run_;
+    run_payload payload_;
+    // Written and read only under mutex_, which orders them, so every access is relaxed.
+    std::atomic<bool> prepared_{false};
+    std::atomic<std::uint32_t> gate_calls_{0};
+    std::atomic<std::uint32_t> steps_finished_{0};
+    std::atomic<std::uint32_t> progress_calls_{0};
+    std::atomic<std::uint64_t> error_total_{0};
+    std::atomic<bool> completed_{false};
+    std::atomic<bool> released_{false};
 };
 
 /** How the scripted affinity fails worker k_failing_worker's pin. */
@@ -678,7 +712,7 @@ enum class pin_failure {
  * region is allocated and locked, so the commit charge sampled in the failing pin includes the
  * whole region.
  */
-class scripted_affinity final : public IThreadAffinity {
+class scripted_affinity final : public thread_affinity {
 public:
     explicit scripted_affinity(pin_failure failure)
         : failure_(failure), real_(make_win32_thread_affinity()) {}
@@ -704,7 +738,7 @@ public:
 
 private:
     pin_failure failure_;
-    std::shared_ptr<IThreadAffinity> real_;
+    std::shared_ptr<thread_affinity> real_;
     std::atomic<std::uint64_t> private_usage_at_pin_{0};
 };
 
@@ -793,7 +827,7 @@ struct layer_handles {
 session_dependencies make_dependencies(address_capture& capture, layer_handles& layers,
                                        std::optional<rq_fault_spec> fault,
                                        std::shared_ptr<IClock> clock,
-                                       std::shared_ptr<IThreadAffinity> affinity) {
+                                       std::shared_ptr<thread_affinity> affinity) {
     session_dependencies dependencies;
     dependencies.clock = clock;
     dependencies.affinity = std::move(affinity);
@@ -847,9 +881,9 @@ void PrintTo(const plan_case& value, std::ostream* os) {
     *os << value.name;
 }
 
-class MemoryRegionPlan : public ::testing::TestWithParam<plan_case> {};
+class memory_region_plan : public ::testing::TestWithParam<plan_case> {};
 
-TEST_P(MemoryRegionPlan, SplitsSlicesIntoChunksRoundedToTwoMib) {
+TEST_P(memory_region_plan, SplitsSlicesIntoChunksRoundedToTwoMib) {
     const plan_case& expected = GetParam();
     const region_plan plan = plan_region(expected.region_bytes, expected.worker_count);
 
@@ -875,7 +909,7 @@ TEST_P(MemoryRegionPlan, SplitsSlicesIntoChunksRoundedToTwoMib) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    MemoryRegionPlanCases, MemoryRegionPlan,
+    MemoryRegionPlanCases, memory_region_plan,
     ::testing::Values(
         // 10240 / 12 = 853.3 MiB, rounded down to 852 MiB = 3 x 256 + 84 MiB.
         plan_case{"TenGibOverTwelveWorkers", 10 * k_gib, 12, 12, 852 * k_mib, 3, 84 * k_mib, 4},
@@ -907,9 +941,9 @@ void PrintTo(const retry_case& value, std::ostream* os) {
     *os << value.name;
 }
 
-class MemoryRegionRetry : public ::testing::TestWithParam<retry_case> {};
+class memory_region_retry : public ::testing::TestWithParam<retry_case> {};
 
-TEST_P(MemoryRegionRetry, ShrinksTenPercentRoundedToTheWorkerUnit) {
+TEST_P(memory_region_retry, ShrinksTenPercentRoundedToTheWorkerUnit) {
     const retry_case& expected = GetParam();
     EXPECT_EQ(next_retry_bytes(expected.attempted_bytes, expected.min_region_bytes,
                                expected.worker_count),
@@ -917,7 +951,7 @@ TEST_P(MemoryRegionRetry, ShrinksTenPercentRoundedToTheWorkerUnit) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    MemoryRegionRetryCases, MemoryRegionRetry,
+    MemoryRegionRetryCases, memory_region_retry,
     ::testing::Values(
         // 8 workers: unit 16 MiB. 1200 x 0.9 = 1080, rounded down to 1072 MiB.
         retry_case{"ShrinksTenPercent", 1200 * k_mib, k_gib, 8, 1072 * k_mib},
@@ -983,9 +1017,9 @@ void PrintTo(const allocation_case& value, std::ostream* os) {
     *os << value.name;
 }
 
-class MemoryRegionAllocate : public ::testing::TestWithParam<allocation_case> {};
+class memory_region_allocate : public ::testing::TestWithParam<allocation_case> {};
 
-TEST_P(MemoryRegionAllocate, LocksEveryChunkOfEverySliceAndReleasesThem) {
+TEST_P(memory_region_allocate, LocksEveryChunkOfEverySliceAndReleasesThem) {
     const allocation_case& request = GetParam();
     const region_plan expected = plan_region(request.region_bytes, request.worker_count);
     ASSERT_GT(expected.tested_bytes, 0u);
@@ -1063,7 +1097,7 @@ TEST_P(MemoryRegionAllocate, LocksEveryChunkOfEverySliceAndReleasesThem) {
     expect_limits_restored(limits_before, "after release()");
 }
 
-INSTANTIATE_TEST_SUITE_P(MemoryRegionAllocateCases, MemoryRegionAllocate,
+INSTANTIATE_TEST_SUITE_P(MemoryRegionAllocateCases, memory_region_allocate,
                          ::testing::Values(
                              // One 262 MiB slice: a full 256 MiB chunk and a 6 MiB final chunk.
                              allocation_case{"FullAndFinalChunkInOneSlice", 262 * k_mib, 1},
@@ -1176,9 +1210,9 @@ void PrintTo(const refusal_case& value, std::ostream* os) {
     *os << value.name;
 }
 
-class MemoryRegionRefusal : public ::testing::TestWithParam<refusal_case> {};
+class memory_region_refusal : public ::testing::TestWithParam<refusal_case> {};
 
-TEST_P(MemoryRegionRefusal, RefusesBeforeAnyAllocation) {
+TEST_P(memory_region_refusal, RefusesBeforeAnyAllocation) {
     const refusal_case& request = GetParam();
     stop_signal stop;
     lock_script script(0);
@@ -1198,7 +1232,7 @@ TEST_P(MemoryRegionRefusal, RefusesBeforeAnyAllocation) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    MemoryRegionRefusalCases, MemoryRegionRefusal,
+    MemoryRegionRefusalCases, memory_region_refusal,
     ::testing::Values(
         refusal_case{"NoTwoMibSlicePerWorker", 3 * k_mib, 2 * k_mib, 2,
                      "cannot give each of 2 workers a 2 MiB slice"},
@@ -1223,10 +1257,10 @@ void PrintTo(const physical_bound_case& value, std::ostream* os) {
     *os << value.name;
 }
 
-class MemoryRegionRefusalAbovePhysicalMemory
+class memory_region_refusal_above_physical_memory
     : public ::testing::TestWithParam<physical_bound_case> {};
 
-TEST_P(MemoryRegionRefusalAbovePhysicalMemory, RefusesBeforeReservingTheChunkList) {
+TEST_P(memory_region_refusal_above_physical_memory, RefusesBeforeReservingTheChunkList) {
     // The refusal makes one query and allocates nothing, so this limit is generous.
     constexpr long long k_refusal_limit_ms = 1000;
     const physical_bound_case& request = GetParam();
@@ -1283,7 +1317,7 @@ TEST_P(MemoryRegionRefusalAbovePhysicalMemory, RefusesBeforeReservingTheChunkLis
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    MemoryRegionRefusalAbovePhysicalMemoryCases, MemoryRegionRefusalAbovePhysicalMemory,
+    MemoryRegionRefusalAbovePhysicalMemoryCases, memory_region_refusal_above_physical_memory,
     ::testing::Values(
         // The largest plannable slice, 2^32 - 2 chunks of 256 MiB: nearly 1 EiB, whose chunk list
         // alone would need over 100 GiB.
@@ -1426,7 +1460,7 @@ public:
     /** Makes every later call free for real. */
     void stop_refusing() {
         std::lock_guard<std::mutex> lock(mutex_);
-        refusals_ = refused_;
+        refusals_.store(refused_.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
 
     free_function bind() {
@@ -1435,12 +1469,12 @@ public:
 
     std::uint32_t calls() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return calls_;
+        return calls_.load(std::memory_order_relaxed);
     }
 
     std::uint32_t refusals_made() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return refused_;
+        return refused_.load(std::memory_order_relaxed);
     }
 
     /** The chunk whose free is refused: the first one asked for; null before any call. */
@@ -1452,7 +1486,8 @@ public:
     /** Waits, for at most k_event_timeout, until count calls have been made. */
     bool wait_for_calls(std::uint32_t count) {
         std::unique_lock<std::mutex> lock(mutex_);
-        return called_.wait_for(lock, k_event_timeout, [&] { return calls_ >= count; });
+        return called_.wait_for(lock, k_event_timeout,
+                                [&] { return calls_.load(std::memory_order_relaxed) >= count; });
     }
 
 private:
@@ -1460,12 +1495,13 @@ private:
         bool refuse = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            ++calls_;
+            calls_.fetch_add(1, std::memory_order_relaxed);
             if (refused_base_ == nullptr) {
                 refused_base_ = address;
             }
-            if (address == refused_base_ && refused_ < refusals_) {
-                ++refused_;
+            if (address == refused_base_ && refused_.load(std::memory_order_relaxed) <
+                                                refusals_.load(std::memory_order_relaxed)) {
+                refused_.fetch_add(1, std::memory_order_relaxed);
                 refuse = true;
             }
         }
@@ -1479,11 +1515,13 @@ private:
         return VirtualFree(address, 0, MEM_RELEASE) != FALSE;
     }
 
-    std::uint32_t refusals_;
+    // The counts and the refusal limit stop_refusing() lowers are written and read only under
+    // mutex_, which orders them, so every access is relaxed.
+    std::atomic<std::uint32_t> refusals_;
     mutable std::mutex mutex_;
     std::condition_variable called_;
-    std::uint32_t calls_ = 0;
-    std::uint32_t refused_ = 0;
+    std::atomic<std::uint32_t> calls_{0};
+    std::atomic<std::uint32_t> refused_{0};
     const void* refused_base_ = nullptr;
 };
 
@@ -2026,7 +2064,7 @@ public:
     void stop() {
         {
             const std::lock_guard<std::mutex> lock(mutex_);
-            stop_ = true;
+            stop_.store(true, std::memory_order_relaxed);
         }
         changed_.notify_all();
         if (thread_.joinable()) {
@@ -2046,7 +2084,7 @@ public:
 private:
     void run() {
         std::unique_lock<std::mutex> lock(mutex_);
-        while (!stop_) {
+        while (!stop_.load(std::memory_order_relaxed)) {
             lock.unlock();
             const probe_clock::time_point begin = probe_clock::now();
             DWORD error = ERROR_SUCCESS;
@@ -2069,7 +2107,8 @@ private:
             }
             samples_.push_back(probe_sample{begin, end});
             changed_.notify_all();
-            changed_.wait_until(lock, begin + k_probe_interval, [this] { return stop_; });
+            changed_.wait_until(lock, begin + k_probe_interval,
+                                [this] { return stop_.load(std::memory_order_relaxed); });
         }
     }
 
@@ -2077,7 +2116,8 @@ private:
     std::condition_variable changed_;
     std::vector<probe_sample> samples_;
     DWORD failure_ = ERROR_SUCCESS;
-    bool stop_ = false;
+    // Written and read only under mutex_, which orders it, so every access is relaxed.
+    std::atomic<bool> stop_{false};
     std::thread thread_;
 };
 
@@ -2101,9 +2141,9 @@ std::int64_t whole_microseconds(probe_clock::duration duration) noexcept {
     return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
 }
 
-class MemoryRegionResponsiveness : public ::testing::TestWithParam<responsiveness_case> {};
+class memory_region_responsiveness : public ::testing::TestWithParam<responsiveness_case> {};
 
-TEST_P(MemoryRegionResponsiveness, AnotherThreadKeepsCommittingMemoryWhileTheRegionIsLocked) {
+TEST_P(memory_region_responsiveness, AnotherThreadKeepsCommittingMemoryWhileTheRegionIsLocked) {
     MEMORYSTATUSEX memory{};
     memory.dwLength = sizeof(memory);
     ASSERT_TRUE(GlobalMemoryStatusEx(&memory))
@@ -2193,7 +2233,7 @@ TEST_P(MemoryRegionResponsiveness, AnotherThreadKeepsCommittingMemoryWhileTheReg
     expect_limits_restored(limits_before, "after release() of the probed region");
 }
 
-INSTANTIATE_TEST_SUITE_P(MemoryRegionResponsivenessCases, MemoryRegionResponsiveness,
+INSTANTIATE_TEST_SUITE_P(MemoryRegionResponsivenessCases, memory_region_responsiveness,
                          ::testing::Values(responsiveness_case::one_worker,
                                            responsiveness_case::every_logical_processor),
                          [](const ::testing::TestParamInfo<responsiveness_case>& info) {
@@ -2230,15 +2270,17 @@ public:
         return [this](void* address, std::size_t bytes) { return lock(address, bytes); };
     }
 
-    std::uint32_t calls() const noexcept { return calls_; }
+    std::uint32_t calls() const noexcept { return calls_.load(std::memory_order_relaxed); }
 
     /** Chunks VirtualLock locked for real. */
-    std::uint32_t real_locks() const noexcept { return real_locks_; }
+    std::uint32_t real_locks() const noexcept {
+        return real_locks_.load(std::memory_order_relaxed);
+    }
 
 private:
     bool lock(void* address, std::size_t bytes) noexcept {
         capture_.record(address);
-        ++calls_;
+        calls_.fetch_add(1, std::memory_order_relaxed);
         bool fail = true;
         if (attempt_ < attempt_chunks_.size()) {
             ++chunk_in_attempt_;
@@ -2250,7 +2292,7 @@ private:
         }
         if (!fail) {
             if (VirtualLock(address, bytes) != FALSE) {
-                ++real_locks_;
+                real_locks_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
             // A real failure ends the attempt as well, so the next call starts the next one;
@@ -2268,8 +2310,10 @@ private:
     address_capture& capture_;
     std::size_t attempt_ = 0;
     std::uint32_t chunk_in_attempt_ = 0;
-    std::uint32_t calls_ = 0;
-    std::uint32_t real_locks_ = 0;
+    // Counted on the coordinator and read by the test once session_destroy has joined it, which
+    // orders them, so every access is relaxed.
+    std::atomic<std::uint32_t> calls_{0};
+    std::atomic<std::uint32_t> real_locks_{0};
 };
 
 /** The ways a session can end. */
@@ -2379,9 +2423,9 @@ void PrintTo(end_scenario scenario, std::ostream* os) {
     *os << spec_for(scenario).name;
 }
 
-class MemoryRegionEndReason : public ::testing::TestWithParam<end_scenario> {};
+class memory_region_end_reason : public ::testing::TestWithParam<end_scenario> {};
 
-TEST_P(MemoryRegionEndReason, ReleasesEveryChunkBeforeReleasedIsRaised) {
+TEST_P(memory_region_end_reason, ReleasesEveryChunkBeforeReleasedIsRaised) {
     const scenario_spec spec = spec_for(GetParam());
     const std::string reason = end_reason_name(spec.end_reason);
     const std::uint32_t workers = session_worker_count();
@@ -2596,7 +2640,7 @@ TEST_P(MemoryRegionEndReason, ReleasesEveryChunkBeforeReleasedIsRaised) {
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(MemoryRegionEndReasons, MemoryRegionEndReason,
+INSTANTIATE_TEST_SUITE_P(MemoryRegionEndReasons, memory_region_end_reason,
                          ::testing::Values(end_scenario::completed, end_scenario::user_stop,
                                            end_scenario::first_error, end_scenario::thermal,
                                            end_scenario::insufficient_memory,

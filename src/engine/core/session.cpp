@@ -270,7 +270,7 @@ std::shared_ptr<IClock> clock_or_default(std::shared_ptr<IClock> clock) {
     return std::make_shared<qpc_clock>();
 }
 
-std::shared_ptr<IThreadAffinity> affinity_or_default(std::shared_ptr<IThreadAffinity> affinity) {
+std::shared_ptr<thread_affinity> affinity_or_default(std::shared_ptr<thread_affinity> affinity) {
     if (affinity) {
         return affinity;
     }
@@ -509,7 +509,7 @@ struct session::state {
 
     // Seams, kept for the session's lifetime.
     std::shared_ptr<IClock> clock_;
-    std::shared_ptr<IThreadAffinity> affinity_;
+    std::shared_ptr<thread_affinity> affinity_;
     free_function free_override_;
     lock_function lock_override_;
 
@@ -534,11 +534,12 @@ struct session::state {
     // The coordinator's thread id while it runs, 0 otherwise; never 0 for a live thread.
     std::atomic<DWORD> coordinator_tid_{0};
 
-    // Guards started_, shut_down_ and coordinator_, so the std::thread is never read while it
-    // is being assigned.
+    // Guards the lifecycle transition and the coordinator_ thread object, so the std::thread is
+    // never read while it is being assigned. started_ and shut_down_ are atomic storage, as every
+    // shared flag is, and are read and written only under this mutex, which orders them.
     std::mutex lifecycle_mutex_;
-    bool started_ = false;
-    bool shut_down_ = false;
+    std::atomic<bool> started_{false};
+    std::atomic<bool> shut_down_{false};
     std::thread coordinator_;
 };
 
@@ -609,12 +610,12 @@ session::state::state(const rq_session_config& config, const rq_callbacks& callb
 
 rq_result session::state::start() {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    if (started_ || shut_down_) {
+    if (started_.load(std::memory_order_relaxed) || shut_down_.load(std::memory_order_relaxed)) {
         return RQ_E_INVALID_STATE;
     }
     // Set before the attempt: start is allowed once whatever its outcome, so a failed thread
     // creation leaves a session that can only be destroyed and never raises a callback.
-    started_ = true;
+    started_.store(true, std::memory_order_relaxed);
     try {
         coordinator_ = std::thread([this]() noexcept { coordinator_main(); });
     } catch (const std::system_error&) {
@@ -668,7 +669,7 @@ void session::state::shutdown() {
     std::thread coordinator;
     {
         std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-        shut_down_ = true;
+        shut_down_.store(true, std::memory_order_relaxed);
         // First writer wins, so an end reason recorded earlier is kept.
         stop_.request(RQ_END_USER_STOP, 0, "Session destroyed by host");
         // The callback in flight, if any, returns normally; nothing new is raised after it.

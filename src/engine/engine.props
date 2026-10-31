@@ -62,6 +62,11 @@
       selected it. It also keeps engine_core.lib linkable into both DLLs and the test exe.
     -->
     <WholeProgramOptimization>false</WholeProgramOptimization>
+    <!--
+      /guard:cf on the link of both DLLs and the test exe, so the loader enforces the CFG
+      bitmap the compiler emits (see ControlFlowGuard below); engine_core.lib has no link step.
+    -->
+    <LinkControlFlowGuard>true</LinkControlFlowGuard>
 
     <!--
       One output folder per configuration for all four projects: engine_core.lib,
@@ -85,6 +90,15 @@
         violations, in-page errors) must terminate the process, never be swallowed.
       -->
       <ExceptionHandling>Sync</ExceptionHandling>
+      <!--
+        /guard:cf and /sdl: defence in depth for native code running in an elevated process.
+        CFG checks only indirect calls, which the step runner makes once per 1 MiB work group or
+        4 KiB block through the kernel table, never inside a kernel's inner loop. The warnings
+        /sdl promotes are already errors under /W4 /WX; it adds strict /GS, sanitising of deleted
+        pointers and nulling of pointer members before a user-defined constructor runs.
+      -->
+      <ControlFlowGuard>Guard</ControlFlowGuard>
+      <SDLCheck>true</SDLCheck>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <!-- The x64 SSE2 baseline; only the two kernel files override it (see the contract). -->
       <EnableEnhancedInstructionSet>NotSet</EnableEnhancedInstructionSet>

@@ -92,7 +92,7 @@ struct session_dependencies {
      * it concurrently from every worker thread during preparation, so it must be thread-safe.
      * Shared ownership keeps it alive for the session's lifetime.
      */
-    std::shared_ptr<IThreadAffinity> affinity;
+    std::shared_ptr<thread_affinity> affinity;
 
     /**
      * Frees each chunk of the session's region in place of VirtualFree(MEM_RELEASE); empty, as

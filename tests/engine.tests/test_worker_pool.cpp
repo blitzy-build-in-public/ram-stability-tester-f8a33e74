@@ -8,11 +8,11 @@
  * - WorkerPoolPinning: with every placement, each worker pins itself on its own thread, then runs
  *   its task on exactly its placement's processor, with only that processor in its group
  *   affinity, at THREAD_PRIORITY_BELOW_NORMAL.
- * - WorkerPoolHalfMode: an active_set::even phase runs exactly the even-indexed workers, the odd
+ * - worker_pool_half_mode: an active_set::even phase runs exactly the even-indexed workers, the odd
  *   partners sleep through it and run the next all-thread phase.
- * - WorkerPoolAffinityFailure: a pin failure injected through the affinity seam ends start() with
- *   affinity_failed, the failing worker's placement and its Windows error, after which no phase
- *   can run and every worker thread has been joined.
+ * - worker_pool_affinity_failure: a pin failure injected through the affinity seam ends start()
+ *   with affinity_failed, the failing worker's placement and its Windows error, after which no
+ *   phase can run and every worker thread has been joined.
  * - WorkerPoolStop: phases posted after a stop, and phases running when one arrives, end within
  *   the 2 s stop bound; start() reports a pending stop; shutdown() is idempotent and closes every
  *   thread handle.
@@ -145,7 +145,7 @@ std::string describe(const pool_start_result& result) {
  * Thread-safe: workers call pin() concurrently, each touching only its own slots. Read the
  * records once start() has returned, whose wait for every worker orders them before the read.
  */
-class failing_affinity final : public IThreadAffinity {
+class failing_affinity final : public thread_affinity {
 public:
     failing_affinity(std::uint32_t worker_count, std::uint32_t fail_worker,
                      std::uint32_t fail_error)
@@ -275,19 +275,20 @@ void observe_current_thread(worker_observation& seen) noexcept {
  * ------------------------------------------------------------------------------------------- */
 
 /**
- * Every callback a session raised, counted under one lock. Callbacks run on the coordinator,
- * the test thread waits for Released, and the lock orders the two.
+ * Every callback a session raised. Callbacks run on the coordinator and the test thread waits
+ * for Released. The shared counters are atomic, yet still changed and read under one lock, which
+ * orders them with the payload and keeps the wait from missing Released's notification.
  */
 struct session_events {
     std::mutex lock;
     std::condition_variable changed;
-    std::uint32_t prepared = 0;
-    std::uint32_t step_starting = 0;
-    std::uint32_t step_finished = 0;
-    std::uint32_t progress = 0;
-    std::uint32_t error_batches = 0;
-    std::uint32_t completed = 0;
-    std::uint32_t released = 0;
+    std::atomic<std::uint32_t> prepared{0U};
+    std::atomic<std::uint32_t> step_starting{0U};
+    std::atomic<std::uint32_t> step_finished{0U};
+    std::atomic<std::uint32_t> progress{0U};
+    std::atomic<std::uint32_t> error_batches{0U};
+    std::atomic<std::uint32_t> completed{0U};
+    std::atomic<std::uint32_t> released{0U};
     /** The header delivered with Completed; its step_results pointer is never dereferenced. */
     rq_run_result result{};
     std::uint64_t released_bytes = 0;
@@ -300,7 +301,7 @@ session_events& events_of(void* user_data) noexcept {
 void RQ_CALL record_prepared(void* user_data, const rq_prepared*) noexcept {
     session_events& events = events_of(user_data);
     const std::lock_guard hold(events.lock);
-    ++events.prepared;
+    events.prepared.fetch_add(1U, std::memory_order_relaxed);
 }
 
 /**
@@ -310,34 +311,34 @@ void RQ_CALL record_prepared(void* user_data, const rq_prepared*) noexcept {
 std::uint32_t RQ_CALL record_step_starting(void* user_data, const rq_step_start*) noexcept {
     session_events& events = events_of(user_data);
     const std::lock_guard hold(events.lock);
-    ++events.step_starting;
+    events.step_starting.fetch_add(1U, std::memory_order_relaxed);
     return RQ_ACTION_ABORT;
 }
 
 void RQ_CALL record_step_finished(void* user_data, const rq_step_result*) noexcept {
     session_events& events = events_of(user_data);
     const std::lock_guard hold(events.lock);
-    ++events.step_finished;
+    events.step_finished.fetch_add(1U, std::memory_order_relaxed);
 }
 
 void RQ_CALL record_progress(void* user_data, const rq_progress*) noexcept {
     session_events& events = events_of(user_data);
     const std::lock_guard hold(events.lock);
-    ++events.progress;
+    events.progress.fetch_add(1U, std::memory_order_relaxed);
 }
 
 void RQ_CALL record_errors(void* user_data, const rq_error_record*, std::uint32_t,
                            std::uint64_t) noexcept {
     session_events& events = events_of(user_data);
     const std::lock_guard hold(events.lock);
-    ++events.error_batches;
+    events.error_batches.fetch_add(1U, std::memory_order_relaxed);
 }
 
 void RQ_CALL record_completed(void* user_data, const rq_run_result* result) noexcept {
     session_events& events = events_of(user_data);
     {
         const std::lock_guard hold(events.lock);
-        ++events.completed;
+        events.completed.fetch_add(1U, std::memory_order_relaxed);
         events.result = *result;
     }
     events.changed.notify_all();
@@ -348,7 +349,7 @@ void RQ_CALL record_released(void* user_data, std::uint64_t released_bytes,
     session_events& events = events_of(user_data);
     {
         const std::lock_guard hold(events.lock);
-        ++events.released;
+        events.released.fetch_add(1U, std::memory_order_relaxed);
         events.released_bytes = released_bytes;
     }
     events.changed.notify_all();
@@ -499,7 +500,7 @@ TEST(WorkerPoolPinning, EveryWorkerRunsOnlyOnItsOwnProcessorAtBelowNormalPriorit
 }
 
 /* ---------------------------------------------------------------------------------------------
- * WorkerPoolHalfMode
+ * worker_pool_half_mode
  * ------------------------------------------------------------------------------------------- */
 
 /** Fixed Half-mode worker counts: a lone even worker, one pair, a pair plus an unpaired worker. */
@@ -528,9 +529,9 @@ std::vector<std::uint32_t> half_mode_worker_counts() {
  * Worker count of a Half-mode case; 0 stands for every placement of the machine. Only counts the
  * machine has are registered.
  */
-class WorkerPoolHalfMode : public ::testing::TestWithParam<std::uint32_t> {};
+class worker_pool_half_mode : public ::testing::TestWithParam<std::uint32_t> {};
 
-TEST_P(WorkerPoolHalfMode, EvenPhaseRunsExactlyTheEvenWorkersAndTheOddPartnersRunTheNextPhase) {
+TEST_P(worker_pool_half_mode, EvenPhaseRunsExactlyTheEvenWorkersAndTheOddPartnersRunTheNextPhase) {
     const std::vector<logical_processor> placements = machine_placements();
     const auto available = static_cast<std::uint32_t>(placements.size());
     const std::uint32_t count = GetParam() == 0U ? available : GetParam();
@@ -588,7 +589,7 @@ TEST_P(WorkerPoolHalfMode, EvenPhaseRunsExactlyTheEvenWorkersAndTheOddPartnersRu
     EXPECT_FALSE(stop.stop_requested());
 }
 
-INSTANTIATE_TEST_SUITE_P(WorkerPoolSizes, WorkerPoolHalfMode,
+INSTANTIATE_TEST_SUITE_P(WorkerPoolSizes, worker_pool_half_mode,
                          ::testing::ValuesIn(half_mode_worker_counts()),
                          [](const ::testing::TestParamInfo<std::uint32_t>& info) {
                              return info.param == 0U
@@ -597,7 +598,7 @@ INSTANTIATE_TEST_SUITE_P(WorkerPoolSizes, WorkerPoolHalfMode,
                          });
 
 /* ---------------------------------------------------------------------------------------------
- * WorkerPoolAffinityFailure
+ * worker_pool_affinity_failure
  * ------------------------------------------------------------------------------------------- */
 
 /** Which worker's pin fails. */
@@ -608,9 +609,9 @@ enum class failing_worker : std::uint32_t {
     last,
 };
 
-class WorkerPoolAffinityFailure : public ::testing::TestWithParam<failing_worker> {};
+class worker_pool_affinity_failure : public ::testing::TestWithParam<failing_worker> {};
 
-TEST_P(WorkerPoolAffinityFailure, StartReportsTheFailingPlacementAndErrorAndNoPhaseCanRun) {
+TEST_P(worker_pool_affinity_failure, StartReportsTheFailingPlacementAndErrorAndNoPhaseCanRun) {
     const std::vector<logical_processor> placements = machine_placements();
     const auto count = static_cast<std::uint32_t>(placements.size());
     const std::uint32_t fail =
@@ -662,7 +663,7 @@ TEST_P(WorkerPoolAffinityFailure, StartReportsTheFailingPlacementAndErrorAndNoPh
     EXPECT_TRUE(no_handle_leak(handles_before, "after shutdown"));
 }
 
-INSTANTIATE_TEST_SUITE_P(WorkerPoolFailingWorker, WorkerPoolAffinityFailure,
+INSTANTIATE_TEST_SUITE_P(WorkerPoolFailingWorker, worker_pool_affinity_failure,
                          ::testing::Values(failing_worker::second, failing_worker::last),
                          [](const ::testing::TestParamInfo<failing_worker>& info) {
                              return info.param == failing_worker::second
@@ -983,8 +984,9 @@ TEST(WorkerPoolSession, AffinityFailureEndsTheRunWithoutTrafficAndReleasesItsMem
     ASSERT_EQ(session_start(session.get()), RQ_OK);
     {
         std::unique_lock hold(events.lock);
-        ASSERT_TRUE(events.changed.wait_for(hold, k_session_timeout,
-                                            [&events] { return events.released > 0U; }))
+        ASSERT_TRUE(events.changed.wait_for(
+            hold, k_session_timeout,
+            [&events] { return events.released.load(std::memory_order_relaxed) > 0U; }))
             << "Released did not arrive within " << k_session_timeout.count() << " s";
     }
 
@@ -999,13 +1001,15 @@ TEST(WorkerPoolSession, AffinityFailureEndsTheRunWithoutTrafficAndReleasesItsMem
 
     // No callback runs once the session is destroyed, so the record is final.
     const std::lock_guard hold(events.lock);
-    EXPECT_EQ(events.prepared, 0U) << "Prepared was raised although a worker was never pinned";
-    EXPECT_EQ(events.step_starting, 0U) << "a step gate was raised after the pin failure";
-    EXPECT_EQ(events.step_finished, 0U);
-    EXPECT_EQ(events.progress, 0U);
-    EXPECT_EQ(events.error_batches, 0U);
-    EXPECT_EQ(events.completed, 1U);
-    EXPECT_EQ(events.released, 1U);
+    EXPECT_EQ(events.prepared.load(std::memory_order_relaxed), 0U)
+        << "Prepared was raised although a worker was never pinned";
+    EXPECT_EQ(events.step_starting.load(std::memory_order_relaxed), 0U)
+        << "a step gate was raised after the pin failure";
+    EXPECT_EQ(events.step_finished.load(std::memory_order_relaxed), 0U);
+    EXPECT_EQ(events.progress.load(std::memory_order_relaxed), 0U);
+    EXPECT_EQ(events.error_batches.load(std::memory_order_relaxed), 0U);
+    EXPECT_EQ(events.completed.load(std::memory_order_relaxed), 1U);
+    EXPECT_EQ(events.released.load(std::memory_order_relaxed), 1U);
 
     const rq_run_result& result = events.result;
     EXPECT_EQ(result.end_reason, RQ_END_AFFINITY_FAILED);

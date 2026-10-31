@@ -659,8 +659,8 @@ bool hold_clock::wait_for_stop(const stop_signal& signal, std::uint64_t timeout_
     std::uint32_t step = 0;
     {
         const std::lock_guard<std::mutex> lock(arm_mutex_);
-        if (armed_) {
-            armed_ = false;
+        if (armed_.load(std::memory_order_relaxed)) {
+            armed_.store(false, std::memory_order_relaxed);
             entering = true;
             step = armed_step_;
         }
@@ -690,15 +690,15 @@ bool hold_clock::wait_for_stop(const stop_signal& signal, std::uint64_t timeout_
 void hold_clock::note_pre_hold_fence(std::uint32_t step_index, std::uint32_t pass_index) {
     const std::uint64_t key = set_key(step_index, pass_index);
     const std::lock_guard<std::mutex> lock(arm_mutex_);
-    if (!counting_ || counting_key_ != key) {
-        counting_ = true;
+    if (!counting_.load(std::memory_order_relaxed) || counting_key_ != key) {
+        counting_.store(true, std::memory_order_relaxed);
         counting_key_ = key;
-        fence_count_ = 0;
+        fence_count_.store(0, std::memory_order_relaxed);
     }
-    ++fence_count_;
+    const std::uint64_t counted = fence_count_.fetch_add(1, std::memory_order_relaxed) + 1;
     // Equality, not >=, so the hold arms once even if a caller fences the same key again.
-    if (fence_count_ == fences_per_hold_) {
-        armed_ = true;
+    if (counted == fences_per_hold_) {
+        armed_.store(true, std::memory_order_relaxed);
         armed_step_ = step_index;
     }
 }

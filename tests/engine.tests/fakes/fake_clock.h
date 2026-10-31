@@ -168,9 +168,11 @@ public:
         if (!seen_.insert(key).second || per_pass_ns_.empty()) {
             return;
         }
-        clock_.advance(per_pass_ns_[next_entry_]);
-        if (next_entry_ + 1 < per_pass_ns_.size()) {
-            ++next_entry_;
+        // Relaxed: mutex_ orders every access to the cursor.
+        const size_t entry = next_entry_.load(std::memory_order_relaxed);
+        clock_.advance(per_pass_ns_[entry]);
+        if (entry + 1 < per_pass_ns_.size()) {
+            next_entry_.store(entry + 1, std::memory_order_relaxed);
         }
     }
 
@@ -185,7 +187,9 @@ private:
     const std::vector<uint64_t> per_pass_ns_;
     // Guarded by mutex_.
     std::unordered_set<uint64_t> seen_;
-    size_t next_entry_ = 0;
+    // Atomic storage, still read and advanced only under mutex_, so that script entries are
+    // consumed in first-seen order.
+    std::atomic<size_t> next_entry_{0};
     mutable std::mutex mutex_;
 };
 

@@ -161,7 +161,7 @@ uint32_t win32_thread_affinity::pin([[maybe_unused]] uint32_t worker_index, uint
     return 0;
 }
 
-std::shared_ptr<IThreadAffinity> make_win32_thread_affinity() {
+std::shared_ptr<thread_affinity> make_win32_thread_affinity() {
     return std::make_shared<win32_thread_affinity>();
 }
 
@@ -186,7 +186,7 @@ struct worker_pool::impl {
         uint32_t pin_error = 0;
         uint32_t priority_error = 0;
         /** Set under lock when the worker's loop ended on a C++ exception; see depart(). */
-        bool departed = false;
+        std::atomic<bool> departed{false};
     };
 
     static DWORD WINAPI thread_entry(void* context);
@@ -198,7 +198,7 @@ struct worker_pool::impl {
     void depart(worker_slot& slot, uint64_t seen_generation) noexcept;
     void request_internal_fault(const char* detail) noexcept;
 
-    IThreadAffinity* affinity = nullptr;
+    thread_affinity* affinity = nullptr;
     stop_signal* stop = nullptr;
 
     /** Sized once in start(), before any thread exists, so slot addresses stay valid. */
@@ -220,12 +220,14 @@ struct worker_pool::impl {
     /** wait_phase() waits here until remaining reaches 0. */
     CONDITION_VARIABLE done_cv = CONDITION_VARIABLE_INIT;
 
-    // Guarded by lock.
+    // Guarded by lock. generation, exit_requested and ready_count, like worker_slot::departed,
+    // are atomic storage, as every shared counter and flag is, while the lock still orders them
+    // against the condition-variable predicates, so each access under it is relaxed.
     phase_task task;
     active_set phase_set = active_set::all;
-    uint64_t generation = 0;
-    bool exit_requested = false;
-    uint32_t ready_count = 0;
+    std::atomic<uint64_t> generation{0};
+    std::atomic<bool> exit_requested{false};
+    std::atomic<uint32_t> ready_count{0};
 
     /**
      * Active workers that have not finished the posted phase. Decremented outside the lock with
@@ -284,8 +286,7 @@ uint32_t worker_pool::impl::prepare_worker(worker_slot& slot) noexcept {
     srw_exclusive hold(lock);
     slot.pin_error = pin_error;
     slot.priority_error = priority_error;
-    ++ready_count;
-    if (ready_count == slots.size()) {
+    if (ready_count.fetch_add(1, std::memory_order_relaxed) + 1 == slots.size()) {
         WakeAllConditionVariable(&ready_cv);
     }
     return pin_error;
@@ -312,13 +313,14 @@ void worker_pool::impl::run_phases(const worker_slot& slot, bool pinned,
         active_set posted_set = active_set::all;
         {
             srw_exclusive hold(lock);
-            while (!exit_requested && generation == seen_generation) {
+            while (!exit_requested.load(std::memory_order_relaxed) &&
+                   generation.load(std::memory_order_relaxed) == seen_generation) {
                 sleep_on(work_cv, lock);
             }
-            if (exit_requested) {
+            if (exit_requested.load(std::memory_order_relaxed)) {
                 return;
             }
-            seen_generation = generation;
+            seen_generation = generation.load(std::memory_order_relaxed);
             posted_set = phase_set;
             // The task object stays in place until the next post_phase, which cannot happen
             // before this worker has finished it, or until shutdown, which joins this thread.
@@ -361,8 +363,10 @@ void worker_pool::impl::finish_share() noexcept {
  */
 void worker_pool::impl::depart(worker_slot& slot, uint64_t seen_generation) noexcept {
     srw_exclusive hold(lock);
-    slot.departed = true;
-    if (!exit_requested && generation != seen_generation && is_active(phase_set, slot.index) &&
+    slot.departed.store(true, std::memory_order_relaxed);
+    if (!exit_requested.load(std::memory_order_relaxed) &&
+        generation.load(std::memory_order_relaxed) != seen_generation &&
+        is_active(phase_set, slot.index) &&
         remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         WakeAllConditionVariable(&done_cv);
     }
@@ -380,7 +384,7 @@ worker_pool::~worker_pool() {
 }
 
 pool_start_result worker_pool::start(std::span<const logical_processor> placements, uint32_t count,
-                                     IThreadAffinity& affinity, stop_signal& stop) {
+                                     thread_affinity& affinity, stop_signal& stop) {
     impl& pool = *impl_;
     if (pool.start_called) {
         throw std::logic_error("worker_pool::start may be called only once");
@@ -392,8 +396,9 @@ pool_start_result worker_pool::start(std::span<const logical_processor> placemen
 
     // Everything that can throw is allocated before the first thread exists, so a throw here
     // leaves no thread running. Slots are sized once and never resized: their addresses are the
-    // thread parameters.
-    pool.slots.resize(count);
+    // thread parameters. Assigned rather than resized: an atomic member makes a slot neither
+    // copyable nor movable, and the assignment only takes over the new buffer.
+    pool.slots = std::vector<impl::worker_slot>(count);
     pool.threads.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
         pool.slots[i].pool = &pool;
@@ -422,7 +427,7 @@ pool_start_result worker_pool::start(std::span<const logical_processor> placemen
 
     try {
         srw_exclusive hold(pool.lock);
-        while (pool.ready_count < count) {
+        while (pool.ready_count.load(std::memory_order_relaxed) < count) {
             sleep_on(pool.ready_cv, pool.lock);
         }
     } catch (...) {
@@ -478,7 +483,7 @@ void worker_pool::post_phase(phase_task task, active_set set) {
         srw_exclusive hold(pool.lock);
         uint32_t active = 0;
         for (const impl::worker_slot& slot : pool.slots) {
-            if (!slot.departed && is_active(set, slot.index)) {
+            if (!slot.departed.load(std::memory_order_relaxed) && is_active(set, slot.index)) {
                 ++active;
             }
         }
@@ -487,7 +492,7 @@ void worker_pool::post_phase(phase_task task, active_set set) {
         // Workers read remaining only after taking the new generation under this lock, so the
         // count is in place before any of them can decrement it.
         pool.remaining.store(active, std::memory_order_relaxed);
-        ++pool.generation;
+        pool.generation.fetch_add(1, std::memory_order_relaxed);
     }
     WakeAllConditionVariable(&pool.work_cv);
 }
@@ -563,7 +568,7 @@ void worker_pool::shutdown() noexcept {
     impl& pool = *impl_;
     {
         srw_exclusive hold(pool.lock);
-        pool.exit_requested = true;
+        pool.exit_requested.store(true, std::memory_order_relaxed);
     }
     WakeAllConditionVariable(&pool.work_cv);
 
