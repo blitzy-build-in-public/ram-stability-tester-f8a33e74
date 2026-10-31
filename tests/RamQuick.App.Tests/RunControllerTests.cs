@@ -3284,6 +3284,136 @@ public sealed class RunControllerTests
             character => CharUnicodeInfo.GetUnicodeCategory(character) is UnicodeCategory.Control or UnicodeCategory.Format);
     }
 
+    // A fault's runtime text is shown as one line of plain text, as a journal step name is: a forged line break must
+    // not put a line beside the ABORTED badge or under the notice, and an escape, a NUL, a bidirectional control or a
+    // line separator must not hide, cut or reorder the text. Each replaced character is one space, as in the text
+    // summary. A run's persisted detail is that same line: the state machine's, which the VERDICT line writes, the
+    // result record's and both summaries' state what the window shows, and no .log line begins with the forged text.
+    // Redaction comes first: the other account's folder name ends at the line break and is redacted alone, and the
+    // forged text after it is kept. It comes last too: the user name followed by an escape is redacted once the
+    // escape is a space, as every persisted copy redacts it.
+    [Theory]
+    [InlineData("CallbackFault")]
+    [InlineData("JournalFailure")]
+    [InlineData("SessionStart")]
+    [InlineData("EngineFaultDetail")]
+    [InlineData("QuerySystem")]
+    public void DisplayedFailure_TextHoldsLineBreaksAndControls_ShowsAndPersistsOneLineOfPlainText(string failurePoint)
+    {
+        const string OneLine =
+            @"QA sink boom at '%LOCALAPPDATA%\RamQuick\x.tmp' after C:\Users\<user>  "
+            + @"2026-01-01T00:00:00Z APP_ERROR source=""Forged""  [31m   done in D:\share\<user> [0m";
+        const string ForgedLine = "2026-01-01T00:00:00Z APP_ERROR";
+        using var harness = new ControllerHarness();
+        harness.UseStalledJournal();
+        string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string message = "QA sink boom at '" + Path.Combine(localAppData, "RamQuick", "x.tmp") + "'"
+            + @" after C:\Users\Alice Smith" + "\r\n"
+            + ForgedLine + " source=\"Forged\" \u001b[31m\u0000\u202E\u2028done"
+            + @" in D:\share\" + Environment.UserName + "\u001b[0m";
+        string expected;
+        string? persisted;
+        string displayed;
+        switch (failurePoint)
+        {
+            case "CallbackFault":
+                harness.Initialize();
+                harness.StartAccepted();
+                harness.Prepare();
+                harness.Session.InvokeCallbackFault("on_progress", new InvalidOperationException(message));
+                harness.Session.CompleteWithFirstRecordedReason();
+                harness.AwaitVerdict();
+                Assert.Equal(RunEndReason.HostFault, harness.StateMachine.EndReason);
+                expected = UiText.HostFault(OneLine);
+                persisted = expected;
+                displayed = harness.Controller.ResultMessage!;
+                harness.Release(TimeSpan.FromMilliseconds(100));
+                break;
+
+            case "JournalFailure":
+                harness.Initialize();
+                FakeEngineSession session = harness.StartAccepted();
+                harness.Prepare();
+                ProgressJournal journal = Assert.Single(harness.Journals);
+                harness.Storage!.FailNext("stepEnd", new IOException(message));
+                session.RaiseStepFinished(0);
+                harness.RunUntil(() => journal.Failure is not null);
+                StepAttributes next = session.Options.Steps[1];
+                session.PublishProgress(FakeEngineData.Progress(
+                    next.Index,
+                    session.Options.Steps.Count,
+                    next.Name,
+                    TimeSpan.FromSeconds(45),
+                    TimeSpan.FromSeconds(255),
+                    2 * GiB,
+                    session.Options.RegionBytes,
+                    0));
+                harness.RunUntil(() => session.StopRequests.Count > 0);
+                session.CompleteWithFirstRecordedReason();
+                harness.AwaitVerdict();
+                Assert.Equal(RunEndReason.HostFault, harness.StateMachine.EndReason);
+                expected = UiText.JournalWriteFailed(OneLine);
+                persisted = expected;
+                displayed = harness.Controller.ResultMessage!;
+                harness.Release(TimeSpan.FromMilliseconds(100));
+                break;
+
+            case "SessionStart":
+                harness.Engine.StartException = new IOException(message);
+                harness.Initialize();
+                Assert.Equal(StartResult.Accepted, harness.TryStart());
+                harness.WaitForPublication();
+                Assert.Equal(RunEndReason.EngineFault, harness.StateMachine.EndReason);
+                expected = UiText.EngineError(OneLine);
+                persisted = OneLine;
+                displayed = harness.Controller.ResultMessage!;
+                break;
+
+            case "EngineFaultDetail":
+                harness.Initialize();
+                harness.StartAccepted();
+                harness.Prepare();
+                harness.Complete(RunEndReason.EngineFault, endDetail: message);
+                Assert.Equal(RunEndReason.EngineFault, harness.StateMachine.EndReason);
+                expected = UiText.EngineError(OneLine);
+                persisted = OneLine;
+                displayed = harness.Controller.ResultMessage!;
+                harness.Release(TimeSpan.FromMilliseconds(100));
+                break;
+
+            default:
+                harness.Initialize();
+                harness.Engine.QuerySystemException = new InvalidOperationException(message);
+                Assert.Equal(StartResult.Accepted, harness.TryStart());
+                Assert.Equal(StartResult.EngineUnavailable, harness.AwaitResult(harness.Controller.StartTask));
+                expected = UiText.EngineError(OneLine);
+                persisted = null;
+                displayed = harness.Controller.NoticeMessage!;
+                break;
+        }
+
+        Assert.Equal(expected, displayed);
+        Assert.DoesNotContain(
+            displayed,
+            character => CharUnicodeInfo.GetUnicodeCategory(character) is UnicodeCategory.Control
+                or UnicodeCategory.Format
+                or UnicodeCategory.LineSeparator
+                or UnicodeCategory.ParagraphSeparator);
+        Assert.DoesNotContain(profile, displayed, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Alice", displayed, StringComparison.OrdinalIgnoreCase);
+        if (persisted is null)
+        {
+            return;
+        }
+
+        Assert.Equal(persisted, harness.StateMachine.EndDetail);
+        AssertPublishedEndDetail(harness, persisted);
+        Assert.DoesNotContain(
+            harness.LogText().Split('\r', '\n'),
+            line => line.StartsWith(ForgedLine, StringComparison.Ordinal));
+    }
+
     [Fact]
     public void InitializeAsync_JournalEndsBeforeFirstStep_FailsWithPreparingMessage()
     {

@@ -2171,7 +2171,7 @@ public sealed partial class RunController : ObservableObject, IDisposable
             // An end the current state cannot take, such as Completed before Prepared, breaks the engine's event
             // contract; the run still ends, as an engine fault, so the state machine never stays in progress.
             string detail = conclusion.EndDetail ?? conclusion.EndReason.ToString();
-            if (!StateMachine.TryFinish(RunEndReason.EngineFault, TotalErrors, SummaryFormat.RedactPersonalPaths(detail)))
+            if (!StateMachine.TryFinish(RunEndReason.EngineFault, TotalErrors, RedactForDisplay(detail)))
             {
                 throw new InvalidOperationException($"A run cannot end from {StateMachine.State}.");
             }
@@ -2270,9 +2270,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
     };
 
     // The engine reports a host-fault stop only as the host's request; the cause this controller recorded is what the
-    // state machine, the VERDICT line, the result record and both summaries state. The persisted detail and the
-    // displayed reason are both redacted, because either can carry an exception message that names a path in the
-    // user's profile; app-errors.log keeps the full exception.
+    // state machine, the VERDICT line, the result record and both summaries state. The persisted detail takes the
+    // displayed reason's form, redacted and on one line, because either can carry an exception message that names a
+    // path in the user's profile or holds a line break; app-errors.log keeps the full exception.
     private static string? PersistedEndDetail(RunContext run, Conclusion conclusion)
     {
         string? detail = conclusion.EndReason switch
@@ -2281,13 +2281,20 @@ public sealed partial class RunController : ObservableObject, IDisposable
             RunEndReason.HostFault when run.CallbackFaultText is { } callbackFault => UiText.HostFault(callbackFault),
             _ => conclusion.EndDetail,
         };
-        return detail is null ? null : SummaryFormat.RedactPersonalPaths(detail);
+        return detail is null ? null : RedactForDisplay(detail);
     }
 
     // Every runtime text a notice or a result reason substitutes, such as an exception message, an error the results
     // log or crash recovery reported, or an engine detail, passes through here, so the window never shows a path in
-    // the user's profile, as no persisted copy of that text does. app-errors.log keeps the full exception.
-    private static string RedactForDisplay(string text) => SummaryFormat.RedactPersonalPaths(text);
+    // the user's profile, as no persisted copy of that text does. app-errors.log keeps the full exception. The text
+    // is then one line of plain text, the form the text summary writes, so a line break in it cannot add a line
+    // beside the verdict badge or under the notice, and an escape, a NUL or a bidirectional control cannot hide, cut
+    // or reorder what the window shows. Redaction runs first because a profile folder name ends at a line break; with
+    // a space in its place, the redaction would swallow the text after it. It runs again on the plain text, as every
+    // persisted copy redacts it again: a user name followed by an escape or a NUL ends a name only once that
+    // character is a space, and redaction leaves its own output unchanged, so the window shows what they hold.
+    private static string RedactForDisplay(string text) =>
+        SummaryFormat.RedactPersonalPaths(SummaryFormat.PlainText(SummaryFormat.RedactPersonalPaths(text)));
 
     private async Task<CauseHints> AnalyseAsync(RunContext run, IReadOnlyList<StepOutcome> outcomes)
     {
