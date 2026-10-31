@@ -16,9 +16,10 @@ namespace RamQuick.Sensors;
 /// </para>
 /// <para>
 /// Freshness: an <see cref="SensorStatus.Available"/> value older than <see cref="StaleAfter"/> is
-/// re-marked <see cref="SensorStatus.Stale"/> as soon as it is that old, not at the next tick, so it
-/// shows N/A and its thermal limit is inactive until a fresh reading arrives. A call to
-/// <see cref="ISensorSource.Open"/> or <see cref="ISensorSource.Read"/> still outstanding after
+/// re-marked <see cref="SensorStatus.Stale"/> as soon as it is that old, not at the next tick, and
+/// again as each snapshot is raised through <see cref="ReadingsChanged"/>, however long the context
+/// held its post, so it shows N/A and its thermal limit is inactive until a fresh reading arrives.
+/// A call to <see cref="ISensorSource.Open"/> or <see cref="ISensorSource.Read"/> still outstanding after
 /// <see cref="HungAfter"/> marks the source <see cref="SensorStatus.Hung"/>: both readings are N/A,
 /// polling stops, and the source is never called again, not even to dispose it, for the life of the
 /// process. The blocked thread is left parked; it is a background thread, so it never keeps the
@@ -76,6 +77,9 @@ public sealed class SensorMonitor : IDisposable
     // When the source call in flight, Open or Read, began; null while the sensor thread is outside the source.
     private DateTimeOffset? _callStartedAt;
     private long _publishedVersion;
+
+    // The newest version whose post the context accepted, raised only once Post returns, from whichever thread posted.
+    private long _postedVersion;
     private long _deliveredVersion;
     private volatile SensorReadings _current;
     private volatile bool _hung;
@@ -133,11 +137,21 @@ public sealed class SensorMonitor : IDisposable
     /// <see cref="SensorStatus.Hung"/>, each raised when its deadline passes rather than at the next tick.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Always raised through <see cref="SynchronizationContext.Post"/> on the context passed to
     /// <see cref="Start"/>, never directly on the sensor or timer thread. A snapshot that reaches the
     /// context after a newer one has already been raised is dropped, so handlers never move back to an
     /// older snapshot. A snapshot whose post the context rejects by throwing is not raised; polling
     /// continues and <see cref="Current"/> still reflects it. Nothing is raised after <see cref="Dispose"/>.
+    /// </para>
+    /// <para>
+    /// Each snapshot's age is measured again on the <see cref="TimeProvider"/> passed to the constructor
+    /// when the handlers are invoked, so a value that passed <see cref="StaleAfter"/> while its post was
+    /// queued is raised <see cref="SensorStatus.Stale"/>, never <see cref="SensorStatus.Available"/>. A
+    /// snapshot left with no <see cref="SensorStatus.Available"/> value by that re-marking is not raised
+    /// when the context has already accepted the post of a newer one. A snapshot that still carries a
+    /// fresh value is always raised, so every fresh sample reaches the handlers.
+    /// </para>
     /// </remarks>
     public event EventHandler<SensorReadings>? ReadingsChanged;
 
@@ -557,15 +571,48 @@ public sealed class SensorMonitor : IDisposable
             // A context that rejects the post, for example one already shut down, costs only this
             // notification: Current already holds the snapshot. Polling must go on, and an exception
             // escaping the sensor or timer thread would terminate the process.
+            return;
+        }
+
+        RaisePostedVersion(version);
+    }
+
+    // The sensor thread and both timers post, so the highest accepted version wins whatever order they finish in.
+    private void RaisePostedVersion(long version)
+    {
+        long posted = Interlocked.Read(ref _postedVersion);
+        while (version > posted)
+        {
+            long observed = Interlocked.CompareExchange(ref _postedVersion, version, posted);
+            if (observed == posted)
+            {
+                return;
+            }
+
+            posted = observed;
         }
     }
 
-    // The sensor thread and the watchdog tick both publish, and their posts can reach the context in a
-    // different order from their updates of _current. Raising only snapshots newer than the last one
-    // raised keeps handlers from ending on an older snapshot than Current.
+    // The sensor thread and both timers publish, and their posts can reach the context in a different
+    // order from their updates of _current, after however long the context holds them. Raising only
+    // snapshots newer than the last one raised keeps handlers from ending on an older snapshot than
+    // Current. Handlers display, record and check each snapshot against the thermal limits at once, so
+    // its age is measured again here, on the injected clock: a value that went stale in the queue is
+    // raised Stale, never Available. A snapshot left with no Available value that way is not raised at
+    // all once the context has accepted a newer one, which follows it; one that still carries a fresh
+    // value is always raised, so every fresh sample reaches the thermal check.
     private void Deliver(SensorReadings snapshot, long version)
     {
         if (_disposed)
+        {
+            return;
+        }
+
+        SensorReadings aged = MarkStale(snapshot, _timeProvider.GetUtcNow());
+        if (!ReferenceEquals(aged, snapshot)
+            && !aged.Cpu.IsAvailable
+            && !aged.Ram.IsAvailable
+            && Interlocked.Read(ref _postedVersion) > version)
         {
             return;
         }
@@ -576,7 +623,7 @@ public sealed class SensorMonitor : IDisposable
             long observed = Interlocked.CompareExchange(ref _deliveredVersion, version, delivered);
             if (observed == delivered)
             {
-                ReadingsChanged?.Invoke(this, snapshot);
+                ReadingsChanged?.Invoke(this, aged);
                 return;
             }
 

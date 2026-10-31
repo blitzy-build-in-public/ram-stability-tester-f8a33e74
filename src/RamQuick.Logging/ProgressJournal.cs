@@ -1130,4 +1130,3 @@ public sealed class ProgressJournal : IDisposable
         }
     }
 }
-

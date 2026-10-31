@@ -656,4 +656,3 @@ finally {
     Set-Location -LiteralPath $originalLocation.Path -ErrorAction SilentlyContinue
 }
 exit $script:ExitCode
-

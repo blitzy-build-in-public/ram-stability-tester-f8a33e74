@@ -108,6 +108,8 @@ The timestamp is the test's local start time, and `<runId>` is a 32-digit hexade
 
 The JSON and text summaries are the files meant for sharing, for example to compare attempts: they hold memory-test data and hardware descriptors. The `.log` and `app-errors.log` are local diagnostic logs that can also hold exception messages and stack traces. In them, the data folder is written `<data>`, your folders `%LOCALAPPDATA%`, `%APPDATA%` and `%USERPROFILE%`, and your Windows user name, where it is part of a path, `%USERNAME%`. Inspect them before you share them. Nothing leaves the PC.
 
+**Retention and erasure.** Results and logs do not expire. RAMQuick never deletes, rotates or expires the logs and summaries it saves in `<data>\logs`: they accumulate, one set per test, until you remove them. To erase the test data stored on this PC, close RAMQuick and delete its data folder; RAMQuick creates a new, empty one at the next launch. If RAMQuick has run from more than one place, check both locations: `<app folder>\data` beside each copy you ran, and `%LOCALAPPDATA%\RamQuick`. Copies you saved or shared elsewhere are not affected; delete them separately.
+
 ## Privacy and safety
 
 - No telemetry, no update checks and no network activity initiated by RAMQuick.

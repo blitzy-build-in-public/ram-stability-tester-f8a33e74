@@ -1145,4 +1145,3 @@ file static class PlanAssert
         return $"[{at}, name {name}] {violation.Message}";
     }
 }
-

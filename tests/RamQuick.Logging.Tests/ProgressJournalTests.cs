@@ -2527,4 +2527,3 @@ public sealed class JournalAckHandleTests
         return self.HandleCount;
     }
 }
-

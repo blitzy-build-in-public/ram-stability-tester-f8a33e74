@@ -2557,4 +2557,3 @@ public sealed partial class ResultsLogTests
         }
     }
 }
-

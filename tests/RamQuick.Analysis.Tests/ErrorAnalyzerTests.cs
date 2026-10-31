@@ -1630,4 +1630,3 @@ public sealed class ErrorAnalyzerTests
         }
     }
 }
-

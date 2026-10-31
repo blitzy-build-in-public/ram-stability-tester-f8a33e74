@@ -2158,4 +2158,3 @@ internal static class ScaledPlans
         return plan;
     }
 }
-

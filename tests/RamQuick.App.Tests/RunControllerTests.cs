@@ -2521,6 +2521,55 @@ public sealed class RunControllerTests
         }
     }
 
+    // The UI thread stalls while the sensor thread keeps reading: the post of a reading at both limits waits in the
+    // queue, behind fresh cool readings, until it is older than the monitor's freshness bound. Its late delivery must
+    // neither stop the run nor be shown or recorded as a fresh temperature.
+    [Fact]
+    public void Readings_AtLimitsButDeliveredAfterStaleAfter_NeverStopAndNewestFreshReadingIsShown()
+    {
+        const double CoolCpuCelsius = 60.0;
+        const double CoolRamCelsius = 50.0;
+        using var harness = new ControllerHarness();
+        harness.StartSensors();
+        harness.Initialize();
+        FakeEngineSession session = harness.StartAccepted();
+        harness.Prepare();
+        harness.Pump();
+
+        harness.Sensors.SetCpu(ThermalLimits.CpuLimitCelsius);
+        harness.Sensors.SetRam(ThermalLimits.RamLimitCelsius);
+        DateTimeOffset hotCapturedAt = ReadWithoutPumping(harness);
+        harness.Sensors.SetCpu(CoolCpuCelsius);
+        harness.Sensors.SetRam(CoolRamCelsius);
+        DateTimeOffset coolCapturedAt = hotCapturedAt;
+        for (int read = 0; read < 3; read++)
+        {
+            coolCapturedAt = ReadWithoutPumping(harness);
+        }
+
+        // Half a second after the last read, no tick due: the reading at the limits is 3.5 s old.
+        harness.Time.Advance(TimeSpan.FromMilliseconds(500));
+        Assert.True(harness.Time.GetUtcNow() - hotCapturedAt > SensorMonitor.StaleAfter);
+        harness.RunUntil(() => harness.Controller.LatestReadings.Cpu.CapturedAt == coolCapturedAt);
+        harness.Pump();
+
+        Assert.Empty(session.StopRequests);
+        Assert.Equal(RunState.Running, harness.StateMachine.State);
+        SensorReadings shown = harness.Controller.LatestReadings;
+        Assert.Equal(SensorStatus.Available, shown.Cpu.Status);
+        Assert.Equal(SensorStatus.Available, shown.Ram.Status);
+        Assert.Equal(CoolCpuCelsius, shown.Cpu.Celsius);
+        Assert.Equal(CoolRamCelsius, shown.Ram.Celsius);
+
+        // The summary's peaks are fresh readings only, so the late reading at the limits is not among them.
+        harness.Complete(RunEndReason.Completed);
+        harness.Release(TimeSpan.FromMilliseconds(100));
+        using JsonDocument summary = harness.ReadSummary();
+        JsonElement temperatures = summary.RootElement.GetProperty("temperatures");
+        Assert.Equal(CoolCpuCelsius, temperatures.GetProperty("cpuMaxC").GetDouble());
+        Assert.Equal(CoolRamCelsius, temperatures.GetProperty("ramMaxC").GetDouble());
+    }
+
 
     [Fact]
     public void Prepared_ReducedInstructionSet_FlagsReducedSet()
@@ -3552,6 +3601,25 @@ public sealed class RunControllerTests
             release.Set();
             harness.Dispose();
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Sensor staging
+    // ---------------------------------------------------------------------------------------------
+
+    // Advances the clock one poll interval without pumping, as a stalled UI thread would, and waits until the
+    // monitor holds the read that tick starts, which it posts next. Returns that read's capture time.
+    private static DateTimeOffset ReadWithoutPumping(ControllerHarness harness)
+    {
+        int completedBefore = harness.Sensors.CompletedReadCount;
+        harness.Time.Advance(SensorMonitor.PollInterval);
+        DateTimeOffset capturedAt = harness.Time.GetUtcNow();
+        Assert.True(
+            SpinWait.SpinUntil(
+                () => harness.Sensors.CompletedReadCount > completedBefore && harness.Monitor.Current.Cpu.CapturedAt == capturedAt,
+                ControllerHarness.DefaultWait),
+            $"The read at {capturedAt:O} did not complete within {ControllerHarness.DefaultWait.TotalSeconds:0.#} s.");
+        return capturedAt;
     }
 
     // ---------------------------------------------------------------------------------------------

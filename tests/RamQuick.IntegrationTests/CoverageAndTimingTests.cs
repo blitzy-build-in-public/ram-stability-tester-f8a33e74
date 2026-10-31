@@ -1481,4 +1481,3 @@ public sealed class CoverageAndTimingTests
         private readonly record struct ProbeSample(long PostedAt, TimeSpan Latency);
     }
 }
-

@@ -1839,4 +1839,3 @@ internal static class IsolatedTestRun
     // What the child's result XML says: why it did not pass, or null once it did, and the test's output lines.
     private sealed record ChildResult(string? Failure, IReadOnlyList<string> OutputLines);
 }
-

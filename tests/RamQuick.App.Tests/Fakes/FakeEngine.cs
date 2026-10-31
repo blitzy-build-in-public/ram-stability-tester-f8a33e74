@@ -1546,4 +1546,3 @@ public sealed class FakeEngineSession : IEngineSession
         }
     }
 }
-

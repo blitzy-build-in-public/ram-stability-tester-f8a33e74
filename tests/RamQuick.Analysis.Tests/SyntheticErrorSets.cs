@@ -1663,4 +1663,3 @@ internal static class SyntheticErrorSets
             Input(_records, outcomes, _testedBytes, _workers, memoryType);
     }
 }
-

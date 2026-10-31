@@ -8,10 +8,10 @@ namespace RamQuick.Sensors.Tests;
 /// <summary>
 /// Tests for <see cref="SensorMonitor"/>: one dedicated background thread owns the source and reads it
 /// once per simulated second, a tick during an in-flight read is skipped, a reading older than 3 s is
-/// re-marked <see cref="SensorStatus.Stale"/> at its own deadline, an open or read outstanding for 5 s
-/// marks the source <see cref="SensorStatus.Hung"/> for good, each sensor's availability stays
-/// independent, a context that rejects posts never stops polling, and <see cref="SensorMonitor.Dispose"/>
-/// returns within 1 s and closes the source only on the sensor thread.
+/// re-marked <see cref="SensorStatus.Stale"/> at its own deadline and when a late post of it is raised,
+/// an open or read outstanding for 5 s marks the source <see cref="SensorStatus.Hung"/> for good, each
+/// sensor's availability stays independent, a context that rejects posts never stops polling, and
+/// <see cref="SensorMonitor.Dispose"/> returns within 1 s and closes the source only on the sensor thread.
 /// </summary>
 /// <remarks>
 /// Polling and every age run on a <see cref="FakeTimeProvider"/>, whose <c>Advance</c> runs the monitor's
@@ -643,6 +643,93 @@ public sealed class SensorMonitorTests
         Assert.Same(monitor.Current, delivered);
     }
 
+    // A stalled UI thread holds the posts of four reads a second apart, at the limits and below them in
+    // turn, until the first is older than StaleAfter and the rest are still fresh. The first is not
+    // raised, since a newer post follows it; the fresh ones are raised in order, and the one at the
+    // limits among them alone trips, as every fresh sample must.
+    [Fact]
+    public void ReadingsChanged_DeliveryWithheldPastStaleAfter_DropsTheStaleSnapshotAndRaisesEachFreshOne()
+    {
+        (double Cpu, double Ram)[] reads =
+        [
+            (ThermalLimits.CpuLimitCelsius, ThermalLimits.RamLimitCelsius),
+            (FakeSensorSource.DefaultCpuCelsius, FakeSensorSource.DefaultRamCelsius),
+            (ThermalLimits.CpuLimitCelsius, ThermalLimits.RamLimitCelsius),
+            (FakeSensorSource.DefaultCpuCelsius, FakeSensorSource.DefaultRamCelsius),
+        ];
+        using var h = new Harness();
+        h.Start();
+        h.Context.RunPending();
+        int eventsBefore = h.EventCount;
+
+        var capturedAt = new List<DateTimeOffset>();
+        foreach ((double cpu, double ram) in reads)
+        {
+            h.Source.SetCpu(cpu);
+            h.Source.SetRam(ram);
+            capturedAt.Add(PostNextReadWithheld(h));
+        }
+
+        Assert.Equal(reads.Length, h.Context.PendingCount);
+
+        // Half a second after the last read, no tick due: the first read is 3.5 s old, the second 2.5 s.
+        h.Time.Advance(TimeSpan.FromMilliseconds(500));
+        DateTimeOffset drainedAt = h.Time.GetUtcNow();
+        Assert.True(drainedAt - capturedAt[0] > SensorMonitor.StaleAfter);
+        Assert.True(drainedAt - capturedAt[1] <= SensorMonitor.StaleAfter);
+        h.Context.RunPending();
+
+        SensorReadings[] raised = h.Events.Skip(eventsBefore).Select(received => received.Readings).ToArray();
+        Assert.Equal(capturedAt.Skip(1), raised.Select(readings => readings.Cpu.CapturedAt));
+        Assert.Equal(capturedAt.Skip(1), raised.Select(readings => readings.Ram.CapturedAt));
+        Assert.Equal(reads.Skip(1).Select(read => (double?)read.Cpu), raised.Select(readings => readings.Cpu.Celsius));
+        Assert.Equal(reads.Skip(1).Select(read => (double?)read.Ram), raised.Select(readings => readings.Ram.Celsius));
+        var cpuVerdict = new ThermalVerdict(ThermalSensor.Cpu, ThermalLimits.CpuLimitCelsius, ThermalLimits.CpuLimitCelsius);
+        Assert.Equal(new ThermalVerdict?[] { null, cpuVerdict, null }, raised.Select(ThermalLimits.Evaluate));
+        Assert.All(raised, readings => Assert.All(
+            new[] { readings.Cpu, readings.Ram },
+            value => Assert.True(
+                !value.IsAvailable || drainedAt - value.CapturedAt <= SensorMonitor.StaleAfter,
+                $"A reading captured at {value.CapturedAt:O} was raised Available at {drainedAt:O}.")));
+        Assert.Same(h.Monitor.Current, raised[^1]);
+    }
+
+    // A reading at the limits whose post is still queued when it passes StaleAfter, with the next read
+    // blocked so nothing fresh follows it. On both paths, the deadline timer re-marking it when due
+    // timers run and no timer at all when the clock moves without running them, the drain raises it
+    // once, Stale, and it never trips.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ReadingsChanged_SnapshotAtLimitsQueuedPastStaleAfter_IsRaisedOnceStaleAndNeverTrips(bool timersRun)
+    {
+        using var h = new Harness();
+        h.Start();
+        h.Context.RunPending();
+        int eventsBefore = h.EventCount;
+        ScriptReadingsAtLimits(h.Source, TimeSpan.Zero);
+        DateTimeOffset capturedAt = PostNextReadWithheld(h);
+
+        int readsEntered = h.Source.ReadCount + 1;
+        h.Source.BlockReads();
+        h.Time.Advance(SensorMonitor.PollInterval);
+        Assert.True(
+            h.Source.WaitForReadCount(readsEntered, _safetyTimeout),
+            $"The blocked read did not start within {_safetyTimeout}; reads entered: {h.Source.ReadCount}.");
+
+        // 2.5 s into the blocked read, short of HungAfter; only due timers post the Stale re-marking.
+        MoveClockTo(h.Time, capturedAt + SensorMonitor.StaleAfter + TimeSpan.FromMilliseconds(500), timersRun);
+        Assert.Equal(timersRun ? 2 : 1, h.Context.PendingCount);
+        h.Context.RunPending();
+
+        SensorReadings raised = Assert.Single(h.Events.Skip(eventsBefore)).Readings;
+        AssertBothUnavailable(raised, SensorStatus.Stale);
+        Assert.Equal(capturedAt, raised.Cpu.CapturedAt);
+        Assert.Equal(capturedAt, raised.Ram.CapturedAt);
+        Assert.Null(ThermalLimits.Evaluate(raised));
+        Assert.False(h.Monitor.IsHung);
+    }
+
     [Fact]
     public void Dispose_WhileReadHung_ReturnsWithinDisposeTimeoutWithoutClosingSource()
     {
@@ -1112,6 +1199,22 @@ public sealed class SensorMonitorTests
         {
             time.AdjustTime(target);
         }
+    }
+
+    // Ticks once without draining the context, as a stalled UI thread would, and waits until the read
+    // that tick starts has posted its snapshot, the only post the tick may make. Returns that read's
+    // capture time: the fake clock stands still meanwhile, so the source stamps the read with it.
+    private static DateTimeOffset PostNextReadWithheld(Harness h)
+    {
+        int pendingBefore = h.Context.PendingCount;
+        int completedBefore = h.Source.CompletedReadCount;
+        h.Time.Advance(SensorMonitor.PollInterval);
+        Assert.True(
+            SpinWait.SpinUntil(() => h.Context.PendingCount > pendingBefore, _safetyTimeout),
+            $"The read at {h.Time.GetUtcNow():O} was not posted within {_safetyTimeout}; completed reads: {h.Source.CompletedReadCount}.");
+        Assert.Equal(pendingBefore + 1, h.Context.PendingCount);
+        Assert.Equal(completedBefore + 1, h.Source.CompletedReadCount);
+        return h.Time.GetUtcNow() + h.Source.CapturedAtOffset;
     }
 
     private static string Describe(SensorReadings? readings) =>

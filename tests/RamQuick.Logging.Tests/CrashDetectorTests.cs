@@ -1819,4 +1819,3 @@ public sealed class CrashDetectorTests
         public void Dispose() => IsDisposed = true;
     }
 }
-

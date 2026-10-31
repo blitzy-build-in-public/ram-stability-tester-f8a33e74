@@ -5301,4 +5301,3 @@ if ($null -eq $report) { exit 1 }
 Write-Output $report.Markdown
 Write-Host ('Wrote {0}' -f $report.Path)
 exit 0
-
