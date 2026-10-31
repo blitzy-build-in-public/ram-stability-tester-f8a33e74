@@ -1,0 +1,54 @@
+# Native code layout for src/engine and tests/engine.tests (*.h, *.cpp), including the C API
+# header. Checked by scripts/build.ps1 with `clang-format --dry-run --Werror`, using the
+# clang-format 19 build bundled with Visual Studio 2022 17.14 (component VC.Llvm.Clang).
+# Only options that release supports are used.
+#
+# LineEnding is deliberately not set: the default derives it from each file. No .gitattributes
+# normalises line endings and Git for Windows checks out with core.autocrlf, so forcing CRLF or
+# LF would make the --Werror check fail on a fresh checkout.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++20
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+ColumnLimit: 100
+AccessModifierOffset: -4
+
+NamespaceIndentation: None
+FixNamespaceComments: true
+
+PointerAlignment: Left
+DerivePointerAlignment: false
+ReferenceAlignment: Pointer
+
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+# clang-format 19 name of the former AlwaysBreakTemplateDeclarations.
+BreakTemplateDeclarations: Yes
+
+# Never reorder includes: Win32 headers are order-sensitive. <windows.h> must come before
+# <memoryapi.h>, <processtopologyapi.h> and <sysinfoapi.h>, and alphabetical sorting would
+# put those first and break the engine build.
+SortIncludes: Never
+IncludeBlocks: Preserve
+
+InsertNewlineAtEOF: true
+# clang-format 19 replaced KeepEmptyLinesAtTheStartOfBlocks with this map; the other two
+# members keep their LLVM values.
+KeepEmptyLines:
+  AtStartOfBlock: false
+MaxEmptyLinesToKeep: 1
+
+SpaceAfterCStyleCast: false
+SpacesBeforeTrailingComments: 2
+
+# Aligns the runs of #define enumeration values in ramquick_engine.h.
+AlignConsecutiveMacros: Consecutive
+...

@@ -1,0 +1,125 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Integration tests: wrapper binding, marshalling, session lifetime, fault injection, coverage, timing
+    and latency through RamQuick.Interop, plus the process-level crash-recovery and production-binding
+    tests that launch RamQuick.TestHost.
+
+    Bindings per process:
+    - This test process binds the wrapper once to ramquick_engine_test.dll (EngineBindingFixture), so that
+      DLL is copied into this project's output root.
+    - RamQuick.TestHost runs in its own process against the production ramquick_engine.dll. Its build
+      output is copied, unchanged, into the isolated TestHost\ subfolder, so the host loads its own
+      RamQuick.Interop.dll and the production DLL and never sees the test DLL.
+
+    Language, analyzer, nullable, platform (x64), lock-file and documentation settings come from the root
+    Directory.Build.props; package versions come only from Directory.Packages.props.
+  -->
+  <PropertyGroup>
+    <TargetFramework>$(RamQuickTargetFramework)</TargetFramework>
+    <!-- xunit.v3 test projects are executables; xunit.v3 generates the entry point. -->
+    <OutputType>Exe</OutputType>
+    <!-- DispatcherThread hosts a real WPF Dispatcher, and the referenced RamQuick.App is a WPF executable. -->
+    <UseWPF>true</UseWPF>
+    <!-- TestEngineNative's source-generated LibraryImport takes pointers; struct-size checks use sizeof and fixed buffers. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The production controller graph; Core, Interop, Plans, Analysis, Sensors and Logging flow transitively. -->
+    <ProjectReference Include="..\..\src\RamQuick.App\RamQuick.App.csproj" />
+
+    <!--
+      Build order only: produces ramquick_engine_test.dll, copied by the None item below. The metadata matches
+      RamQuick.App's reference to ramquick_engine.vcxproj, so no target-framework negotiation or publish
+      global property reaches the C++ project; Private=false keeps its outputs from flowing in transitively.
+    -->
+    <ProjectReference Include="..\engine.tests\test_dll\ramquick_engine_test.vcxproj"
+                      ReferenceOutputAssembly="false"
+                      Private="false"
+                      SkipGetTargetFrameworkProperties="true"
+                      GlobalPropertiesToRemove="RuntimeIdentifier;SelfContained;PublishProfile">
+      <Project>{811B4532-CBD4-4FEE-9C60-7192E959005D}</Project>
+    </ProjectReference>
+
+    <!--
+      Build order only: the host must be built before CopyTestHostOutput runs. Private=false keeps every host
+      file out of this output root; the host lives only in TestHost\.
+    -->
+    <ProjectReference Include="..\RamQuick.TestHost\RamQuick.TestHost.csproj"
+                      ReferenceOutputAssembly="false"
+                      Private="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Shared fakes for the controller's non-engine dependencies, owned by RamQuick.App.Tests. -->
+    <Compile Include="..\RamQuick.App.Tests\Fakes\*.cs" Link="Fakes\%(Filename)%(Extension)" />
+    <!-- Stalled or failing journal storage, owned by RamQuick.Logging.Tests. -->
+    <Compile Include="..\RamQuick.Logging.Tests\StalledJournalStorage.cs" Link="Linked\StalledJournalStorage.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Literal path, so the item exists at evaluation even before the native project has built. -->
+    <None Include="$(RamQuickNativeOutRoot)$(Configuration)\ramquick_engine_test.dll"
+          Link="ramquick_engine_test.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          Visible="false" />
+  </ItemGroup>
+
+  <Target Name="VerifyTestEngineDll" AfterTargets="CopyFilesToOutputDirectory">
+    <Error Condition="!Exists('$(OutDir)ramquick_engine_test.dll')"
+           Text="ramquick_engine_test.dll was not copied from $(RamQuickNativeOutRoot)$(Configuration)\; build RamQuick.sln with Visual Studio MSBuild (x64)." />
+  </Target>
+
+  <!--
+    Copies the TestHost build output into $(OutDir)TestHost\. GetTargetPath only evaluates the host project, so
+    its RID-specific output folder is resolved rather than hard-coded. The glob runs inside the target, after
+    the host has been built.
+  -->
+  <Target Name="CopyTestHostOutput" AfterTargets="CopyFilesToOutputDirectory">
+    <MSBuild Projects="..\RamQuick.TestHost\RamQuick.TestHost.csproj"
+             Targets="GetTargetPath"
+             Properties="Configuration=$(Configuration);Platform=$(Platform)">
+      <Output TaskParameter="TargetOutputs" ItemName="_RqTestHostTargetPath" />
+    </MSBuild>
+
+    <PropertyGroup>
+      <_RqTestHostOutDir>@(_RqTestHostTargetPath->'%(RootDir)%(Directory)')</_RqTestHostOutDir>
+      <_RqTestHostDestDir>$(OutDir)TestHost\</_RqTestHostDestDir>
+    </PropertyGroup>
+
+    <Error Condition="'$(_RqTestHostOutDir)' == '' or !Exists('$(_RqTestHostOutDir)')"
+           Text="RamQuick.TestHost output folder '$(_RqTestHostOutDir)' was not found; build RamQuick.sln with Visual Studio MSBuild (x64)." />
+
+    <ItemGroup>
+      <_RqTestHostFiles Include="$(_RqTestHostOutDir)**\*" />
+    </ItemGroup>
+
+    <Copy SourceFiles="@(_RqTestHostFiles)"
+          DestinationFiles="@(_RqTestHostFiles->'$(_RqTestHostDestDir)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true">
+      <!-- Tracked as build outputs, so Clean removes the copies. -->
+      <Output TaskParameter="DestinationFiles" ItemName="FileWrites" />
+    </Copy>
+
+    <Error Condition="!Exists('$(_RqTestHostDestDir)RamQuick.TestHost.exe')"
+           Text="RamQuick.TestHost.exe is missing from $(_RqTestHostDestDir)." />
+    <Error Condition="!Exists('$(_RqTestHostDestDir)ramquick_engine.dll')"
+           Text="The production ramquick_engine.dll is missing from $(_RqTestHostDestDir)." />
+    <Error Condition="Exists('$(_RqTestHostDestDir)ramquick_engine_test.dll')"
+           Text="RamQuick.TestHost must bind the production engine only; ramquick_engine_test.dll was found in $(_RqTestHostDestDir)." />
+  </Target>
+
+</Project>

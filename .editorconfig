@@ -1,0 +1,240 @@
+# Editor conventions and C# code-style analyzer settings for every file in the repository.
+# C# rules set to warning or error here fail the build: Directory.Build.props sets
+# EnforceCodeStyleInBuild and TreatWarningsAsErrors for every managed project.
+# Later sections override earlier ones for the files they match, so section order matters.
+
+root = true
+
+[*]
+charset = utf-8
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+# end_of_line is deliberately not set: no .gitattributes normalises line endings and Git for
+# Windows converts them on checkout, so forcing CRLF or LF would fight that conversion.
+
+[*.{cs,xaml,ps1,psm1,cpp,h}]
+indent_size = 4
+
+[*.{csproj,vcxproj,props,targets,pubxml,manifest,xml,config,json,yml}]
+indent_size = 2
+
+# Windows PowerShell 5.1 runs the scripts, and it reads a UTF-8 file without a byte order mark
+# as the ANSI code page, so any non-ASCII character in a script would be misread.
+[*.{ps1,psm1}]
+charset = utf-8-bom
+
+# Two trailing spaces are a Markdown line break.
+[*.md]
+trim_trailing_whitespace = false
+
+# Visual Studio writes solution files with tabs.
+[*.sln]
+indent_style = tab
+
+# Binary files, such as the synthesised SMBIOS tables in tests/RamQuick.Sensors.Tests/Fixtures,
+# must never be rewritten by an editor.
+[*.bin]
+charset = unset
+insert_final_newline = false
+trim_trailing_whitespace = false
+indent_style = unset
+
+# NuGet restore generates every project's lock file without a final newline, and the files are
+# committed byte for byte as restore wrote them, so an editor must not rewrite them.
+[packages.lock.json]
+charset = unset
+insert_final_newline = false
+trim_trailing_whitespace = false
+
+# Native layout is defined by .clang-format, which scripts/build.ps1 checks with
+# clang-format --dry-run --Werror; these keys only keep editors consistent with it.
+# C++ naming is snake_case with the rq_ prefix on every exported symbol. No analyzer checks
+# it, so it is a code-review responsibility.
+[*.{cpp,h}]
+tab_width = 4
+max_line_length = 100
+
+[*.cs]
+
+#### Naming ####
+
+# Naming violations are build errors.
+dotnet_diagnostic.IDE1006.severity = error
+
+# The analyzer applies only the first rule whose symbols match, ordering rules by specificity
+# with required modifiers ahead of accessibilities: a private const is PascalCase, not
+# _camelCase. The rules are also listed from most to least specific, as older tooling needs.
+
+# Constants, fields and locals alike: PascalCase.
+dotnet_naming_rule.constants_should_be_pascal_case.symbols = constants
+dotnet_naming_rule.constants_should_be_pascal_case.style = pascal_case
+dotnet_naming_rule.constants_should_be_pascal_case.severity = error
+
+# Non-private static readonly fields are part of a type's surface: PascalCase, like its other
+# members. Private ones are private fields first, so they follow the _camelCase rule below.
+dotnet_naming_rule.static_readonly_fields_should_be_pascal_case.symbols = static_readonly_fields
+dotnet_naming_rule.static_readonly_fields_should_be_pascal_case.style = pascal_case
+dotnet_naming_rule.static_readonly_fields_should_be_pascal_case.severity = error
+
+# Methods and local functions declared async: PascalCase ending in Async. The rule matches the
+# async modifier, not the return type, so it also covers async void event handlers, and cannot
+# see a method that returns Task or ValueTask without the async keyword: that method's Async
+# suffix is a code-review responsibility.
+dotnet_naming_rule.async_methods_should_end_in_async.symbols = async_methods
+dotnet_naming_rule.async_methods_should_end_in_async.style = async_method_style
+dotnet_naming_rule.async_methods_should_end_in_async.severity = error
+
+dotnet_naming_rule.interfaces_should_begin_with_i.symbols = interfaces
+dotnet_naming_rule.interfaces_should_begin_with_i.style = interface_style
+dotnet_naming_rule.interfaces_should_begin_with_i.severity = error
+
+dotnet_naming_rule.type_parameters_should_begin_with_t.symbols = type_parameters
+dotnet_naming_rule.type_parameters_should_begin_with_t.style = type_parameter_style
+dotnet_naming_rule.type_parameters_should_begin_with_t.severity = error
+
+# Private fields of every kind, static readonly included, and internal fields: _camelCase.
+# Constants and internal static readonly fields match the more specific rules above first.
+dotnet_naming_rule.private_internal_fields_should_be_underscore_camel_case.symbols = private_internal_fields
+dotnet_naming_rule.private_internal_fields_should_be_underscore_camel_case.style = private_field_style
+dotnet_naming_rule.private_internal_fields_should_be_underscore_camel_case.severity = error
+
+dotnet_naming_rule.non_private_fields_should_be_pascal_case.symbols = non_private_fields
+dotnet_naming_rule.non_private_fields_should_be_pascal_case.style = pascal_case
+dotnet_naming_rule.non_private_fields_should_be_pascal_case.severity = error
+
+dotnet_naming_rule.types_and_namespaces_should_be_pascal_case.symbols = types_and_namespaces
+dotnet_naming_rule.types_and_namespaces_should_be_pascal_case.style = pascal_case
+dotnet_naming_rule.types_and_namespaces_should_be_pascal_case.severity = error
+
+dotnet_naming_rule.methods_should_be_pascal_case.symbols = methods
+dotnet_naming_rule.methods_should_be_pascal_case.style = method_style
+dotnet_naming_rule.methods_should_be_pascal_case.severity = error
+
+dotnet_naming_rule.properties_and_events_should_be_pascal_case.symbols = properties_and_events
+dotnet_naming_rule.properties_and_events_should_be_pascal_case.style = pascal_case
+dotnet_naming_rule.properties_and_events_should_be_pascal_case.severity = error
+
+dotnet_naming_rule.parameters_and_locals_should_be_camel_case.symbols = parameters_and_locals
+dotnet_naming_rule.parameters_and_locals_should_be_camel_case.style = camel_case
+dotnet_naming_rule.parameters_and_locals_should_be_camel_case.severity = error
+
+# Symbols
+dotnet_naming_symbols.constants.applicable_kinds = field, local
+dotnet_naming_symbols.constants.applicable_accessibilities = *
+dotnet_naming_symbols.constants.required_modifiers = const
+
+dotnet_naming_symbols.static_readonly_fields.applicable_kinds = field
+dotnet_naming_symbols.static_readonly_fields.applicable_accessibilities = public, internal, protected, protected_internal, private_protected
+dotnet_naming_symbols.static_readonly_fields.required_modifiers = static, readonly
+
+dotnet_naming_symbols.async_methods.applicable_kinds = method, local_function
+dotnet_naming_symbols.async_methods.applicable_accessibilities = *
+dotnet_naming_symbols.async_methods.required_modifiers = async
+
+dotnet_naming_symbols.interfaces.applicable_kinds = interface
+dotnet_naming_symbols.interfaces.applicable_accessibilities = *
+
+dotnet_naming_symbols.type_parameters.applicable_kinds = type_parameter
+dotnet_naming_symbols.type_parameters.applicable_accessibilities = *
+
+dotnet_naming_symbols.private_internal_fields.applicable_kinds = field
+dotnet_naming_symbols.private_internal_fields.applicable_accessibilities = private, internal
+
+dotnet_naming_symbols.non_private_fields.applicable_kinds = field
+dotnet_naming_symbols.non_private_fields.applicable_accessibilities = public, protected, protected_internal, private_protected
+
+dotnet_naming_symbols.types_and_namespaces.applicable_kinds = namespace, class, struct, enum, delegate
+dotnet_naming_symbols.types_and_namespaces.applicable_accessibilities = *
+
+dotnet_naming_symbols.methods.applicable_kinds = method, local_function
+dotnet_naming_symbols.methods.applicable_accessibilities = *
+
+dotnet_naming_symbols.properties_and_events.applicable_kinds = property, event
+dotnet_naming_symbols.properties_and_events.applicable_accessibilities = *
+
+dotnet_naming_symbols.parameters_and_locals.applicable_kinds = parameter, local
+dotnet_naming_symbols.parameters_and_locals.applicable_accessibilities = *
+
+# Styles
+dotnet_naming_style.pascal_case.capitalization = pascal_case
+
+dotnet_naming_style.camel_case.capitalization = camel_case
+
+dotnet_naming_style.private_field_style.required_prefix = _
+dotnet_naming_style.private_field_style.capitalization = camel_case
+
+dotnet_naming_style.interface_style.required_prefix = I
+dotnet_naming_style.interface_style.capitalization = pascal_case
+
+dotnet_naming_style.type_parameter_style.required_prefix = T
+dotnet_naming_style.type_parameter_style.capitalization = pascal_case
+
+# Methods have their own styles so that tests/ can add a word separator to them alone.
+dotnet_naming_style.method_style.capitalization = pascal_case
+
+dotnet_naming_style.async_method_style.required_suffix = Async
+dotnet_naming_style.async_method_style.capitalization = pascal_case
+
+#### Style ####
+
+# The build ignores the severity written after an option value; only a
+# dotnet_diagnostic.<id>.severity entry makes a style rule a build warning (an error under
+# TreatWarningsAsErrors). Every option marked warning or error below has one.
+
+csharp_style_namespace_declarations = file_scoped:error
+dotnet_diagnostic.IDE0161.severity = error
+
+dotnet_sort_system_directives_first = true
+csharp_using_directive_placement = outside_namespace:warning
+dotnet_diagnostic.IDE0065.severity = warning
+
+csharp_style_var_for_built_in_types = false:suggestion
+csharp_style_var_when_type_is_apparent = true:suggestion
+csharp_style_var_elsewhere = false:suggestion
+
+csharp_prefer_braces = true:warning
+dotnet_diagnostic.IDE0011.severity = warning
+
+dotnet_style_readonly_field = true:warning
+dotnet_diagnostic.IDE0044.severity = warning
+
+csharp_style_prefer_primary_constructors = false:suggestion
+
+dotnet_style_qualification_for_field = false:suggestion
+dotnet_style_qualification_for_property = false:suggestion
+dotnet_style_qualification_for_method = false:suggestion
+dotnet_style_qualification_for_event = false:suggestion
+
+# IDE0049 covers both options: int, not Int32, in declarations and in member access alike.
+# The build never runs IDE0049 at any severity, so it is an editor warning only.
+dotnet_style_predefined_type_for_locals_parameters_members = true:warning
+dotnet_style_predefined_type_for_member_access = true:warning
+dotnet_diagnostic.IDE0049.severity = warning
+
+#### Analyzers ####
+
+# Nullable warnings (CS86xx) are deliberately not configured: TreatWarningsAsErrors makes them
+# errors. Apart from CA2007 below, the CA rules keep their AnalysisLevel 8.0 defaults.
+
+# CA2007 (ConfigureAwait) is off by default and turned on for library code only, below.
+dotnet_diagnostic.CA2007.severity = none
+
+# Library code must not resume on its caller's context: every await uses ConfigureAwait(false).
+[src/**.cs]
+dotnet_diagnostic.CA2007.severity = warning
+
+# The WPF application resumes on the UI thread after an await, so ConfigureAwait(false) would
+# be wrong there.
+[src/RamQuick.App/**.cs]
+dotnet_diagnostic.CA2007.severity = none
+
+# Test code: names read as Unit_Condition_Outcome, each underscore-separated word PascalCase.
+# Every other naming rule still applies, the Async suffix included. Underscores are allowed
+# (CA1707), awaits need no ConfigureAwait (CA2007) and no documentation is generated (CS1591).
+[tests/**.cs]
+dotnet_naming_style.method_style.word_separator = _
+dotnet_naming_style.async_method_style.word_separator = _
+dotnet_diagnostic.CA1707.severity = none
+dotnet_diagnostic.CA2007.severity = none
+dotnet_diagnostic.CS1591.severity = none

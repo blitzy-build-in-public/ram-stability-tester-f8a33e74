@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Plan catalogue, validator and methodology-map tests. xunit.v3 test assemblies host their own
+       runner, so the project is an executable; the framework comes from the single retarget
+       property in Directory.Build.props and is never written out here. -->
+  <PropertyGroup>
+    <TargetFramework>$(RamQuickTargetFramework)</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>RamQuick.Plans.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <!-- Versions are pinned centrally in Directory.Packages.props. -->
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+  </ItemGroup>
+
+  <!-- RamQuick.Core's step enums and StepAttributes arrive through this reference. -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RamQuick.Plans\RamQuick.Plans.csproj" />
+  </ItemGroup>
+
+  <!-- The step-to-mechanism map test reads the methodology document from the output root.
+       A missing document fails the copy step (MSB3030), so the build stops before the tests run. -->
+  <ItemGroup>
+    <None Include="$([MSBuild]::NormalizePath('$(RamQuickRepoRoot)', 'docs', 'METHODOLOGY.md'))"
+          Link="METHODOLOGY.md"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

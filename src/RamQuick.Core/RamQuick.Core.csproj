@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Shared contracts: the single RunStateMachine and the records and enums every layer exchanges.
+    It has no package or project references, so no dependency cycle can form through it.
+    The target stays platform-neutral because the net8.0 libraries (Plans, Analysis, Logging)
+    reference it; Directory.Build.props derives the neutral framework from RamQuickTargetFramework.
+  -->
+  <PropertyGroup>
+    <TargetFramework>$(RamQuickNeutralTargetFramework)</TargetFramework>
+    <RootNamespace>RamQuick.Core</RootNamespace>
+    <AssemblyName>RamQuick.Core</AssemblyName>
+  </PropertyGroup>
+
+</Project>

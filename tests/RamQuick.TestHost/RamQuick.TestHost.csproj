@@ -1,0 +1,76 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Headless run host for the process-level tests in tests/RamQuick.IntegrationTests
+    (CrashRecoveryProcessTests kills it mid-step; ProductionBindingTests reads its PASS summary).
+    It drives the production RunController over the production ramquick_engine.dll in its own
+    process, so the integration-test process can stay bound to ramquick_engine_test.dll.
+    Language, analyzer, platform, lock-file and documentation settings come from the root
+    Directory.Build.props; it references no packages, so nothing here sets a version.
+  -->
+  <PropertyGroup>
+    <!-- Console exe: stdout is the line protocol the integration tests read. -->
+    <OutputType>Exe</OutputType>
+    <TargetFramework>$(RamQuickTargetFramework)</TargetFramework>
+    <!-- Supplies the WPF Dispatcher the host pumps as its UI thread; no Window or Application is created. -->
+    <UseWPF>true</UseWPF>
+    <AssemblyName>RamQuick.TestHost</AssemblyName>
+    <RootNamespace>RamQuick.TestHost</RootNamespace>
+    <!--
+      Matches the framework-dependent win-x64 RamQuick.App exe it references. A RID no longer
+      implies self-contained in the .NET 8 SDK; stating SelfContained=false keeps the exe-to-exe
+      reference clear of NETSDK1150/NETSDK1151.
+    -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <!-- Test infrastructure only: never packed or published; the portable folder holds the app alone. -->
+    <IsPackable>false</IsPackable>
+    <IsPublishable>false</IsPublishable>
+    <!-- A plain executable, not a VSTest project, so test runs skip it. -->
+    <IsTestProject>false</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The production controller graph; Core, Interop, Plans, Analysis, Sensors, Logging and CommunityToolkit.Mvvm flow transitively. -->
+    <ProjectReference Include="..\..\src\RamQuick.App\RamQuick.App.csproj" />
+    <!-- Build order only, with the same metadata RamQuick.App uses on this reference. -->
+    <ProjectReference Include="..\..\src\engine\ramquick_engine.vcxproj"
+                      ReferenceOutputAssembly="false"
+                      SkipGetTargetFrameworkProperties="true"
+                      GlobalPropertiesToRemove="RuntimeIdentifier;SelfContained;PublishProfile">
+      <Project>{CE24E0D8-4D34-4891-8FA6-5A5FB83CB6EA}</Project>
+    </ProjectReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Shared fakes for the controller's hardware-facing seams. FakeEngine, ImmediateSynchronizationContext
+      and StalledJournalStorage are deliberately not linked: the host runs the real NativeEngine, a real
+      WPF dispatcher and the real FileJournalStorage.
+    -->
+    <Compile Include="..\RamQuick.App.Tests\Fakes\FakeSensorSource.cs" Link="Fakes\FakeSensorSource.cs" />
+    <Compile Include="..\RamQuick.App.Tests\Fakes\FakeElevationService.cs" Link="Fakes\FakeElevationService.cs" />
+    <Compile Include="..\RamQuick.App.Tests\Fakes\FakeUserPrompt.cs" Link="Fakes\FakeUserPrompt.cs" />
+    <Compile Include="..\RamQuick.App.Tests\Fakes\FakeMemoryInventorySource.cs" Link="Fakes\FakeMemoryInventorySource.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      The production engine, bound by default because the host never calls EngineLibrary.Bind.
+      Stated here as well as flowing from RamQuick.App so the host's output never depends on the app's items.
+    -->
+    <None Include="$(RamQuickNativeOutRoot)$(Configuration)\ramquick_engine.dll"
+          Link="ramquick_engine.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          Visible="false" />
+  </ItemGroup>
+
+  <!-- ProductionBindingTests relies on this folder holding the production engine and never the test engine. -->
+  <Target Name="RamQuickVerifyProductionEngineOnly" AfterTargets="Build">
+    <Error Condition="Exists('$(OutDir)ramquick_engine_test.dll')"
+           Text="RamQuick.TestHost must bind the production engine only; ramquick_engine_test.dll was found in $(OutDir)." />
+    <Error Condition="!Exists('$(OutDir)ramquick_engine.dll')"
+           Text="ramquick_engine.dll is missing from $(OutDir)." />
+  </Target>
+
+</Project>
