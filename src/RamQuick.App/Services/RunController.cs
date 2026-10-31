@@ -64,7 +64,7 @@ public enum StartResult
     /// write probe fails, the results log cannot reserve the run's name, the <c>begin</c> record is not durable
     /// within 5 s, or preparing the run fails unexpectedly. The notice reads
     /// <see cref="UiText.DataFolderUnusableMessage"/>, or <see cref="UiText.ResultsNotSaved(string)"/> when the
-    /// journal of an earlier run whose publication failed still cannot be published.
+    /// journal of an earlier run whose publication failed still cannot be published, or its recovery fails.
     /// </summary>
     DataFolderUnusable,
 
@@ -626,7 +626,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
     /// <para>
     /// An unfinished journal moves the state Idle → Failed with the "did not finish" reason, shown without a dialog.
     /// A run whose verdict was journalled but whose summaries were missing stays Idle with the recovery notice. A
-    /// failed probe or recovery is written to the application error log and does not stop initialisation.
+    /// journal that held damaged data shows <see cref="UiText.RecoveredDamagedNotice"/> instead. A failed probe or
+    /// recovery is written to the application error log and does not stop initialisation; a failed recovery also
+    /// shows <see cref="UiText.ResultsNotSaved(string)"/>.
     /// </para>
     /// </remarks>
     /// <returns>A task that completes when Start can be offered, or when this instance is about to close.</returns>
@@ -662,7 +664,9 @@ public sealed partial class RunController : ObservableObject, IDisposable
             }
             catch (Exception exception)
             {
+                // The previous run's results may be lost, so the user is told, not only the error log.
                 ReportAppError(nameof(InitializeAsync), exception);
+                NoticeMessage = UiText.ResultsNotSaved(RedactForDisplay(exception.Message));
             }
         }
 
@@ -901,12 +905,19 @@ public sealed partial class RunController : ObservableObject, IDisposable
             : informational;
     }
 
-    private static string UnfinishedRunMessage(JournalRecovery recovery) =>
-        recovery is { InPreparation: false, LastStepNumber: int number, StepCount: int count }
-        && number >= 1
-        && number <= count
+    // A journal that shows neither preparation nor a step of the plan is damaged, so the step is reported unknown
+    // rather than guessed.
+    private static string UnfinishedRunMessage(JournalRecovery recovery)
+    {
+        if (recovery.InPreparation)
+        {
+            return UiText.PreviousRunUnfinishedPreparing;
+        }
+
+        return recovery is { LastStepNumber: int number, StepCount: int count } && number >= 1 && number <= count
             ? UiText.PreviousRunUnfinished(number, count, recovery.LastStepName ?? string.Empty)
-            : UiText.PreviousRunUnfinishedPreparing;
+            : UiText.PreviousRunUnfinishedStepUnknown;
+    }
 
     private async Task ShutdownCoreAsync()
     {
@@ -1043,7 +1054,19 @@ public sealed partial class RunController : ObservableObject, IDisposable
         {
             NoticeMessage = UiText.ResultsNotSaved(RedactForDisplay(error));
         }
+        else if (DamagedJournalNotice(recovery) is { } damagedNotice)
+        {
+            NoticeMessage = damagedNotice;
+        }
     }
+
+    // The notice of a recovery that published from a damaged journal, or null when the journal held no damage.
+    private static string? DamagedJournalNotice(JournalRecovery recovery) =>
+        recovery.JournalDamage is { } damage
+            ? UiText.RecoveredDamagedNotice(
+                RedactForDisplay(damage),
+                recovery.DamagedJournalPath is { } keptPath ? RedactForDisplay(keptPath) : null)
+            : null;
 
     private async Task<StartResult> RunStartAsync(StartSelection selection, CancellationTokenSource pending)
     {
@@ -1190,10 +1213,27 @@ public sealed partial class RunController : ObservableObject, IDisposable
         // retried first, and Start is refused while it still fails.
         if (File.Exists(dataDirectory.JournalPath))
         {
-            JournalRecovery recovery = CrashDetector.Detect(dataDirectory, _timeProvider);
+            JournalRecovery recovery;
+            try
+            {
+                recovery = CrashDetector.Detect(dataDirectory, _timeProvider);
+            }
+            catch (Exception exception)
+            {
+                // A recovery that fails is a failure to save the earlier run's results, not an unusable folder: the
+                // folder has just proved writable.
+                ReportAppError(nameof(TryStart), exception);
+                return new DataFolderCheck(UiText.ResultsNotSaved(RedactForDisplay(exception.Message)), null);
+            }
+
             if (recovery.PublicationError is { } error)
             {
                 return new DataFolderCheck(UiText.ResultsNotSaved(RedactForDisplay(error)), null);
+            }
+
+            if (DamagedJournalNotice(recovery) is { } damagedNotice)
+            {
+                return new DataFolderCheck(null, damagedNotice);
             }
 
             if (recovery.PublishedFiles.Count > 0)

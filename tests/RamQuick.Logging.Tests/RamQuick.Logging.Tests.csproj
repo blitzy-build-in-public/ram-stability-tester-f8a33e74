@@ -17,6 +17,11 @@
     <RootNamespace>RamQuick.Logging.Tests</RootNamespace>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
+    <!--
+      The source-generated kernel32 import behind the test assembly's DataDirectory.FinalPathQuery needs unsafe code.
+      This project references no RamQuick.Interop, so it declares the query the application takes from there itself.
+    -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>

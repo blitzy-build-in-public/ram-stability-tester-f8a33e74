@@ -583,7 +583,10 @@ public sealed class ProgressJournal : IDisposable
     /// Queues the <c>stepEnd</c> record of a finished or interrupted step, without acknowledgment. Called on
     /// StepFinished.
     /// </summary>
-    /// <remarks>Never blocks. A no-op once the journal is disposed or its writer has closed.</remarks>
+    /// <remarks>
+    /// The record carries the run id of the <c>begin</c> record. Never blocks. A no-op once the journal is
+    /// disposed or its writer has closed.
+    /// </remarks>
     /// <param name="outcome">What the engine measured for the step.</param>
     /// <exception cref="ArgumentNullException"><paramref name="outcome"/> is <see langword="null"/>.</exception>
     /// <exception cref="InvalidOperationException"><see cref="BeginAsync"/> has not been called.</exception>
@@ -591,7 +594,7 @@ public sealed class ProgressJournal : IDisposable
     {
         JournalStepEnd record = JournalStepEnd.FromOutcome(outcome);
         ThrowIfNotBegun();
-        _ = TryOffer(record, ack: null);
+        _ = TryOffer(record with { RunId = _runId }, ack: null);
     }
 
     /// <summary>
@@ -633,8 +636,9 @@ public sealed class ProgressJournal : IDisposable
     /// </summary>
     /// <remarks>
     /// The run state arrives as <see cref="JournalResult.TerminalState"/>; the journal never keeps a copy of it.
-    /// No <c>beat</c> follows the <c>result</c> record. The 5 s bound is measured on the journal's
-    /// <see cref="TimeProvider"/>.
+    /// The record is written with the run id of the <c>begin</c> record in <see cref="JournalResult.RunId"/>,
+    /// whatever the caller set there. No <c>beat</c> follows the <c>result</c> record. The 5 s bound is measured
+    /// on the journal's <see cref="TimeProvider"/>.
     /// </remarks>
     /// <param name="result">The run's verdict and true totals.</param>
     /// <returns>
@@ -657,7 +661,7 @@ public sealed class ProgressJournal : IDisposable
         _writer.StopHeartbeats();
 
         var ack = new JournalAck();
-        return TryOffer(result, ack)
+        return TryOffer(result with { RunId = _runId }, ack)
             ? AwaitAcknowledgmentAsync(ack, _timeProvider)
             : Task.FromResult(JournalAckStatus.Failed);
     }
@@ -666,7 +670,10 @@ public sealed class ProgressJournal : IDisposable
     /// Queues the <c>released</c> record, without acknowledgment. Called on Released, before the summaries are
     /// published.
     /// </summary>
-    /// <remarks>Never blocks. A no-op once the journal is disposed or its writer has closed.</remarks>
+    /// <remarks>
+    /// The record carries the run id of the <c>begin</c> record. Never blocks. A no-op once the journal is
+    /// disposed or its writer has closed.
+    /// </remarks>
     /// <param name="releasedBytes">The bytes the engine released.</param>
     /// <param name="releaseTime">The time the release took; persisted in whole milliseconds.</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="releaseTime"/> is negative.</exception>
@@ -681,6 +688,7 @@ public sealed class ProgressJournal : IDisposable
         ThrowIfNotBegun();
         var record = new JournalReleased
         {
+            RunId = _runId,
             ReleasedBytes = releasedBytes,
             ReleaseMs = JournalValues.WholeMilliseconds(releaseTime),
         };

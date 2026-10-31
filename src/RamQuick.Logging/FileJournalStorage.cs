@@ -1,5 +1,5 @@
+using System.Globalization;
 using System.Text;
-using Microsoft.Win32.SafeHandles;
 
 namespace RamQuick.Logging;
 
@@ -22,6 +22,13 @@ namespace RamQuick.Logging;
 /// it, so records are never interleaved.
 /// </para>
 /// <para>
+/// Links: the journal is never opened, created or deleted through a link. Each of those operations
+/// first pins the journal's folder and the data folder above it (<see cref="DataFolderPin"/>),
+/// which must be plain folders and, for a data folder an elevated process resolved, protected
+/// ones, and a journal file that is itself a link is refused, so an elevated run cannot be steered
+/// into writing or deleting a file elsewhere.
+/// </para>
+/// <para>
 /// Threading: as <see cref="IJournalStorage"/> requires, one thread uses an instance at a time.
 /// A private lock nevertheless guards the open handle, so a <see cref="Dispose"/> issued from
 /// another thread cannot close the stream underneath an append in progress.
@@ -30,6 +37,13 @@ namespace RamQuick.Logging;
 public sealed class FileJournalStorage : IJournalStorage
 {
     private const byte LineTerminator = (byte)'\n';
+
+    private const string DamagedNameInfix = ".damaged-";
+    private const string DamagedStampFormat = "yyyyMMdd-HHmmss";
+
+    // Bounds the search for a free damaged-journal name, which a folder full of planted names could
+    // otherwise prolong without end.
+    private const int MaxDamagedNameAttempts = 1_000;
 
     // No byte-order mark, and invalid input never throws: unpaired surrogates are written and
     // malformed bytes are read as U+FFFD, so a damaged line reaches the parser, which rejects it.
@@ -86,9 +100,10 @@ public sealed class FileJournalStorage : IJournalStorage
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The journal's folder and file are created when missing, including after <see cref="Delete"/>.
-    /// The file stays open between appends, because reopening it for every record would add latency
-    /// to the acknowledged records that a run waits on.
+    /// The journal's folder and file are created when missing, including after <see cref="Delete"/>;
+    /// the folder above the journal's folder must exist. The file stays open between appends, because
+    /// reopening it for every record would add latency to the acknowledged records that a run waits
+    /// on, and while it is open it keeps both folders in place.
     /// </para>
     /// <para>
     /// The record is durable once this method returns, to the extent the drive honours flush. When
@@ -101,7 +116,8 @@ public sealed class FileJournalStorage : IJournalStorage
     /// <exception cref="ArgumentNullException"><paramref name="line"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException"><paramref name="line"/> contains <c>\r</c> or <c>\n</c>.</exception>
     /// <exception cref="IOException">
-    /// The record could not be written or made durable, or the instance has been disposed.
+    /// The record could not be written or made durable, the instance has been disposed, or the
+    /// journal, its folder or the data folder is a link or, where required, not protected.
     /// </exception>
     /// <exception cref="UnauthorizedAccessException">The journal location denies write access.</exception>
     public void AppendDurable(string line)
@@ -149,52 +165,68 @@ public sealed class FileJournalStorage : IJournalStorage
     }
 
     /// <summary>
-    /// Reads every line of the journal in the order written, without terminators.
+    /// Reads the journal's lines in the order written, without terminators: the lines of
+    /// <see cref="ReadContent"/>, so no more of the journal than <see cref="JournalReadLimits"/> allows.
+    /// </summary>
+    /// <returns>The journal's lines, or an empty list when the journal or its folder does not exist.</returns>
+    /// <exception cref="IOException">An existing journal could not be read.</exception>
+    /// <exception cref="UnauthorizedAccessException">The journal location denies read access.</exception>
+    public IReadOnlyList<string> ReadLines() => ReadContent().Lines;
+
+    /// <summary>
+    /// Reads the journal's lines in the order written, without terminators, holding no more of the file
+    /// than <see cref="JournalReadLimits"/> allows, and reports what it left unread.
     /// </summary>
     /// <remarks>
     /// <para>
     /// The file is opened for reading with read, write and delete sharing, so an instance or another
-    /// process appending to it is unaffected. The content is decoded as UTF-8, with malformed bytes
-    /// replaced by U+FFFD rather than throwing, and split on <c>\n</c>; one trailing <c>\r</c> is
-    /// removed from each line.
+    /// process appending to it is unaffected, and is read in chunks. A UTF-8 byte-order mark at its start
+    /// is skipped. The bytes are split on <c>\n</c>, one trailing <c>\r</c> is removed from each line, and
+    /// each line is decoded as UTF-8, with malformed bytes replaced by U+FFFD rather than throwing.
     /// </para>
     /// <para>
-    /// Only the empty segment after the last terminator is dropped. A final line without a
-    /// terminator is returned as stored even though it may be torn; rejecting it is the parser's job.
+    /// Bounds: a line longer than <see cref="JournalReadLimits.MaxLineBytes"/> is left out, and no more of
+    /// it than that bound is ever buffered. Reading stops after <see cref="JournalReadLimits.MaxJournalBytes"/>
+    /// bytes, leaving out the line that bound cuts short, or once <see cref="JournalReadLimits.MaxLines"/>
+    /// lines are held and another follows. <see cref="JournalContent.Damage"/> names the first bound reached.
+    /// </para>
+    /// <para>
+    /// Only the empty segment after the last terminator is dropped. A final line without a terminator, at
+    /// the end of the file, is returned as stored even though it may be torn, and
+    /// <see cref="JournalContent.LastLineUnterminated"/> is then set; rejecting the line is the parser's job.
     /// </para>
     /// </remarks>
-    /// <returns>The journal's lines, or an empty list when the journal or its folder does not exist.</returns>
-    /// <exception cref="IOException">An existing journal could not be read.</exception>
+    /// <returns>
+    /// The lines read and the reason any part of the journal was left unread; no lines and no damage when the
+    /// journal or its folder does not exist.
+    /// </returns>
+    /// <exception cref="IOException">
+    /// An existing journal could not be read, or the journal, its folder or the data folder is a link.
+    /// </exception>
     /// <exception cref="UnauthorizedAccessException">The journal location denies read access.</exception>
-    public IReadOnlyList<string> ReadLines()
+    public JournalContent ReadContent()
     {
-        string content;
+        // A journal reached through a link is not this data folder's journal: recovering it would make
+        // an elevated launch read, and act on, a file a non-elevated user pointed it to.
+        if (!DataFolderPin.RequirePlainLocation(_path))
+        {
+            return new JournalContent(Array.Empty<string>(), Damage: null);
+        }
+
+        FileStream stream;
         try
         {
-            using FileStream stream = new(
-                _path,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete);
-            using StreamReader reader = new(stream, _utf8, detectEncodingFromByteOrderMarks: false);
-            content = reader.ReadToEnd();
+            stream = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         }
         catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
         {
-            return Array.Empty<string>();
+            return new JournalContent(Array.Empty<string>(), Damage: null);
         }
 
-        string[] segments = content.Split('\n');
-        int count = segments[^1].Length == 0 ? segments.Length - 1 : segments.Length;
-
-        string[] lines = new string[count];
-        for (int index = 0; index < count; index++)
+        using (stream)
         {
-            string segment = segments[index];
-            lines[index] = segment.EndsWith('\r') ? segment[..^1] : segment;
+            return new BoundedLineReader().Read(stream);
         }
-
-        return lines;
     }
 
     /// <summary>
@@ -204,18 +236,68 @@ public sealed class FileJournalStorage : IJournalStorage
     /// <remarks>
     /// A later <see cref="AppendDurable"/> creates a new journal. When this method throws, the
     /// journal stays in place, so the next launch recovers it again; the caller decides whether that
-    /// is fatal.
+    /// is fatal. The deletion runs while the journal's folder and the data folder are pinned, and
+    /// removes a journal that is a link without touching what it points to.
     /// </remarks>
-    /// <exception cref="IOException">The journal exists but could not be deleted.</exception>
+    /// <exception cref="IOException">
+    /// The journal exists but could not be deleted, or its folder or the data folder is a link or,
+    /// where required, not protected.
+    /// </exception>
     /// <exception cref="UnauthorizedAccessException">The journal location denies deletion.</exception>
     public void Delete()
     {
         lock (_gate)
         {
             CloseStream();
-            if (File.Exists(_path))
+
+            // A missing folder holds no journal to delete, and pinning it would need it created.
+            if (string.IsNullOrEmpty(_directory) || DataFolderPin.TryGetAttributes(_directory) is null)
             {
-                File.Delete(_path);
+                return;
+            }
+
+            using (DataFolderPin.ForFolder(_directory, createFolder: false))
+            {
+                if (File.Exists(_path))
+                {
+                    File.Delete(_path);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Closes the handle this instance holds open on the journal, then renames the journal file, in its
+    /// folder, to <c>&lt;name&gt;.damaged-&lt;yyyyMMdd-HHmmss&gt;&lt;extension&gt;</c>, normally
+    /// <c>active-run.damaged-20261028-150500.jsonl</c>, stamped in UTC.
+    /// </summary>
+    /// <remarks>
+    /// When that name is taken, by a file or a folder, <c>-2</c>, <c>-3</c> and so on are added after the
+    /// stamp until a free name is found. The rename never overwrites: should the chosen name be taken
+    /// between the check and the rename, the rename fails and the journal stays in place. A later
+    /// <see cref="AppendDurable"/> creates a new journal. The rename runs while the journal's folder and the data
+    /// folder are pinned, and moves a journal that is a link without touching what it points to.
+    /// </remarks>
+    /// <param name="utc">The time the journal is retired, which the new name carries in UTC.</param>
+    /// <returns>The full path the journal was moved to.</returns>
+    /// <exception cref="IOException">
+    /// The journal does not exist, no free name was found among the first 1,000, the rename failed, or the
+    /// journal's folder or the data folder is a link or, where required, not protected.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">The journal location denies the rename.</exception>
+    public string MoveAside(DateTimeOffset utc)
+    {
+        lock (_gate)
+        {
+            CloseStream();
+
+            // Pinned as for Delete, so the name checked and the rename both stay in this data folder's journal
+            // folder: an elevated recovery must not rename a file in a folder a junction swapped in leads to.
+            using (string.IsNullOrEmpty(_directory) ? null : DataFolderPin.ForFolder(_directory, createFolder: false))
+            {
+                string target = FreeDamagedName(utc);
+                File.Move(_path, target, overwrite: false);
+                return target;
             }
         }
     }
@@ -249,26 +331,26 @@ public sealed class FileJournalStorage : IJournalStorage
         return record;
     }
 
-    // Called with _gate held.
+    // Called with _gate held. The folders stay pinned while the journal is opened; once open, the
+    // journal itself keeps them in place.
     private FileStream OpenForAppend()
     {
-        if (!string.IsNullOrEmpty(_directory))
-        {
-            Directory.CreateDirectory(_directory);
-        }
+        using DataFolderPin? pin = string.IsNullOrEmpty(_directory)
+            ? null
+            : DataFolderPin.ForFolder(_directory, createFolder: true);
 
-        // bufferSize 1 disables FileStream's own buffer, so each Write reaches the OS at once and
-        // WriteThrough carries it past the OS cache.
-        FileStream stream = new(
-            _path,
-            FileMode.Append,
-            FileAccess.Write,
-            FileShare.Read | FileShare.Delete,
-            bufferSize: 1,
-            FileOptions.WriteThrough);
+        FileStream stream = OpenJournalFile();
         try
         {
-            _startNextRecordOnNewLine = stream.Length > 0 && !EndsWithTerminator(stream.Length);
+            // Checked again once open: an entry that became a link before the open was followed.
+            if (DataFolderPin.IsLink(_path))
+            {
+                throw DataFolderPin.LinkedFile(_path);
+            }
+
+            long length = stream.Length;
+            _startNextRecordOnNewLine = length > 0 && !EndsWithTerminator(stream, length);
+            stream.Seek(0, SeekOrigin.End);
         }
         catch
         {
@@ -280,16 +362,63 @@ public sealed class FileJournalStorage : IJournalStorage
         return stream;
     }
 
-    // The append handle is write-only, so the last byte is read through a second, shared handle.
-    private bool EndsWithTerminator(long length)
+    // An existing journal is opened and a missing one created exclusively, so the open never follows
+    // a link standing in the journal's place. Read access lets the tail be inspected through this
+    // handle. bufferSize 1 disables FileStream's own buffer, so each Write reaches the OS at once and
+    // WriteThrough carries it past the OS cache.
+    private FileStream OpenJournalFile()
     {
-        using SafeFileHandle handle = File.OpenHandle(
-            _path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.ReadWrite | FileShare.Delete);
-        Span<byte> lastByte = stackalloc byte[1];
-        return RandomAccess.Read(handle, lastByte, length - 1) == 1 && lastByte[0] == LineTerminator;
+        for (int attempt = 0; ; attempt++)
+        {
+            FileAttributes? existing = DataFolderPin.TryGetAttributes(_path);
+            if (existing is { } attributes && (attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                throw DataFolderPin.LinkedFile(_path);
+            }
+
+            try
+            {
+                return new FileStream(
+                    _path,
+                    existing is null ? FileMode.CreateNew : FileMode.Open,
+                    FileAccess.ReadWrite,
+                    FileShare.Read | FileShare.Delete,
+                    bufferSize: 1,
+                    FileOptions.WriteThrough);
+            }
+            catch (IOException) when (attempt == 0 && existing is null && DataFolderPin.TryGetAttributes(_path) is not null)
+            {
+                // Created by another instance since the check: open it as an existing journal.
+            }
+        }
+    }
+
+    // The last byte is read through the append handle itself, so the file inspected is the file the
+    // records go to; a second open by path could reach another one.
+    private static bool EndsWithTerminator(FileStream stream, long length)
+    {
+        stream.Seek(length - 1, SeekOrigin.Begin);
+        return stream.ReadByte() == LineTerminator;
+    }
+
+    // The first damaged-journal name beside the journal that holds neither a file nor a folder.
+    private string FreeDamagedName(DateTimeOffset utc)
+    {
+        string directory = _directory ?? string.Empty;
+        string stem = Path.GetFileNameWithoutExtension(_path) + DamagedNameInfix
+            + utc.UtcDateTime.ToString(DamagedStampFormat, CultureInfo.InvariantCulture);
+        string extension = Path.GetExtension(_path);
+        for (int attempt = 1; attempt <= MaxDamagedNameAttempts; attempt++)
+        {
+            string suffix = attempt == 1 ? string.Empty : "-" + attempt.ToString(CultureInfo.InvariantCulture);
+            string candidate = Path.Combine(directory, stem + suffix + extension);
+            if (!Path.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        throw new IOException($"No free name was found beside the progress journal '{_path}' to keep it as damaged.");
     }
 
     // Called with _gate held.
@@ -317,5 +446,162 @@ public sealed class FileJournalStorage : IJournalStorage
         {
             Monitor.Exit(_gate);
         }
+    }
+
+    // Splits a stream into lines within JournalReadLimits, holding at most one line of at most the line bound
+    // beside one read chunk, so a journal of any size or shape costs bounded memory. Single use.
+    private sealed class BoundedLineReader
+    {
+        private const int ChunkBytes = 64 * 1024;
+        private const int InitialLineBytes = 4 * 1024;
+        private const int Mebibyte = 1024 * 1024;
+        private const byte CarriageReturn = (byte)'\r';
+
+        // A line within the bound may still carry the '\r' that precedes its terminator.
+        private const int LineBufferLimit = JournalReadLimits.MaxLineBytes + 1;
+
+        private static readonly byte[] _byteOrderMark = { 0xEF, 0xBB, 0xBF };
+
+        private readonly List<string> _lines = new();
+        private byte[] _line = new byte[InitialLineBytes];
+        private int _lineLength;
+        private bool _skippingLongLine;
+        private bool _lastLineUnterminated;
+        private string? _damage;
+
+        public JournalContent Read(Stream stream)
+        {
+            byte[] chunk = new byte[ChunkBytes];
+            long remaining = JournalReadLimits.MaxJournalBytes;
+
+            // The journal is written without a byte-order mark; one an editor added is skipped, not read as text.
+            int head = stream.ReadAtLeast(chunk.AsSpan(0, _byteOrderMark.Length), _byteOrderMark.Length, throwOnEndOfStream: false);
+            remaining -= head;
+            // Three bytes complete at most three lines, so the line bound cannot stop the read here.
+            if (!chunk.AsSpan(0, head).SequenceEqual(_byteOrderMark))
+            {
+                _ = Process(chunk.AsSpan(0, head));
+            }
+
+            while (true)
+            {
+                if (remaining == 0)
+                {
+                    if (stream.ReadByte() >= 0)
+                    {
+                        // The line the bound cuts short is incomplete, so it is left out rather than returned torn.
+                        NoteDamage(string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"the journal is larger than {JournalReadLimits.MaxJournalBytes / Mebibyte} MiB, so the rest of it was left unread"));
+                        return Content();
+                    }
+
+                    break;
+                }
+
+                int read = stream.Read(chunk, 0, (int)Math.Min(chunk.Length, remaining));
+                if (read == 0)
+                {
+                    break;
+                }
+
+                remaining -= read;
+                if (!Process(chunk.AsSpan(0, read)))
+                {
+                    return Content();
+                }
+            }
+
+            // The final line has no terminator, as after an append cut short by a crash; it is kept as stored, and
+            // reported as unterminated unless the line bound left it out.
+            if (_lineLength > 0 || _skippingLongLine)
+            {
+                int held = _lines.Count;
+                _ = EndLine();
+                _lastLineUnterminated = _lines.Count > held;
+            }
+
+            return Content();
+        }
+
+        // Appends the data to the pending line and completes a line at each terminator. Returns false once the
+        // line bound stops the read.
+        private bool Process(ReadOnlySpan<byte> data)
+        {
+            while (!data.IsEmpty)
+            {
+                int terminator = data.IndexOf(LineTerminator);
+                Append(terminator < 0 ? data : data[..terminator]);
+                if (terminator < 0)
+                {
+                    return true;
+                }
+
+                if (!EndLine())
+                {
+                    return false;
+                }
+
+                data = data[(terminator + 1)..];
+            }
+
+            return true;
+        }
+
+        private void Append(ReadOnlySpan<byte> part)
+        {
+            if (_skippingLongLine || part.IsEmpty)
+            {
+                return;
+            }
+
+            int length = _lineLength + part.Length;
+            if (length > LineBufferLimit)
+            {
+                // Too long to keep: the rest of the line is skipped up to its terminator, never buffered.
+                _skippingLongLine = true;
+                _lineLength = 0;
+                return;
+            }
+
+            if (length > _line.Length)
+            {
+                Array.Resize(ref _line, Math.Min(Math.Max(length, _line.Length * 2), LineBufferLimit));
+            }
+
+            part.CopyTo(_line.AsSpan(_lineLength));
+            _lineLength = length;
+        }
+
+        // Completes the pending line. Returns false, keeping nothing more, when the line bound is reached.
+        private bool EndLine()
+        {
+            int length = _lineLength > 0 && _line[_lineLength - 1] == CarriageReturn ? _lineLength - 1 : _lineLength;
+            bool tooLong = _skippingLongLine || length > JournalReadLimits.MaxLineBytes;
+            _lineLength = 0;
+            _skippingLongLine = false;
+            if (tooLong)
+            {
+                NoteDamage(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"a line longer than {JournalReadLimits.MaxLineBytes / Mebibyte} MiB was left unread"));
+                return true;
+            }
+
+            if (_lines.Count == JournalReadLimits.MaxLines)
+            {
+                NoteDamage(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"the journal holds more than {JournalReadLimits.MaxLines:N0} lines, so the rest of them were left unread"));
+                return false;
+            }
+
+            _lines.Add(_utf8.GetString(_line, 0, length));
+            return true;
+        }
+
+        private void NoteDamage(string damage) => _damage ??= damage;
+
+        private JournalContent Content() => new(_lines.AsReadOnly(), _damage, _lastLineUnterminated);
     }
 }

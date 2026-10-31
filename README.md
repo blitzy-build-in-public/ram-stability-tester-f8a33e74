@@ -84,7 +84,7 @@ Step 'Random bank thrash' at 01:12 — 3 errors — virtual address 0x0000023A4F
 
 > The previous test did not finish at step n of N (name), which likely indicates severe instability.
 
-A partial summary of that test is saved. If the process ended after the verdict but before the results were saved, they are rebuilt from the progress journal and the notice reads "Results of the previous test were recovered and saved."
+A partial summary of that test is saved. If the process ended after the verdict but before the results were saved, they are rebuilt from the progress journal and the notice reads "Results of the previous test were recovered and saved." In either case, if the journal held damaged data, what the rest of it holds is still saved, and the notice says the results were recovered and saved but the journal held damaged data, naming the damage and, if the journal was moved aside, where it was kept. If the damage hides the step at which the test stopped, the FAIL reason reads "The previous test did not finish, which likely indicates severe instability. The step at which it stopped is unknown because its progress journal is damaged."
 
 ## Data and log files
 
@@ -95,20 +95,25 @@ RAMQuick stores its files in a data folder, `<data>`:
 
 If neither is writable, Start is refused with "RAMQuick cannot save its progress journal and logs. Move it to a writable folder and try again."
 
+RAMQuick never uses a data folder, `journal` folder or `logs` folder that is a link or junction, and never reads or writes its own files through a link: an elevated RAMQuick following a link planted by another program could otherwise write outside the data folder. Such a location counts as not writable.
+
+When RAMQuick runs as Administrator, it uses only a data folder that only administrators can change, so that a program running without Administrator rights cannot redirect its files. It creates a missing data folder that way: owned by Administrators, changeable by SYSTEM and Administrators only, and readable by your account, so you can still open the logs and summaries. A data folder that an earlier launch without Administrator rights created, holding nothing but empty `journal` and `logs` folders, is replaced by such a folder. A data folder that anyone else can change and that holds anything more is left untouched, and RAMQuick uses the other location. Once an elevated RAMQuick has protected `<app folder>\data`, a launch without Administrator rights cannot write there and uses `%LOCALAPPDATA%\RamQuick` instead. An elevated RAMQuick also refuses a data folder reached through a link or junction that a program without Administrator rights could change. It holds each folder open, so that the folder cannot be renamed, deleted or moved, and verifies where Windows finds it before it creates or deletes anything in it, including the folder that holds the data folder and any missing folder above it, which it creates one level at a time. A folder swapped for a link before RAMQuick holds it is refused, and nothing is created or deleted where the link leads.
+
 | File | Content |
 |------|---------|
-| `<data>\journal\active-run.jsonl` | Progress journal, written durably throughout a test and deleted once its results are saved |
+| `<data>\journal\active-run.jsonl` | Progress journal, written durably throughout a test. Once its results are saved it is deleted, or, if it held damaged data, kept under the name below |
+| `<data>\journal\active-run.damaged-<yyyyMMdd-HHmmss>.jsonl` | A progress journal that held damaged data, kept as evidence once the results it describes are saved and recorded in it as saved. The timestamp is the UTC time it was set aside; `-2`, `-3` and so on follow it when that name is taken. If it cannot be moved, it stays as `active-run.jsonl` and the next launch retries the move |
 | `<data>\logs\RamQuick-<yyyyMMdd-HHmmss>-<TestType>-<runId>.log` | Timestamped event log of one test: configuration, steps, progress every 10 s, errors, temperatures, journal and callback failures, stop and verdict |
 | `<data>\logs\RamQuick-<yyyyMMdd-HHmmss>-<TestType>-<runId>-summary.json` | Machine-readable summary (`schemaVersion: 1`): configuration, steps, coverage, temperatures, errors, cause hints and verdict |
 | `<data>\logs\RamQuick-<yyyyMMdd-HHmmss>-<TestType>-<runId>-summary.txt` | The same summary as readable text |
 | `<data>\logs\…-recovered-summary.json`, `…-recovered-summary.txt` | A summary rebuilt from the journal, used when a file under the original name already exists but cannot be read or belongs to another test |
 | `<data>\logs\app-errors.log` | Unexpected application errors, such as exceptions raised while handling engine events: one `APP_ERROR` header per error, with the test's `run_id` while a test is running, followed by the exception text and stack trace, each line indented by two spaces |
 
-The timestamp is the test's local start time, and `<runId>` is a 32-digit hexadecimal run identifier.
+In the `<data>\logs` names, the timestamp is the test's local start time, and `<runId>` is a 32-digit hexadecimal run identifier. If the base name the progress journal recorded for a test is missing or unusable (not a valid file name, longer than 228 characters, or holding a character that cannot be shown as plain text, such as a control or formatting character), its recovered summaries are saved under the base name `RamQuick-recovered-<runId>` instead, with 32 hexadecimal digits derived from a hash of the test's first line in the journal in place of `<runId>` when the run identifier is unknown.
 
 The JSON and text summaries are the files meant for sharing, for example to compare attempts: they hold memory-test data and hardware descriptors. The `.log` and `app-errors.log` are local diagnostic logs that can also hold exception messages and stack traces. In them, the data folder is written `<data>`, your folders `%LOCALAPPDATA%`, `%APPDATA%` and `%USERPROFILE%`, and your Windows user name, where it is part of a path, `%USERNAME%`. Inspect them before you share them. Nothing leaves the PC.
 
-**Retention and erasure.** Results and logs do not expire. RAMQuick never deletes, rotates or expires the logs and summaries it saves in `<data>\logs`: they accumulate, one set per test, until you remove them. To erase the test data stored on this PC, close RAMQuick and delete its data folder; RAMQuick creates a new, empty one at the next launch. If RAMQuick has run from more than one place, check both locations: `<app folder>\data` beside each copy you ran, and `%LOCALAPPDATA%\RamQuick`. Copies you saved or shared elsewhere are not affected; delete them separately.
+**Retention and erasure.** Results and logs do not expire. RAMQuick never deletes, rotates or expires the logs and summaries it saves in `<data>\logs`: they accumulate, one set per test, until you remove them. Nor does it delete the damaged progress journals it keeps in `<data>\journal`; they too accumulate until you remove them. To erase the test data stored on this PC, kept journals included, close RAMQuick and delete its data folder; RAMQuick creates a new, empty one at the next launch. If RAMQuick has run from more than one place, check both locations: `<app folder>\data` beside each copy you ran, and `%LOCALAPPDATA%\RamQuick`. Copies you saved or shared elsewhere are not affected; delete them separately.
 
 ## Privacy and safety
 

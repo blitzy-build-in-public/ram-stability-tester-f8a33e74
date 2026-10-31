@@ -1087,7 +1087,10 @@ function Import-JsonDocument {
 
 # The schema-1 summary fields this script reads, with the rule each must meet (see
 # Get-JsonFieldProblem). Types and nullability follow RunSummary.cs; nulls are legitimate where a
-# recovered Unfinished summary carries them for values its journal never captured.
+# recovered Unfinished summary carries them for values its journal never captured, such as the plan
+# targets and the coverage of a run whose plan was lost. RunSummary.cs also lets such a summary hold a
+# null run.id or run.testType; this script still requires both, because a run it cannot identify can
+# neither be counted under its type nor left out (see -FailingProfileRuns).
 $SummaryFieldRules = @(
     @{ Section = 'run'; Name = 'id'; Kind = 'RunId' }
     @{ Section = 'run'; Name = 'testType'; Kind = 'Name'; Allowed = $TestTypes }
@@ -1102,12 +1105,12 @@ $SummaryFieldRules = @(
     @{ Section = 'run'; Name = 'firstErrorSeconds'; Kind = 'OptionalNumber' }
     @{ Section = 'run'; Name = 'recovered'; Kind = 'Flag' }
     @{ Section = 'run'; Name = 'partial'; Kind = 'Flag' }
-    @{ Section = 'plan'; Name = 'targetSeconds'; Kind = 'Number' }
+    @{ Section = 'plan'; Name = 'targetSeconds'; Kind = 'OptionalNumber' }
     @{ Section = 'memory'; Name = 'releaseSeconds'; Kind = 'OptionalNumber' }
     @{ Section = 'memory'; Name = 'testedBytes'; Kind = 'OptionalNumber' }
-    @{ Section = 'coverage'; Name = 'percent'; Kind = 'Number' }
-    @{ Section = 'coverage'; Name = 'targetPercent'; Kind = 'Number' }
-    @{ Section = 'coverage'; Name = 'targetReached'; Kind = 'Flag' }
+    @{ Section = 'coverage'; Name = 'percent'; Kind = 'OptionalNumber' }
+    @{ Section = 'coverage'; Name = 'targetPercent'; Kind = 'OptionalNumber' }
+    @{ Section = 'coverage'; Name = 'targetReached'; Kind = 'OptionalFlag' }
 )
 
 $SummaryStepRules = @(
@@ -1123,14 +1126,15 @@ function Get-JsonFieldProblem {
     # The problem with one member of a parsed JSON object, reported under its full JSON path, or
     # $null when the member is present and meets its rule: Name (one of -Allowed, case-sensitive,
     # because enum names are persisted exactly), RunId (32 hex digits, a GUID in N form), Text,
-    # Flag, Number (a finite JSON number >= 0), OptionalNumber (also null), Index (an integer >= 1),
-    # OptionalCount (null or an integer >= 0) or Timestamp (null or ISO 8601 UTC).
+    # Flag, OptionalFlag (also null), Number (a finite JSON number >= 0), OptionalNumber (also null),
+    # Index (an integer >= 1), OptionalCount (null or an integer >= 0) or Timestamp (null or ISO 8601
+    # UTC).
     param(
         [AllowNull()][object]$Object,
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)]
-        [ValidateSet('Name', 'RunId', 'Text', 'Flag', 'Number', 'OptionalNumber', 'Index', 'OptionalCount', 'Timestamp')]
+        [ValidateSet('Name', 'RunId', 'Text', 'Flag', 'OptionalFlag', 'Number', 'OptionalNumber', 'Index', 'OptionalCount', 'Timestamp')]
         [string]$Kind,
         [AllowNull()][string[]]$Allowed
     )
@@ -1155,6 +1159,10 @@ function Get-JsonFieldProblem {
         'Flag' {
             if ($value -is [bool]) { return $null }
             $expected = 'true or false'
+        }
+        'OptionalFlag' {
+            if ($null -eq $value -or $value -is [bool]) { return $null }
+            $expected = 'null, true or false'
         }
         'Number' {
             if ((Test-JsonNumber $value) -and [double]$value -ge 0) { return $null }
@@ -5057,6 +5065,9 @@ function Invoke-SelfTest {
             '"partial": false'                        = '"partial": true'
             '"testedBytes": 268435456'                = '"testedBytes": null'
             '"releaseSeconds": 0.035'                 = '"releaseSeconds": null'
+            '"targetSeconds": 24,'                    = '"targetSeconds": null,'
+            '"percent": 61200, "targetPercent": 60, "targetReached": true' =
+            '"percent": null, "targetPercent": null, "targetReached": null'
             '"actualSeconds": 12.507, "overrunSeconds": 0.507, "passes": 269, "coveragePercent": 26900, "errors": 0, "completed": true' =
             '"actualSeconds": null, "overrunSeconds": null, "passes": null, "coveragePercent": null, "errors": null, "completed": false'
         }
@@ -5083,6 +5094,10 @@ function Invoke-SelfTest {
             @{ Find = '"verdict": "PASS"'; Replace = '"verdict": "MAYBE"'; Problem = 'run.verdict: expected one of PASS, FAIL, ABORTED' }
             @{ Find = '"id": "13ae3ce49e4046f4a7e9789c7f9355fe"'; Replace = '"id": "13ae3ce4-9e40"'; Problem = 'run.id: expected a run id of 32 hex digits' }
             @{ Find = '"testType": "Quick"'; Replace = '"testType": "Turbo"'; Problem = 'run.testType: expected one of Quick, Standard, Exhaustive' }
+            @{ Find = '"testType": "Quick"'; Replace = '"testType": null'; Problem = 'run.testType: expected one of Quick, Standard, Exhaustive, found null' }
+            @{ Find = '"id": "13ae3ce49e4046f4a7e9789c7f9355fe"'; Replace = '"id": null'; Problem = 'run.id: expected a run id of 32 hex digits, found null' }
+            @{ Find = '"targetReached": true'; Replace = '"targetReached": "yes"'; Problem = 'coverage.targetReached: expected null, true or false' }
+            @{ Find = '"targetSeconds": 24,'; Replace = '"targetSeconds": -24,'; Problem = 'plan.targetSeconds: expected null or a finite number >= 0' }
             @{ Find = '{ "index": 1, '; Replace = '{ '; Problem = 'steps[0].index: missing' }
             @{ Find = '"startRequestedUtc": "2026-10-30T02:15:29.828Z"'; Replace = '"startRequestedUtc": "2026-10-30T02:15:29.828"'; Problem = 'run.startRequestedUtc: expected null or an ISO 8601 UTC timestamp' }
             @{ Find = '"startRequestedUtc": "2026-10-30T02:15:29.828Z"'; Replace = '"startRequestedUtc": "2026-10-30T04:15:29.828+02:00"'; Problem = 'run.startRequestedUtc: expected null or an ISO 8601 UTC timestamp' }

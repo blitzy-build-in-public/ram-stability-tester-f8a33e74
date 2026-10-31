@@ -40,14 +40,18 @@ public static class TextSummaryFormatter
 {
     /// <summary>
     /// The start of the header line that carries the run id, <c>"Run ID: "</c>. The rest of that line is the
-    /// run GUID in its 32-hex-digit <c>N</c> form.
+    /// run GUID in its 32-hex-digit <c>N</c> form, or <c>"Unknown"</c> in a summary rebuilt from a journal that
+    /// never captured the run id.
     /// </summary>
     public const string RunIdLinePrefix = "Run ID: ";
 
     private const string NewLine = "\r\n";
     private const string Title = "RAMQuick test summary";
+    private const string RecoveredLine = "This summary was rebuilt from the progress journal at the next launch.";
     private const string CauseHintsHeading = "Probable cause (hint)";
     private const string NotCaptured = "n/a";
+
+    // A value the run's journal never captured; also the run id of a summary rebuilt without one.
     private const string Unknown = "Unknown";
     private const string NotAvailable = "N/A";
     private const string EmDash = "\u2014";
@@ -120,7 +124,7 @@ public static class TextSummaryFormatter
         AppendCauseHints(text, summary.CauseHints);
         if (summary.UnfinishedRun is { } unfinished)
         {
-            AppendUnfinishedRun(text, unfinished);
+            AppendUnfinishedRun(text, summary, unfinished);
         }
 
         return text.ToString();
@@ -131,9 +135,10 @@ public static class TextSummaryFormatter
     /// </summary>
     /// <param name="text">The text of a <c>-summary.txt</c> file.</param>
     /// <returns>
-    /// The run id on the first line that starts with <see cref="RunIdLinePrefix"/>, or
-    /// <see langword="null"/> when no line starts with it or the rest of that line is not a 32-hex-digit
-    /// <c>N</c>-format GUID.
+    /// The run id on the first line that starts with <see cref="RunIdLinePrefix"/>; <see cref="Guid.Empty"/>
+    /// when the rest of that line is <c>"Unknown"</c>, as <see cref="Format"/> writes it for a summary rebuilt
+    /// without a run id; or <see langword="null"/> when no line starts with the prefix or the rest of that line
+    /// is neither a 32-hex-digit <c>N</c>-format GUID nor <c>"Unknown"</c>.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="text"/> is <see langword="null"/>.</exception>
     public static Guid? TryParseRunId(string text)
@@ -151,6 +156,11 @@ public static class TextSummaryFormatter
             if (line.StartsWith(RunIdLinePrefix, StringComparison.Ordinal))
             {
                 ReadOnlySpan<char> value = line[RunIdLinePrefix.Length..].Trim();
+                if (value.SequenceEqual(Unknown))
+                {
+                    return Guid.Empty;
+                }
+
                 return Guid.TryParseExact(value, "N", out Guid runId) ? runId : null;
             }
         }
@@ -158,16 +168,44 @@ public static class TextSummaryFormatter
         return null;
     }
 
+    /// <summary>
+    /// Reads from a text summary written by <see cref="Format"/> whether it states that it was rebuilt from a
+    /// progress journal at a later launch, as <see cref="SummaryRun.Recovered"/> records.
+    /// </summary>
+    /// <param name="text">The text of a <c>-summary.txt</c> file.</param>
+    /// <returns>
+    /// <see langword="true"/> when one of its lines is the line <see cref="Format"/> writes for a recovered
+    /// summary, "This summary was rebuilt from the progress journal at the next launch."; otherwise
+    /// <see langword="false"/>.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="text"/> is <see langword="null"/>.</exception>
+    public static bool StatesRecovered(string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+
+        // An explicit MoveNext loop, for the reason TryParseRunId gives.
+        SpanLineEnumerator lines = text.AsSpan().EnumerateLines();
+        while (lines.MoveNext())
+        {
+            if (lines.Current.SequenceEqual(RecoveredLine))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static void AppendHeader(StringBuilder text, RunSummary summary)
     {
         Line(text, Title);
         Line(text, new string('=', Title.Length));
         Field(text, "App", AppText(summary.App));
-        Line(text, RunIdLinePrefix + TextOrNotCaptured(summary.Run.Id));
+        Line(text, RunIdLinePrefix + (summary.Run.Id is null ? Unknown : TextOrNotCaptured(summary.Run.Id)));
         Field(text, "Schema version", Integer(summary.SchemaVersion));
         if (summary.Run.Recovered)
         {
-            Line(text, "This summary was rebuilt from the progress journal at the next launch.");
+            Line(text, RecoveredLine);
         }
 
         if (summary.Run.Partial)
@@ -187,23 +225,26 @@ public static class TextSummaryFormatter
         }
 
         // An ABORTED run still reports the errors it found before the stop.
-        if (string.Equals(run.Verdict, AbortedVerdict, StringComparison.Ordinal) && errors.Total > 0)
+        if (string.Equals(run.Verdict, AbortedVerdict, StringComparison.Ordinal) && errors.Total is { } total && total > 0)
         {
             Line(
                 text,
-                errors.Total == 1
+                total == 1
                     ? "1 error was detected before the test stopped."
-                    : Count(errors.Total) + " errors were detected before the test stopped.");
+                    : Count(total) + " errors were detected before the test stopped.");
         }
     }
 
     private static void AppendConfiguration(StringBuilder text, SummaryRun run, SummaryPlan plan)
     {
         Heading(text, "Configuration");
-        Field(text, "Test type", TextOrNotCaptured(run.TestType));
-        Field(text, "Stop on error", YesNo(run.StopOnError));
-        Field(text, "Target duration", MinutesSeconds(plan.TargetSeconds));
-        Field(text, "Target coverage", Percent(plan.TargetCoveragePercent, UpToOneDecimal));
+        Field(text, "Test type", run.TestType is null ? Unknown : TextOrNotCaptured(run.TestType));
+        Field(text, "Stop on error", YesNoOrUnknown(run.StopOnError));
+        Field(text, "Target duration", plan.TargetSeconds is { } seconds ? MinutesSeconds(seconds) : Unknown);
+        Field(
+            text,
+            "Target coverage",
+            plan.TargetCoveragePercent is { } coverage ? Percent(coverage, UpToOneDecimal) : Unknown);
     }
 
     private static void AppendTimes(StringBuilder text, SummaryRun run)
@@ -353,9 +394,9 @@ public static class TextSummaryFormatter
         Heading(text, "Coverage");
         Line(
             text,
-            Percent(coverage.Percent, OneDecimal)
-                + " (target " + Percent(coverage.TargetPercent, UpToOneDecimal) + ")"
-                + Separator + "target reached: " + YesNo(coverage.TargetReached));
+            (coverage.Percent is { } percent ? Percent(percent, OneDecimal) : Unknown)
+                + " (target " + (coverage.TargetPercent is { } target ? Percent(target, UpToOneDecimal) : Unknown) + ")"
+                + Separator + "target reached: " + YesNoOrUnknown(coverage.TargetReached));
     }
 
     private static void AppendTemperatures(StringBuilder text, SummaryTemperatures temperatures)
@@ -368,7 +409,7 @@ public static class TextSummaryFormatter
     private static void AppendErrors(StringBuilder text, SummaryErrors errors, string? addressKind)
     {
         Heading(text, "Errors");
-        Field(text, "Total errors (true count)", Count(errors.Total));
+        Field(text, "Total errors (true count)", errors.Total is { } total ? Count(total) : Unknown);
         if (!errors.DetailAvailable)
         {
             Line(text, "Error detail is not available for this run.");
@@ -504,14 +545,27 @@ public static class TextSummaryFormatter
         }
     }
 
-    private static void AppendUnfinishedRun(StringBuilder text, SummaryUnfinishedRun unfinished)
+    // Without a last step the run either stopped while preparing memory, before any traffic and so before any
+    // heartbeat or step entry, or stopped at a step its journal no longer shows: one that left a heartbeat or a step,
+    // or left no traffic figures at all. A plan size the journal did not capture is left out of the position.
+    private static void AppendUnfinishedRun(StringBuilder text, RunSummary summary, SummaryUnfinishedRun unfinished)
     {
-        string position = unfinished.LastStepIndex is not { } number
-            ? "while preparing memory (before step 1)"
-            : string.IsNullOrWhiteSpace(unfinished.LastStepName)
-                ? "at step " + Integer(number) + " of " + Integer(unfinished.StepCount)
-                : "at step " + Integer(number) + " of " + Integer(unfinished.StepCount)
-                    + " (" + TextOrNotCaptured(unfinished.LastStepName) + ")";
+        string position;
+        if (unfinished.LastStepIndex is not { } number)
+        {
+            bool leftPreparation = unfinished.LastCoveragePercent is not null
+                || summary.Steps.Count > 0
+                || summary.Coverage.Percent is null;
+            position = leftPreparation ? "at an unknown step" : "while preparing memory (before step 1)";
+        }
+        else
+        {
+            string step = "at step " + Integer(number)
+                + (unfinished.StepCount is { } count ? " of " + Integer(count) : string.Empty);
+            position = string.IsNullOrWhiteSpace(unfinished.LastStepName)
+                ? step
+                : step + " (" + TextOrNotCaptured(unfinished.LastStepName) + ")";
+        }
 
         Heading(text, "Unfinished run");
         Line(text, "The previous test did not finish " + position + ", which likely indicates severe instability.");
@@ -536,7 +590,8 @@ public static class TextSummaryFormatter
 
     private static string AppText(SummaryApp app)
     {
-        string nameAndVersion = (OneLine(app.Name) + " " + OneLine(app.Version)).Trim();
+        string version = app.Version is null ? "(version unknown)" : OneLine(app.Version);
+        string nameAndVersion = (OneLine(app.Name) + " " + version).Trim();
         return nameAndVersion.Length > 0 ? nameAndVersion : NotCaptured;
     }
 
@@ -661,4 +716,6 @@ public static class TextSummaryFormatter
     private static string UtcOrNotCaptured(DateTimeOffset? value) => value is { } stamp ? Utc(stamp) : NotCaptured;
 
     private static string YesNo(bool value) => value ? "Yes" : "No";
+
+    private static string YesNoOrUnknown(bool? value) => value is { } known ? YesNo(known) : Unknown;
 }

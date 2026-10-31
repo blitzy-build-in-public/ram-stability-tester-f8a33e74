@@ -45,6 +45,9 @@ public static class UiText
     private const string ResultsSavedWithoutEventLogFormat = "Results were saved, but the event log is incomplete: {0}";
     private const string PreviousRunUnfinishedFormat =
         "The previous test did not finish at step {0} of {1} ({2}), which likely indicates severe instability.";
+    private const string RecoveredDamagedFormat =
+        "Results of the previous test were recovered and saved, but its progress journal held damaged data: {0}.";
+    private const string DamagedJournalKeptFormat = " The damaged journal was kept as '{0}'.";
 
     // Shortest round-trip form: an integral limit such as 95.0 prints as "95", and a retuned
     // fractional limit keeps its exact digits instead of being rounded to a misleading value.
@@ -356,10 +359,19 @@ public static class UiText
     /// <summary>
     /// The result reason shown at launch when the previous run's journal ends while it was still
     /// preparing memory, before step 1 started. <see cref="PreviousRunUnfinished"/> covers a run
-    /// that ended inside a step.
+    /// that ended inside a step, and <see cref="PreviousRunUnfinishedStepUnknown"/> a journal too
+    /// damaged to tell.
     /// </summary>
     public const string PreviousRunUnfinishedPreparing =
         "The previous test did not finish while preparing memory (before step 1), which likely indicates severe instability.";
+
+    /// <summary>
+    /// The result reason shown at launch when the previous run's journal ends without a verdict but is
+    /// too damaged to show the step at which the run stopped. <see cref="PreviousRunUnfinished"/> and
+    /// <see cref="PreviousRunUnfinishedPreparing"/> cover a journal that shows it.
+    /// </summary>
+    public const string PreviousRunUnfinishedStepUnknown =
+        "The previous test did not finish, which likely indicates severe instability. The step at which it stopped is unknown because its progress journal is damaged.";
 
     /// <summary>
     /// The header of the cause hint list. Every hint is a probable cause, never a diagnosis.
@@ -619,6 +631,29 @@ public static class UiText
     {
         ArgumentNullException.ThrowIfNull(error);
         return string.Format(CultureInfo.InvariantCulture, ResultsNotSavedFormat, error);
+    }
+
+    /// <summary>
+    /// Returns the notice shown when the previous run's results were recovered and saved from a
+    /// progress journal that held damaged data, which recovery left out of the summaries.
+    /// </summary>
+    /// <param name="damage">The first damage found, a phrase without a trailing period, shown verbatim.</param>
+    /// <param name="keptPath">
+    /// Where the damaged journal was kept, shown verbatim, or <see langword="null"/> when it was not kept.
+    /// </param>
+    /// <returns>
+    /// "Results of the previous test were recovered and saved, but its progress journal held damaged
+    /// data: " followed by <paramref name="damage"/> and a period, then, when the journal was kept,
+    /// " The damaged journal was kept as '" followed by <paramref name="keptPath"/> and "'.".
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="damage"/> is <see langword="null"/>.</exception>
+    public static string RecoveredDamagedNotice(string damage, string? keptPath)
+    {
+        ArgumentNullException.ThrowIfNull(damage);
+        string notice = string.Format(CultureInfo.InvariantCulture, RecoveredDamagedFormat, damage);
+        return keptPath is null
+            ? notice
+            : notice + string.Format(CultureInfo.InvariantCulture, DamagedJournalKeptFormat, keptPath);
     }
 
     /// <summary>

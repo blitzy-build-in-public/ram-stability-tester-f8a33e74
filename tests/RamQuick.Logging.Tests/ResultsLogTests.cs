@@ -184,6 +184,22 @@ public sealed partial class ResultsLogTests
         Assert.False(Directory.Exists(root.Data.LogsDirectory));
     }
 
+    [Fact]
+    public void OpenRun_LogsFolderIsJunction_ReturnsNullAndCreatesNothingThroughIt()
+    {
+        using var root = new TestDataRoot();
+        string target = root.CreateLinkTarget();
+        Directory.Delete(root.Data.LogsDirectory);
+        TestDataRoot.CreateJunction(root.Data.LogsDirectory, target);
+        var runIds = new ScriptedRunIds(_g1);
+
+        ResultsLog? log = ResultsLog.OpenRun(root.Data, Quick, _t0, CreateTime(), runIds.Next);
+
+        Assert.Null(log);
+        Assert.Equal(0, runIds.Calls);
+        TestDataRoot.AssertLinkTargetUntouched(target);
+    }
+
     [Theory]
     [InlineData("")]
     [InlineData("Quick Test")]
@@ -240,6 +256,29 @@ public sealed partial class ResultsLogTests
         Assert.Throws<ArgumentException>(() => ResultsLog.GetSummaryTextPath(root.Data, baseName));
         Assert.Throws<ArgumentException>(() => ResultsLog.GetRecoveredSummaryJsonPath(root.Data, baseName));
         Assert.Throws<ArgumentException>(() => ResultsLog.GetRecoveredSummaryTextPath(root.Data, baseName));
+    }
+
+    // The longest name the folder holds, a recovered summary's temporary file, must fit the 255-character limit
+    // of a file name, or a damaged journal's base name would make every publication fail.
+    [Fact]
+    public void GetPaths_BaseNameLength_LongestNameFitsAndOneMoreThrows()
+    {
+        using var root = new TestDataRoot();
+        string longest = new('A', ResultsLog.MaxBaseNameLength);
+        string tooLong = longest + "A";
+
+        Assert.Equal(255, Path.GetFileName(ResultsLog.GetRecoveredSummaryJsonPath(root.Data, longest)).Length + ".tmp".Length);
+        string jsonPath = ResultsLog.GetRecoveredSummaryJsonPath(root.Data, longest);
+        Directory.CreateDirectory(root.Data.LogsDirectory);
+        File.WriteAllText(jsonPath + ".tmp", "{}");
+        Assert.True(File.Exists(jsonPath + ".tmp"));
+        Assert.Equal(Path.Combine(root.Data.LogsDirectory, longest + ".log"), ResultsLog.GetLogPath(root.Data, longest));
+
+        Assert.Throws<ArgumentException>(() => ResultsLog.GetLogPath(root.Data, tooLong));
+        Assert.Throws<ArgumentException>(() => ResultsLog.GetSummaryJsonPath(root.Data, tooLong));
+        Assert.Throws<ArgumentException>(() => ResultsLog.GetSummaryTextPath(root.Data, tooLong));
+        Assert.Throws<ArgumentException>(() => ResultsLog.GetRecoveredSummaryJsonPath(root.Data, tooLong));
+        Assert.Throws<ArgumentException>(() => ResultsLog.GetRecoveredSummaryTextPath(root.Data, tooLong));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -728,6 +767,23 @@ public sealed partial class ResultsLogTests
         Assert.Equal(0, reused.ReadsOffCallerThread);
     }
 
+    // A begin record JournalBegin.Create made always captures Stop on error; one that did not is logged as unknown,
+    // as every other value the record did not capture is.
+    [Theory]
+    [InlineData(true, "stop_on_error=true")]
+    [InlineData(false, "stop_on_error=false")]
+    [InlineData(null, "stop_on_error=unknown")]
+    public async Task LogRunStarting_StopOnError_LogsTheCapturedValueOrUnknownAsync(bool? stopOnError, string expectedField)
+    {
+        using var root = new TestDataRoot();
+        using ResultsLog log = Open(root, CreateTime(), new ScriptedRunIds(JournalSamples.RunIdA));
+
+        log.LogRunStarting(JournalSamples.BeginA(_t0) with { StopOnError = stopOnError });
+
+        string[] lines = await ReadLogLinesAsync(log);
+        AssertFields(Line(lines, "START_REQUESTED"), expectedField);
+    }
+
     [Fact]
     public async Task LogErrors_LinesCarryTimeAndStepCountOfTheCallAsync()
     {
@@ -1041,6 +1097,72 @@ public sealed partial class ResultsLogTests
         Assert.Throws<ArgumentNullException>(() => ResultsLog.PublishFile(target, null!));
 
         Assert.Empty(Directory.GetFiles(root.Data.LogsDirectory));
+    }
+
+    [Theory]
+    [InlineData("file link")]
+    [InlineData("dangling file link")]
+    [InlineData("junction")]
+    public void PublishFile_LinkAtTempName_RemovesOnlyTheLinkAndPublishes(string planted)
+    {
+        const string Content = "{\"published\":true}";
+        using var root = new TestDataRoot();
+        string target = root.CreateLinkTarget();
+        string final = root.Combine("logs", "RamQuick-planted-summary.json");
+        string temp = final + ".tmp";
+        string protectedFile = Path.Combine(target, TestDataRoot.SentinelFileName);
+        string missingFile = Path.Combine(target, "created-through-link.txt");
+        switch (planted)
+        {
+            case "file link":
+                TestDataRoot.CreateFileSymbolicLinkOrSkip(temp, protectedFile);
+                break;
+            case "dangling file link":
+                TestDataRoot.CreateFileSymbolicLinkOrSkip(temp, missingFile);
+                break;
+            default:
+                TestDataRoot.CreateJunction(temp, target);
+                break;
+        }
+
+        ResultsLog.PublishFile(final, Content);
+
+        // The planted entry is gone, the file it pointed to is neither overwritten nor created, and the summary
+        // is a file of its own.
+        Assert.False(File.Exists(temp) || Directory.Exists(temp));
+        TestDataRoot.AssertLinkTargetUntouched(target);
+        Assert.False(File.Exists(missingFile));
+        Assert.False(File.GetAttributes(final).HasFlag(FileAttributes.ReparsePoint));
+        Assert.Equal(Content, File.ReadAllText(final));
+    }
+
+    [Fact]
+    public void PublishFile_FolderAtTempName_FailsAndLeavesFolderAndFinalNameUntouched()
+    {
+        using var root = new TestDataRoot();
+        string final = root.Combine("logs", "RamQuick-blocked-summary.json");
+        string nested = Path.Combine(final + ".tmp", "inside.txt");
+        Directory.CreateDirectory(final + ".tmp");
+        File.WriteAllBytes(nested, _sentinel);
+
+        Assert.Throws<UnauthorizedAccessException>(() => ResultsLog.PublishFile(final, "{}"));
+
+        // RAMQuick never creates a folder at a file's name, so it removes none: the folder and its content stay.
+        Assert.Equal(_sentinel, File.ReadAllBytes(nested));
+        Assert.False(File.Exists(final));
+    }
+
+    [Fact]
+    public void PublishFile_LogsFolderIsJunction_ThrowsAndWritesNothingThroughIt()
+    {
+        using var root = new TestDataRoot();
+        string target = root.CreateLinkTarget();
+        Directory.Delete(root.Data.LogsDirectory);
+        TestDataRoot.CreateJunction(root.Data.LogsDirectory, target);
+
+        Assert.ThrowsAny<IOException>(() => ResultsLog.PublishFile(Path.Combine(root.Data.LogsDirectory, "x-summary.json"), "{}"));
+
+        TestDataRoot.AssertLinkTargetUntouched(target);
     }
 
 
@@ -1700,11 +1822,26 @@ public sealed partial class ResultsLogTests
         Assert.Equal(JournalSamples.RunIdA, TextSummaryFormatter.TryParseRunId(text));
     }
 
+    // A summary rebuilt from a journal that never captured the run id says so on its run-id line, which reads back as
+    // the empty id, and states that it was recovered; only those exact lines count.
+    [Theory]
+    [InlineData("Run ID: Unknown\r\nThis summary was rebuilt from the progress journal at the next launch.\r\n", true)]
+    [InlineData("Run ID:  Unknown \r\nThis summary was rebuilt from the progress journal at the next launch.", true)]
+    [InlineData("Run ID: Unknown\r\nThis summary was rebuilt from the progress journal.\r\n", false)]
+    [InlineData("Run ID: Unknown\r\n  This summary was rebuilt from the progress journal at the next launch.\r\n", false)]
+    public void TextSummary_UnknownRunIdLine_ReadsAsEmptyIdAndRecoveredLineIsExact(string text, bool statesRecovered)
+    {
+        Assert.Equal(Guid.Empty, TextSummaryFormatter.TryParseRunId(text));
+        Assert.Equal(statesRecovered, TextSummaryFormatter.StatesRecovered(text));
+        Assert.Null(TextSummaryFormatter.TryParseRunId("Run ID: unknown\r\n"));
+    }
+
     [Fact]
     public void TextSummary_NullArguments_ThrowArgumentNullException()
     {
         Assert.Throws<ArgumentNullException>(() => TextSummaryFormatter.Format(null!));
         Assert.Throws<ArgumentNullException>(() => TextSummaryFormatter.TryParseRunId(null!));
+        Assert.Throws<ArgumentNullException>(() => TextSummaryFormatter.StatesRecovered(null!));
         Assert.Throws<ArgumentNullException>(() => RunSummaryJson.Serialize(null!));
         Assert.Throws<ArgumentNullException>(() => SummaryFormat.RedactPersonalPaths(null!));
     }
@@ -2085,6 +2222,34 @@ public sealed partial class ResultsLogTests
         Assert.Null(thrown);
         Assert.False(written);
         Assert.False(File.Exists(root.Data.AppErrorsLogPath));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TryAppendAppError_ThroughLink_ReturnsFalseAndWritesNothingToTarget(bool fileLink)
+    {
+        using var root = new TestDataRoot();
+        string target = root.CreateLinkTarget();
+        if (fileLink)
+        {
+            TestDataRoot.CreateFileSymbolicLinkOrSkip(
+                root.Data.AppErrorsLogPath, Path.Combine(target, TestDataRoot.SentinelFileName));
+        }
+        else
+        {
+            Directory.Delete(root.Data.LogsDirectory);
+            TestDataRoot.CreateJunction(root.Data.LogsDirectory, target);
+        }
+
+        bool written = ResultsLog.TryAppendAppError(
+            root.Data, "App.OnExit", new InvalidOperationException("Redirected"), _t0, _ceiling);
+        ResultsLog.AppendAppError(root.Data, "DispatcherUnhandledException", new InvalidOperationException("Redirected"), _t0);
+
+        Assert.False(written);
+        TestDataRoot.AssertLinkTargetUntouched(target);
+        Assert.True(File.GetAttributes(fileLink ? root.Data.AppErrorsLogPath : root.Data.LogsDirectory)
+            .HasFlag(FileAttributes.ReparsePoint));
     }
 
     [Fact]

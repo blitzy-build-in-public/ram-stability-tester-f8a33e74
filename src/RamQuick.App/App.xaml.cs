@@ -331,6 +331,11 @@ public sealed partial class App : Application
             return;
         }
 
+        // RamQuick.Logging has no native code; without this query and this opener, which hold each data folder open and
+        // verify where it lies, an elevated launch refuses every data folder.
+        DataDirectory.FinalPathQuery = Win32FilePath.GetFinalPath;
+        DataDirectory.FolderOpener = Win32FilePath.OpenFolder;
+
         // The write probe flushes to the device, so it runs off the UI thread. No writable folder is not fatal: the
         // window still opens, and the run controller refuses Start with its own message.
         DataDirectory? dataDirectory = await Task.Run(DataDirectory.Resolve);

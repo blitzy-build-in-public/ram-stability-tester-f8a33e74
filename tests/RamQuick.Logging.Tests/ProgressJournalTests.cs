@@ -1427,21 +1427,25 @@ public sealed partial class ProgressJournalTests
         DrivenRun run = DriveFullRun(journal, storage, time);
         await AssertRunAcknowledgedAsync(run);
 
-        // No beat follows the result record, although the clock moved on after it.
+        // No beat follows the result record, although the clock moved on after it. The stepEnd, result and released
+        // records carry the begin record's run id, which recovery attributes them by.
         Assert.Equal(_fullRunRecordTypes, storage.RecordTypesWritten());
         IReadOnlyList<string> lines = storage.Lines;
         DateTimeOffset oneSecond = _t0 + TimeSpan.FromSeconds(1);
         DateTimeOffset twoSeconds = _t0 + TimeSpan.FromSeconds(2);
+        Guid runId = run.Begin.RunId;
+        Assert.NotEqual(Guid.Empty, runId);
+        Assert.Equal(Guid.Empty, run.Result.RunId);
         var expected = new JournalRecord[]
         {
             run.Begin with { Utc = _t0 },
             run.Prepared with { Utc = _t0 },
             new JournalStepStart { Index = 1, Count = 6, Name = run.Outcome.Attributes.Name, Utc = _t0 },
-            JournalStepEnd.FromOutcome(run.Outcome) with { Utc = _t0 },
+            JournalStepEnd.FromOutcome(run.Outcome) with { RunId = runId, Utc = _t0 },
             JournalBeat.From(run.Progress, run.Readings) with { Utc = oneSecond },
-            run.Result with { Utc = oneSecond },
-            new JournalReleased { ReleasedBytes = JournalSamples.GiB, ReleaseMs = 850, Utc = twoSeconds },
-            new JournalEnd { RunId = run.Begin.RunId, Published = true, Utc = twoSeconds },
+            run.Result with { RunId = runId, Utc = oneSecond },
+            new JournalReleased { RunId = runId, ReleasedBytes = JournalSamples.GiB, ReleaseMs = 850, Utc = twoSeconds },
+            new JournalEnd { RunId = runId, Published = true, Utc = twoSeconds },
         };
 
         Assert.Equal(expected.Length, lines.Count);
@@ -1682,6 +1686,94 @@ public sealed partial class ProgressJournalTests
         Assert.IsType<JournalStepStart>(Assert.Single(JournalLineSerializer.ParseAll(storage.ReadLines())));
     }
 
+    // The journal is untrusted input, so it is held only within JournalReadLimits, whatever its size or shape.
+    // The last line returned is reported as unterminated only when it ends the file with no terminator, so that only it
+    // can be taken for a torn append: a final line the bounds left out leaves the last returned line a complete one.
+    [Theory]
+    [InlineData("ByteOrderMark", null, true)]
+    [InlineData("LineAtTheBound", null, false)]
+    [InlineData("LongLine", "a line longer than 1 MiB was left unread", false)]
+    [InlineData("LongTornLine", "a line longer than 1 MiB was left unread", false)]
+    [InlineData("AtTheByteBound", null, true)]
+    [InlineData("LargerThanByteBound", "the journal is larger than 16 MiB, so the rest of it was left unread", false)]
+    [InlineData("MoreLinesThanBound", "the journal holds more than 262,144 lines, so the rest of them were left unread", false)]
+    public void FileJournalStorage_ReadContent_HoldsOnlyWhatTheReadBoundsAllow(
+        string shape,
+        string? expectedDamage,
+        bool lastLineUnterminated)
+    {
+        using var root = new TestDataRoot();
+        (byte[] content, IReadOnlyList<string> expectedLines) = BoundedJournalContent(shape);
+        File.WriteAllBytes(root.Data.JournalPath, content);
+        using var storage = new FileJournalStorage(root.Data.JournalPath);
+
+        JournalContent read = storage.ReadContent();
+
+        Assert.Equal(expectedDamage, read.Damage);
+        Assert.Equal(expectedLines, read.Lines);
+        Assert.Equal(lastLineUnterminated, read.LastLineUnterminated);
+        Assert.Equal(expectedLines, storage.ReadLines());
+    }
+
+    [Fact]
+    public void FileJournalStorage_MoveAside_RenamesToFreeStampedNameAndLaterAppendStartsNewJournal()
+    {
+        using var root = new TestDataRoot();
+        IReadOnlyList<string> lines = JournalSamples.Lines(SampleRecord(BeginType), SampleRecord(StepType));
+        string directory = Path.GetFullPath(root.Data.JournalDirectory);
+
+        // 17:05:00 at UTC+2 is stamped 15:05:00 UTC; the first two names are already taken by a file and a folder.
+        var retiredAt = new DateTimeOffset(2026, 10, 28, 17, 5, 0, TimeSpan.FromHours(2));
+        string takenByFile = Path.Combine(directory, "active-run.damaged-20261028-150500.jsonl");
+        Directory.CreateDirectory(directory);
+        File.WriteAllText(takenByFile, "earlier", _utf8NoBom);
+        Directory.CreateDirectory(Path.Combine(directory, "active-run.damaged-20261028-150500-2.jsonl"));
+        using var storage = new FileJournalStorage(root.Data.JournalPath);
+        storage.AppendDurable(lines[0]);
+
+        string moved = storage.MoveAside(retiredAt);
+
+        // The open append handle was closed first, so the rename succeeded and nothing taken was overwritten.
+        Assert.Equal(Path.Combine(directory, "active-run.damaged-20261028-150500-3.jsonl"), moved);
+        Assert.Equal(lines[0] + "\n", File.ReadAllText(moved, _utf8NoBom));
+        Assert.Equal("earlier", File.ReadAllText(takenByFile, _utf8NoBom));
+        Assert.False(storage.Exists());
+        Assert.Empty(storage.ReadLines());
+
+        storage.AppendDurable(lines[1]);
+        Assert.Equal(new[] { lines[1] }, storage.ReadLines());
+        storage.Delete();
+
+        // Without a journal there is nothing to keep, so the move fails like any other.
+        Assert.ThrowsAny<IOException>(() => storage.MoveAside(retiredAt));
+    }
+
+    [Fact]
+    public void FileJournalStorage_MoveAside_EveryNameTaken_ThrowsAndKeepsJournal()
+    {
+        using var root = new TestDataRoot();
+        string line = JournalLineSerializer.Serialize(SampleRecord(BeginType));
+        string directory = Path.GetFullPath(root.Data.JournalDirectory);
+        Directory.CreateDirectory(directory);
+        var retiredAt = new DateTimeOffset(2026, 10, 28, 15, 5, 0, TimeSpan.Zero);
+
+        // A folder full of planted names bounds the search to the first 1,000 names rather than looping on.
+        File.WriteAllText(Path.Combine(directory, "active-run.damaged-20261028-150500.jsonl"), string.Empty);
+        for (int attempt = 2; attempt <= 1_000; attempt++)
+        {
+            File.WriteAllText(
+                Path.Combine(directory, "active-run.damaged-20261028-150500-" + attempt.ToString(CultureInfo.InvariantCulture) + ".jsonl"),
+                string.Empty);
+        }
+
+        using var storage = new FileJournalStorage(root.Data.JournalPath);
+        storage.AppendDurable(line);
+
+        Assert.Throws<IOException>(() => storage.MoveAside(retiredAt));
+        Assert.Equal(new[] { line }, storage.ReadLines());
+        Assert.False(File.Exists(Path.Combine(directory, "active-run.damaged-20261028-150500-1001.jsonl")));
+    }
+
     [Fact]
     public void FileJournalStorage_Delete_RemovesFile()
     {
@@ -1731,6 +1823,74 @@ public sealed partial class ProgressJournalTests
         // A closed storage reports an ordinary write failure, and leaves the journal in place.
         Assert.Throws<IOException>(() => storage.AppendDurable(line));
         Assert.Equal(new[] { line }, storage.ReadLines());
+    }
+
+    [Theory]
+    [InlineData("journal folder")]
+    [InlineData("data folder")]
+    [InlineData("journal file")]
+    public void FileJournalStorage_AppendThroughLink_ThrowsAndLeavesTargetUntouched(string linked)
+    {
+        using var root = new TestDataRoot();
+        string target = root.CreateLinkTarget();
+        string journalPath = root.Data.JournalPath;
+        switch (linked)
+        {
+            case "journal folder":
+                Directory.Delete(root.Data.JournalDirectory);
+                TestDataRoot.CreateJunction(root.Data.JournalDirectory, target);
+                break;
+            case "data folder":
+                string dataRoot = root.Combine("linked-data");
+                TestDataRoot.CreateJunction(dataRoot, target);
+                journalPath = Path.Combine(dataRoot, "journal", "active-run.jsonl");
+                break;
+            default:
+                TestDataRoot.CreateFileSymbolicLinkOrSkip(journalPath, Path.Combine(target, TestDataRoot.SentinelFileName));
+                break;
+        }
+
+        using var storage = new FileJournalStorage(journalPath);
+
+        Assert.ThrowsAny<IOException>(() => storage.AppendDurable(JournalLineSerializer.Serialize(SampleRecord(BeginType))));
+
+        // Neither the record nor a journal folder reached the folder or file the link points to.
+        TestDataRoot.AssertLinkTargetUntouched(target);
+    }
+
+    [Fact]
+    public void FileJournalStorage_JournalFolderIsJunction_ReadDeleteAndMoveAsideThrowAndKeepTargetFile()
+    {
+        using var root = new TestDataRoot();
+        string target = root.CreateLinkTarget();
+        string targetJournal = Path.Combine(target, DataDirectory.JournalFileName);
+        File.WriteAllText(targetJournal, TornBeat, _utf8NoBom);
+        Directory.Delete(root.Data.JournalDirectory);
+        TestDataRoot.CreateJunction(root.Data.JournalDirectory, target);
+        using var storage = new FileJournalStorage(root.Data.JournalPath);
+
+        Assert.ThrowsAny<IOException>(() => storage.ReadLines());
+        Assert.ThrowsAny<IOException>(() => storage.Delete());
+        Assert.ThrowsAny<IOException>(() => storage.MoveAside(new DateTimeOffset(2026, 10, 28, 15, 5, 0, TimeSpan.Zero)));
+
+        // The file the junction leads to is neither deleted nor renamed to a damaged-journal name.
+        Assert.Equal(TornBeat, File.ReadAllText(targetJournal, _utf8NoBom));
+        Assert.DoesNotContain(Directory.EnumerateFiles(target), path => Path.GetFileName(path).Contains(".damaged-", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void FileJournalStorage_DeleteJournalFileLink_RemovesLinkOnly()
+    {
+        using var root = new TestDataRoot();
+        string target = root.CreateLinkTarget();
+        TestDataRoot.CreateFileSymbolicLinkOrSkip(root.Data.JournalPath, Path.Combine(target, TestDataRoot.SentinelFileName));
+        using var storage = new FileJournalStorage(root.Data.JournalPath);
+
+        Assert.ThrowsAny<IOException>(() => storage.ReadLines());
+        storage.Delete();
+
+        Assert.False(storage.Exists());
+        TestDataRoot.AssertLinkTargetUntouched(target);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -2210,6 +2370,38 @@ public sealed partial class ProgressJournalTests
         return copy.ToArray();
     }
 
+    // A journal file of the named shape and the lines FileJournalStorage.ReadContent holds of it.
+    private static (byte[] Content, IReadOnlyList<string> Lines) BoundedJournalContent(string shape)
+    {
+        // 999 bytes plus the terminator: the byte bound falls 216 bytes into line 16,778.
+        string thousandByteLine = new('b', 999);
+        int linesWithinByteBound = JournalReadLimits.MaxJournalBytes / 1_000;
+        string[] withinByteBound = Enumerable.Repeat(thousandByteLine, linesWithinByteBound).ToArray();
+        string tailAtTheByteBound = new('c', JournalReadLimits.MaxJournalBytes - (linesWithinByteBound * 1_000));
+        string longLine = new('x', JournalReadLimits.MaxLineBytes + 1);
+        string lineAtTheBound = new('y', JournalReadLimits.MaxLineBytes);
+        (string text, IReadOnlyList<string> lines) = shape switch
+        {
+            // UTF-8 encodes U+FEFF as the byte-order mark EF BB BF.
+            "ByteOrderMark" => ("\uFEFFfirst\r\nsecond\ntorn", new[] { "first", "second", "torn" }),
+            "LineAtTheBound" => ("first\n" + lineAtTheBound + "\r\nlast\n", new[] { "first", lineAtTheBound, "last" }),
+            "LongLine" => ("first\n" + longLine + "\nlast\n", new[] { "first", "last" }),
+            "LongTornLine" => ("first\n" + longLine, new[] { "first" }),
+            "AtTheByteBound" => (
+                string.Concat(withinByteBound.Select(line => line + "\n")) + tailAtTheByteBound,
+                withinByteBound.Append(tailAtTheByteBound).ToArray()),
+            "LargerThanByteBound" => (
+                string.Concat(Enumerable.Repeat(thousandByteLine + "\n", linesWithinByteBound + 23)),
+                withinByteBound),
+            "MoreLinesThanBound" => (
+                string.Concat(Enumerable.Repeat("a\n", JournalReadLimits.MaxLines + 1)),
+                Enumerable.Repeat("a", JournalReadLimits.MaxLines).ToArray()),
+            _ => throw new ArgumentOutOfRangeException(nameof(shape), shape, "Unknown journal shape."),
+        };
+        return (_utf8NoBom.GetBytes(text), lines);
+    }
+
+
     /// <summary>
     /// Runs <paramref name="work"/> on a new background thread and returns its result with the
     /// thread's managed id, rethrowing whatever it threw.
@@ -2331,7 +2523,7 @@ public sealed partial class ProgressJournalTests
             BeginType => JournalSamples.BeginB(_t0),
             PreparedType => JournalSamples.Prepared(16 * JournalSamples.GiB, 64, PageMode.Mixed, InstructionSet.Avx512, 3_750),
             StepType => new JournalStepStart { Index = 3, Count = 6, Name = turnaround.Name },
-            StepEndType => JournalStepEnd.FromOutcome(interrupted),
+            StepEndType => JournalStepEnd.FromOutcome(interrupted) with { RunId = JournalSamples.RunIdB },
             BeatType => JournalBeat.From(progress, JournalSamples.Readings(71.5, null)),
             ResultType => JournalSamples.Result(
                 RunState.Failed,
@@ -2343,8 +2535,13 @@ public sealed partial class ProgressJournalTests
                 1,
                 completed,
                 completed + TimeSpan.FromMilliseconds(50),
-                "Stopped on the first error at step 2 of 6 (\"Random bank thrash\")"),
-            ReleasedType => new JournalReleased { ReleasedBytes = 16 * JournalSamples.GiB, ReleaseMs = 1_875 },
+                "Stopped on the first error at step 2 of 6 (\"Random bank thrash\")") with { RunId = JournalSamples.RunIdB },
+            ReleasedType => new JournalReleased
+            {
+                RunId = JournalSamples.RunIdB,
+                ReleasedBytes = 16 * JournalSamples.GiB,
+                ReleaseMs = 1_875,
+            },
             EndType => new JournalEnd { RunId = JournalSamples.RunIdB, Published = true },
             _ => throw new ArgumentOutOfRangeException(nameof(recordType), recordType, "Unknown journal record type."),
         };
@@ -2393,6 +2590,8 @@ public sealed partial class ProgressJournalTests
 
         public IReadOnlyList<string> ReadLines() => Inner.ReadLines();
 
+        public JournalContent ReadContent() => Inner.ReadContent();
+
         public void Delete()
         {
             if (FailDelete)
@@ -2402,6 +2601,8 @@ public sealed partial class ProgressJournalTests
 
             Inner.Delete();
         }
+
+        public string MoveAside(DateTimeOffset utc) => Inner.MoveAside(utc);
 
         public void Dispose()
         {

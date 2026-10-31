@@ -223,7 +223,12 @@ public sealed record RunSummary
     /// Pure and deterministic: the same source always yields an equal summary. Every value comes from the
     /// source, and a value it does not hold is <see langword="null"/>: a missing record, a nullable field a
     /// record left empty, a timestamp a record omitted (<c>default(DateTimeOffset)</c>), or a 0 where no run
-    /// can measure 0 (a processor count, the tested bytes).
+    /// can measure 0 (a processor count, the tested bytes, the plan's step count). So are a run id, test type
+    /// or app version the <c>begin</c> record did not capture (<see cref="Guid.Empty"/>, empty text), the plan
+    /// targets and whether coverage reached them when it holds no plan, and the coverage and error total of an
+    /// unfinished run placed at an unknown step that left neither a heartbeat nor a step result. A
+    /// <c>begin</c> record <see cref="JournalBegin.Create"/> made captures the run id, test type, app version,
+    /// Stop on error and plan, so a run that publishes its own summary never reports them as null.
     /// </para>
     /// <para>
     /// Times: <see cref="SummaryRun.DurationSeconds"/> is the engine's measured test time from the result
@@ -239,6 +244,12 @@ public sealed record RunSummary
     /// from the last heartbeat, and an <see cref="UnfinishedRun"/> section. A time the last heartbeat did not
     /// capture, and both times when no heartbeat was written, are <see langword="null"/>; no other record's
     /// stamp stands in for one.
+    /// </para>
+    /// <para>
+    /// Damage: when <see cref="RunSummarySource.JournalDamage"/> is set, for either kind of run,
+    /// <see cref="SummaryRun.EndDetail"/> ends with "The progress journal held damaged data: " and the damage.
+    /// When <see cref="RunSummarySource.StepPositionUnknown"/> is set, an unfinished run is reported as stopped
+    /// at an unknown step.
     /// </para>
     /// <para>
     /// Steps: one entry per started step, in step order. A finished step is the last
@@ -278,7 +289,10 @@ public sealed record RunSummary
         Dictionary<int, JournalStep> definitions = DefinitionsByNumber(begin);
         IReadOnlyList<JournalStepEnd> finishedSteps = LatestPerStep(source.FinishedSteps);
         int stepCount = begin.Steps.Count > 0 ? begin.Steps.Count : source.UnfinishedStep?.Count ?? 0;
-        (int? lastStepNumber, string? lastStepName) = LastPosition(definitions, finishedSteps, source.UnfinishedStep);
+        // Where recovery could not place an unfinished run, a finished step does not stand in for the one it stopped in.
+        (int? lastStepNumber, string? lastStepName) = result is null && source.StepPositionUnknown
+            ? (null, null)
+            : LastPosition(definitions, finishedSteps, source.UnfinishedStep);
 
         DateTimeOffset? startRequestedUtc = CapturedUtc(begin.StartRequestedUtc);
         DateTimeOffset? startedUtc = CapturedUtc(prepared?.Utc);
@@ -296,24 +310,28 @@ public sealed record RunSummary
             ? Seconds(result.ElapsedMs)
             : lastBeat is null ? null : Seconds(lastBeat.ElapsedMs);
 
+        // Only a begin record recovery could not read lacks the run id, test type or version; each is then not captured.
         var run = new SummaryRun
         {
-            Id = SummaryFormat.RunId(begin.RunId),
-            TestType = begin.TestType,
+            Id = begin.RunId == Guid.Empty ? null : SummaryFormat.RunId(begin.RunId),
+            TestType = begin.TestType.Length > 0 ? begin.TestType : null,
             StopOnError = begin.StopOnError,
             Verdict = result is null ? FailVerdict : VerdictOf(result),
             EndReason = result is null ? nameof(RunEndReason.PreviousRunUnfinished) : result.EndReason.ToString(),
 
             // A result's detail is redacted here as well as by JournalResult.Create: recovery reads results back
             // from journals, which an earlier build may have written unredacted, and the summary is shared.
-            EndDetail = result is null
-                ? UnfinishedDetail(
-                    lastStepNumber,
-                    stepCount,
-                    lastStepName,
-                    lastBeat is not null,
-                    lastBeatUtc is not null)
-                : SummaryFormat.RedactPersonalPaths(result.EndDetail),
+            EndDetail = WithJournalDamage(
+                result is null
+                    ? UnfinishedDetail(
+                        lastStepNumber,
+                        stepCount,
+                        lastStepName,
+                        source.StepPositionUnknown,
+                        lastBeat is not null,
+                        lastBeatUtc is not null)
+                    : SummaryFormat.RedactPersonalPaths(result.EndDetail),
+                source.JournalDamage),
             StartRequestedUtc = startRequestedUtc,
             StartedUtc = startedUtc,
             EndedUtc = endedUtc,
@@ -325,10 +343,20 @@ public sealed record RunSummary
             Partial = source.Partial,
         };
 
-        double targetCoveragePercent = Finite(begin.TargetCoveragePercent);
-        double coveragePercent = (result is null ? null : Percent(result.VerifiedBytes, testedBytes))
-            ?? FiniteOrNull(lastBeat?.Coverage)
-            ?? 0;
+        // A begin record without a plan captured no targets, so they and whether coverage reached them are unknown.
+        bool planCaptured = begin.Steps.Any(step => step is not null);
+        double? targetSeconds = planCaptured ? Finite(begin.TargetSeconds) : null;
+        double? targetCoveragePercent = planCaptured ? Finite(begin.TargetCoveragePercent) : null;
+
+        // An unfinished run that recovery could not place and that left neither a heartbeat nor a step result
+        // captured no traffic figures at all. A run known to have stopped while preparing ran no traffic, so its 0s
+        // are measured.
+        bool trafficUnknown = result is null && source.StepPositionUnknown && lastBeat is null && finishedSteps.Count == 0;
+        double? coveragePercent = trafficUnknown
+            ? null
+            : (result is null ? null : Percent(result.VerifiedBytes, testedBytes))
+                ?? FiniteOrNull(lastBeat?.Coverage)
+                ?? 0;
 
         SummaryTemperatures temperatures = source.Temperatures;
         if (source.Recovered && lastBeat is not null)
@@ -341,13 +369,13 @@ public sealed record RunSummary
         return new RunSummary
         {
             SchemaVersion = CurrentSchemaVersion,
-            App = new SummaryApp { Name = source.AppName, Version = begin.AppVersion },
+            App = new SummaryApp { Name = source.AppName, Version = begin.AppVersion.Length > 0 ? begin.AppVersion : null },
             Run = run,
             System = BuildSystem(begin.System, prepared),
             Memory = BuildMemory(begin, prepared, testedBytes, source.Released),
             Plan = new SummaryPlan
             {
-                TargetSeconds = Finite(begin.TargetSeconds),
+                TargetSeconds = targetSeconds,
                 TargetCoveragePercent = targetCoveragePercent,
             },
             Steps = BuildSteps(definitions, finishedSteps, source.UnfinishedStep, testedBytes),
@@ -355,10 +383,10 @@ public sealed record RunSummary
             {
                 Percent = coveragePercent,
                 TargetPercent = targetCoveragePercent,
-                TargetReached = coveragePercent >= targetCoveragePercent,
+                TargetReached = coveragePercent is { } reached && targetCoveragePercent is { } target ? reached >= target : null,
             },
             Temperatures = temperatures,
-            Errors = BuildErrors(source, result, lastBeat, finishedSteps),
+            Errors = BuildErrors(source, result, lastBeat, finishedSteps, trafficUnknown),
             CauseHints = source.CauseHints,
             UnfinishedRun = result is not null
                 ? null
@@ -366,7 +394,7 @@ public sealed record RunSummary
                 {
                     LastStepIndex = lastStepNumber,
                     LastStepName = lastStepName,
-                    StepCount = stepCount,
+                    StepCount = stepCount > 0 ? stepCount : null,
                     LastHeartbeatUtc = lastBeatUtc,
                     LastCoveragePercent = FiniteOrNull(lastBeat?.Coverage),
                 },
@@ -384,14 +412,20 @@ public sealed record RunSummary
         int? lastStepNumber,
         int stepCount,
         string? lastStepName,
+        bool stepPositionUnknown,
         bool hasHeartbeat,
         bool heartbeatStamped)
     {
-        string position = lastStepNumber is not { } number
-            ? "while preparing memory (before step 1)"
-            : string.IsNullOrEmpty(lastStepName)
-                ? string.Create(CultureInfo.InvariantCulture, $"at step {number} of {stepCount}")
-                : string.Create(CultureInfo.InvariantCulture, $"at step {number} of {stepCount} ({lastStepName})");
+        // A plan size neither the begin record nor the step record captured is left out rather than stated as 0.
+        string step = stepCount > 0
+            ? string.Create(CultureInfo.InvariantCulture, $"at step {lastStepNumber} of {stepCount}")
+            : string.Create(CultureInfo.InvariantCulture, $"at step {lastStepNumber}");
+
+        // Without step data the run either never left preparation or, when its journal is damaged, stopped at a
+        // step the journal no longer shows; only the first is "before step 1".
+        string position = lastStepNumber is null
+            ? stepPositionUnknown ? "at an unknown step" : "while preparing memory (before step 1)"
+            : string.IsNullOrEmpty(lastStepName) ? step : $"{step} ({lastStepName})";
 
         // The schema has no field for approximate values, so the detail labels them. Both times come from the
         // last heartbeat alone: its elapsed time gives durationSeconds and its stamp gives endedUtc, and a
@@ -403,6 +437,18 @@ public sealed record RunSummary
                 : "durationSeconds is approximate (last heartbeat) and endedUtc is unknown.";
 
         return $"The previous test did not finish {position}, which likely indicates severe instability. {approximation}";
+    }
+
+    // A summary recovery rebuilt from a damaged journal says so, after whatever detail the run itself recorded.
+    private static string WithJournalDamage(string endDetail, string? journalDamage)
+    {
+        if (journalDamage is null)
+        {
+            return endDetail;
+        }
+
+        string damage = $"The progress journal held damaged data: {journalDamage}.";
+        return endDetail.Length == 0 ? damage : endDetail + " " + damage;
     }
 
     private static SummarySystem BuildSystem(JournalSystemInfo system, JournalPrepared? prepared)
@@ -556,14 +602,17 @@ public sealed record RunSummary
         RunSummarySource source,
         JournalResult? result,
         JournalBeat? lastBeat,
-        IReadOnlyList<JournalStepEnd> finishedSteps)
+        IReadOnlyList<JournalStepEnd> finishedSteps,
+        bool totalUnknown)
     {
         IReadOnlyList<ErrorRecord> stored = source.StoredErrors;
 
         // Group validates the records, rejecting a null element before any is mapped.
         IReadOnlyList<ErrorGroup> groups = ErrorGrouping.Group(stored);
 
-        ulong total = result?.TotalErrors ?? Math.Max(lastBeat?.Errors ?? 0, SumErrors(finishedSteps));
+        ulong? total = totalUnknown
+            ? null
+            : result?.TotalErrors ?? Math.Max(lastBeat?.Errors ?? 0, SumErrors(finishedSteps));
         var groupItems = new SummaryErrorGroup[groups.Count];
         for (int i = 0; i < groups.Count; i++)
         {
@@ -579,7 +628,7 @@ public sealed record RunSummary
         return new SummaryErrors
         {
             Total = total,
-            Truncated = total > (ulong)stored.Count && stored.Count >= ErrorGrouping.StoredDetailCap,
+            Truncated = total is { } known && known > (ulong)stored.Count && stored.Count >= ErrorGrouping.StoredDetailCap,
             DetailAvailable = source.ErrorDetailAvailable,
             StoredCount = stored.Count,
             StoredCap = ErrorGrouping.StoredDetailCap,
@@ -669,9 +718,8 @@ public sealed record RunSummary
 /// </summary>
 public sealed record SummaryApp
 {
-    // See RunSummary: the init accessors keep the strings non-null when a document omits them.
+    // See RunSummary: the init accessor keeps the name non-null when a document omits it.
     private readonly string _name = string.Empty;
-    private readonly string _version = string.Empty;
 
     /// <summary>
     /// Gets the product name, <c>"RAMQuick"</c>.
@@ -683,13 +731,10 @@ public sealed record SummaryApp
     }
 
     /// <summary>
-    /// Gets the product build version that ran the test, as the <c>begin</c> record captured it.
+    /// Gets the product build version that ran the test, as the <c>begin</c> record captured it, or
+    /// <see langword="null"/> when the journal did not capture it.
     /// </summary>
-    public string Version
-    {
-        get => _version;
-        init => _version = value ?? string.Empty;
-    }
+    public string? Version { get; init; }
 }
 
 /// <summary>
@@ -698,35 +743,28 @@ public sealed record SummaryApp
 public sealed record SummaryRun
 {
     // See RunSummary: the init accessors keep the strings non-null when a document omits them.
-    private readonly string _id = string.Empty;
-    private readonly string _testType = string.Empty;
     private readonly string _verdict = string.Empty;
     private readonly string _endReason = string.Empty;
     private readonly string _endDetail = string.Empty;
 
     /// <summary>
     /// Gets the run id: the run GUID in its 32-hex-digit <c>N</c> form, which also ends the results file
-    /// base name.
+    /// base name. <see langword="null"/> only in a summary rebuilt from a journal that never captured the
+    /// run's id; <see cref="RunSummaryJson.TryDeserialize"/> accepts no other summary without one.
     /// </summary>
-    public string Id
-    {
-        get => _id;
-        init => _id = value ?? string.Empty;
-    }
+    public string? Id { get; init; }
 
     /// <summary>
-    /// Gets the test type name, for example <c>"Quick"</c>.
+    /// Gets the test type name, for example <c>"Quick"</c>, or <see langword="null"/> when the journal did not
+    /// capture it.
     /// </summary>
-    public string TestType
-    {
-        get => _testType;
-        init => _testType = value ?? string.Empty;
-    }
+    public string? TestType { get; init; }
 
     /// <summary>
-    /// Gets a value indicating whether Stop on error was on.
+    /// Gets a value indicating whether Stop on error was on, or <see langword="null"/> when the journal did not
+    /// capture it.
     /// </summary>
-    public bool StopOnError { get; init; }
+    public bool? StopOnError { get; init; }
 
     /// <summary>
     /// Gets the verdict: <c>"PASS"</c>, <c>"FAIL"</c> or <c>"ABORTED"</c>.
@@ -925,19 +963,20 @@ public sealed record SummaryMemory
 }
 
 /// <summary>
-/// The plan's targets, the summary's <c>plan</c> object.
+/// The plan's targets, the summary's <c>plan</c> object. Both are <see langword="null"/> when the journal did not
+/// capture the plan.
 /// </summary>
 public sealed record SummaryPlan
 {
     /// <summary>
     /// Gets the plan's target duration in seconds: the sum of its steps' time budgets.
     /// </summary>
-    public double TargetSeconds { get; init; }
+    public double? TargetSeconds { get; init; }
 
     /// <summary>
     /// Gets the plan's coverage target as a percentage: the sum of its steps' coverage budgets.
     /// </summary>
-    public double TargetCoveragePercent { get; init; }
+    public double? TargetCoveragePercent { get; init; }
 }
 
 
@@ -1061,19 +1100,22 @@ public sealed record SummaryStep
 public sealed record SummaryCoverage
 {
     /// <summary>
-    /// Gets the coverage the run reached, as a percentage of the tested bytes.
+    /// Gets the coverage the run reached, as a percentage of the tested bytes, or <see langword="null"/> when the
+    /// journal of an unfinished run captured neither where it stopped nor any of its traffic.
     /// </summary>
-    public double Percent { get; init; }
+    public double? Percent { get; init; }
 
     /// <summary>
-    /// Gets the plan's coverage target, as a percentage.
+    /// Gets the plan's coverage target, as a percentage, or <see langword="null"/> when the journal did not
+    /// capture the plan.
     /// </summary>
-    public double TargetPercent { get; init; }
+    public double? TargetPercent { get; init; }
 
     /// <summary>
-    /// Gets a value indicating whether <see cref="Percent"/> reached <see cref="TargetPercent"/>.
+    /// Gets a value indicating whether <see cref="Percent"/> reached <see cref="TargetPercent"/>, or
+    /// <see langword="null"/> when either is unknown.
     /// </summary>
-    public bool TargetReached { get; init; }
+    public bool? TargetReached { get; init; }
 }
 
 /// <summary>
@@ -1217,9 +1259,10 @@ public sealed record SummaryErrors
     private readonly IReadOnlyList<SummaryErrorRecord> _records = Array.Empty<SummaryErrorRecord>();
 
     /// <summary>
-    /// Gets the true error total, from the engine's counters.
+    /// Gets the true error total, from the engine's counters, or <see langword="null"/> when the journal of an
+    /// unfinished run captured neither where it stopped nor any of its traffic.
     /// </summary>
-    public ulong Total { get; init; }
+    public ulong? Total { get; init; }
 
     /// <summary>
     /// Gets a value indicating whether the stored-detail cap was reached while more errors were counted.
@@ -1737,9 +1780,10 @@ public sealed record SummaryUnfinishedRun
     public string? LastStepName { get; init; }
 
     /// <summary>
-    /// Gets the number of steps in the plan.
+    /// Gets the number of steps in the plan, or <see langword="null"/> when neither the <c>begin</c> record nor the
+    /// step's own record captured it.
     /// </summary>
-    public int StepCount { get; init; }
+    public int? StepCount { get; init; }
 
     /// <summary>
     /// Gets the UTC time of the last heartbeat, or <see langword="null"/> when none was written or it did
@@ -2575,6 +2619,21 @@ public sealed record RunSummarySource
     /// Gets a value indicating whether the summary is partial because the run never finished.
     /// </summary>
     public bool Partial { get; init; }
+
+    /// <summary>
+    /// Gets the first damage recovery found in the run's journal, as a phrase without a trailing period, or
+    /// <see langword="null"/> when there was none. When set, <c>run.endDetail</c> ends with "The progress
+    /// journal held damaged data: " followed by it and a period.
+    /// </summary>
+    public string? JournalDamage { get; init; }
+
+    /// <summary>
+    /// Gets a value indicating whether recovery could not tell where an unfinished run stopped, because its
+    /// journal is damaged. A run without a <see cref="Result"/> then reads "did not finish at an unknown step"
+    /// in <c>run.endDetail</c>, instead of "did not finish while preparing memory (before step 1)" or a step
+    /// taken from its <see cref="FinishedSteps"/>, and its <c>unfinishedRun</c> names no last step.
+    /// </summary>
+    public bool StepPositionUnknown { get; init; }
 
     /// <summary>
     /// Gets the product name written as <c>app.name</c>; an empty or white-space value becomes

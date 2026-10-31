@@ -35,7 +35,6 @@ public sealed class CrashDetectorTests
     private const string TornFragment = "{\"t\":\"beat\",\"step\":2,\"elapsedMs\":9";
     private const string FallbackBaseNamePrefix = "RamQuick-recovered-";
     private const string UnreadableJournalPrefix = "The progress journal could not be read: ";
-    private const string DamagedJournalPrefix = "The progress journal holds damaged data: ";
     private const ulong ResultTotalErrors = 3;
     private const long ReleaseMs = 1_250;
 
@@ -62,6 +61,9 @@ public sealed class CrashDetectorTests
     private static readonly DateTimeOffset _recoveryUtc = _startRequestedUtc + TimeSpan.FromHours(1);
     private static readonly UTF8Encoding _utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
     private static readonly UTF8Encoding _strictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+    // One character more than the free text a record may carry into a summary.
+    private static readonly string _tooLongText = new('t', 1_025);
 
     private static CancellationToken Cancellation => TestContext.Current.CancellationToken;
 
@@ -90,18 +92,11 @@ public sealed class CrashDetectorTests
         AssertLogsEmpty(root);
     }
 
-    [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void Detect_EndPresent_DeletesJournalAndReturnsNone(bool endNamesRun)
+    [Fact]
+    public void Detect_EndPresent_DeletesJournalAndReturnsNone()
     {
         using var root = new TestDataRoot();
-        var end = new JournalEnd
-        {
-            RunId = endNamesRun ? _runId : Guid.Empty,
-            Published = true,
-            Utc = _verdictUtc + TimeSpan.FromSeconds(2),
-        };
+        var end = new JournalEnd { RunId = _runId, Published = true, Utc = _verdictUtc + TimeSpan.FromSeconds(2) };
         WriteJournal(root, CompletedJournal(withReleased: true).Append(end).ToArray());
 
         JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
@@ -112,33 +107,306 @@ public sealed class CrashDetectorTests
         Assert.Null(recovery.Summary);
         Assert.Empty(recovery.PublishedFiles);
         Assert.Null(recovery.PublicationError);
+        Assert.Null(recovery.JournalDamage);
         Assert.True(recovery.JournalDeleted);
         Assert.False(File.Exists(root.Data.JournalPath));
         AssertLogsEmpty(root);
     }
 
+    // An end without an id ends only a run whose id is unknown, and one naming another run ends none of this journal's
+    // runs; either way it is not this run's end.
     [Theory]
-    [InlineData("Empty")]
-    [InlineData("NoBegin")]
-    [InlineData("InvalidBegin")]
-    [InlineData("DiscriminatorNotFirst")]
-    [InlineData("NotJson")]
-    public void Detect_BeginMissingOrInvalid_ReturnsNone(string journalCase)
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Detect_EndOfAnotherRun_IsIgnoredAndRunPublished(bool namesAnotherRun)
     {
         using var root = new TestDataRoot();
-        WriteJournalLines(root, JournalWithoutUsableBegin(journalCase));
+        using var storage = new StalledJournalStorage();
+        var end = new JournalEnd
+        {
+            RunId = namesAnotherRun ? _otherRunId : Guid.Empty,
+            Published = true,
+            Utc = _verdictUtc + TimeSpan.FromSeconds(2),
+        };
+        storage.Seed(JournalSamples.Lines(CompletedJournal(withReleased: true).Append(end).ToArray()));
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, storage, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.CompletedUnpublished, recovery.Kind);
+        Assert.Equal(FinalPathList(root, _runId), recovery.PublishedFiles);
+        Assert.Equal("an end record of another run was ignored", recovery.JournalDamage);
+        Assert.Null(recovery.PublicationError);
+        AssertEndWrittenThenMovedAside(storage, recovery, _runId);
+    }
+
+    [Theory]
+    [InlineData("Empty")]
+    [InlineData("TornBegin")]
+    [InlineData("TornBeginAfterBlankLine")]
+    [InlineData("BlankLines")]
+    public void Detect_JournalWithoutRunRecords_ReturnsNone(string journalCase)
+    {
+        using var root = new TestDataRoot();
+        (IReadOnlyList<string> lines, string? torn) = JournalWithoutUsableBegin(journalCase);
+        WriteJournalLines(root, lines, torn);
         Assert.True(File.Exists(root.Data.JournalPath));
 
         JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
 
-        // Begin is acknowledged before the engine starts, so a journal without one never carried traffic.
+        // Begin is acknowledged before the engine starts, so a journal that holds no more than a begin torn by a
+        // crash during its own append, a last line with no terminator after it, never carried traffic.
         Assert.Equal(JournalRecoveryKind.None, recovery.Kind);
         Assert.Null(recovery.RunId);
         Assert.Null(recovery.Summary);
         Assert.Null(recovery.PublicationError);
+        Assert.Null(recovery.JournalDamage);
         Assert.True(recovery.JournalDeleted);
         Assert.False(File.Exists(root.Data.JournalPath));
         AssertLogsEmpty(root);
+    }
+
+    // Only the storage can tell whether the last line was terminated. A lone line that does not parse is a begin torn
+    // during its own append only when it has no terminator; a storage that holds it complete reports a run whose begin
+    // could not be read.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Detect_LoneUnparseableLine_IsTornBeginOnlyWithoutItsTerminator(bool unterminated)
+    {
+        using var root = new TestDataRoot();
+        using var storage = new StalledJournalStorage();
+        string begin = JournalLineSerializer.Serialize(BeginRecord(_runId));
+        storage.Seed(new[] { begin[..(begin.Length / 2)] });
+        storage.LastLineUnterminated = unterminated;
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, storage, CreateRecoveryClock());
+
+        if (unterminated)
+        {
+            Assert.Equal(JournalRecoveryKind.None, recovery.Kind);
+            Assert.Null(recovery.JournalDamage);
+            Assert.True(recovery.JournalDeleted);
+            Assert.Equal(1, storage.DeleteCount);
+            Assert.Equal(0, storage.AppendCallCount);
+            AssertLogsEmpty(root);
+            return;
+        }
+
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Null(recovery.RunId);
+        Assert.Equal("the journal's begin record is missing or could not be read", recovery.JournalDamage);
+        Assert.Equal(2, recovery.PublishedFiles.Count);
+        AssertEndWrittenThenMovedAside(storage, recovery, Guid.Empty);
+    }
+
+    // A journal whose begin record is missing or does not parse still carried a run, so it is reported as unfinished
+    // and published with what the rest of the journal holds, never deleted in silence.
+    [Theory]
+    [InlineData("NoBegin", "the journal's begin record is missing or could not be read")]
+    [InlineData("NotJson", "the journal's begin record is missing or could not be read")]
+    [InlineData("LoneLineNotJson", "the journal's begin record is missing or could not be read")]
+    [InlineData("LoneLineRunIdOnly", "the journal's begin record is missing or could not be read")]
+    [InlineData("BadRunIdFormat", "the begin record was damaged: runId could not be read")]
+    [InlineData("RunIdNFormatOnly", "the begin record was damaged: runId could not be read")]
+    [InlineData("BadStartRequestedUtc", "the begin record was damaged: startRequestedUtc could not be read")]
+    [InlineData("BadStopOnError", "the begin record was damaged: stopOnError could not be read")]
+    [InlineData("DiscriminatorNotFirst", "the begin record was damaged")]
+    public async Task Detect_BeginMissingOrDamaged_RecoversUnfinishedRunAndMovesJournalAsideAsync(
+        string journalCase,
+        string expectedDamage)
+    {
+        using var root = new TestDataRoot();
+        IReadOnlyList<string> lines = JournalWithDamagedBegin(journalCase);
+        string journalPath = WriteJournalLines(root, lines);
+        byte[] journalBytes = File.ReadAllBytes(journalPath);
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        // A lone line that does not parse is a complete line, with its terminator, so it is no begin torn by a crash
+        // during its own append: it is a run whose begin could not be read.
+        bool unidentified = journalCase is "NotJson" or "LoneLineNotJson" or "LoneLineRunIdOnly";
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Equal(expectedDamage, recovery.JournalDamage);
+        Assert.Null(recovery.PublicationError);
+        Assert.False(recovery.JournalDeleted);
+        Assert.False(File.Exists(root.Data.JournalPath));
+        AssertMovedAsideWithEnds(root, recovery, journalBytes, unidentified ? Guid.Empty : _runId);
+
+        // The begin's base name is kept when it survived; otherwise the run is named after its id, which the
+        // stepEnd record supplies, and a journal without one after a hash of its first line.
+        bool beginBaseNameRead = journalCase is "BadRunIdFormat" or "BadStartRequestedUtc" or "BadStopOnError" or "DiscriminatorNotFirst";
+        string expectedBaseName = unidentified
+            ? FallbackBaseNamePrefix + AnonymousName(lines[0])
+            : beginBaseNameRead ? BaseNameOf(_runId) : FallbackBaseNamePrefix + SummaryFormat.RunId(_runId);
+        Assert.Equal(expectedBaseName, recovery.LogBaseName);
+        Assert.Equal(unidentified ? null : _runId, recovery.RunId);
+        string jsonPath = ResultsLog.GetSummaryJsonPath(root.Data, expectedBaseName);
+        Assert.Equal(new[] { jsonPath, ResultsLog.GetSummaryTextPath(root.Data, expectedBaseName) }, recovery.PublishedFiles);
+
+        string json = await File.ReadAllTextAsync(jsonPath, Cancellation);
+        Assert.Equal(recovery.Summary, ParseSummary(json));
+        using JsonDocument document = JsonDocument.Parse(json);
+        JsonElement summary = document.RootElement;
+        Assert.Equal("FAIL", StringAt(summary, "run.verdict"));
+        Assert.Equal(nameof(RunEndReason.PreviousRunUnfinished), StringAt(summary, "run.endReason"));
+        Assert.True(At(summary, "run.partial").GetBoolean());
+        Assert.EndsWith(
+            " The progress journal held damaged data: " + expectedDamage + ".",
+            StringAt(summary, "run.endDetail"),
+            StringComparison.Ordinal);
+
+        string text = await File.ReadAllTextAsync(recovery.PublishedFiles[1], Cancellation);
+        if (unidentified)
+        {
+            // Nothing of the run could be read: the step at which it stopped is unknown, never "before step 1", and
+            // every field is null rather than a value the journal never held, its traffic figures included.
+            Assert.False(recovery.InPreparation);
+            Assert.Null(recovery.LastStepNumber);
+            Assert.Null(recovery.StepCount);
+            Assert.Contains("did not finish at an unknown step", StringAt(summary, "run.endDetail"), StringComparison.Ordinal);
+            AssertNullAt(
+                summary,
+                "app.version",
+                "run.id",
+                "run.testType",
+                "run.stopOnError",
+                "run.startRequestedUtc",
+                "run.endedUtc",
+                "system.os",
+                "memory.installedBytes",
+                "plan.targetSeconds",
+                "plan.targetCoveragePercent",
+                "coverage.percent",
+                "coverage.targetPercent",
+                "coverage.targetReached",
+                "errors.total",
+                "unfinishedRun.stepCount");
+            Assert.True(At(summary, "run.recovered").GetBoolean());
+
+            // The text says so in words, and its run-id line still identifies it as this run's own on a retry.
+            Assert.Equal(Guid.Empty, TextSummaryFormatter.TryParseRunId(text));
+            Assert.True(TextSummaryFormatter.StatesRecovered(text));
+            Assert.Contains("\r\nStop on error: Unknown\r\n", text, StringComparison.Ordinal);
+            Assert.Contains("\r\nTotal errors (true count): Unknown\r\n", text, StringComparison.Ordinal);
+            Assert.Contains("\r\nUnknown (target Unknown) \u2014 target reached: Unknown\r\n", text, StringComparison.Ordinal);
+            Assert.Contains(
+                "\r\nThe previous test did not finish at an unknown step, which likely indicates severe instability.\r\n",
+                text,
+                StringComparison.Ordinal);
+            return;
+        }
+
+        // The step records survived, so the message keeps the AAP form "did not finish at step n of N (name)".
+        Assert.False(recovery.InPreparation);
+        Assert.Equal(2, recovery.LastStepNumber);
+        Assert.Equal(StepCount, recovery.StepCount);
+        Assert.Equal(RandomBankThrash, recovery.LastStepName);
+        Assert.Contains("did not finish at step 2 of 3 (Random bank thrash)", StringAt(summary, "run.endDetail"), StringComparison.Ordinal);
+        Assert.Equal(SummaryFormat.RunId(_runId), StringAt(summary, "run.id"));
+        Assert.Equal(_runId, TextSummaryFormatter.TryParseRunId(text));
+        Assert.Equal(_lastBeatUtc, At(summary, "run.endedUtc").GetDateTimeOffset());
+
+        // The heartbeats and the step record carry the traffic figures and the plan's size whatever became of the begin.
+        Assert.Equal(120.5, At(summary, "coverage.percent").GetDouble());
+        Assert.Equal(0UL, At(summary, "errors.total").GetUInt64());
+        Assert.Equal(StepCount, At(summary, "unfinishedRun.stepCount").GetInt32());
+        switch (journalCase)
+        {
+            case "NoBegin":
+            case "RunIdNFormatOnly":
+                // Every value the begin record carries was lost with it.
+                AssertNullAt(
+                    summary,
+                    "app.version",
+                    "run.testType",
+                    "run.stopOnError",
+                    "run.startRequestedUtc",
+                    "system.os",
+                    "system.cpu",
+                    "memory.installedBytes",
+                    "memory.plannedBytes",
+                    "plan.targetSeconds",
+                    "plan.targetCoveragePercent",
+                    "coverage.targetPercent",
+                    "coverage.targetReached");
+                Assert.Contains("\r\nTest type: Unknown\r\nStop on error: Unknown\r\nTarget duration: Unknown\r\nTarget coverage: Unknown\r\n", text, StringComparison.Ordinal);
+                break;
+            case "BadStartRequestedUtc":
+                AssertNullAt(summary, "run.startRequestedUtc");
+                Assert.Equal(JournalSamples.OsA, StringAt(summary, "system.os"));
+                break;
+            case "BadStopOnError":
+                // A salvaged begin keeps every field that read; only Stop on error was not captured.
+                AssertNullAt(summary, "run.stopOnError");
+                Assert.Equal(JournalSamples.QuickTestType, StringAt(summary, "run.testType"));
+                Assert.Equal(JournalSamples.AppVersion, StringAt(summary, "app.version"));
+                Assert.Equal(_startRequestedUtc, At(summary, "run.startRequestedUtc").GetDateTimeOffset());
+                Assert.Equal(140.0, At(summary, "plan.targetSeconds").GetDouble());
+                Assert.Equal(95.0, At(summary, "coverage.targetPercent").GetDouble());
+                Assert.True(At(summary, "coverage.targetReached").GetBoolean());
+                Assert.Contains("\r\nStop on error: Unknown\r\n", text, StringComparison.Ordinal);
+                break;
+            default:
+                Assert.Equal(_startRequestedUtc, At(summary, "run.startRequestedUtc").GetDateTimeOffset());
+                Assert.Equal(JournalSamples.OsA, StringAt(summary, "system.os"));
+                Assert.Equal(2, At(summary, "steps").GetArrayLength());
+                break;
+        }
+    }
+
+    [Fact]
+    public async Task Detect_WholeJournalUtf16_RecoversUnfinishedRunAtUnknownStepUnderHashedNameAsync()
+    {
+        using var root = new TestDataRoot();
+        var content = new StringBuilder();
+        foreach (string line in JournalSamples.Lines(UnfinishedJournal()))
+        {
+            content.Append(line).Append('\n');
+        }
+
+        // Saved by an editor as UTF-16LE with its byte-order mark: no line reads as UTF-8 JSON.
+        Directory.CreateDirectory(root.Data.JournalDirectory);
+        File.WriteAllText(root.Data.JournalPath, content.ToString(), new UnicodeEncoding(bigEndian: false, byteOrderMark: true));
+        byte[] journalBytes = File.ReadAllBytes(root.Data.JournalPath);
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Null(recovery.RunId);
+        Assert.False(recovery.InPreparation);
+        Assert.Null(recovery.LastStepNumber);
+        Assert.Equal("the journal's begin record is missing or could not be read", recovery.JournalDamage);
+        Assert.StartsWith(FallbackBaseNamePrefix, recovery.LogBaseName, StringComparison.Ordinal);
+        Assert.Matches("^RamQuick-recovered-[0-9a-f]{32}$", recovery.LogBaseName);
+        Assert.Equal(2, recovery.PublishedFiles.Count);
+        Assert.Contains(
+            "did not finish at an unknown step",
+            ParseSummary(await File.ReadAllTextAsync(recovery.PublishedFiles[0], Cancellation)).Run.EndDetail,
+            StringComparison.Ordinal);
+        AssertMovedAsideWithEnds(root, recovery, journalBytes, Guid.Empty);
+
+        // Another unidentified journal is named after its own first line, so the two never share files.
+        using var otherRoot = new TestDataRoot();
+        WriteJournalLines(otherRoot, new[] { "not json", "{" });
+        JournalRecovery other = CrashDetector.Detect(otherRoot.Data, CreateRecoveryClock());
+        Assert.Matches("^RamQuick-recovered-[0-9a-f]{32}$", other.LogBaseName);
+        Assert.NotEqual(recovery.LogBaseName, other.LogBaseName);
+    }
+
+    [Fact]
+    public async Task Detect_JournalWithUtf8ByteOrderMark_RecoversAsWrittenAsync()
+    {
+        using var root = new TestDataRoot();
+        string journalPath = WriteJournal(root, UnfinishedJournal());
+        byte[] withoutMark = File.ReadAllBytes(journalPath);
+        File.WriteAllBytes(journalPath, new byte[] { 0xEF, 0xBB, 0xBF }.Concat(withoutMark).ToArray());
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        // The mark an editor added is not part of the begin line, so the journal recovers as if it had none.
+        await AssertUnfinishedRecoveryAsync(root, recovery, lastBeatErrors: 0);
+        Assert.Null(recovery.JournalDamage);
+        Assert.False(File.Exists(journalPath));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -689,6 +957,34 @@ public sealed class CrashDetectorTests
         Assert.Equal(journalBytes, File.ReadAllBytes(journalPath));
     }
 
+    [Fact]
+    public async Task Detect_LinkAtFinalJsonName_NeverReadOrReplaced_RecoveredSummaryPublishedAsync()
+    {
+        using var root = new TestDataRoot();
+        WriteJournal(root, CompletedJournal(withReleased: true));
+        (string jsonPath, string textPath) = FinalPaths(root, _runId);
+
+        // The link points to a file that would pass as this run's summary if it were read through the link.
+        string target = root.CreateLinkTarget();
+        string pointedTo = Path.Combine(target, "pointed-to-summary.json");
+        File.WriteAllText(pointedTo, RunSummaryJson.Serialize(SentinelSummary(_runId)), _utf8NoBom);
+        byte[] pointedToBytes = File.ReadAllBytes(pointedTo);
+        TestDataRoot.CreateFileSymbolicLinkOrSkip(jsonPath, pointedTo);
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.CompletedUnpublished, recovery.Kind);
+        string recoveredJsonPath = ResultsLog.GetRecoveredSummaryJsonPath(root.Data, BaseNameOf(_runId));
+        Assert.Equal(new[] { recoveredJsonPath, textPath }, recovery.PublishedFiles);
+        RunSummary recovered = ParseSummary(await File.ReadAllTextAsync(recoveredJsonPath, Cancellation));
+        Assert.True(recovered.Run.Recovered);
+        Assert.Equal(recovery.Summary, recovered);
+        Assert.Equal(pointedToBytes, File.ReadAllBytes(pointedTo));
+        Assert.True(File.GetAttributes(jsonPath).HasFlag(FileAttributes.ReparsePoint));
+        Assert.Null(recovery.PublicationError);
+        Assert.False(File.Exists(root.Data.JournalPath));
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Failures that keep the journal for the next launch
     // ---------------------------------------------------------------------------------------------
@@ -954,8 +1250,12 @@ public sealed class CrashDetectorTests
         Assert.False(File.Exists(root.Data.JournalPath));
     }
 
+    // A base name that is not a plain file name, that is too long for every file of the run, or that holds a
+    // control or format character falls back.
     [Theory]
     [InlineData("ParentFolder")]
+    [InlineData("LongName300")]
+    [InlineData("LongNameAboveMax")]
     [InlineData("BidiOverride")]
     [InlineData("NextLineControl")]
     public async Task Detect_UnusableBaseName_PublishesUnderFallbackNameAsync(string baseNameCase)
@@ -964,6 +1264,8 @@ public sealed class CrashDetectorTests
         string damagedBaseName = baseNameCase switch
         {
             "ParentFolder" => "..\\escaped",
+            "LongName300" => new string('A', 300),
+            "LongNameAboveMax" => new string('B', ResultsLog.MaxBaseNameLength + 1),
             "BidiOverride" => BaseNameOf(_runId) + "\u202Etxt.exe",
             "NextLineControl" => BaseNameOf(_runId) + "\u0085escaped",
             _ => throw new ArgumentOutOfRangeException(nameof(baseNameCase), baseNameCase, "Unknown base name case."),
@@ -1025,6 +1327,15 @@ public sealed class CrashDetectorTests
         AssertPlainText(expected);
         Assert.InRange(Encoding.UTF8.GetByteCount(expected), 1, MaxStepNameUtf8Bytes);
         Assert.Null(recovery.PublicationError);
+
+        // A name longer than the plan's limit is also damage, so the journal is kept aside as evidence.
+        bool tooLong = Encoding.UTF8.GetByteCount(planted) > MaxStepNameUtf8Bytes;
+        Assert.Equal(
+            !tooLong ? null
+                : onlyInDefinition ? "step 2's name in the begin record is out of range"
+                : "step 2's name in a step record is out of range",
+            recovery.JournalDamage);
+        Assert.Equal(tooLong, recovery.DamagedJournalPath is not null);
         (string jsonPath, string textPath) = FinalPaths(root, _runId);
         Assert.Equal(new[] { jsonPath, textPath }, recovery.PublishedFiles);
 
@@ -1213,7 +1524,17 @@ public sealed class CrashDetectorTests
     [InlineData("ResultFirstErrorMs", true, "firstErrorMs in the result record")]
     [InlineData("ReleaseMs", true, "releaseMs in the released record")]
     [InlineData("ReleasedBytes", true, "releasedBytes in the released record")]
-    public void Detect_DamagedValue_PublishesNothingAndKeepsJournal(string damage, bool completedRun, string damagedField)
+    [InlineData("StepCountAboveBound", false, "the step count in the begin record")]
+    [InlineData("TestTypeTooLong", false, "testType in the begin record")]
+    [InlineData("AppVersionTooLong", true, "appVersion in the begin record")]
+    [InlineData("OsTooLong", false, "system.os in the begin record")]
+    [InlineData("CpuNameTooLong", true, "system.cpuName in the begin record")]
+    [InlineData("VerdictTooLong", true, "verdict in the result record")]
+    [InlineData("EndDetailTooLong", true, "endDetail in the result record")]
+    public async Task Detect_DamagedValue_PublishesWithoutItAndMovesJournalAsideAsync(
+        string damage,
+        bool completedRun,
+        string damagedField)
     {
         using var root = new TestDataRoot();
         string journalPath = WriteJournal(root, DamagedJournal(damage, completedRun));
@@ -1221,30 +1542,81 @@ public sealed class CrashDetectorTests
 
         JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
 
-        // A summary rebuilt from these records would state a value no run measured, so none is published, and
-        // the journal is kept without an end record where the message says it is.
-        Assert.Equal(
-            DamagedJournalPrefix + damagedField + " is out of range. The journal is kept at '"
-                + Path.GetFullPath(journalPath) + "'.",
-            recovery.PublicationError);
-        Assert.Equal(
-            completedRun ? JournalRecoveryKind.CompletedUnpublished : JournalRecoveryKind.Unfinished,
-            recovery.Kind);
+        // The damaged value is left out and the rest is published, so the journal never blocks a later Start. It
+        // is kept aside, as it was, for evidence; a damaged result leaves the run without a verdict.
+        string expectedDamage = damagedField + " is out of range";
+        Assert.Null(recovery.PublicationError);
+        Assert.Equal(expectedDamage, recovery.JournalDamage);
+        bool verdictKept = completedRun && !damage.StartsWith("Result", StringComparison.Ordinal);
+        Assert.Equal(verdictKept ? JournalRecoveryKind.CompletedUnpublished : JournalRecoveryKind.Unfinished, recovery.Kind);
         Assert.Equal(_runId, recovery.RunId);
         Assert.Equal(BaseNameOf(_runId), recovery.LogBaseName);
-        Assert.Null(recovery.Summary);
-        Assert.Empty(recovery.PublishedFiles);
+        Assert.Equal(FinalPathList(root, _runId), recovery.PublishedFiles);
         Assert.False(recovery.JournalDeleted);
-        Assert.Equal(journalBytes, File.ReadAllBytes(journalPath));
-        AssertLogsEmpty(root);
-        if (!completedRun)
+        Assert.False(File.Exists(journalPath));
+        AssertMovedAsideWithEnds(root, recovery, journalBytes, _runId);
+
+        string json = await File.ReadAllTextAsync(FinalPaths(root, _runId).Json, Cancellation);
+        Assert.Equal(recovery.Summary, ParseSummary(json));
+        Assert.DoesNotContain(_tooLongText, json, StringComparison.Ordinal);
+        using JsonDocument document = JsonDocument.Parse(json);
+        AssertEveryIntegerWithinBound(document.RootElement);
+        Assert.EndsWith(
+            "The progress journal held damaged data: " + expectedDamage + ".",
+            StringAt(document.RootElement, "run.endDetail"),
+            StringComparison.Ordinal);
+        if (!verdictKept)
         {
             Assert.False(recovery.InPreparation);
             Assert.Equal(2, recovery.LastStepNumber);
             Assert.Equal(StepCount, recovery.StepCount);
             Assert.Equal(RandomBankThrash, recovery.LastStepName);
-            Assert.Equal(_lastBeatUtc, recovery.LastHeartbeatUtc);
+            Assert.Equal("FAIL", StringAt(document.RootElement, "run.verdict"));
+            Assert.Equal(nameof(RunEndReason.PreviousRunUnfinished), StringAt(document.RootElement, "run.endReason"));
         }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Detect_HeartbeatElapsedAtLongMaxValue_PublishesAndMovesJournalAside(bool useStorage)
+    {
+        using var root = new TestDataRoot();
+        using var storage = new StalledJournalStorage();
+        JournalRecord[] journal = DamagedJournal("BeatElapsedMs", completedRun: false);
+
+        JournalRecovery recovery;
+        if (useStorage)
+        {
+            storage.Seed(JournalSamples.Lines(journal));
+            recovery = CrashDetector.Detect(root.Data, storage, CreateRecoveryClock());
+        }
+        else
+        {
+            WriteJournal(root, journal);
+            recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+        }
+
+        // Every heartbeat is damaged, so the end time and duration are not captured, and the run is still FAIL.
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Equal("elapsedMs in a beat record is out of range", recovery.JournalDamage);
+        Assert.Null(recovery.LastHeartbeatUtc);
+        Assert.Null(recovery.Summary!.Run.DurationSeconds);
+        Assert.Null(recovery.PublicationError);
+        Assert.Equal(FinalPathList(root, _runId), recovery.PublishedFiles);
+        if (useStorage)
+        {
+            AssertEndWrittenThenMovedAside(storage, recovery, _runId);
+        }
+        else
+        {
+            Assert.False(File.Exists(root.Data.JournalPath));
+            Assert.Equal(DamagedJournalPath(root), recovery.DamagedJournalPath);
+            Assert.True(File.Exists(recovery.DamagedJournalPath));
+        }
+
+        // The journal no longer stands in the way: the next launch finds nothing to recover.
+        Assert.Same(JournalRecovery.None, CrashDetector.Detect(root.Data, CreateRecoveryClock()));
     }
 
     [Fact]
@@ -1343,7 +1715,7 @@ public sealed class CrashDetectorTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void Detect_DamagedRunBeforeValidRun_PublishesValidRunAndKeepsJournal(bool completedRun)
+    public void Detect_DamagedRunBeforeValidRun_PublishesBothAndMovesJournalAside(bool completedRun)
     {
         using var root = new TestDataRoot();
         using var storage = new StalledJournalStorage();
@@ -1355,31 +1727,37 @@ public sealed class CrashDetectorTests
 
         JournalRecovery recovery = CrashDetector.Detect(root.Data, storage, CreateRecoveryClock());
 
+        // H is published without its plan, which held the damaged budget; G is published whole.
         Assert.Equal(
             completedRun ? JournalRecoveryKind.CompletedUnpublished : JournalRecoveryKind.Unfinished,
             recovery.Kind);
         Assert.Equal(_runId, recovery.RunId);
-        Assert.Equal(
-            DamagedJournalPrefix + "step 1's timeBudgetMs in the begin record is out of range. The journal is kept at '"
-                + storage.Location + "'.",
-            recovery.PublicationError);
-        Assert.Equal(FinalPathList(root, _runId), recovery.PublishedFiles);
+        Assert.Null(recovery.PublicationError);
+        Assert.Equal("step 1's timeBudgetMs in the begin record is out of range", recovery.JournalDamage);
+        Assert.Equal(FinalPathList(root, _otherRunId).Concat(FinalPathList(root, _runId)), recovery.PublishedFiles);
         Assert.Equal(recovery.Summary, ParseSummary(File.ReadAllText(FinalPaths(root, _runId).Json)));
-        Assert.False(File.Exists(FinalPaths(root, _otherRunId).Json));
-        Assert.False(File.Exists(FinalPaths(root, _otherRunId).Text));
-        AssertNoRecoveredFiles(root, _otherRunId);
+        Assert.DoesNotContain("damaged", recovery.Summary!.Run.EndDetail, StringComparison.Ordinal);
+        RunSummary other = ParseSummary(File.ReadAllText(FinalPaths(root, _otherRunId).Json));
+        Assert.Empty(other.Steps);
 
-        // Run H is still unpublished, so neither run gets an end record and the journal stays as it was.
-        Assert.False(recovery.JournalDeleted);
-        Assert.Equal(0, storage.AppendCallCount);
-        Assert.Equal(0, storage.DeleteCount);
-        Assert.Equal(lines, storage.ReadLines());
+        // Without its plan, H's targets were never captured.
+        Assert.Null(other.Plan.TargetSeconds);
+        Assert.Null(other.Plan.TargetCoveragePercent);
+        Assert.Null(other.Coverage.TargetPercent);
+        Assert.Null(other.Coverage.TargetReached);
+        Assert.EndsWith(
+            "The progress journal held damaged data: step 1's timeBudgetMs in the begin record is out of range.",
+            other.Run.EndDetail,
+            StringComparison.Ordinal);
+
+        AssertEndWrittenThenMovedAside(storage, recovery, _otherRunId, _runId);
+        Assert.Equal(lines, Assert.Single(storage.MovedAside).Lines.Take(lines.Count));
     }
 
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void Detect_DamagedJournal_SummariesAlreadyPublished_RetiresJournal(bool completedRun)
+    public void Detect_DamagedJournal_SummariesAlreadyPublished_KeepsThemAndMovesJournalAside(bool completedRun)
     {
         using var root = new TestDataRoot();
         using var storage = new StalledJournalStorage();
@@ -1391,19 +1769,685 @@ public sealed class CrashDetectorTests
 
         JournalRecovery recovery = CrashDetector.Detect(root.Data, storage, CreateRecoveryClock());
 
-        // Both of the run's summaries are on disk, so nothing is rebuilt from the damaged values.
+        // Both of the run's summaries are on disk and kept; the damaged journal is moved aside, not deleted.
         Assert.Equal(
             completedRun ? JournalRecoveryKind.CompletedUnpublished : JournalRecoveryKind.None,
             recovery.Kind);
         Assert.Equal(published, recovery.Summary);
         Assert.Null(recovery.PublicationError);
+        Assert.Equal("step 1's timeBudgetMs in the begin record is out of range", recovery.JournalDamage);
         Assert.Empty(recovery.PublishedFiles);
         Assert.Equal(jsonBytes, File.ReadAllBytes(jsonPath));
         Assert.Equal(textBytes, File.ReadAllBytes(textPath));
         AssertNoRecoveredFiles(root, _runId);
-        Assert.True(recovery.JournalDeleted);
-        AssertEndWrittenThenDeleted(storage, _runId);
+        AssertEndWrittenThenMovedAside(storage, recovery, _runId);
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // Untrusted journals: foreign records, repeated begins, oversized input, names and links
+    // ---------------------------------------------------------------------------------------------
+
+    // A record naming another run, or none, is never this run's: a foreign PASS cannot turn a crash into a verdict.
+    [Theory]
+    [InlineData("result", true)]
+    [InlineData("result", false)]
+    [InlineData("stepEnd", true)]
+    [InlineData("released", true)]
+    public async Task Detect_OutcomeRecordOfAnotherRun_IsIgnoredAsDamageAsync(string recordType, bool namesAnotherRun)
+    {
+        using var root = new TestDataRoot();
+        Guid foreignId = namesAnotherRun ? new Guid("11111111-2222-3333-4444-555555555555") : Guid.Empty;
+        JournalRecord foreign = recordType switch
+        {
+            "result" => JournalSamples.Result(
+                RunState.Passed,
+                RunEndReason.Completed,
+                0,
+                3 * JournalSamples.GiB,
+                TimeSpan.FromSeconds(1),
+                null,
+                StepCount,
+                _completedUtc,
+                _verdictUtc) with { RunId = foreignId, Utc = _verdictUtc },
+            "stepEnd" => JournalStepEnd.FromOutcome(JournalSamples.Outcome(
+                _steps[1], TimeSpan.FromSeconds(50), 1, JournalSamples.GiB, 0, completed: true)) with
+            {
+                RunId = foreignId,
+                Utc = _lastBeatUtc,
+            },
+            _ => new JournalReleased { RunId = foreignId, ReleasedBytes = JournalSamples.GiB, ReleaseMs = 1, Utc = _verdictUtc },
+        };
+        bool completedRun = recordType == "released";
+        JournalRecord[] journal = completedRun ? CompletedJournal(withReleased: false) : UnfinishedJournal();
+        WriteJournal(root, journal.Append(foreign).ToArray());
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        Assert.Equal($"a {recordType} record of another run was ignored", recovery.JournalDamage);
+        Assert.Null(recovery.PublicationError);
+        Assert.Equal(_runId, recovery.RunId);
+        Assert.Equal(FinalPathList(root, _runId), recovery.PublishedFiles);
+        RunSummary summary = ParseSummary(await File.ReadAllTextAsync(FinalPaths(root, _runId).Json, Cancellation));
+        Assert.Equal(recovery.Summary, summary);
+        if (completedRun)
+        {
+            Assert.Equal(JournalRecoveryKind.CompletedUnpublished, recovery.Kind);
+            Assert.Null(summary.Memory.ReleaseSeconds);
+            return;
+        }
+
+        // The run still stopped in step 2: FAIL with the unfinished step, never the foreign PASS or step result.
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Equal(2, recovery.LastStepNumber);
+        Assert.Equal(StepCount, recovery.StepCount);
+        Assert.Equal(RandomBankThrash, recovery.LastStepName);
+        Assert.Equal("FAIL", summary.Run.Verdict);
+        Assert.Equal(nameof(RunEndReason.PreviousRunUnfinished), summary.Run.EndReason);
+        Assert.True(summary.Run.Partial);
+        Assert.False(Assert.Single(summary.Steps, step => step.Index == 2).Completed);
+        Assert.Contains("did not finish at step 2 of 3 (Random bank thrash)", summary.Run.EndDetail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Detect_RepeatedBegin_ContinuesItsRunAndReportsItUnfinished()
+    {
+        using var root = new TestDataRoot();
+        using var storage = new StalledJournalStorage();
+
+        // The begin line appears a second time inside the run, as a tampered or replayed journal holds it.
+        IReadOnlyList<string> lines = JournalSamples.Lines(UnfinishedJournal());
+        storage.Seed(lines.Take(3).Append(lines[0]).Concat(lines.Skip(3)));
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, storage, CreateRecoveryClock());
+
+        // One run, one pair of summaries, and the FAIL is shown rather than taken for an already published run.
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Equal("a repeated begin record", recovery.JournalDamage);
+        Assert.Equal(2, recovery.LastStepNumber);
+        Assert.Equal(RandomBankThrash, recovery.LastStepName);
+        Assert.Equal(FinalPathList(root, _runId), recovery.PublishedFiles);
+        Assert.Equal(2, recovery.Summary!.Steps.Count);
+        AssertNoRecoveredFiles(root, _runId);
+        AssertEndWrittenThenMovedAside(storage, recovery, _runId);
+    }
+
+    // Neither the lost begin record nor step records without a count captured the plan's size, so the position names
+    // the step alone, never "of 0".
+    [Fact]
+    public async Task Detect_PlanSizeNeverCaptured_IsLeftOutOfThePositionAsync()
+    {
+        using var root = new TestDataRoot();
+        JournalRecord[] journal = UnfinishedJournal()
+            .Skip(1)
+            .Select(record => record is JournalStepStart step ? step with { Count = 0 } : record)
+            .ToArray();
+        WriteJournal(root, journal);
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Equal(2, recovery.LastStepNumber);
+        Assert.Null(recovery.StepCount);
+        using JsonDocument document = JsonDocument.Parse(await File.ReadAllTextAsync(recovery.PublishedFiles[0], Cancellation));
+        AssertNullAt(document.RootElement, "unfinishedRun.stepCount");
+        Assert.StartsWith(
+            "The previous test did not finish at step 2 (Random bank thrash), which likely indicates severe instability.",
+            StringAt(document.RootElement, "run.endDetail"),
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "\r\nThe previous test did not finish at step 2 (Random bank thrash), which likely indicates severe instability.\r\n",
+            await File.ReadAllTextAsync(recovery.PublishedFiles[1], Cancellation),
+            StringComparison.Ordinal);
+    }
+
+    // A run whose id its journal never captured is named after its first line, and its rebuilt summaries carry no id;
+    // a retry recognises them as its own all the same, so it publishes nothing twice and shows the FAIL again.
+    [Fact]
+    public void Detect_UnidentifiedRunRecoveredAgain_KeepsItsOwnSummaries()
+    {
+        using var root = new TestDataRoot();
+        string[] journal = { "not json", "{" };
+        WriteJournalLines(root, journal);
+        JournalRecovery first = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+        Assert.Equal(2, first.PublishedFiles.Count);
+        Assert.Null(first.Summary!.Run.Id);
+
+        // The journal comes back, as after a launch that published the summaries but could not retire it.
+        WriteJournalLines(root, journal);
+
+        JournalRecovery again = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.Unfinished, again.Kind);
+        Assert.Equal(first.LogBaseName, again.LogBaseName);
+        Assert.Equal(first.Summary, again.Summary);
+        Assert.Empty(again.PublishedFiles);
+        Assert.Null(again.PublicationError);
+        Assert.False(File.Exists(ResultsLog.GetRecoveredSummaryJsonPath(root.Data, again.LogBaseName!)));
+        Assert.False(File.Exists(ResultsLog.GetRecoveredSummaryTextPath(root.Data, again.LogBaseName!)));
+    }
+
+    // Only a summary recovery rebuilt may lack a run id; an empty one names no run in any summary.
+    [Theory]
+    [InlineData(null, true, true)]
+    [InlineData(null, false, false)]
+    [InlineData("", true, false)]
+    [InlineData("   ", true, false)]
+    public void TryDeserialize_RunIdMissing_AcceptedOnlyAsNullInRecoveredSummary(string? runId, bool recovered, bool accepted)
+    {
+        RunSummary sentinel = SentinelSummary(_runId);
+        RunSummary summary = sentinel with { Run = sentinel.Run with { Id = runId, Recovered = recovered } };
+
+        Assert.Equal(accepted, RunSummaryJson.TryDeserialize(RunSummaryJson.Serialize(summary), out RunSummary? read));
+        Assert.Equal(accepted ? summary : null, read);
+    }
+
+    // Run A's begin repeats after run B's records, so A owns the end of the journal: A's FAIL is the outcome shown,
+    // while B, which reached its verdict, is still published.
+    [Fact]
+    public async Task Detect_RepeatedBeginAfterAnotherRun_ReportsTheRunThatEndsTheJournalAsync()
+    {
+        using var root = new TestDataRoot();
+        using var storage = new StalledJournalStorage();
+        JournalRecord[] journal =
+        [
+            BeginRecord(_runId),
+            StepStartRecord(1, TimeSpan.Zero),
+            .. CompletedJournal(withReleased: true, _otherRunId),
+            BeginRecord(_runId),
+            StepStartRecord(2, _step1Actual),
+            BeatRecord(2, 61_000, 120.5, 0, 71.5, 48.0),
+        ];
+        storage.Seed(JournalSamples.Lines(journal));
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, storage, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Equal(_runId, recovery.RunId);
+        Assert.Equal(2, recovery.LastStepNumber);
+        Assert.Equal(RandomBankThrash, recovery.LastStepName);
+        Assert.Equal("a repeated begin record", recovery.JournalDamage);
+        Assert.Null(recovery.PublicationError);
+        Assert.Equal(FinalPathList(root, _runId).Concat(FinalPathList(root, _otherRunId)), recovery.PublishedFiles);
+        Assert.Equal(SummaryFormat.RunId(_runId), recovery.Summary!.Run.Id);
+        Assert.True(recovery.Summary.Run.Partial);
+        RunSummary other = ParseSummary(await File.ReadAllTextAsync(FinalPaths(root, _otherRunId).Json, Cancellation));
+        Assert.Equal(SummaryFormat.RunId(_otherRunId), other.Run.Id);
+        Assert.Equal(nameof(RunEndReason.FirstError), other.Run.EndReason);
+        AssertEndWrittenThenMovedAside(storage, recovery, _runId, _otherRunId);
+    }
+
+    [Fact]
+    public void Detect_FinalJsonIsRecoveredPartialSummary_StaysUnfinished()
+    {
+        using var root = new TestDataRoot();
+        WriteJournal(root, UnfinishedJournal());
+        JournalRecovery first = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+        Assert.Equal(JournalRecoveryKind.Unfinished, first.Kind);
+
+        // The journal comes back, as after a launch that published the partial summaries but could not retire it.
+        WriteJournal(root, UnfinishedJournal());
+
+        JournalRecovery again = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        // A partial summary recovery rebuilt does not show that the run finished, so its FAIL is shown again.
+        Assert.Equal(JournalRecoveryKind.Unfinished, again.Kind);
+        Assert.Equal(2, again.LastStepNumber);
+        Assert.Equal(first.Summary, again.Summary);
+        Assert.Empty(again.PublishedFiles);
+        Assert.Null(again.PublicationError);
+        Assert.True(again.JournalDeleted);
+        AssertNoRecoveredFiles(root, _runId);
+    }
+
+    // A folder or a link at the final name is never read or followed, and a file above the summary bound is never
+    // read: the link and the oversized file here hold a valid summary of this very run, which recovery would
+    // otherwise keep.
+    [Theory]
+    [InlineData("Directory")]
+    [InlineData("SymbolicLink")]
+    [InlineData("Oversized")]
+    public async Task Detect_FinalJsonNameHeldByFolderLinkOrOversizedFile_PublishesUnderRecoveredNameAsync(string entry)
+    {
+        using var root = new TestDataRoot();
+        WriteJournal(root, CompletedJournal(withReleased: true));
+        (string jsonPath, string textPath) = FinalPaths(root, _runId);
+        string keptSummary = RunSummaryJson.Serialize(SentinelSummary(_runId));
+        switch (entry)
+        {
+            case "Directory":
+                Directory.CreateDirectory(jsonPath);
+                break;
+            case "SymbolicLink":
+                string target = root.Combine("elsewhere-summary.json");
+                File.WriteAllText(target, keptSummary, _utf8NoBom);
+                try
+                {
+                    _ = File.CreateSymbolicLink(jsonPath, target);
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                {
+                    Assert.Skip($"Creating a symbolic link needs SeCreateSymbolicLinkPrivilege: {exception.Message}");
+                }
+
+                break;
+            default:
+                // Trailing white space keeps the document valid JSON, one byte above the bound.
+                File.WriteAllText(
+                    jsonPath,
+                    keptSummary + new string(' ', JournalReadLimits.MaxSummaryBytes + 1 - _utf8NoBom.GetByteCount(keptSummary)),
+                    _utf8NoBom);
+                break;
+        }
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.CompletedUnpublished, recovery.Kind);
+        Assert.Null(recovery.PublicationError);
+        string recoveredJsonPath = ResultsLog.GetRecoveredSummaryJsonPath(root.Data, BaseNameOf(_runId));
+        Assert.Equal(new[] { recoveredJsonPath, textPath }, recovery.PublishedFiles);
+        RunSummary recovered = ParseSummary(await File.ReadAllTextAsync(recoveredJsonPath, Cancellation));
+        Assert.Equal(JournalSamples.AppVersion, recovered.App.Version);
+        Assert.Equal(recovery.Summary, recovered);
+        FileInfo kept = new(jsonPath);
+        switch (entry)
+        {
+            case "Directory":
+                Assert.True(kept.Attributes.HasFlag(FileAttributes.Directory));
+                break;
+            case "SymbolicLink":
+                Assert.True(kept.Attributes.HasFlag(FileAttributes.ReparsePoint));
+                break;
+            default:
+                Assert.Equal(JournalReadLimits.MaxSummaryBytes + 1L, kept.Length);
+                break;
+        }
+
+        Assert.True(recovery.JournalDeleted);
+    }
+
+    // A final JSON summary of this very run that the summary reader accepts, but that lies beyond one of the summary
+    // bounds, is left untouched and never rendered: the unfinished run's rebuilt summary goes to the recovered name and
+    // its FAIL is shown. The first case is the one that exhausted memory: 10,000 steps, the first named by 100,000
+    // characters, which the text form pads every row to.
+    [Theory]
+    [InlineData("TenThousandStepsWithLongName")]
+    [InlineData("StringAboveBound")]
+    [InlineData("EscapedStringAboveBound")]
+    [InlineData("PropertyNameAboveBound")]
+    [InlineData("ArrayAboveBound")]
+    [InlineData("NestedBeyondDepth")]
+    [InlineData("MoreStepsThanAPlan")]
+    [InlineData("StepNameAboveThePlanLimit")]
+    [InlineData("StepCellAboveBound")]
+    public async Task Detect_FinalJsonBeyondSummaryBounds_LeftUntouched_RecoveredSummaryPublishedAsync(string shape)
+    {
+        using var root = new TestDataRoot();
+        WriteJournal(root, UnfinishedJournal());
+        (string jsonPath, string textPath) = FinalPaths(root, _runId);
+        string kept = KeptSummaryOfShape(shape);
+        Assert.True(RunSummaryJson.TryDeserialize(kept, out RunSummary? readable), "Only the summary bounds may refuse it.");
+        Assert.Equal(SummaryFormat.RunId(_runId), readable.Run.Id);
+        File.WriteAllText(jsonPath, kept, _utf8NoBom);
+        byte[] keptBytes = File.ReadAllBytes(jsonPath);
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Equal(2, recovery.LastStepNumber);
+        Assert.Null(recovery.PublicationError);
+        Assert.Null(recovery.JournalDamage);
+        string recoveredJsonPath = ResultsLog.GetRecoveredSummaryJsonPath(root.Data, BaseNameOf(_runId));
+        Assert.Equal(new[] { recoveredJsonPath, textPath }, recovery.PublishedFiles);
+        Assert.Equal(keptBytes, File.ReadAllBytes(jsonPath));
+        RunSummary rebuilt = ParseSummary(await File.ReadAllTextAsync(recoveredJsonPath, Cancellation));
+        Assert.Equal(recovery.Summary, rebuilt);
+        Assert.True(rebuilt.Run.Partial);
+
+        // The text is the rebuilt summary's, never a rendering of the kept one.
+        Assert.Equal(TextSummaryFormatter.Format(rebuilt), await File.ReadAllTextAsync(textPath, Cancellation));
+        Assert.True(recovery.JournalDeleted);
+    }
+
+    // A summary at every bound at once is still this run's: it is kept, and the unfinished run is reported as already
+    // published. Its end detail is written 98,304 bytes long, every character escaped, yet holds the 16,384 the bound
+    // allows.
+    [Fact]
+    public async Task Detect_FinalJsonAtTheSummaryBounds_IsKeptAndRenderedAsync()
+    {
+        using var root = new TestDataRoot();
+        WriteJournal(root, UnfinishedJournal());
+        (string jsonPath, string textPath) = FinalPaths(root, _runId);
+        string kept = KeptSummaryOfShape("AtTheBounds");
+        File.WriteAllText(jsonPath, kept, _utf8NoBom);
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.None, recovery.Kind);
+        Assert.Null(recovery.PublicationError);
+        Assert.Equal(new[] { textPath }, recovery.PublishedFiles);
+        Assert.Equal(ParseSummary(kept), recovery.Summary);
+        Assert.Equal(JournalReadLimits.MaxPlanSteps, recovery.Summary!.Steps.Count);
+        Assert.Equal(JournalReadLimits.MaxSummaryStringLength, recovery.Summary.Run.EndDetail.Length);
+        Assert.Equal(TextSummaryFormatter.Format(recovery.Summary), await File.ReadAllTextAsync(textPath, Cancellation));
+        AssertNoRecoveredFiles(root, _runId);
+        Assert.True(recovery.JournalDeleted);
+    }
+
+    // Input beyond the read bounds is left unread, never allocated: what was read is published, and the journal is
+    // moved aside.
+    [Theory]
+    [InlineData("LongStepName", "a line longer than 1 MiB was left unread")]
+    [InlineData("LargerThanBound", "the journal is larger than 16 MiB, so the rest of it was left unread")]
+    public async Task Detect_JournalBeyondReadBounds_PublishesWhatWasReadAndMovesItAsideAsync(string journalCase, string expectedDamage)
+    {
+        using var root = new TestDataRoot();
+        JournalRecord[] journal = UnfinishedJournal();
+        string? tail = null;
+        if (journalCase == "LongStepName")
+        {
+            // Step 2's record names the step with 2 MiB of text, so the run is read without it.
+            int stepIndex = Array.FindLastIndex(journal, record => record is JournalStepStart);
+            journal[stepIndex] = (JournalStepStart)journal[stepIndex] with { Name = new string('x', 2 * 1024 * 1024) };
+        }
+        else
+        {
+            // Heartbeats beyond the 16 MiB bound; reading stops there, mid-line.
+            string beat = JournalLineSerializer.Serialize(BeatRecord(2, 61_000, 120.5, 0, 71.5, 48.0)) + "\n";
+            tail = string.Concat(Enumerable.Repeat(beat, (JournalReadLimits.MaxJournalBytes / beat.Length) + 100));
+        }
+
+        string journalPath = WriteJournal(root, journal);
+        if (tail is not null)
+        {
+            File.AppendAllText(journalPath, tail, _utf8NoBom);
+        }
+
+        byte[] journalBytes = File.ReadAllBytes(journalPath);
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Equal(expectedDamage, recovery.JournalDamage);
+        Assert.Null(recovery.PublicationError);
+        Assert.Equal(FinalPathList(root, _runId), recovery.PublishedFiles);
+        Assert.False(recovery.InPreparation);
+        RunSummary summary = ParseSummary(await File.ReadAllTextAsync(FinalPaths(root, _runId).Json, Cancellation));
+        Assert.EndsWith("The progress journal held damaged data: " + expectedDamage + ".", summary.Run.EndDetail, StringComparison.Ordinal);
+        if (journalCase == "LongStepName")
+        {
+            // Step 2's heartbeats outlive its record, so the stop is unknown rather than placed in finished step 1.
+            Assert.Null(recovery.LastStepNumber);
+            Assert.Contains("did not finish at an unknown step", summary.Run.EndDetail, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Equal(2, recovery.LastStepNumber);
+        }
+
+        Assert.False(File.Exists(journalPath));
+        AssertMovedAsideWithEnds(root, recovery, journalBytes, _runId);
+    }
+
+    [Fact]
+    public void Detect_JournalLeftUnreadWithoutAnyLine_ReportsUnfinishedRunOfUnknownStep()
+    {
+        using var root = new TestDataRoot();
+        using var storage = new StalledJournalStorage();
+
+        // A journal whose only content is a line beyond the bounds still held a run, so it is reported.
+        storage.Seed(Array.Empty<string>());
+        storage.ReadDamage = "a line longer than 1 MiB was left unread";
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, storage, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Null(recovery.RunId);
+        Assert.False(recovery.InPreparation);
+        Assert.Null(recovery.LastStepNumber);
+        Assert.Equal(storage.ReadDamage, recovery.JournalDamage);
+        Assert.Equal(2, recovery.PublishedFiles.Count);
+        Assert.Contains("did not finish at an unknown step", recovery.Summary!.Run.EndDetail, StringComparison.Ordinal);
+        AssertEndWrittenThenMovedAside(storage, recovery, Guid.Empty);
+    }
+
+    // The plan's step names are at most 63 UTF-8 bytes; a longer one is a value no run writes, so it is damage, and
+    // the text summary would pad every step row to it, so it is never published whole.
+    [Theory]
+    [InlineData("Plan", "step 2's name in the begin record is out of range")]
+    [InlineData("StepRecord", "step 2's name in a step record is out of range")]
+    public void Detect_StepNameAboveThePlanLimit_IsDamageAndNeverPublishedWhole(string where, string expectedDamage)
+    {
+        using var root = new TestDataRoot();
+        string longName = new('n', 64);
+        JournalRecord[] journal = UnfinishedJournal();
+        int stepIndex = Array.FindLastIndex(journal, record => record is JournalStepStart);
+        if (where == "Plan")
+        {
+            journal[0] = WithStep((JournalBegin)journal[0], 1, step => step with { Name = longName });
+        }
+        else
+        {
+            journal[stepIndex] = (JournalStepStart)journal[stepIndex] with { Name = longName };
+        }
+
+        WriteJournal(root, journal);
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Equal(expectedDamage, recovery.JournalDamage);
+        Assert.Equal(2, recovery.LastStepNumber);
+        Assert.Equal(StepCount, recovery.StepCount);
+
+        // The step record names the step; without the record's name the plan does. The plan stands, and its long
+        // name is cut to the limit with a marker.
+        Assert.Equal(RandomBankThrash, recovery.LastStepName);
+        Assert.DoesNotContain(longName, RunSummaryJson.Serialize(recovery.Summary!), StringComparison.Ordinal);
+        Assert.Equal(2, recovery.Summary!.Steps.Count);
+        Assert.Equal(
+            where == "Plan" ? new string('n', 60) + "\u2026" : RandomBankThrash,
+            recovery.Summary.Steps[1].Name);
+    }
+
+    [Fact]
+    public void Detect_LoneSurrogateEscapes_NeverThrowAndLeaveTheValuesOut()
+    {
+        using var root = new TestDataRoot();
+        IReadOnlyList<string> lines = JournalSamples.Lines(UnfinishedJournal());
+        JsonObject begin = JsonNode.Parse(lines[0])!.AsObject();
+        begin["logBaseName"] = "PLACEHOLDER";
+        string damagedBegin = begin.ToJsonString().Replace("PLACEHOLDER", "\\ud800x", StringComparison.Ordinal);
+        string damagedStep = lines[5].Replace(RandomBankThrash, "\\ud800", StringComparison.Ordinal);
+        Assert.False(JournalLineSerializer.TryParse(damagedBegin, out _));
+        Assert.False(JournalLineSerializer.TryParse(damagedStep, out _));
+        Assert.False(RunSummaryJson.TryDeserialize("{\"schemaVersion\":1,\"run\":{\"id\":\"\\ud800\"}}", out _));
+        WriteJournalLines(root, lines.Skip(1).Take(4).Prepend(damagedBegin).Append(damagedStep).Concat(lines.Skip(6)));
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        // The base name is left out of the begin record, so the run is named after its id; the step 2 record is
+        // skipped like any malformed line, so step 2's heartbeats leave the stop unknown.
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Equal("the begin record was damaged: logBaseName could not be read", recovery.JournalDamage);
+        Assert.Equal(FallbackBaseNamePrefix + SummaryFormat.RunId(_runId), recovery.LogBaseName);
+        Assert.Null(recovery.LastStepNumber);
+        Assert.False(recovery.InPreparation);
+        Assert.Equal(2, recovery.PublishedFiles.Count);
+    }
+
+    [Fact]
+    public void Detect_MoveAsideFails_KeepsJournalInPlaceAndNextLaunchOnlyRetriesTheMove()
+    {
+        using var root = new TestDataRoot();
+        IReadOnlyList<string> lines = JournalSamples.Lines(DamagedJournal("BeatErrors", completedRun: false));
+        var storage = new FaultingJournalStorage(lines, moveAsideFailure: new IOException("Simulated move failure"));
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, storage, CreateRecoveryClock());
+
+        // The damaged journal is evidence, so a journal that cannot be moved aside stays where it is rather than being
+        // deleted. Its results are published and its run has its end record, so it refuses no Start.
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Equal("errors in a beat record is out of range", recovery.JournalDamage);
+        Assert.Null(recovery.PublicationError);
+        Assert.Null(recovery.DamagedJournalPath);
+        Assert.Equal(1, storage.MoveAsideCalls);
+        Assert.Equal(0, storage.DeleteCalls);
+        Assert.False(recovery.JournalDeleted);
+        Assert.Equal(_runId, ParseEnd(Assert.Single(storage.Appended)).RunId);
+        Assert.Equal(2, recovery.PublishedFiles.Count);
+
+        // The next launch finds the same journal with the end record after it: nothing is published again, the run is
+        // not reported again, and the move is retried.
+        var kept = new FaultingJournalStorage(lines.Concat(storage.Appended));
+        JournalRecovery retry = CrashDetector.Detect(root.Data, kept, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.None, retry.Kind);
+        Assert.Equal(_runId, retry.RunId);
+        Assert.Empty(retry.PublishedFiles);
+        Assert.Null(retry.PublicationError);
+        Assert.Equal(recovery.JournalDamage, retry.JournalDamage);
+        Assert.Empty(kept.Appended);
+        Assert.Equal(1, kept.MoveAsideCalls);
+        Assert.Equal(0, kept.DeleteCalls);
+        Assert.Equal("memory://faulting/active-run.damaged-20261028-150500.jsonl", retry.DamagedJournalPath);
+    }
+
+    [Fact]
+    public void Detect_PublicationFailsForDamagedJournal_KeepsJournalWithoutEnd()
+    {
+        using var root = new TestDataRoot();
+        using var storage = new StalledJournalStorage();
+        storage.Seed(JournalSamples.Lines(DamagedJournal("BeatErrors", completedRun: false)));
+        IReadOnlyList<string> lines = storage.ReadLines();
+        _ = root.CreateBlockingFile("logs");
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, storage, CreateRecoveryClock());
+
+        // A transient save failure keeps the journal for the next launch to retry, damaged or not.
+        Assert.False(string.IsNullOrWhiteSpace(recovery.PublicationError));
+        Assert.Equal("errors in a beat record is out of range", recovery.JournalDamage);
+        Assert.Null(recovery.DamagedJournalPath);
+        Assert.False(recovery.JournalDeleted);
+        Assert.Equal(0, storage.AppendCallCount);
+        Assert.Empty(storage.MovedAside);
+        Assert.Equal(lines, storage.ReadLines());
+    }
+
+    [Theory]
+    [InlineData("[1,2]")]
+    [InlineData("{\"t\":\"step\",\"index\":\"two\"}")]
+    [InlineData("{\"t\":\"begin\",\"runId\":\"a\",\"runId\":")]
+    [InlineData("not json")]
+    public void TrySalvageBegin_LineThatIsNotABeginObject_ReturnsFalse(string line)
+    {
+        Assert.False(JournalLineSerializer.TrySalvageBegin(line, out JournalBegin? begin, out IReadOnlyList<string> dropped));
+        Assert.Null(begin);
+        Assert.Empty(dropped);
+    }
+
+    [Fact]
+    public void TrySalvageBegin_KeepsEveryFieldThatReadsAndNamesTheRest()
+    {
+        JournalBegin written = BeginRecord(_runId);
+        JsonObject line = JsonNode.Parse(JournalLineSerializer.Serialize(written))!.AsObject();
+        line["stopOnError"] = "yes";
+        line["memory"] = 42;
+        line["plannedBytes"] = -1;
+
+        Assert.True(JournalLineSerializer.TrySalvageBegin(line.ToJsonString(), out JournalBegin? begin, out IReadOnlyList<string> dropped));
+
+        // The names come in line order, which replacing a value leaves as the record writes it.
+        string[] damagedFields = { "stopOnError", "memory", "plannedBytes" };
+        Assert.Equal(line.Select(property => property.Key).Where(damagedFields.Contains), dropped);
+        Assert.Equal(written with { StopOnError = null, Memory = new JournalMemoryInfo(), PlannedBytes = null }, begin);
+    }
+
+    // A name that is not valid UTF-16 cannot be shown, so the notice names the field by its kind only.
+    [Fact]
+    public void TrySalvageBegin_FieldWithUnreadableName_IsNamedByItsKind()
+    {
+        string line = "{\"t\":\"begin\",\"runId\":\"" + _runId.ToString("D", CultureInfo.InvariantCulture)
+            + "\",\"stopOnError\":\"yes\",\"\\ud800\":1}";
+        Assert.False(JournalLineSerializer.TryParse(line, out _));
+
+        Assert.True(JournalLineSerializer.TrySalvageBegin(line, out JournalBegin? begin, out IReadOnlyList<string> dropped));
+
+        Assert.Equal(new[] { "stopOnError", "a field with an unreadable name" }, dropped);
+        Assert.Equal(_runId, begin.RunId);
+    }
+
+    // The step records are what place a run: without them, or without the record of the step its last heartbeats
+    // name, the run's beats and stepEnds show it ran, but not where it stopped.
+    [Theory]
+    [InlineData("EveryStepRecord")]
+    [InlineData("Step2Record")]
+    public async Task Detect_StepRecordsMissing_ReportsUnfinishedRunAtUnknownStepAsync(string missing)
+    {
+        using var root = new TestDataRoot();
+        WriteJournal(root, UnfinishedJournal()
+            .Where(record => record is not JournalStepStart step || (missing == "Step2Record" && step.Index == 1))
+            .ToArray());
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.Unfinished, recovery.Kind);
+        Assert.Equal("the run's step records are missing or could not be read", recovery.JournalDamage);
+        Assert.Equal(_runId, recovery.RunId);
+        Assert.False(recovery.InPreparation);
+        Assert.Null(recovery.LastStepNumber);
+        Assert.Null(recovery.LastStepName);
+        RunSummary summary = ParseSummary(await File.ReadAllTextAsync(FinalPaths(root, _runId).Json, Cancellation));
+        Assert.Contains("did not finish at an unknown step", summary.Run.EndDetail, StringComparison.Ordinal);
+
+        // The summary agrees with the outcome: step 1's stepEnd is kept as a finished step, not taken as the stop.
+        Assert.Null(summary.UnfinishedRun!.LastStepIndex);
+        Assert.Null(summary.UnfinishedRun.LastStepName);
+        Assert.True(Assert.Single(summary.Steps).Completed);
+        Assert.Equal(DamagedJournalPath(root), recovery.DamagedJournalPath);
+    }
+
+    // A journal kept because it could neither be moved nor deleted holds the end recovery appended without an id; the
+    // next launch takes it as the unidentified run's end, publishes nothing more, and retires the journal again.
+    [Fact]
+    public void Detect_UnidentifiedRunWithItsEnd_PublishesNothingAndRetiresJournal()
+    {
+        using var root = new TestDataRoot();
+        string end = JournalLineSerializer.Serialize(new JournalEnd { Published = true, Utc = _recoveryUtc });
+        var storage = new FaultingJournalStorage(new[] { "not json", "{", end });
+
+        JournalRecovery recovery = CrashDetector.Detect(root.Data, storage, CreateRecoveryClock());
+
+        Assert.Equal(JournalRecoveryKind.None, recovery.Kind);
+        Assert.Null(recovery.RunId);
+        Assert.Empty(recovery.PublishedFiles);
+        Assert.Null(recovery.PublicationError);
+        Assert.Equal("the journal's begin record is missing or could not be read", recovery.JournalDamage);
+        Assert.Empty(storage.Appended);
+        Assert.Equal(1, storage.MoveAsideCalls);
+        Assert.Equal(0, storage.DeleteCalls);
+        Assert.Equal("memory://faulting/active-run.damaged-20261028-150500.jsonl", recovery.DamagedJournalPath);
+        AssertLogsEmpty(root);
+    }
+
+    [Fact]
+    public void JournalRecovery_EqualsAndHashCode_IncludeTheDamageAndTheKeptJournal()
+    {
+        var recovery = new JournalRecovery
+        {
+            Kind = JournalRecoveryKind.Unfinished,
+            RunId = _runId,
+            JournalDamage = "a repeated begin record",
+            DamagedJournalPath = "memory://journal/active-run.damaged-20261028-150500.jsonl",
+        };
+        JournalRecovery same = recovery with { };
+
+        Assert.Equal(recovery, same);
+        Assert.Equal(recovery.GetHashCode(), same.GetHashCode());
+        Assert.NotEqual(recovery, recovery with { JournalDamage = null });
+        Assert.NotEqual(recovery, recovery with { DamagedJournalPath = null });
+        Assert.NotEqual(recovery.GetHashCode(), (recovery with { JournalDamage = "a result record of another run was ignored" }).GetHashCode());
+    }
+
 
     [Theory]
     [InlineData("steps", false)]
@@ -1619,6 +2663,66 @@ public sealed class CrashDetectorTests
         Assert.False(storage.Exists());
     }
 
+    // Recovery appended one end record per run and then moved the seeded journal aside, never deleting it.
+    private static void AssertEndWrittenThenMovedAside(StalledJournalStorage storage, JournalRecovery recovery, params Guid[] runIds)
+    {
+        Assert.Equal(runIds.Select(_ => (string?)EndType), storage.RecordTypesWritten());
+        Assert.Equal(runIds, storage.Lines.Select(line => ParseEnd(line).RunId));
+        Assert.All(storage.Calls, call => Assert.Equal(AppendOutcome.Succeeded, call.Outcome));
+        MovedAsideJournal moved = Assert.Single(storage.MovedAside);
+        Assert.Equal("memory://journal/active-run.damaged-20261028-150500.jsonl", moved.Location);
+        Assert.Equal(moved.Location, recovery.DamagedJournalPath);
+        Assert.Equal(storage.Lines, moved.Lines.TakeLast(runIds.Length));
+        Assert.False(storage.Exists());
+        Assert.Equal(0, storage.DeleteCount);
+        Assert.False(recovery.JournalDeleted);
+    }
+
+    // The file journal was moved aside as it was, followed by the end record recovery appended for each run.
+    private static void AssertMovedAsideWithEnds(TestDataRoot root, JournalRecovery recovery, byte[] journalBytes, params Guid[] runIds)
+    {
+        Assert.Equal(DamagedJournalPath(root), recovery.DamagedJournalPath);
+        byte[] moved = File.ReadAllBytes(DamagedJournalPath(root));
+        Assert.Equal(journalBytes, moved.Take(journalBytes.Length));
+        string[] ends = _utf8NoBom.GetString(moved, journalBytes.Length, moved.Length - journalBytes.Length)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(runIds, ends.Select(line => ParseEnd(line).RunId));
+    }
+
+    private static string DamagedJournalPath(TestDataRoot root) =>
+        Path.GetFullPath(Path.Combine(root.Data.JournalDirectory, "active-run.damaged-20261028-150500.jsonl"));
+
+    // The summary schema keeps every integer below 2^53, so no number a damaged journal held may be published.
+    private static void AssertEveryIntegerWithinBound(JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                foreach (JsonProperty property in element.EnumerateObject())
+                {
+                    AssertEveryIntegerWithinBound(property.Value);
+                }
+
+                break;
+            case JsonValueKind.Array:
+                foreach (JsonElement item in element.EnumerateArray())
+                {
+                    AssertEveryIntegerWithinBound(item);
+                }
+
+                break;
+            case JsonValueKind.Number:
+                Assert.InRange(Math.Abs(element.GetDouble()), 0.0, MaxQuantity);
+                break;
+        }
+    }
+
+    // The reference for the name of a run whose id is unknown: the first 32 lowercase hex digits of SHA-256 over the
+    // UTF-8 of its first line.
+    private static string AnonymousName(string firstLine) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(firstLine)))[..32]
+            .ToLowerInvariant();
+
     // Plain text holds no control, format, line separator or paragraph separator character, and no surrogate
     // without its partner, which a strict UTF-8 round trip would refuse.
     private static void AssertPlainText(string text)
@@ -1737,7 +2841,8 @@ public sealed class CrashDetectorTests
         Utc = _runningUtc + elapsed,
     };
 
-    private static JournalStepEnd FirstStepEndRecord()
+    // Stamped with the run id, as ProgressJournal stamps every stepEnd, result and released record.
+    private static JournalStepEnd FirstStepEndRecord(Guid? runId = null)
     {
         StepOutcome outcome = JournalSamples.Outcome(
             _steps[0],
@@ -1747,7 +2852,7 @@ public sealed class CrashDetectorTests
             0,
             completed: true,
             overrun: _step1Overrun);
-        return JournalStepEnd.FromOutcome(outcome) with { Utc = _runningUtc + _step1Actual };
+        return JournalStepEnd.FromOutcome(outcome) with { RunId = runId ?? _runId, Utc = _runningUtc + _step1Actual };
     }
 
     private static JournalBeat BeatRecord(int step, long elapsedMs, double coverage, ulong errors, double cpuC, double ramC) => new()
@@ -1770,7 +2875,8 @@ public sealed class CrashDetectorTests
         bool includePrepared = true,
         string? baseName = null)
     {
-        var records = new List<JournalRecord> { BeginRecord(runId ?? _runId, baseName) };
+        Guid id = runId ?? _runId;
+        var records = new List<JournalRecord> { BeginRecord(id, baseName) };
         if (includePrepared)
         {
             records.Add(PreparedRecord());
@@ -1778,7 +2884,7 @@ public sealed class CrashDetectorTests
 
         records.Add(StepStartRecord(1, TimeSpan.Zero));
         records.Add(BeatRecord(1, 20_000, 50.0, 0, 65.5, 49.5));
-        records.Add(FirstStepEndRecord());
+        records.Add(FirstStepEndRecord(id));
         records.Add(StepStartRecord(2, _step1Actual));
         records.Add(BeatRecord(2, 50_000, 110.25, 0, 70.0, 47.5));
         records.Add(BeatRecord(2, 61_000, 120.5, lastBeatErrors, 71.5, 48.0));
@@ -1806,22 +2912,24 @@ public sealed class CrashDetectorTests
             1,
             _completedUtc,
             _verdictUtc);
+        Guid id = runId ?? _runId;
         var records = new List<JournalRecord>
         {
-            BeginRecord(runId ?? _runId),
+            BeginRecord(id),
             PreparedRecord(),
             StepStartRecord(1, TimeSpan.Zero),
             BeatRecord(1, 20_000, 50.0, 0, 65.5, 49.5),
-            FirstStepEndRecord(),
+            FirstStepEndRecord(id),
             StepStartRecord(2, _step1Actual),
             BeatRecord(2, 61_000, 120.5, 0, 71.5, 48.0),
-            JournalStepEnd.FromOutcome(secondStep) with { Utc = _completedUtc },
-            result with { Utc = _verdictUtc },
+            JournalStepEnd.FromOutcome(secondStep) with { RunId = id, Utc = _completedUtc },
+            result with { RunId = id, Utc = _verdictUtc },
         };
         if (withReleased)
         {
             records.Add(new JournalReleased
             {
+                RunId = id,
                 ReleasedBytes = JournalSamples.GiB,
                 ReleaseMs = ReleaseMs,
                 Utc = _completedUtc + TimeSpan.FromMilliseconds(1_300),
@@ -1831,21 +2939,64 @@ public sealed class CrashDetectorTests
         return records.ToArray();
     }
 
-    private static IReadOnlyList<string> JournalWithoutUsableBegin(string journalCase)
+    // A journal that holds nothing a run writes, as its terminated lines and a final fragment without a terminator:
+    // empty, a begin torn by a crash during its own append, alone or after a blank line, or blank lines.
+    private static (IReadOnlyList<string> Lines, string? Torn) JournalWithoutUsableBegin(string journalCase)
     {
-        IReadOnlyList<string> body = JournalSamples.Lines(UnfinishedJournal().Skip(1).ToArray());
-        string runIdText = _runId.ToString("D", CultureInfo.InvariantCulture);
+        string begin = JournalLineSerializer.Serialize(BeginRecord(_runId));
+        string tornBegin = begin[..(begin.Length / 2)];
         return journalCase switch
         {
-            "Empty" => Array.Empty<string>(),
-            "NoBegin" => body,
-            "InvalidBegin" => body.Prepend("{\"t\":\"begin\",\"runId\":\"not-a-guid\",\"logBaseName\":\"x\"}").ToArray(),
-
-            // .NET 8 System.Text.Json reads a polymorphic record only when its discriminator comes first.
-            "DiscriminatorNotFirst" => body.Prepend("{\"runId\":\"" + runIdText + "\",\"t\":\"begin\"}").ToArray(),
-            "NotJson" => new[] { "not json", "{" },
+            "Empty" => (Array.Empty<string>(), null),
+            "TornBegin" => (Array.Empty<string>(), tornBegin),
+            "TornBeginAfterBlankLine" => (new[] { string.Empty }, tornBegin),
+            "BlankLines" => (new[] { string.Empty, "   " }, null),
             _ => throw new ArgumentOutOfRangeException(nameof(journalCase), journalCase, "Unknown journal case."),
         };
+    }
+
+    // The standard unfinished journal whose begin record is missing, unreadable or damaged in one way.
+    private static IReadOnlyList<string> JournalWithDamagedBegin(string journalCase)
+    {
+        IReadOnlyList<string> lines = JournalSamples.Lines(UnfinishedJournal());
+        IEnumerable<string> body = lines.Skip(1);
+        JsonObject begin = JsonNode.Parse(lines[0])!.AsObject();
+        switch (journalCase)
+        {
+            case "NoBegin":
+                return body.ToArray();
+            case "NotJson":
+                return new[] { "not json", "{" };
+            case "LoneLineNotJson":
+                return new[] { "not json" };
+            case "LoneLineRunIdOnly":
+                // An object holding only the run id, with no "t" discriminator: no record at all.
+                return new[] { new JsonObject { ["runId"] = _runId.ToString("D", CultureInfo.InvariantCulture) }.ToJsonString() };
+            case "BadRunIdFormat":
+                begin["runId"] = "../../x";
+                break;
+            case "RunIdNFormatOnly":
+                begin = new JsonObject { ["t"] = "begin", ["runId"] = _runId.ToString("N", CultureInfo.InvariantCulture) };
+                break;
+            case "BadStartRequestedUtc":
+                begin["startRequestedUtc"] = "99999-99-99T99:99:99Z";
+                break;
+            case "BadStopOnError":
+                begin["stopOnError"] = "yes";
+                break;
+            case "DiscriminatorNotFirst":
+                // .NET 8 System.Text.Json reads a polymorphic record only when its discriminator comes first.
+                JsonNode? discriminator = begin["t"];
+                _ = begin.Remove("t");
+                begin["t"] = discriminator?.DeepClone();
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(journalCase), journalCase, "Unknown journal case.");
+        }
+
+        string damaged = begin.ToJsonString();
+        Assert.False(JournalLineSerializer.TryParse(damaged, out _), $"The damaged begin '{damaged}' parses.");
+        return body.Prepend(damaged).ToArray();
     }
 
     // A valid summary of the given run that recovery cannot have produced: its app version is a sentinel.
@@ -1876,6 +3027,106 @@ public sealed class CrashDetectorTests
         return RunSummary.Build(JournalSamples.CompletedRunSource(JournalSamples.ErrorRecords(3), hints, runId: runId));
     }
 
+    // A JSON summary of this run, as text, at or one beyond the summary bounds in the named way.
+    private static string KeptSummaryOfShape(string shape)
+    {
+        const int Bound = JournalReadLimits.MaxSummaryStringLength;
+        if (shape == "TenThousandStepsWithLongName")
+        {
+            var steps = new JsonArray();
+            for (int index = 1; index <= 10_000; index++)
+            {
+                steps.Add(new JsonObject { ["index"] = index, ["name"] = index == 1 ? new string('N', 100_000) : "short" });
+            }
+
+            var minimal = new JsonObject
+            {
+                ["schemaVersion"] = RunSummary.CurrentSchemaVersion,
+                ["run"] = new JsonObject { ["id"] = SummaryFormat.RunId(_runId), ["verdict"] = "PASS", ["endReason"] = "Completed" },
+                ["steps"] = steps,
+            };
+            return minimal.ToJsonString();
+        }
+
+        JsonObject document = JsonNode.Parse(RunSummaryJson.Serialize(SentinelSummary(_runId)))!.AsObject();
+        JsonObject firstStep = document["steps"]![0]!.AsObject();
+        switch (shape)
+        {
+            case "StringAboveBound":
+                document["run"]!["endDetail"] = new string('d', Bound + 1);
+                break;
+            case "EscapedStringAboveBound":
+                // The writer escapes every non-ASCII character, so each one is written as six bytes.
+                document["run"]!["endDetail"] = new string('\u00E9', Bound + 1);
+                break;
+            case "PropertyNameAboveBound":
+                document[new string('k', Bound + 1)] = 1;
+                break;
+            case "ArrayAboveBound":
+                document["errors"]!["records"] = Objects(JournalReadLimits.MaxSummaryArrayLength + 1);
+                break;
+            case "NestedBeyondDepth":
+                document["extra"] = NestedArrays(JournalReadLimits.MaxSummaryDepth);
+                break;
+            case "MoreStepsThanAPlan":
+                document["steps"] = Copies(firstStep, JournalReadLimits.MaxPlanSteps + 1);
+                break;
+            case "StepNameAboveThePlanLimit":
+                firstStep["name"] = new string('n', 64);
+                break;
+            case "StepCellAboveBound":
+                firstStep["pattern"] = new string('p', 65);
+                break;
+            case "AtTheBounds":
+                document["run"]!["endDetail"] = new string('\u00E9', Bound);
+                document[new string('k', Bound)] = 1;
+                document["errors"]!["records"] = Objects(JournalReadLimits.MaxSummaryArrayLength);
+                document["extra"] = NestedArrays(JournalReadLimits.MaxSummaryDepth - 1);
+                firstStep["name"] = new string('n', 63);
+                firstStep["pattern"] = new string('p', 64);
+                document["steps"] = Copies(firstStep, JournalReadLimits.MaxPlanSteps);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(shape), shape, "Unknown summary shape.");
+        }
+
+        return document.ToJsonString();
+
+        static JsonArray Objects(int count)
+        {
+            var array = new JsonArray();
+            for (int i = 0; i < count; i++)
+            {
+                array.Add(new JsonObject());
+            }
+
+            return array;
+        }
+
+        static JsonArray Copies(JsonObject item, int count)
+        {
+            var array = new JsonArray();
+            for (int i = 0; i < count; i++)
+            {
+                array.Add(item.DeepClone());
+            }
+
+            return array;
+        }
+
+        // Arrays nested this many deep, inside the document's own object, which is one level more.
+        static JsonArray NestedArrays(int depth)
+        {
+            var nested = new JsonArray();
+            for (int level = 1; level < depth; level++)
+            {
+                nested = new JsonArray(nested);
+            }
+
+            return nested;
+        }
+    }
+
     // The summary's JSON document with a null element appended to the array at the dotted path.
     private static string WithNullElement(RunSummary summary, string arrayPath)
     {
@@ -1896,7 +3147,7 @@ public sealed class CrashDetectorTests
             // from, the sum over steps 1 and 2, is one above it.
             JournalStepEnd secondStepEnd = JournalStepEnd.FromOutcome(
                 JournalSamples.Outcome(_steps[1], TimeSpan.FromSeconds(20), 1, JournalSamples.GiB, 2, completed: true));
-            journal = journal.Append(secondStepEnd with { Utc = _lastBeatUtc }).ToArray();
+            journal = journal.Append(secondStepEnd with { RunId = runId ?? _runId, Utc = _lastBeatUtc }).ToArray();
         }
 
         return journal.Select(record => (damage, record) switch
@@ -1907,6 +3158,10 @@ public sealed class CrashDetectorTests
                 1,
                 step => step with { TimeBudgetMs = 1 }),
             ("TimeBudgetTotal", JournalBegin begin) => WithStep(begin, 0, step => step with { TimeBudgetMs = MaxQuantity }),
+            ("StepCountAboveBound", JournalBegin begin) => begin with
+            {
+                Steps = Enumerable.Range(0, JournalReadLimits.MaxPlanSteps + 1).Select(_ => begin.Steps[0]).ToArray(),
+            },
             ("NegativeTimeBudget", JournalBegin begin) => WithStep(begin, 1, step => step with { TimeBudgetMs = -1 }),
             ("HoldAboveBound", JournalBegin begin) => WithStep(begin, 2, step => step with { HoldMs = MaxQuantity + 1 }),
             ("NegativeHold", JournalBegin begin) => WithStep(begin, 0, step => step with { HoldMs = -1 }),
@@ -1928,6 +3183,12 @@ public sealed class CrashDetectorTests
             ("ResultFirstErrorMs", JournalResult result) => result with { FirstErrorMs = MaxQuantity + 1 },
             ("ReleaseMs", JournalReleased released) => released with { ReleaseMs = long.MaxValue },
             ("ReleasedBytes", JournalReleased released) => released with { ReleasedBytes = ulong.MaxValue },
+            ("TestTypeTooLong", JournalBegin begin) => begin with { TestType = _tooLongText },
+            ("AppVersionTooLong", JournalBegin begin) => begin with { AppVersion = _tooLongText },
+            ("OsTooLong", JournalBegin begin) => begin with { System = begin.System with { Os = _tooLongText } },
+            ("CpuNameTooLong", JournalBegin begin) => begin with { System = begin.System with { CpuName = _tooLongText } },
+            ("VerdictTooLong", JournalResult result) => result with { Verdict = _tooLongText },
+            ("EndDetailTooLong", JournalResult result) => result with { EndDetail = _tooLongText },
             _ => record,
         }).ToArray();
     }
@@ -2024,8 +3285,8 @@ public sealed class CrashDetectorTests
     }
 
     /// <summary>
-    /// A journal whose read or delete fails, for the I/O failure paths <see cref="StalledJournalStorage"/>
-    /// cannot script. Appends always succeed and are recorded.
+    /// A journal whose read, delete or move aside fails, for the I/O failure paths
+    /// <see cref="StalledJournalStorage"/> cannot script. Appends always succeed and are recorded.
     /// </summary>
     private sealed class FaultingJournalStorage : IJournalStorage
     {
@@ -2033,12 +3294,18 @@ public sealed class CrashDetectorTests
         private readonly List<string> _appended = new();
         private readonly Exception? _readFailure;
         private readonly Exception? _deleteFailure;
+        private readonly Exception? _moveAsideFailure;
 
-        public FaultingJournalStorage(IEnumerable<string> lines, Exception? readFailure = null, Exception? deleteFailure = null)
+        public FaultingJournalStorage(
+            IEnumerable<string> lines,
+            Exception? readFailure = null,
+            Exception? deleteFailure = null,
+            Exception? moveAsideFailure = null)
         {
             _lines = new List<string>(lines);
             _readFailure = readFailure;
             _deleteFailure = deleteFailure;
+            _moveAsideFailure = moveAsideFailure;
         }
 
         public string Location => "memory://faulting/active-run.jsonl";
@@ -2046,6 +3313,8 @@ public sealed class CrashDetectorTests
         public IReadOnlyList<string> Appended => _appended.ToArray();
 
         public int DeleteCalls { get; private set; }
+
+        public int MoveAsideCalls { get; private set; }
 
         public bool IsDisposed { get; private set; }
 
@@ -2064,6 +3333,19 @@ public sealed class CrashDetectorTests
             }
 
             _lines.Clear();
+        }
+
+        public string MoveAside(DateTimeOffset utc)
+        {
+            MoveAsideCalls++;
+            if (_moveAsideFailure is not null)
+            {
+                throw _moveAsideFailure;
+            }
+
+            _lines.Clear();
+            return "memory://faulting/active-run.damaged-"
+                + utc.UtcDateTime.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + ".jsonl";
         }
 
         public void Dispose() => IsDisposed = true;

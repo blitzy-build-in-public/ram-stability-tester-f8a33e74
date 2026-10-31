@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Text.Json;
 using System.Threading;
@@ -58,6 +59,13 @@ public sealed record AppendCall(
 }
 
 /// <summary>
+/// A journal <see cref="StalledJournalStorage.MoveAside(DateTimeOffset)"/> moved aside.
+/// </summary>
+/// <param name="Location">The location the call returned.</param>
+/// <param name="Lines">The journal's lines at the time of the move.</param>
+public sealed record MovedAsideJournal(string Location, IReadOnlyList<string> Lines);
+
+/// <summary>
 /// An in-memory <see cref="IJournalStorage"/> that blocks or fails appends on demand, for the
 /// stalled-writer and failed-write paths of the progress journal, the step gate and the run
 /// controller, and that replays seeded journals, torn final lines included, for crash recovery.
@@ -83,8 +91,9 @@ public sealed record AppendCall(
 /// <see cref="ClearRules"/> first to stop stalling.
 /// </para>
 /// <para>
-/// <see cref="ReadLines"/> and <see cref="Exists"/> show the current journal, which
-/// <see cref="Delete"/> removes. <see cref="Lines"/>, <see cref="RecordTypesWritten"/> and
+/// <see cref="ReadLines"/>, <see cref="ReadContent"/> and <see cref="Exists"/> show the current
+/// journal, which <see cref="Delete"/> removes and <see cref="MoveAside"/> moves into
+/// <see cref="MovedAside"/>. <see cref="Lines"/>, <see cref="RecordTypesWritten"/> and
 /// <see cref="Calls"/> are the append history, which nothing clears, because the journal's owner
 /// deletes the journal right after writing its final record.
 /// </para>
@@ -109,6 +118,9 @@ public sealed class StalledJournalStorage : IJournalStorage
     private readonly List<FailRule> _failAll = new();
     private readonly List<string?> _blockAll = new();
     private readonly List<BlockedAppend> _blocked = new();
+    private readonly List<MovedAsideJournal> _movedAside = new();
+    private string? _readDamage;
+    private bool _lastLineUnterminated;
     private bool _journalPresent;
     private bool _isDeleted;
     private int _deleteCount;
@@ -220,6 +232,71 @@ public sealed class StalledJournalStorage : IJournalStorage
     }
 
     /// <summary>
+    /// Gets every journal <see cref="MoveAside"/> moved aside, in call order. Like the append
+    /// history, nothing clears it.
+    /// </summary>
+    public IReadOnlyList<MovedAsideJournal> MovedAside
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _movedAside.ToArray();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the damage <see cref="ReadContent"/> reports with the journal's lines, standing for
+    /// a file journal that held more than its read bounds allow; <see langword="null"/>, the default,
+    /// for a journal read whole.
+    /// </summary>
+    public string? ReadDamage
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _readDamage;
+            }
+        }
+
+        set
+        {
+            lock (_sync)
+            {
+                _readDamage = value;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets whether <see cref="ReadContent"/> reports the journal's last line as having no
+    /// terminator, standing for a file journal that ends in an append cut short by a crash;
+    /// <see langword="false"/>, the default, for a journal whose every line was terminated. Set it after
+    /// seeding; a successful append, <see cref="Delete"/> and <see cref="MoveAside"/> clear it, as each
+    /// leaves the journal without an unterminated last line.
+    /// </summary>
+    public bool LastLineUnterminated
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _lastLineUnterminated;
+            }
+        }
+
+        set
+        {
+            lock (_sync)
+            {
+                _lastLineUnterminated = value;
+            }
+        }
+    }
+
+    /// <summary>
     /// Returns whether a journal is present: a line was seeded or appended, or an empty journal
     /// was seeded, and <see cref="Delete"/> has not been called since.
     /// </summary>
@@ -324,6 +401,57 @@ public sealed class StalledJournalStorage : IJournalStorage
     }
 
     /// <summary>
+    /// Returns the lines <see cref="ReadLines"/> returns, with <see cref="ReadDamage"/> as their damage
+    /// and <see cref="LastLineUnterminated"/> as whether the last of them is unterminated, which only a
+    /// journal holding lines reports.
+    /// </summary>
+    /// <returns>A snapshot of the journal's lines and the scripted damage and terminator state.</returns>
+    public JournalContent ReadContent()
+    {
+        lock (_sync)
+        {
+            return new JournalContent(_journalLines.ToArray(), _readDamage, _lastLineUnterminated && _journalLines.Count > 0);
+        }
+    }
+
+    /// <summary>
+    /// Moves the journal aside: its lines join <see cref="MovedAside"/> under a location beside
+    /// <see cref="Location"/> named as <c>FileJournalStorage</c> names it, with <c>-2</c>, <c>-3</c>
+    /// and so on added when an earlier call took the name. <see cref="Exists"/> then returns
+    /// <see langword="false"/> until a line is seeded or appended; the append history is kept.
+    /// </summary>
+    /// <param name="utc">The time that stamps the new location, in UTC.</param>
+    /// <returns>The new location.</returns>
+    /// <exception cref="FileNotFoundException">No journal exists.</exception>
+    public string MoveAside(DateTimeOffset utc)
+    {
+        lock (_sync)
+        {
+            if (!_journalPresent)
+            {
+                throw new FileNotFoundException("No journal exists to move aside (StalledJournalStorage).", Location);
+            }
+
+            int dot = Location.LastIndexOf('.');
+            bool hasExtension = dot > Location.LastIndexOf('/');
+            string stem = (hasExtension ? Location[..dot] : Location)
+                + ".damaged-" + utc.UtcDateTime.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+            string extension = hasExtension ? Location[dot..] : string.Empty;
+            string location = stem + extension;
+            for (int attempt = 2; _movedAside.Exists(moved => moved.Location == location); attempt++)
+            {
+                location = stem + "-" + attempt.ToString(CultureInfo.InvariantCulture) + extension;
+            }
+
+            _movedAside.Add(new MovedAsideJournal(location, _journalLines.ToArray()));
+            _journalLines.Clear();
+            _journalPresent = false;
+            _lastLineUnterminated = false;
+            return location;
+        }
+    }
+
+    /// <summary>
     /// Deletes the journal: clears the lines <see cref="ReadLines"/> returns, sets
     /// <see cref="IsDeleted"/> and increments <see cref="DeleteCount"/>. <see cref="Exists"/> then
     /// returns <see langword="false"/> until a line is seeded or appended. <see cref="Lines"/>,
@@ -336,6 +464,7 @@ public sealed class StalledJournalStorage : IJournalStorage
         {
             _journalLines.Clear();
             _journalPresent = false;
+            _lastLineUnterminated = false;
             _isDeleted = true;
             _deleteCount++;
         }
@@ -705,6 +834,7 @@ public sealed class StalledJournalStorage : IJournalStorage
     {
         _journalLines.Add(call.Line);
         _durableLines.Add(call.Line);
+        _lastLineUnterminated = false;
         _journalPresent = true;
         _isDeleted = false;
         call.Outcome = AppendOutcome.Succeeded;

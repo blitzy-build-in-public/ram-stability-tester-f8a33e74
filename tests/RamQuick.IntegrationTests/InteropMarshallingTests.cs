@@ -6,6 +6,7 @@ using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Windows.Threading;
+using Microsoft.Win32.SafeHandles;
 using RamQuick.Core;
 using RamQuick.Interop;
 using RamQuick.Logging;
@@ -24,7 +25,8 @@ namespace RamQuick.IntegrationTests;
 /// validation and defaults, exception construction, the rejection of payloads that cannot belong to the configured
 /// session, handle and callback-state ownership on every creation failure, disposal from every thread a caller may
 /// use, the containment of exceptions thrown by progress sinks, step gates, fault sinks, event subscribers and the
-/// captured context as logged host faults, and the monitor work-area query that shares the engine's import resolver.
+/// captured context as logged host faults, and the monitor work-area and file final-path queries that share the
+/// engine's import resolver.
 /// </summary>
 /// <remarks>
 /// Every engine session sizes its region with <see cref="TestRegions.Bytes"/> for one worker per logical processor,
@@ -2343,6 +2345,157 @@ public sealed class InteropMarshallingTests
 
         // A destroyed window maps to no monitor, which reads as "keep the current size" rather than an exception.
         Assert.Null(Win32Display.GetWorkArea(hwnd));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void GetFinalPath_OpenFile_ReportsWhereTheFileLiesWhicheverPathOpenedIt(bool throughJunction, bool longPath)
+    {
+        using var root = new TempDataRoot();
+        string link = root.Path + "-link";
+        CreateJunction(link, root.Path);
+        try
+        {
+            // The BCL resolves a link's final target with the same Windows call, so it states independently where the
+            // root lies: long names in their on-disk case, every link above it resolved, no \\?\ prefix. The folders
+            // below the root are created here, so their names are already final. Three 100-character names take the
+            // path past MAX_PATH, so the first call reports the size it needs.
+            string canonicalRoot = Assert.IsAssignableFrom<DirectoryInfo>(
+                Directory.ResolveLinkTarget(link, returnFinalTarget: true)).FullName;
+            string relative = longPath
+                ? Path.Combine(new string('f', 100), new string('g', 100), new string('h', 100), "probe.txt")
+                : Path.Combine("folder", "probe.txt");
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(root.Path, relative))!);
+            string openedPath = Path.Combine(throughJunction ? link : root.Path, relative);
+            using FileStream file = new(openedPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 1, FileOptions.DeleteOnClose);
+
+            string? finalPath = Win32FilePath.GetFinalPath(file.SafeFileHandle);
+
+            Assert.Equal(Path.Combine(canonicalRoot, relative), finalPath, ignoreCase: true);
+            Assert.False(finalPath!.StartsWith(@"\\?\", StringComparison.Ordinal), finalPath);
+            Assert.True(!longPath || finalPath.Length > 260, finalPath);
+        }
+        finally
+        {
+            // Removes the junction itself; the root's own disposal deletes what it points to.
+            Directory.Delete(link);
+        }
+    }
+
+    [Fact]
+    public void GetFinalPath_InvalidClosedOrNonFileHandle_ReturnsNullAndNullHandleThrows()
+    {
+        using var root = new TempDataRoot();
+        var closed = new FileStream(Path.Combine(root.Path, "closed.txt"), FileMode.CreateNew, FileAccess.Write, FileShare.None, 1, FileOptions.DeleteOnClose);
+        SafeFileHandle closedHandle = closed.SafeFileHandle;
+        closed.Dispose();
+        using var invalid = new SafeFileHandle(new IntPtr(-1), ownsHandle: false);
+
+        // An event's handle is open and valid but names no file, so Windows itself reports the failure.
+        using var notAFile = new ManualResetEvent(initialState: false);
+        using var eventHandle = new SafeFileHandle(notAFile.SafeWaitHandle.DangerousGetHandle(), ownsHandle: false);
+
+        Assert.Null(Win32FilePath.GetFinalPath(invalid));
+        Assert.Null(Win32FilePath.GetFinalPath(closedHandle));
+        Assert.Null(Win32FilePath.GetFinalPath(eventHandle));
+        Assert.Throws<ArgumentNullException>(() => Win32FilePath.GetFinalPath(null!));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void OpenFolder_ExistingFolder_PinsItAgainstRenameAndReportsItsFinalPath(bool longPath)
+    {
+        using var root = new TempDataRoot();
+        string link = root.Path + "-link";
+        CreateJunction(link, root.Path);
+        try
+        {
+            // As for GetFinalPath: the BCL states independently where the root lies. Three 100-character names take the
+            // folder past MAX_PATH, which CreateFileW opens only through the extended-length prefix.
+            string canonicalRoot = Assert.IsAssignableFrom<DirectoryInfo>(
+                Directory.ResolveLinkTarget(link, returnFinalTarget: true)).FullName;
+            string relativeParent = longPath
+                ? Path.Combine(new string('p', 100), new string('q', 100))
+                : "parent";
+            string relative = Path.Combine(relativeParent, longPath ? new string('f', 100) : "folder");
+            string parent = Path.Combine(root.Path, relativeParent);
+            string folder = Path.Combine(root.Path, relative);
+            Directory.CreateDirectory(folder);
+            string expected = Path.Combine(canonicalRoot, relative);
+
+            using (SafeFileHandle? held = Win32FilePath.OpenFolder(folder))
+            {
+                Assert.NotNull(held);
+                Assert.Equal(expected, Win32FilePath.GetFinalPath(held), ignoreCase: true);
+                Assert.True(!longPath || folder.Length > 260, folder);
+
+                // Held: the folder can be neither renamed nor deleted, and the folder above it cannot be moved.
+                Assert.ThrowsAny<IOException>(() => Directory.Move(folder, folder + "-moved"));
+                Assert.ThrowsAny<IOException>(() => Directory.Delete(folder));
+                Assert.ThrowsAny<IOException>(() => Directory.Move(parent, parent + "-moved"));
+
+                // Its entries still change, and another handle sharing reading and writing still opens.
+                string inside = Path.Combine(folder, "probe.txt");
+                File.WriteAllText(inside, "probe");
+                File.Delete(inside);
+                Directory.CreateDirectory(Path.Combine(folder, "sub"));
+                Directory.Delete(Path.Combine(folder, "sub"));
+                using SafeFileHandle? second = Win32FilePath.OpenFolder(folder);
+                Assert.NotNull(second);
+            }
+
+            // Released, the folder moves again, so the handle was what held it.
+            Directory.Move(parent, parent + "-moved");
+            Directory.Move(parent + "-moved", parent);
+
+            using (SafeFileHandle? throughJunction = Win32FilePath.OpenFolder(Path.Combine(link, relative)))
+            {
+                Assert.NotNull(throughJunction);
+                Assert.Equal(expected, Win32FilePath.GetFinalPath(throughJunction), ignoreCase: true);
+            }
+
+            // A missing path, a file's path and a path cut short by a null character open nothing: the result is null,
+            // never a handle to something other than the named folder.
+            string file = Path.Combine(folder, "file.txt");
+            File.WriteAllText(file, "file");
+            Assert.Null(Win32FilePath.OpenFolder(Path.Combine(folder, "missing")));
+            Assert.Null(Win32FilePath.OpenFolder(file));
+            Assert.Null(Win32FilePath.OpenFolder(folder + "\0" + "missing"));
+            Assert.Throws<ArgumentNullException>(() => Win32FilePath.OpenFolder(null!));
+            Assert.Throws<ArgumentException>(() => Win32FilePath.OpenFolder(string.Empty));
+        }
+        finally
+        {
+            // Removes the junction itself; the root's own disposal deletes what it points to.
+            Directory.Delete(link);
+        }
+    }
+
+    // A directory junction, as a user without Administrator rights can create one.
+    private static void CreateJunction(string link, string target)
+    {
+        var start = new ProcessStartInfo("cmd.exe")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        foreach (string argument in new[] { "/c", "mklink", "/J", link, target })
+        {
+            start.ArgumentList.Add(argument);
+        }
+
+        using Process process = Process.Start(start)!;
+        string output = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        Assert.True(
+            process.ExitCode == 0 && File.GetAttributes(link).HasFlag(FileAttributes.ReparsePoint),
+            $"mklink /J '{link}' '{target}' failed ({process.ExitCode}): {output}");
     }
 
     private static TestPlan OneStepPlan() => ScaledPlans.Custom((0, _stepBudget));

@@ -7,9 +7,11 @@ namespace RamQuick.Logging;
 public enum JournalRecoveryKind
 {
     /// <summary>
-    /// Nothing to report: there was no journal, it held no <c>begin</c> record, so no test ever started, or
-    /// the run's summaries were already published, as its <c>end</c> record or a final summary carrying its
-    /// run id shows. The window stays Idle with no recovery message.
+    /// Nothing to report: there was no journal, it held nothing a run writes (it was empty or blank, or held
+    /// only a <c>begin</c> record torn by a crash during its own append, a final line with no terminator), so no
+    /// test ever started, or the run's
+    /// summaries were already published, as its <c>end</c> record or a final summary carrying its run id
+    /// shows. The window stays Idle with no recovery message.
     /// </summary>
     None,
 
@@ -27,7 +29,9 @@ public enum JournalRecoveryKind
     /// journal and published. The window moves Idle → Failed, and its result panel reads "The previous test
     /// did not finish at step n of N (name), which likely indicates severe instability.", or, when the run
     /// stopped before step 1, "The previous test did not finish while preparing memory (before step 1),
-    /// which likely indicates severe instability."
+    /// which likely indicates severe instability." A journal whose <c>begin</c> record is missing or damaged,
+    /// or whose <c>result</c> record could not be used, is reported this way too, with the fields it could not
+    /// supply left unknown.
     /// </summary>
     Unfinished,
 }
@@ -67,8 +71,9 @@ public sealed record JournalRecovery
     public JournalRecoveryKind Kind { get; init; }
 
     /// <summary>
-    /// Gets the recovered run's id, from its <c>begin</c> record, or <see langword="null"/> when no run was
-    /// identified.
+    /// Gets the recovered run's id, from its <c>begin</c> record, or, when that record's id could not be read,
+    /// from the first of its <c>stepEnd</c>, <c>result</c>, <c>released</c> and <c>end</c> records that names
+    /// one; <see langword="null"/> when no run was identified.
     /// </summary>
     public Guid? RunId { get; init; }
 
@@ -87,22 +92,29 @@ public sealed record JournalRecovery
 
     /// <summary>
     /// Gets a value indicating whether an <see cref="JournalRecoveryKind.Unfinished"/> run stopped while
-    /// preparing memory: its journal held no <c>step</c> record. The result panel then reads "The previous
+    /// preparing memory: its <c>begin</c> record was read and its journal held no <c>step</c> record, nor any
+    /// record a step writes, and nothing of it was left unread. The result panel then reads "The previous
     /// test did not finish while preparing memory (before step 1), which likely indicates severe
     /// instability." Always <see langword="false"/> for the other kinds.
     /// </summary>
+    /// <remarks>
+    /// <see langword="false"/> together with a <see langword="null"/> <see cref="LastStepNumber"/> for an
+    /// unfinished run means the step at which it stopped is unknown, because its journal is damaged.
+    /// </remarks>
     public bool InPreparation { get; init; }
 
     /// <summary>
     /// Gets the 1-based number of the last step an <see cref="JournalRecoveryKind.Unfinished"/> run started,
     /// the n of "did not finish at step n of N (name)"; <see langword="null"/> when
-    /// <see cref="InPreparation"/> is <see langword="true"/> and for the other kinds.
+    /// <see cref="InPreparation"/> is <see langword="true"/>, when the journal held no <c>step</c> record of the
+    /// run, and for the other kinds.
     /// </summary>
     public int? LastStepNumber { get; init; }
 
     /// <summary>
     /// Gets the number of steps in an <see cref="JournalRecoveryKind.Unfinished"/> run's plan, the N of "did
-    /// not finish at step n of N (name)"; <see langword="null"/> for the other kinds.
+    /// not finish at step n of N (name)"; <see langword="null"/> when neither its <c>step</c> records nor its
+    /// <c>begin</c> record show it, and for the other kinds.
     /// </summary>
     public int? StepCount { get; init; }
 
@@ -154,10 +166,31 @@ public sealed record JournalRecovery
 
     /// <summary>
     /// Gets a value indicating whether recovery deleted the journal. It stays <see langword="false"/> when
-    /// there was no journal, when a publication failed and the journal was kept for the next launch, or when
-    /// the delete itself failed; the next launch then finishes the cleanup.
+    /// there was no journal, when a publication failed and the journal was kept for the next launch, when the
+    /// journal held damaged data, which is never deleted but moved aside (<see cref="DamagedJournalPath"/>) or,
+    /// when the move fails, kept in place, or when the delete itself failed; the next launch then finishes the
+    /// cleanup.
     /// </summary>
     public bool JournalDeleted { get; init; }
+
+    /// <summary>
+    /// Gets the first damage recovery found in the journal, as a phrase without a trailing period, for
+    /// example "a result record of another run was ignored", or <see langword="null"/> when the journal held
+    /// none. Damaged data never blocks publication: recovery publishes what the rest of the journal holds,
+    /// and each summary it rebuilds names the damage in <c>run.endDetail</c>. The notice line then reads
+    /// "Results of the previous test were recovered and saved, but its progress journal held damaged data: "
+    /// followed by this text.
+    /// </summary>
+    public string? JournalDamage { get; init; }
+
+    /// <summary>
+    /// Gets where recovery moved a journal that held damaged data once every run in it was published, so the
+    /// next run starts a new journal while the damaged one is kept as evidence; <see langword="null"/> when
+    /// the journal was not moved aside. A damaged journal whose move failed is kept where it was, with this
+    /// <see langword="null"/> and <see cref="JournalDamage"/> set, and the next launch retries the move; its runs
+    /// carry their <c>end</c> records, so nothing is published again and no Start is refused.
+    /// </summary>
+    public string? DamagedJournalPath { get; init; }
 
     /// <summary>
     /// Gets a value indicating whether <see cref="Kind"/> is <see cref="JournalRecoveryKind.Unfinished"/>, the
@@ -186,7 +219,9 @@ public sealed record JournalRecovery
             && Summary == other.Summary
             && PublishedFiles.SequenceEqual(other.PublishedFiles, StringComparer.Ordinal)
             && string.Equals(PublicationError, other.PublicationError, StringComparison.Ordinal)
-            && JournalDeleted == other.JournalDeleted);
+            && JournalDeleted == other.JournalDeleted
+            && string.Equals(JournalDamage, other.JournalDamage, StringComparison.Ordinal)
+            && string.Equals(DamagedJournalPath, other.DamagedJournalPath, StringComparison.Ordinal));
 
     /// <summary>
     /// Returns a hash code consistent with <see cref="Equals(JournalRecovery)"/>.
@@ -212,6 +247,8 @@ public sealed record JournalRecovery
 
         hash.Add(PublicationError, StringComparer.Ordinal);
         hash.Add(JournalDeleted);
+        hash.Add(JournalDamage, StringComparer.Ordinal);
+        hash.Add(DamagedJournalPath, StringComparer.Ordinal);
         return hash.ToHashCode();
     }
 }

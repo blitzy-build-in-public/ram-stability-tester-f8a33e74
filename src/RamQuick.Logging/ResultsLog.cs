@@ -133,6 +133,14 @@ public sealed class ResultsLog : IDisposable
     /// </summary>
     internal const string ReleaseNotConfirmedMessage = "memory release not confirmed";
 
+    /// <summary>
+    /// The longest results file base name the path methods accept: 228 characters, the 255-character limit
+    /// of a file name less the longest name a run's file adds to its base name, <c>-recovered-summary.json</c>
+    /// followed by the <c>.tmp</c> of its temporary file. A name <see cref="OpenRun"/> reserves is far
+    /// shorter; a longer one can only come from a damaged journal.
+    /// </summary>
+    public const int MaxBaseNameLength = 228;
+
     private const string BaseNamePrefix = "RamQuick-";
     private const string LocalStartFormat = "yyyyMMdd-HHmmss";
     private const string LogExtension = ".log";
@@ -258,7 +266,8 @@ public sealed class ResultsLog : IDisposable
     /// <returns>
     /// The open results log, or <see langword="null"/> when no base name could be reserved: the <c>.log</c>
     /// name was taken (or could not be created) for four run ids in a row, or the logs folder is not
-    /// writable. The caller then refuses Start as an unusable data folder.
+    /// writable, is a link, or, in a data folder an elevated process resolved, is no longer protected. The
+    /// caller then refuses Start as an unusable data folder.
     /// </returns>
     /// <remarks>
     /// Performs a little synchronous file I/O, so call it off the UI thread. Every failed attempt draws a new
@@ -289,11 +298,10 @@ public sealed class ResultsLog : IDisposable
         string localStart = TimeZoneInfo.ConvertTime(startRequestedUtc, timeProvider.LocalTimeZone)
             .ToString(LocalStartFormat, CultureInfo.InvariantCulture);
 
-        try
-        {
-            Directory.CreateDirectory(dataDirectory.LogsDirectory);
-        }
-        catch (Exception exception) when (IsUnusableLocation(exception))
+        // The logs folder and the data folder are pinned while the .log is created, so it cannot be created
+        // through a link; the open .log then keeps both in place for the run.
+        using DataFolderPin? pin = TryPinLogsFolder(dataDirectory);
+        if (pin is null)
         {
             return null;
         }
@@ -348,8 +356,9 @@ public sealed class ResultsLog : IDisposable
     /// <returns>The full path.</returns>
     /// <exception cref="ArgumentNullException">An argument is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException">
-    /// <paramref name="baseName"/> is empty, white space, <c>.</c> or <c>..</c>, or holds a character that is not
-    /// valid in a file name, such as a directory separator.
+    /// <paramref name="baseName"/> is empty, white space, <c>.</c> or <c>..</c>, is longer than
+    /// <see cref="MaxBaseNameLength"/>, or holds a character that is not valid in a file name, such as a
+    /// directory separator.
     /// </exception>
     public static string GetLogPath(DataDirectory dataDirectory, string baseName) =>
         LogsFile(dataDirectory, baseName, LogExtension);
@@ -361,7 +370,10 @@ public sealed class ResultsLog : IDisposable
     /// <param name="baseName">The run's base name.</param>
     /// <returns>The full path.</returns>
     /// <exception cref="ArgumentNullException">An argument is <see langword="null"/>.</exception>
-    /// <exception cref="ArgumentException"><paramref name="baseName"/> is not a usable file name.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="baseName"/> is not a usable file name, as <see cref="GetLogPath"/> defines it, or is longer than
+    /// <see cref="MaxBaseNameLength"/>.
+    /// </exception>
     public static string GetSummaryJsonPath(DataDirectory dataDirectory, string baseName) =>
         LogsFile(dataDirectory, baseName, SummaryJsonSuffix);
 
@@ -372,7 +384,10 @@ public sealed class ResultsLog : IDisposable
     /// <param name="baseName">The run's base name.</param>
     /// <returns>The full path.</returns>
     /// <exception cref="ArgumentNullException">An argument is <see langword="null"/>.</exception>
-    /// <exception cref="ArgumentException"><paramref name="baseName"/> is not a usable file name.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="baseName"/> is not a usable file name, as <see cref="GetLogPath"/> defines it, or is longer than
+    /// <see cref="MaxBaseNameLength"/>.
+    /// </exception>
     public static string GetSummaryTextPath(DataDirectory dataDirectory, string baseName) =>
         LogsFile(dataDirectory, baseName, SummaryTextSuffix);
 
@@ -384,7 +399,10 @@ public sealed class ResultsLog : IDisposable
     /// <param name="baseName">The run's base name.</param>
     /// <returns>The full path.</returns>
     /// <exception cref="ArgumentNullException">An argument is <see langword="null"/>.</exception>
-    /// <exception cref="ArgumentException"><paramref name="baseName"/> is not a usable file name.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="baseName"/> is not a usable file name, as <see cref="GetLogPath"/> defines it, or is longer than
+    /// <see cref="MaxBaseNameLength"/>.
+    /// </exception>
     public static string GetRecoveredSummaryJsonPath(DataDirectory dataDirectory, string baseName) =>
         LogsFile(dataDirectory, baseName, RecoveredSummaryJsonSuffix);
 
@@ -396,7 +414,10 @@ public sealed class ResultsLog : IDisposable
     /// <param name="baseName">The run's base name.</param>
     /// <returns>The full path.</returns>
     /// <exception cref="ArgumentNullException">An argument is <see langword="null"/>.</exception>
-    /// <exception cref="ArgumentException"><paramref name="baseName"/> is not a usable file name.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="baseName"/> is not a usable file name, as <see cref="GetLogPath"/> defines it, or is longer than
+    /// <see cref="MaxBaseNameLength"/>.
+    /// </exception>
     public static string GetRecoveredSummaryTextPath(DataDirectory dataDirectory, string baseName) =>
         LogsFile(dataDirectory, baseName, RecoveredSummaryTextSuffix);
 
@@ -418,7 +439,7 @@ public sealed class ResultsLog : IDisposable
             .Line(begin.StartRequestedUtc, StartRequestedEvent)
             .Token("run_id", SummaryFormat.RunId(begin.RunId))
             .Token("test_type", begin.TestType)
-            .Flag("stop_on_error", begin.StopOnError)
+            .Optional("stop_on_error", begin.StopOnError)
             .Token("app_version", begin.AppVersion)
             .Line(now, SystemEvent)
             .Text("os", system.Os)
@@ -913,15 +934,25 @@ public sealed class ResultsLog : IDisposable
     /// <param name="finalPath">The final path, normally one of the summary paths of this type.</param>
     /// <param name="content">The complete file content.</param>
     /// <remarks>
-    /// A crash leaves either no final file or the complete one, never a partial one. A stale temporary file
-    /// left by an earlier crash is overwritten. The rename stays on one volume because the temporary file sits
-    /// beside the final one. On failure the temporary file is deleted, best effort, and the exception is
-    /// rethrown.
+    /// <para>
+    /// A crash leaves either no final file or the complete one, never a partial one. The rename stays on one
+    /// volume because the temporary file sits beside the final one. On failure the temporary file is deleted,
+    /// best effort, and the exception is rethrown.
+    /// </para>
+    /// <para>
+    /// The whole publication runs with the final file's folder and the folder above it pinned
+    /// (<see cref="DataFolderPin"/>): both must be plain folders and, for a data folder an elevated process
+    /// resolved, protected ones. A file or link left at the temporary name, such as a stale temporary file from
+    /// an earlier crash, is removed itself, never what a link points to, and the temporary file is then created
+    /// exclusively, so the write never truncates or follows an existing file. A folder at the temporary name is
+    /// left in place, and the publication fails.
+    /// </para>
     /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="content"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException"><paramref name="finalPath"/> is <see langword="null"/>, empty or white space.</exception>
     /// <exception cref="IOException">
-    /// The file could not be written or flushed, or <paramref name="finalPath"/> already exists.
+    /// The file could not be written or flushed, <paramref name="finalPath"/> already exists, an entry at the
+    /// temporary name could not be removed, or a folder is a link or, where required, not protected.
     /// </exception>
     /// <exception cref="UnauthorizedAccessException">The location denies write access.</exception>
     public static void PublishFile(string finalPath, string content)
@@ -930,12 +961,23 @@ public sealed class ResultsLog : IDisposable
         ArgumentNullException.ThrowIfNull(content);
 
         string tempPath = finalPath + TempSuffix;
+        string? folder = Path.GetDirectoryName(Path.GetFullPath(finalPath));
+        using DataFolderPin? pin = folder is null ? null : DataFolderPin.ForFolder(folder, createFolder: false);
         try
         {
-            using (var stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            // A predictable name is never opened as it stands: a file or link holding it, possibly planted to
+            // redirect an elevated write, is removed first, and the file is created only if the name is free.
+            DataFolderPin.RemoveFileOrLink(tempPath);
+            using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
                 stream.Write(_utf8.GetBytes(content));
                 stream.Flush(flushToDisk: true);
+            }
+
+            // The rename moves an entry, so it must still be the file just written, not a link put in its place.
+            if (DataFolderPin.IsLink(tempPath))
+            {
+                throw DataFolderPin.LinkedFile(tempPath);
             }
 
             File.Move(tempPath, finalPath, overwrite: false);
@@ -969,7 +1011,9 @@ public sealed class ResultsLog : IDisposable
     /// Synchronous, for a thread that may block on I/O; the UI thread queues the write with
     /// <see cref="QueueAppError"/> instead, and crash and exit handlers running off the UI thread bound their wait with
     /// <see cref="TryAppendAppError"/>. It runs inside crash handlers, so it never throws for a failure to
-    /// format or write the block: such a failure is swallowed. Only the exception's own text is written, with its
+    /// format or write the block: such a failure is swallowed. Nothing is written when <c>app-errors.log</c> is a
+    /// link, or when the logs folder or the data folder is a link or, for a data folder an elevated process
+    /// resolved, no longer protected. Only the exception's own text is written, with its
     /// locations and names written as placeholders, as in the <c>.log</c>: <c>&lt;data&gt;</c>, <c>%LOCALAPPDATA%</c>,
     /// <c>%APPDATA%</c>, <c>%USERPROFILE%</c>, <c>%USERNAME%</c>, <c>%TEMP%</c>, <c>&lt;app folder&gt;</c>,
     /// <c>&lt;drive&gt;:\Users\&lt;user&gt;</c> and <c>&lt;machine&gt;</c>; no user or machine name is added.
@@ -1114,8 +1158,10 @@ public sealed class ResultsLog : IDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(baseName);
 
         // Recovery passes a base name read back from a journal; a damaged one must not reach outside the logs
-        // folder, so only a plain file name is accepted.
-        if (baseName is "." or ".." || baseName.AsSpan().IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+        // folder, so only a plain file name is accepted, and only one short enough for every file of the run.
+        if (baseName is "." or ".."
+            || baseName.Length > MaxBaseNameLength
+            || baseName.AsSpan().IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
         {
             throw new ArgumentException($"'{baseName}' is not a usable results file base name.", nameof(baseName));
         }
@@ -1123,8 +1169,8 @@ public sealed class ResultsLog : IDisposable
         return Path.Combine(dataDirectory.LogsDirectory, baseName + suffix);
     }
 
-    // The failures Directory.CreateDirectory and FileStream raise for a logs folder that cannot hold the run's
-    // files: read-only or missing media, denied access, or a path the file system rejects.
+    // The failures the folder pin and FileStream raise for a logs folder that cannot hold the run's files: read-only
+    // or missing media, denied access, a link or unprotected folder, or a path the file system rejects.
     private static bool IsUnusableLocation(Exception exception) =>
         exception is IOException
             or UnauthorizedAccessException
@@ -1148,11 +1194,11 @@ public sealed class ResultsLog : IDisposable
     {
         try
         {
-            File.Delete(path);
+            DataFolderPin.RemoveFileOrLink(path);
         }
         catch (Exception exception) when (IsUnusableLocation(exception))
         {
-            // Best effort: a temporary file that cannot be deleted is overwritten by the next attempt.
+            // Best effort: an entry that cannot be removed now is removed by the next attempt before it writes.
         }
     }
 
@@ -1198,13 +1244,18 @@ public sealed class ResultsLog : IDisposable
 
             lock (_appErrorsGate)
             {
+                // The logs folder and the data folder stay pinned while the file is opened and written, so an
+                // elevated process never appends through a link planted in place of either.
                 string? directory = Path.GetDirectoryName(path);
-                if (!string.IsNullOrEmpty(directory))
+                using DataFolderPin? pin = string.IsNullOrEmpty(directory)
+                    ? null
+                    : DataFolderPin.ForFolder(directory, createFolder: true);
+                using FileStream? stream = OpenAppErrorsLog(path);
+                if (stream is null)
                 {
-                    Directory.CreateDirectory(directory);
+                    return false;
                 }
 
-                using var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
                 stream.Write(bytes);
                 stream.Flush(flushToDisk: true);
             }
@@ -1215,6 +1266,70 @@ public sealed class ResultsLog : IDisposable
         {
             // Deliberately swallowed: logging a fault must never raise another one inside a crash handler.
             return false;
+        }
+    }
+
+    // Opens app-errors.log positioned at its end, or returns null when a link holds its name, which is never
+    // followed. An existing file is opened and a missing one created exclusively, so the open never follows a link
+    // standing in its place; another process creating the file at the same moment is met by opening it instead.
+    private static FileStream? OpenAppErrorsLog(string path)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            FileAttributes? existing = DataFolderPin.TryGetAttributes(path);
+            if (existing is { } attributes && (attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                return null;
+            }
+
+            FileStream stream;
+            try
+            {
+                stream = new FileStream(
+                    path,
+                    existing is null ? FileMode.CreateNew : FileMode.Open,
+                    FileAccess.Write,
+                    FileShare.ReadWrite);
+            }
+            catch (IOException) when (attempt == 0 && existing is null && DataFolderPin.TryGetAttributes(path) is not null)
+            {
+                continue;
+            }
+
+            // Checked again once open: an entry that became a link before the open was followed.
+            bool linked;
+            try
+            {
+                linked = DataFolderPin.IsLink(path);
+                stream.Seek(0, SeekOrigin.End);
+            }
+            catch
+            {
+                stream.Dispose();
+                throw;
+            }
+
+            if (linked)
+            {
+                stream.Dispose();
+                return null;
+            }
+
+            return stream;
+        }
+    }
+
+    // Pins the logs folder and the data folder for OpenRun, creating the logs folder when it is missing; null when
+    // either is unusable.
+    private static DataFolderPin? TryPinLogsFolder(DataDirectory dataDirectory)
+    {
+        try
+        {
+            return DataFolderPin.ForFolder(dataDirectory.LogsDirectory, createFolder: true);
+        }
+        catch (Exception exception) when (IsUnusableLocation(exception))
+        {
+            return null;
         }
     }
 
@@ -1742,6 +1857,12 @@ public sealed class ResultsLog : IDisposable
             Key(key).Append(value ? "true" : "false");
             return this;
         }
+
+        /// <summary>
+        /// Appends <c>true</c> or <c>false</c>, or <c>unknown</c> when it was not captured.
+        /// </summary>
+        public EventText Optional(string key, bool? value) =>
+            value is { } captured ? Flag(key, captured) : Token(key, NotCaptured);
 
         /// <summary>
         /// Appends a percentage with one decimal.

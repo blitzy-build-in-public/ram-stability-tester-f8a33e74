@@ -30,6 +30,13 @@ namespace RamQuick.Logging;
 /// <c>RamQuick.Core</c>'s in-memory step indices are 0-based, so the factory methods add 1.
 /// </para>
 /// <para>
+/// Run attribution: the records that state a run's outcome, <c>stepEnd</c>, <c>result</c>, <c>released</c>
+/// and <c>end</c>, carry the run id of their <c>begin</c> record, which <c>ProgressJournal</c> stamps, so
+/// recovery attributes each to its own run and ignores one that names another. The <c>step</c>,
+/// <c>beat</c> and <c>prepared</c> records keep the shape of the plan's example lines and belong to the run
+/// whose <c>begin</c> they follow.
+/// </para>
+/// <para>
 /// Recovery: <c>CrashDetector</c> rebuilds a crashed run's summaries from these records alone, never from
 /// the next launch's machine state, so every value a summary needs is captured here. Records are plain data
 /// with no I/O, clock reads or mutable static state. No member is <see langword="required"/>, so a record
@@ -118,9 +125,10 @@ public sealed record JournalBegin : JournalRecord
     }
 
     /// <summary>
-    /// Gets a value indicating whether Stop on error was on for the run.
+    /// Gets a value indicating whether Stop on error was on for the run, or <see langword="null"/> when the
+    /// record did not capture it; <see cref="Create"/> always sets it.
     /// </summary>
-    public bool StopOnError { get; init; }
+    public bool? StopOnError { get; init; }
 
     /// <summary>
     /// Gets the UTC time Start was accepted, which becomes the summary's <c>run.startRequestedUtc</c> and
@@ -648,6 +656,13 @@ public sealed record JournalStepStart : JournalRecord
 public sealed record JournalStepEnd : JournalRecord
 {
     /// <summary>
+    /// Gets the id of the run that measured the step, as its <c>begin</c> record holds it. JSON
+    /// <c>"runId"</c>. <c>ProgressJournal</c> stamps it, so recovery attaches the record only to that run;
+    /// <see cref="FromOutcome"/> leaves it <see cref="Guid.Empty"/>.
+    /// </summary>
+    public Guid RunId { get; init; }
+
+    /// <summary>
     /// Gets the step's 1-based number: Core's 0-based step index + 1.
     /// </summary>
     public int Index { get; init; }
@@ -900,6 +915,14 @@ public sealed record JournalResult : JournalRecord
     private readonly string _endDetail = string.Empty;
 
     /// <summary>
+    /// Gets the id of the run that reached the verdict, as its <c>begin</c> record holds it. JSON
+    /// <c>"runId"</c>. <c>ProgressJournal</c> stamps it, so recovery takes the verdict only for that run and
+    /// never from a record another run, or a tampered journal, left beside it; <see cref="Create"/> leaves
+    /// it <see cref="Guid.Empty"/>.
+    /// </summary>
+    public Guid RunId { get; init; }
+
+    /// <summary>
     /// Gets the terminal state the run reached: <see cref="RunState.Passed"/>, <see cref="RunState.Failed"/>
     /// or <see cref="RunState.Aborted"/>.
     /// </summary>
@@ -1053,6 +1076,12 @@ public sealed record JournalResult : JournalRecord
 /// </remarks>
 public sealed record JournalReleased : JournalRecord
 {
+    /// <summary>
+    /// Gets the id of the run whose memory was released, as its <c>begin</c> record holds it. JSON
+    /// <c>"runId"</c>. <c>ProgressJournal</c> stamps it, so recovery attaches the record only to that run.
+    /// </summary>
+    public Guid RunId { get; init; }
+
     /// <summary>
     /// Gets the bytes the engine released.
     /// </summary>

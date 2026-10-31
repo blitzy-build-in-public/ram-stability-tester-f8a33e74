@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Text.Json;
@@ -162,10 +163,12 @@ public static class RunSummaryJson
     /// <returns>
     /// <see langword="true"/> when <paramref name="json"/> parses as a summary whose
     /// <see cref="RunSummary.SchemaVersion"/> is <see cref="RunSummary.CurrentSchemaVersion"/>, whose
-    /// <c>run.id</c> is present, and whose <c>steps</c>, <c>errors.groups</c>, <c>errors.records</c> and
-    /// <c>causeHints.items</c> arrays hold no <c>null</c> element; <see langword="false"/> for blank, malformed
-    /// or mistyped JSON, another schema version, a missing run or run id, or a <c>null</c> element in one of
-    /// those arrays. Never throws.
+    /// <c>run.id</c> is present, or <c>null</c> in a summary recovery rebuilt (<c>run.recovered</c>
+    /// <see langword="true"/>) for a run whose id its journal never captured, and whose <c>steps</c>,
+    /// <c>errors.groups</c>, <c>errors.records</c> and <c>causeHints.items</c> arrays hold no <c>null</c>
+    /// element; <see langword="false"/> for blank, malformed or mistyped JSON, another schema version, a
+    /// missing run, an empty run id, a missing run id outside a recovered summary, or a <c>null</c> element in
+    /// one of those arrays. Never throws.
     /// </returns>
     /// <remarks>
     /// <para>
@@ -196,11 +199,11 @@ public static class RunSummaryJson
             return false;
         }
 
-        // The init accessors turn an omitted or null run, and an omitted or null id, into empty values,
-        // so a missing run id reads back as empty text.
+        // The init accessor turns an omitted or null run into an empty one, whose id is null. A null id names no
+        // run, which only a summary rebuilt for a run whose journal never captured its id may do.
         if (parsed is null
             || parsed.SchemaVersion != RunSummary.CurrentSchemaVersion
-            || string.IsNullOrWhiteSpace(parsed.Run.Id)
+            || (parsed.Run.Id is null ? !parsed.Run.Recovered : string.IsNullOrWhiteSpace(parsed.Run.Id))
             || HasNullElement(parsed.Steps)
             || HasNullElement(parsed.Errors.Groups)
             || HasNullElement(parsed.Errors.Records)
@@ -227,6 +230,14 @@ public static class RunSummaryJson
 /// </remarks>
 public static class JournalLineSerializer
 {
+    private const string DiscriminatorName = "t";
+
+    private const string BeginDiscriminator = "begin";
+
+    private const string UnreadableFieldName = "a field with an unreadable name";
+
+    private const int MaxReportedFieldNameLength = 32;
+
     /// <summary>
     /// Serializes a record as one journal line, its <c>"t"</c> discriminator first.
     /// </summary>
@@ -313,6 +324,159 @@ public static class JournalLineSerializer
 
         return records.AsReadOnly();
     }
+
+    /// <summary>
+    /// Recovers what can be read of a <c>begin</c> line that <see cref="TryParse"/> rejects: a JSON object
+    /// holding a <c>"t":"begin"</c> property, wherever that property stands, whose other values do not all
+    /// read as the record's fields.
+    /// </summary>
+    /// <param name="line">The line, without its terminator.</param>
+    /// <param name="begin">
+    /// When the method returns <see langword="true"/>, the record holding every field whose value reads on its
+    /// own; fields left out read as not captured. Otherwise <see langword="null"/>.
+    /// </param>
+    /// <param name="droppedFields">
+    /// The names of the fields left out, in line order, a name that is not up to 32 ASCII letters being given as
+    /// "a field with an unreadable name"; empty when every field read and only the line's form, such as a
+    /// discriminator that is not first, was wrong.
+    /// </param>
+    /// <returns>
+    /// <see langword="true"/> when the line is a JSON object holding <c>"t":"begin"</c>; <see langword="false"/>
+    /// for any other line, malformed JSON included. Never throws.
+    /// </returns>
+    /// <remarks>
+    /// Recovery uses it so that one unreadable value, such as a run id in another format or a timestamp out of
+    /// range, does not cost the run its plan and machine context. Each field is tried alone beside the
+    /// discriminator, then the fields that read are combined, discriminator first, and read together.
+    /// </remarks>
+    internal static bool TrySalvageBegin(
+        string line,
+        [NotNullWhen(true)] out JournalBegin? begin,
+        out IReadOnlyList<string> droppedFields)
+    {
+        begin = null;
+        droppedFields = Array.Empty<string>();
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(line);
+            JsonElement root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object
+                || !root.EnumerateObject().Any(property => IsDiscriminator(property)
+                    && property.Value.ValueKind == JsonValueKind.String
+                    && property.Value.ValueEquals(BeginDiscriminator)))
+            {
+                return false;
+            }
+
+            var kept = new List<JsonProperty>();
+            var dropped = new List<string>();
+            foreach (JsonProperty property in root.EnumerateObject())
+            {
+                if (IsDiscriminator(property))
+                {
+                    continue;
+                }
+
+                if (TryReadBegin(new[] { property }) is not null)
+                {
+                    kept.Add(property);
+                }
+                else
+                {
+                    dropped.Add(NameOf(property));
+                }
+            }
+
+            JournalBegin? combined = TryReadBegin(kept);
+            if (combined is null)
+            {
+                // Each field read alone, yet not together: nothing of the line is trusted.
+                dropped = root.EnumerateObject()
+                    .Where(property => !IsDiscriminator(property))
+                    .Select(NameOf)
+                    .ToList();
+                combined = new JournalBegin();
+            }
+
+            begin = combined;
+            droppedFields = dropped.AsReadOnly();
+            return true;
+        }
+        catch (Exception exception) when (IsSalvageFailure(exception))
+        {
+            begin = null;
+            droppedFields = Array.Empty<string>();
+            return false;
+        }
+    }
+
+    // Writes the properties after a leading begin discriminator and reads the object back; null when it does not read.
+    private static JournalBegin? TryReadBegin(IEnumerable<JsonProperty> properties)
+    {
+        try
+        {
+            var buffer = new ArrayBufferWriter<byte>();
+            using (var writer = new Utf8JsonWriter(buffer))
+            {
+                writer.WriteStartObject();
+                writer.WriteString(DiscriminatorName, BeginDiscriminator);
+                foreach (JsonProperty property in properties)
+                {
+                    property.WriteTo(writer);
+                }
+
+                writer.WriteEndObject();
+            }
+
+            return JsonSerializer.Deserialize(buffer.WrittenSpan, JournalJsonContext.Default.JournalRecord) as JournalBegin;
+        }
+        catch (Exception exception) when (IsSalvageFailure(exception))
+        {
+            return null;
+        }
+    }
+
+    // A name holding an escape that is not valid UTF-16, such as a lone surrogate, cannot be compared, and is no
+    // discriminator: that one field is left out rather than the whole line.
+    private static bool IsDiscriminator(JsonProperty property)
+    {
+        try
+        {
+            return property.NameEquals(DiscriminatorName);
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    // Every field of the record has a short camelCase ASCII name, so only such a name is reported as it stands: the
+    // names reach the user's notice, and the line is untrusted. A name holding an escape that is not valid UTF-16,
+    // such as a lone surrogate, cannot be read as text at all.
+    private static string NameOf(JsonProperty property)
+    {
+        try
+        {
+            string name = property.Name;
+            return name.Length is > 0 and <= MaxReportedFieldNameLength && name.All(char.IsAsciiLetter)
+                ? name
+                : UnreadableFieldName;
+        }
+        catch (InvalidOperationException)
+        {
+            return UnreadableFieldName;
+        }
+    }
+
+    // What System.Text.Json raises for text it cannot read or rewrite: malformed JSON or values, duplicate or
+    // unusable names, and escapes that are not valid UTF-16.
+    private static bool IsSalvageFailure(Exception exception) =>
+        JsonCodec.IsUnreadableText(exception) || exception is InvalidOperationException;
 }
 
 /// <summary>

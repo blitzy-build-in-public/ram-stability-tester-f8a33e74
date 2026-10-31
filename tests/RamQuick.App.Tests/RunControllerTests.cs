@@ -57,6 +57,7 @@ internal sealed class ControllerHarness : IDisposable
     private static readonly TimeSpan _deleteRetryDelay = TimeSpan.FromMilliseconds(100);
 
     private readonly List<ProgressJournal> _journals = new();
+    private readonly RecoveryFaultingClock _clock;
     private RunController? _controller;
     private int _readingsDelivered;
     private int _shutdownRequestedCount;
@@ -71,7 +72,7 @@ internal sealed class ControllerHarness : IDisposable
         RootPath = Path.Combine(Path.GetTempPath(), "RamQuick.App.Tests-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(RootPath);
 
-        Time = new FakeTimeProvider(StartTime);
+        Time = _clock = new RecoveryFaultingClock(StartTime);
         Context = new ImmediateSynchronizationContext(queuePosts: true);
         Engine = new FakeEngine(contextOverride: Context);
         Sensors = new FakeSensorSource(Time);
@@ -227,6 +228,13 @@ internal sealed class ControllerHarness : IDisposable
             BeginTimeout = current.BeginTimeout,
         };
     }
+
+    /// <summary>
+    /// Makes the next crash recovery the controller runs throw <paramref name="fault"/> when it reads the clock, which
+    /// it does once it holds a run, so a recovery failure reaches the controller as an exception.
+    /// </summary>
+    /// <param name="fault">The exception to throw, once.</param>
+    public void FailNextRecovery(Exception fault) => _clock.FailNextRecovery(fault);
 
     /// <summary>Builds the controller without a data folder, as on a machine where neither location is writable.</summary>
     public void WithoutDataDirectory()
@@ -665,9 +673,50 @@ internal sealed class ControllerHarness : IDisposable
 
         public IReadOnlyList<string> ReadLines() => _shared.ReadLines();
 
+        public JournalContent ReadContent() => _shared.ReadContent();
+
         public void Delete() => _shared.Delete();
 
+        public string MoveAside(DateTimeOffset utc) => _shared.MoveAside(utc);
+
         public void Dispose() => Volatile.Write(ref _closed, 1);
+    }
+
+    /// <summary>
+    /// The harness clock: a <see cref="FakeTimeProvider"/> whose reading, once armed, throws for the next caller inside
+    /// <see cref="CrashDetector"/>. Recovery reads the clock once it holds a run, and no journal content makes it
+    /// throw, so this is how a test reaches the controller's handling of a recovery that fails unexpectedly.
+    /// </summary>
+    private sealed class RecoveryFaultingClock : FakeTimeProvider
+    {
+        private Exception? _recoveryFault;
+
+        public RecoveryFaultingClock(DateTimeOffset start)
+            : base(start)
+        {
+        }
+
+        public void FailNextRecovery(Exception fault)
+        {
+            ArgumentNullException.ThrowIfNull(fault);
+            Volatile.Write(ref _recoveryFault, fault);
+        }
+
+        public override DateTimeOffset GetUtcNow()
+        {
+            if (Volatile.Read(ref _recoveryFault) is { } fault
+                && CalledFromCrashDetector()
+                && ReferenceEquals(Interlocked.CompareExchange(ref _recoveryFault, null, fault), fault))
+            {
+                throw fault;
+            }
+
+            return base.GetUtcNow();
+        }
+
+        // Recovery's own frame reads the clock, and is too large to be inlined into its caller.
+        private static bool CalledFromCrashDetector() =>
+            new StackTrace().GetFrames().Any(frame => frame.GetMethod()?.DeclaringType == typeof(CrashDetector));
     }
 }
 
@@ -3274,6 +3323,157 @@ public sealed class RunControllerTests
         Assert.True(harness.Controller.CanStart);
     }
 
+    // A damaged journal still shows the crashed run's FAIL, at its step when the journal shows it, publishes what can
+    // be rebuilt, and tells the user what was damaged and where the journal was kept, so the next Start can run.
+    [Theory]
+    [InlineData("ForeignPassResult", "a result record of another run was ignored", true)]
+    [InlineData("MissingBegin", "the journal's begin record is missing or could not be read", true)]
+    [InlineData("NotJson", "the journal's begin record is missing or could not be read", false)]
+    public void InitializeAsync_DamagedJournal_FailsNamesTheDamageAndKeepsTheJournalAside(
+        string journalCase,
+        string expectedDamage,
+        bool stepKnown)
+    {
+        using var harness = new ControllerHarness();
+        (Guid runId, string baseName) = NewRunIdentity(TestType.Quick);
+        JournalRecord[] journal = UnfinishedJournal(runId, baseName, stepCount: 3, lastStepNumber: 2);
+        switch (journalCase)
+        {
+            case "ForeignPassResult":
+                DateTimeOffset completed = ControllerHarness.StartTime - TimeSpan.FromMinutes(30);
+                JournalResult foreign = JournalResult.Create(
+                    RunState.Passed,
+                    RunEndReason.Completed,
+                    null,
+                    0,
+                    GiB,
+                    TimeSpan.FromSeconds(30),
+                    null,
+                    3,
+                    completed,
+                    completed + TimeSpan.FromMilliseconds(40));
+                harness.WriteJournal(journal.Append(foreign with { RunId = Guid.NewGuid(), Utc = completed }).ToArray());
+                break;
+            case "MissingBegin":
+                harness.WriteJournal(journal.Skip(1).ToArray());
+                break;
+            default:
+                Directory.CreateDirectory(harness.Data!.JournalDirectory);
+                File.WriteAllText(harness.Data.JournalPath, "not json\n{\n");
+                break;
+        }
+
+        harness.Initialize();
+
+        Assert.Equal(RunState.Failed, harness.StateMachine.State);
+        Assert.Equal(RunEndReason.PreviousRunUnfinished, harness.StateMachine.EndReason);
+        Assert.Equal(
+            stepKnown ? UiText.PreviousRunUnfinished(2, 3, _quickSteps[1].Name) : UiText.PreviousRunUnfinishedStepUnknown,
+            harness.Controller.ResultMessage);
+        Assert.False(harness.JournalExists);
+        string kept = Assert.Single(Directory.GetFiles(Path.GetFullPath(harness.Data!.JournalDirectory), "active-run.damaged-*.jsonl"));
+        Assert.Equal(
+            UiText.RecoveredDamagedNotice(expectedDamage, SummaryFormat.RedactPersonalPaths(kept)),
+            harness.Controller.NoticeMessage);
+        Assert.True(harness.Controller.CanStart);
+        using (JsonDocument summary = harness.ReadSummary())
+        {
+            JsonElement run = summary.RootElement.GetProperty("run");
+            Assert.Equal("FAIL", run.GetProperty("verdict").GetString());
+            Assert.True(run.GetProperty("partial").GetBoolean());
+            Assert.EndsWith(
+                "The progress journal held damaged data: " + expectedDamage + ".",
+                run.GetProperty("endDetail").GetString(),
+                StringComparison.Ordinal);
+        }
+
+        // The kept journal never blocks the next run.
+        harness.StartAccepted();
+        Assert.Null(harness.Controller.ResultMessage);
+        Assert.NotEqual(runId, Assert.IsType<JournalBegin>(harness.ReadJournal()[0]).RunId);
+    }
+
+    [Theory]
+    [InlineData(null, "Results of the previous test were recovered and saved, but its progress journal held damaged data: a repeated begin record.")]
+    [InlineData(
+        @"C:\RamQuick\data\journal\active-run.damaged-20261028-140000.jsonl",
+        "Results of the previous test were recovered and saved, but its progress journal held damaged data: a repeated begin record. The damaged journal was kept as 'C:\\RamQuick\\data\\journal\\active-run.damaged-20261028-140000.jsonl'.")]
+    public void UiText_DamagedJournalWording_NamesTheDamageAndTheKeptJournal(string? keptPath, string expectedNotice)
+    {
+        Assert.Equal(expectedNotice, UiText.RecoveredDamagedNotice("a repeated begin record", keptPath));
+        Assert.Equal(
+            "The previous test did not finish, which likely indicates severe instability. The step at which it stopped is unknown because its progress journal is damaged.",
+            UiText.PreviousRunUnfinishedStepUnknown);
+        Assert.Throws<ArgumentNullException>(() => UiText.RecoveredDamagedNotice(null!, keptPath));
+    }
+
+    [Fact]
+    public void TryStart_DamagedJournalOnDisk_PublishesItWithDamagedNoticeAndStarts()
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        (Guid runId, string baseName) = NewRunIdentity(TestType.Quick);
+        JournalRecord[] journal = CompletedJournal(runId, baseName);
+
+        // The released record names no run, so it is not taken as this run's.
+        journal[^1] = ((JournalReleased)journal[^1]) with { RunId = Guid.Empty };
+        harness.WriteJournal(journal);
+
+        FakeEngineSession session = harness.StartAccepted();
+
+        string kept = Assert.Single(Directory.GetFiles(Path.GetFullPath(harness.Data!.JournalDirectory), "active-run.damaged-*.jsonl"));
+        Assert.Equal(
+            UiText.RecoveredDamagedNotice("a released record of another run was ignored", SummaryFormat.RedactPersonalPaths(kept)),
+            harness.Controller.NoticeMessage);
+        Assert.True(File.Exists(ResultsLog.GetSummaryJsonPath(harness.Data!, baseName)));
+        Assert.True(session.IsStarted);
+        Assert.NotEqual(runId, Assert.IsType<JournalBegin>(harness.ReadJournal()[0]).RunId);
+    }
+
+    // A recovery that fails is a failure to save the earlier run's results, which the user is told of; the folder
+    // itself is usable, so it is never reported as unusable.
+    [Fact]
+    public void InitializeAsync_RecoveryThrows_ShowsResultsNotSavedAndLogsTheError()
+    {
+        using var harness = new ControllerHarness();
+        (Guid runId, string baseName) = NewRunIdentity(TestType.Quick);
+        harness.WriteJournal(UnfinishedJournal(runId, baseName, stepCount: 3, lastStepNumber: 2));
+        harness.FailNextRecovery(new InvalidOperationException("Simulated recovery fault"));
+
+        harness.Initialize();
+
+        Assert.Equal(UiText.ResultsNotSaved("Simulated recovery fault"), harness.Controller.NoticeMessage);
+        Assert.Equal(RunState.Idle, harness.StateMachine.State);
+        Assert.True(harness.JournalExists);
+        Assert.True(harness.Controller.CanStart);
+        harness.RunUntil(() => harness.AppErrorsLogText().Contains("Simulated recovery fault", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void TryStart_RecoveryOfJournalOnDiskThrows_RefusesWithResultsNotSavedNotDataFolderUnusable()
+    {
+        using var harness = new ControllerHarness();
+        harness.Initialize();
+        (Guid runId, string baseName) = NewRunIdentity(TestType.Quick);
+        harness.WriteJournal(CompletedJournal(runId, baseName));
+        harness.FailNextRecovery(new InvalidOperationException("Simulated recovery fault"));
+
+        Assert.Equal(StartResult.Accepted, harness.TryStart());
+        Assert.Equal(StartResult.DataFolderUnusable, harness.AwaitResult(harness.Controller.StartTask));
+
+        Assert.Equal(UiText.ResultsNotSaved("Simulated recovery fault"), harness.Controller.NoticeMessage);
+        Assert.Equal(RunState.Idle, harness.StateMachine.State);
+        Assert.Equal(0, harness.Engine.CreateSessionCount);
+        Assert.True(harness.JournalExists);
+        Assert.True(harness.Controller.CanStart);
+        harness.RunUntil(() => harness.AppErrorsLogText().Contains("Simulated recovery fault", StringComparison.Ordinal));
+
+        // The next Start retries the recovery, which retires the journal, and runs.
+        FakeEngineSession session = harness.StartAccepted();
+        Assert.True(session.IsStarted);
+        Assert.NotEqual(runId, Assert.IsType<JournalBegin>(harness.ReadJournal()[0]).RunId);
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Shutdown, disposal and fatal errors
     // ---------------------------------------------------------------------------------------------
@@ -3925,7 +4125,7 @@ public sealed class RunControllerTests
             {
                 elapsed += step.TimeBudget;
                 StepOutcome outcome = FakeEngineData.Outcome(step, verifiedBytes: 5 * GiB);
-                records.Add(JournalStepEnd.FromOutcome(outcome) with { Utc = running + elapsed });
+                records.Add(JournalStepEnd.FromOutcome(outcome) with { RunId = runId, Utc = running + elapsed });
             }
         }
 
@@ -3964,7 +4164,7 @@ public sealed class RunControllerTests
             BeginRecord(runId, baseName, stepCount: 3),
             PreparedRecord(running),
             new JournalStepStart { Index = 1, Count = 3, Name = first.Name, Utc = running },
-            JournalStepEnd.FromOutcome(outcome) with { Utc = completed },
+            JournalStepEnd.FromOutcome(outcome) with { RunId = runId, Utc = completed },
             JournalResult.Create(
                 RunState.Failed,
                 RunEndReason.FirstError,
@@ -3975,8 +4175,14 @@ public sealed class RunControllerTests
                 TimeSpan.FromSeconds(11),
                 0,
                 completed,
-                verdict) with { Utc = verdict },
-            new JournalReleased { ReleasedBytes = 20 * GiB, ReleaseMs = 900, Utc = completed + TimeSpan.FromSeconds(1) },
+                verdict) with { RunId = runId, Utc = verdict },
+            new JournalReleased
+            {
+                RunId = runId,
+                ReleasedBytes = 20 * GiB,
+                ReleaseMs = 900,
+                Utc = completed + TimeSpan.FromSeconds(1),
+            },
         };
     }
 

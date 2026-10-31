@@ -2,7 +2,7 @@
 
   <!--
     Managed wrapper over ramquick_engine.dll, and the only home of managed P/Invoke outside RamQuick.Sensors.
-    It targets the Windows TFM because it calls Win32 (user32) as well as the engine. It deliberately has no
+    It targets the Windows TFM because it calls Win32 (user32, kernel32) as well as the engine. It deliberately has no
     ProjectReference to the native engine and copies no DLL: build order and DLL copying belong to the
     executables that load the engine (RamQuick.App, RamQuick.TestHost, RamQuick.IntegrationTests).
   -->
