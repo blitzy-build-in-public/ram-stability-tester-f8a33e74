@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Cause-signature tests for ErrorAnalyzer: the six heuristics, the step-mechanism prior, ranking,
+    likelihood normalisation and the hint label, on synthetic and injected-signature error sets.
+    Language, nullable, analyzer, platform and lock-file settings come from Directory.Build.props;
+    package versions come only from Directory.Packages.props.
+  -->
+  <PropertyGroup>
+    <TargetFramework>$(RamQuickTargetFramework)</TargetFramework>
+    <!-- xUnit v3 test assemblies are self-hosting executables. -->
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <!--
+    Analysis only; RamQuick.Core arrives transitively. RamQuick.Plans is deliberately not referenced:
+    step data is written as literals in SyntheticErrorSets.cs, so retuning the plans never changes
+    what these tests assert about the analyzer.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RamQuick.Analysis\RamQuick.Analysis.csproj" />
+  </ItemGroup>
+
+</Project>

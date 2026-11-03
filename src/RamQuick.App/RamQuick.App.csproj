@@ -1,0 +1,78 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    RAMQuick.exe: the single-window WPF application and its composition root.
+    Shared compiler, analyzer, platform, version and lock-file settings come from the root
+    Directory.Build.props; package versions come only from Directory.Packages.props.
+    Build with Visual Studio's MSBuild (dotnet build cannot build the referenced .vcxproj):
+      msbuild RamQuick.sln -restore -p:Configuration=Release -p:Platform=x64
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>$(RamQuickTargetFramework)</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <!--
+      SelfContained is deliberately not set here: Properties\PublishProfiles\Portable.pubxml is its
+      only home. Normal builds stay framework-dependent, so the xunit.v3 test executables can
+      reference this exe without NETSDK1150/NETSDK1151.
+    -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>RamQuick</AssemblyName>
+    <RootNamespace>RamQuick.App</RootNamespace>
+    <AssemblyTitle>RAMQuick</AssemblyTitle>
+    <!-- An elevated process must not run startup-hook assemblies that DOTNET_STARTUP_HOOKS names from outside the portable folder. -->
+    <StartupHookSupport>false</StartupHookSupport>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CommunityToolkit.Mvvm" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RamQuick.Core\RamQuick.Core.csproj" />
+    <ProjectReference Include="..\RamQuick.Interop\RamQuick.Interop.csproj" />
+    <ProjectReference Include="..\RamQuick.Plans\RamQuick.Plans.csproj" />
+    <ProjectReference Include="..\RamQuick.Analysis\RamQuick.Analysis.csproj" />
+    <ProjectReference Include="..\RamQuick.Sensors\RamQuick.Sensors.csproj" />
+    <ProjectReference Include="..\RamQuick.Logging\RamQuick.Logging.csproj" />
+  </ItemGroup>
+
+  <!--
+    Build-order-only reference to the production engine DLL. It is not a managed assembly, so it
+    stays out of the NuGet restore graph and packages.lock.json (ReferenceOutputAssembly=false),
+    skips target-framework negotiation with the C++ project, and drops the publish globals so
+    -p:PublishProfile=Portable never flows into the native build.
+    Never reference tests\engine.tests\test_dll\ramquick_engine_test.vcxproj from here: the
+    fault-injecting test DLL must not ship.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\engine\ramquick_engine.vcxproj"
+                      ReferenceOutputAssembly="false"
+                      SkipGetTargetFrameworkProperties="true"
+                      GlobalPropertiesToRemove="RuntimeIdentifier;SelfContained;PublishProfile">
+      <Project>{CE24E0D8-4D34-4891-8FA6-5A5FB83CB6EA}</Project>
+    </ProjectReference>
+  </ItemGroup>
+
+  <!--
+    ramquick_engine.dll sits beside RamQuick.exe in the build output and the portable publish
+    folder. The path is literal rather than a wildcard so the item exists at evaluation time,
+    before the native project has built; the copy itself runs after ResolveProjectReferences
+    has built the DLL into $(RamQuickNativeOutRoot)$(Configuration)\.
+  -->
+  <ItemGroup>
+    <None Include="$(RamQuickNativeOutRoot)$(Configuration)\ramquick_engine.dll"
+          Link="ramquick_engine.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest"
+          Visible="false" />
+  </ItemGroup>
+
+  <!-- MainWindowLayoutTests reach the window's named elements; integration tests drive RunController internals. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="RamQuick.App.Tests" />
+    <InternalsVisibleTo Include="RamQuick.IntegrationTests" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    RunLog: progress journal, crash detection and results log.
+    Platform-neutral (file system only), so it targets the neutral TFM derived from the single
+    retarget property RamQuickTargetFramework in Directory.Build.props. Shared compiler, analyzer,
+    platform, documentation and lock-file settings also come from Directory.Build.props.
+  -->
+  <PropertyGroup>
+    <TargetFramework>$(RamQuickNeutralTargetFramework)</TargetFramework>
+    <RootNamespace>RamQuick.Logging</RootNamespace>
+    <AssemblyName>RamQuick.Logging</AssemblyName>
+  </PropertyGroup>
+
+  <!--
+    Core is the only dependency: RunController maps Plans, Analysis, Sensors and Interop data
+    into Core and Logging types, so this library never references them.
+    System.Text.Json and its source generator are part of the shared framework.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\RamQuick.Core\RamQuick.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="RamQuick.Logging.Tests" />
+  </ItemGroup>
+
+</Project>

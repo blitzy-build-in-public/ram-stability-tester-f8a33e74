@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Declarative Quick, Standard and Exhaustive step plans. Platform-neutral: the framework derives
+       from the single retarget property in Directory.Build.props, so it is never written out here. -->
+  <PropertyGroup>
+    <TargetFramework>$(RamQuickNeutralTargetFramework)</TargetFramework>
+  </PropertyGroup>
+
+  <!-- Core only. Interop, Analysis, Logging and Sensors consume Core's StepAttributes instead of
+       referencing this project, which keeps the plan data free of every other layer. -->
+  <ItemGroup>
+    <ProjectReference Include="..\RamQuick.Core\RamQuick.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="RamQuick.Plans.Tests" />
+  </ItemGroup>
+
+</Project>

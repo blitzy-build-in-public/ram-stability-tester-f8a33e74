@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="RamQuick.app" />
+
+  <!--
+    asInvoker, never requireAdministrator or highestAvailable: RAMQuick must be able to start
+    without elevation, so that ElevationService can detect the missing rights and offer to
+    restart as Administrator. Elevation happens only through that explicit UAC consent.
+  -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!--
+    Declares compatibility only, so Windows reports its real version instead of a shimmed one.
+    It restricts nothing: PlatformCheck enforces x64 and OS build 14393 or later at startup.
+  -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and Windows 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+    </application>
+  </compatibility>
+
+  <!--
+    Per-monitor V2 DPI awareness: WorkAreaSizing sizes the window from the work area of the
+    monitor that holds it, at that monitor's DPI, and recomputes on DpiChanged when the window
+    moves to a monitor with a different scale. dpiAware true/pm is the per-monitor fallback
+    for loaders that ignore dpiAwareness.
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>

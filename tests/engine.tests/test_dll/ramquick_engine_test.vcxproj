@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    ramquick_engine_test: the test-only engine DLL, ramquick_engine_test.dll. It links
+    engine_core.lib with the substitute memory-access layers under ..\fakes\ and exports the
+    production API, compiled unchanged from src\engine\api\api.cpp, plus the six rq_test_*
+    functions of test_exports.cpp. RamQuick.IntegrationTests binds the managed wrapper to it once
+    per process (EngineLibrary.Bind("ramquick_engine_test.dll")).
+    Fault injection must never ship: RamQuick.App, RamQuick.TestHost and the portable publish
+    never reference this project, and scripts\publish-portable.ps1 checks the DLL is absent.
+    Toolset, SDK, compiler, CRT and output settings all come from engine.props.
+  -->
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{811B4532-CBD4-4FEE-9C60-7192E959005D}</ProjectGuid>
+    <RootNamespace>ramquick_engine_test</RootNamespace>
+    <!--
+      TargetName stays at its default, $(ProjectName), so the output is ramquick_engine_test.dll:
+      the name RamQuick.IntegrationTests copies and binds.
+    -->
+    <ProjectName>ramquick_engine_test</ProjectName>
+  </PropertyGroup>
+  <!--
+    Set before Microsoft.Cpp.Default.props so that vcpkg's props and targets see them. The
+    manifest is the root vcpkg.json, found by searching upward, and the install root is the
+    repository's git-ignored vcpkg_installed\, the same one engine.tests.vcxproj uses, so the
+    two projects share one install. The x64-windows-static triplet matches the static CRT that
+    engine.props sets (/MT, /MTd); the default x64-windows triplet would mismatch (LNK2038).
+    The DLL uses nothing from GoogleTest, so no vcpkg library is linked into it, and a static
+    triplet installs no DLLs, so the app-local DLL deployment step after the link is off too.
+  -->
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgTriplet>x64-windows-static</VcpkgTriplet>
+    <VcpkgInstalledDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..\..\..\vcpkg_installed'))</VcpkgInstalledDir>
+    <VcpkgAutoLink>false</VcpkgAutoLink>
+    <VcpkgApplocalDeps>false</VcpkgApplocalDeps>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="..\..\..\src\engine\engine.props" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <!--
+    Every value appends to the engine.props definitions rather than replacing them. No
+    preprocessor definition is added: api.cpp must compile exactly as in ramquick_engine.dll.
+  -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- tests\engine.tests, so the shared fakes resolve "fakes/..." and "test_dll/...". -->
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!--
+        /external:anglebrackets /external:W0, as in engine.tests.vcxproj, so both projects
+        compile the shared fakes identically; /W4 /WX stay in force for every quoted include.
+      -->
+      <TreatAngleIncludeAsExternal>true</TreatAngleIncludeAsExternal>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+    </ClCompile>
+    <!--
+      Linked like ramquick_engine.dll. NoEntryPoint stays unset, so the CRT's DLL entry point
+      initialises the static CRT. No ModuleDefinitionFile: RQ_API (__declspec(dllexport)) on the
+      extern "C" declarations in ramquick_engine.h and ramquick_engine_test.h exports all
+      fourteen functions under undecorated names.
+    -->
+    <Link>
+      <SubSystem>Windows</SubSystem>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="ramquick_engine_test.h" />
+    <ClInclude Include="..\fakes\fault_spec.h" />
+    <ClInclude Include="..\fakes\counting_memory_access.h" />
+    <ClInclude Include="..\fakes\fault_injecting_memory_access.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <!--
+      Exactly these four. The engine itself arrives through engine_core.lib, and the GoogleTest
+      test_*.cpp files belong only to engine.tests.vcxproj.
+    -->
+    <ClCompile Include="..\..\..\src\engine\api\api.cpp" />
+    <ClCompile Include="..\fakes\fault_injecting_memory_access.cpp" />
+    <ClCompile Include="..\fakes\counting_memory_access.cpp" />
+    <ClCompile Include="test_exports.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Links engine_core.lib (LinkLibraryDependencies defaults to true). -->
+    <ProjectReference Include="..\..\..\src\engine\engine_core.vcxproj">
+      <Project>{6CD894C1-5893-41D4-AE2C-C04C2DC31951}</Project>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    xUnit v3 tests for RamQuick.Sensors: SensorMonitor polling and timeouts, thermal limits,
+    SMBIOS parsing and the LibreHardwareMonitorLib smoke test (trait Requires=Hardware, skipped
+    without elevation and PawnIO).
+    The assembly name must stay RamQuick.Sensors.Tests: RamQuick.Sensors grants InternalsVisibleTo
+    to exactly that name. Language, nullable, warnings-as-errors, platform and lock-file settings
+    come from the root Directory.Build.props; package versions come only from Directory.Packages.props.
+  -->
+  <PropertyGroup>
+    <TargetFramework>$(RamQuickTargetFramework)</TargetFramework>
+    <!-- xunit.v3 test assemblies are self-hosting executables. -->
+    <OutputType>Exe</OutputType>
+    <RootNamespace>RamQuick.Sensors.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Brings RamQuick.Core and LibreHardwareMonitorLib transitively; no direct reference to either. -->
+    <ProjectReference Include="..\..\src\RamQuick.Sensors\RamQuick.Sensors.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Shared fakes owned by RamQuick.App.Tests, linked rather than copied so one implementation
+      serves every suite. Only these two are linked: they depend on the BCL and RamQuick.Sensors
+      alone, while the other App.Tests fakes need App and Interop types this project does not reference.
+    -->
+    <Compile Include="..\RamQuick.App.Tests\Fakes\FakeSensorSource.cs" Link="Fakes\FakeSensorSource.cs" />
+    <Compile Include="..\RamQuick.App.Tests\Fakes\ImmediateSynchronizationContext.cs" Link="Fakes\ImmediateSynchronizationContext.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The SDK's default None glob already holds the fixtures; Update avoids duplicate items. -->
+    <None Update="Fixtures\*.bin" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

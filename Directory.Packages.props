@@ -1,0 +1,113 @@
+<Project>
+  <!--
+    Central NuGet package versions for every managed project in RamQuick.sln.
+
+    Conventions:
+    - Project files reference packages as <PackageReference Include="Id" /> with no Version
+      attribute (restore fails with NU1008). VersionOverride is forbidden and disabled below
+      (restore fails with NU1013). A PackageVersion Include, Update or Remove in a project file
+      fails restore as well: NU1506 for a duplicate Include, otherwise the check at the end of
+      this file. This file is the only place a version is set.
+    - Transitive pinning is on, so each PackageVersion below also pins that package wherever it
+      appears transitively. A pin lower than a dependency's minimum fails restore with NU1109;
+      change a pin only together with the package that requires it.
+    - Lock files: every managed project commits the packages.lock.json that restore generates
+      (RestorePackagesWithLockFile=true is set in Directory.Build.props). Lock files are never
+      written by hand. After changing a pin, regenerate them with Visual Studio's MSBuild:
+        msbuild RamQuick.sln -restore -p:Configuration=Release -p:Platform=x64
+      and commit the results. Verification restores with -p:RestoreLockedMode=true.
+
+    Licences, as carried into THIRD-PARTY-NOTICES.txt:
+    - MPL-2.0: LibreHardwareMonitorLib, RAMSPDToolkit-NDD, DiskInfoToolkit, and BlackSharp.Core,
+      which arrives through RAMSPDToolkit-NDD and DiskInfoToolkit, is not pinned in this file and
+      is frozen by the lock files.
+    - Apache-2.0: HidSharp.
+    - MIT: CommunityToolkit.Mvvm, System.*, Mono.Posix.NETStandard. System.* includes
+      System.CodeDom, which arrives through System.Management and, like BlackSharp.Core, is not
+      pinned in this file and is frozen by the lock files.
+    - Test-only packages are Apache-2.0 or MIT and are never shipped.
+    PawnIO is deliberately absent: it is a GPL driver that RamQuick never bundles or installs.
+  -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+    <!-- Enforces the no-VersionOverride convention at restore instead of leaving it to review. -->
+    <CentralPackageVersionOverrideEnabled>false</CentralPackageVersionOverrideEnabled>
+  </PropertyGroup>
+
+  <!-- Shipped in the portable build -->
+  <ItemGroup>
+    <PackageVersion Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+    <PackageVersion Include="LibreHardwareMonitorLib" Version="0.9.6" />
+  </ItemGroup>
+
+  <!-- Transitive pins (via LibreHardwareMonitorLib 0.9.6): its net8.0 dependency set -->
+  <ItemGroup>
+    <PackageVersion Include="DiskInfoToolkit" Version="1.1.2" />
+    <PackageVersion Include="HidSharp" Version="2.6.4" />
+    <PackageVersion Include="Mono.Posix.NETStandard" Version="1.0.0" />
+    <PackageVersion Include="RAMSPDToolkit-NDD" Version="1.4.2" />
+    <PackageVersion Include="System.IO.Ports" Version="10.0.3" />
+    <PackageVersion Include="System.Management" Version="10.0.2" />
+    <PackageVersion Include="System.Threading.AccessControl" Version="10.0.3" />
+  </ItemGroup>
+
+  <!-- Test-only, never published -->
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.Extensions.TimeProvider.Testing" Version="9.10.0" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.1" />
+    <PackageVersion Include="xunit.v3" Version="4.0.2" />
+  </ItemGroup>
+
+  <!--
+    Guard for the convention above. NuGet imports this file before the project body, so a
+    PackageVersion Include, Update or Remove in a project file replaces these pins after the
+    fact, and NuGet itself rejects only a duplicate Include (NU1506). Without this check a
+    normal restore accepts the project's version and rewrites the lock file to it.
+    - The snapshot item is evaluated here, before any project body, so it holds exactly the
+      pins this file defines.
+    - The first target records each item another file defined. It runs before NuGet removes
+      duplicates, because doing so re-creates every item and loses where each was defined.
+    - The second target runs after CollectCentralPackageVersions, so NU1506 still reports a
+      duplicate first, and compares the snapshot with the deduplicated items that restore
+      consumes. A differing version, an added or removed id, or an item defined in another
+      file fails restore, and one error lists every such id.
+    - An Update to the version already pinned leaves the item exactly as this file defined it,
+      so nothing can detect it and restore resolves the pin unchanged.
+  -->
+  <ItemGroup>
+    <_RamQuickPinnedPackageVersion Include="@(PackageVersion)" />
+  </ItemGroup>
+
+  <Target Name="_RamQuickCollectRedefinedPackageVersions"
+          BeforeTargets="CollectCentralPackageVersions"
+          Condition="'$(ManagePackageVersionsCentrally)' == 'true'">
+    <ItemGroup>
+      <_RamQuickRedefinedPackageVersion Include="@(PackageVersion)"
+                                        Condition="'%(DefiningProjectFullPath)' != '$(MSBuildThisFileFullPath)'"
+                                        DefinedIn="%(DefiningProjectFullPath)" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="_RamQuickCheckCentralPackageVersions"
+          AfterTargets="CollectCentralPackageVersions"
+          Condition="'$(ManagePackageVersionsCentrally)' == 'true'">
+    <!-- Unqualified %(Identity) batches the item types into one bucket per package id. -->
+    <ItemGroup>
+      <_RamQuickPackageVersionChange Include="%(Identity)" Condition="'@(PackageVersion)' != '' and '@(_RamQuickPinnedPackageVersion)' != '' and '@(PackageVersion->'%(Version)')' != '@(_RamQuickPinnedPackageVersion->'%(Version)')'">
+        <Description>@(PackageVersion->'%(Version)') (pinned @(_RamQuickPinnedPackageVersion->'%(Version)'))</Description>
+      </_RamQuickPackageVersionChange>
+      <_RamQuickPackageVersionChange Include="%(Identity)" Condition="'@(_RamQuickRedefinedPackageVersion)' != '' and '@(_RamQuickPinnedPackageVersion)' != '' and '@(PackageVersion->'%(Version)')' == '@(_RamQuickPinnedPackageVersion->'%(Version)')'">
+        <Description>@(PackageVersion->'%(Version)') (pinned @(_RamQuickPinnedPackageVersion->'%(Version)'), redefined as @(_RamQuickRedefinedPackageVersion->'%(Version) in %(DefinedIn)', ', '))</Description>
+      </_RamQuickPackageVersionChange>
+      <_RamQuickPackageVersionChange Include="%(Identity)" Condition="'@(PackageVersion)' != '' and '@(_RamQuickPinnedPackageVersion)' == ''">
+        <Description>@(PackageVersion->'%(Version)') (not pinned)</Description>
+      </_RamQuickPackageVersionChange>
+      <_RamQuickPackageVersionChange Include="%(Identity)" Condition="'@(PackageVersion)' == '' and '@(_RamQuickPinnedPackageVersion)' != ''">
+        <Description>removed (pinned @(_RamQuickPinnedPackageVersion->'%(Version)'))</Description>
+      </_RamQuickPackageVersionChange>
+    </ItemGroup>
+    <Error Condition="'@(_RamQuickPackageVersionChange)' != ''" Text="Package versions are set only in Directory.Packages.props, but PackageVersion items in $(MSBuildProjectFullPath) change them: @(_RamQuickPackageVersionChange->'%(Identity) %(Description)', '; '). Delete those PackageVersion Include, Update or Remove items from the project file." />
+  </Target>
+</Project>

@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    engine_core: the native test engine as a static library. ramquick_engine.vcxproj (the
+    production DLL) and tests\engine.tests\test_dll\ramquick_engine_test.vcxproj (the test-only
+    DLL) each compile api\api.cpp and link this library; tests\engine.tests\engine.tests.vcxproj
+    links it directly. api\api.cpp is therefore not part of this project: listing it here would
+    duplicate the exported rq_* symbols in the test DLL.
+    Toolset, SDK, compiler, CRT and output settings all come from engine.props.
+  -->
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{6CD894C1-5893-41D4-AE2C-C04C2DC31951}</ProjectGuid>
+    <RootNamespace>engine_core</RootNamespace>
+    <ProjectName>engine_core</ProjectName>
+    <!-- Production engine code uses no vcpkg packages; only the test projects use vcpkg.json. -->
+    <VcpkgEnabled>false</VcpkgEnabled>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="engine.props" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <ItemGroup>
+    <ClInclude Include="include\ramquick_engine.h" />
+    <ClInclude Include="core\session.h" />
+    <ClInclude Include="core\system_info.h" />
+    <ClInclude Include="core\clock.h" />
+    <ClInclude Include="core\memory\memory_region.h" />
+    <ClInclude Include="core\memory\memory_access.h" />
+    <ClInclude Include="core\memory\real_memory_access.h" />
+    <ClInclude Include="core\kernels\kernels.h" />
+    <ClInclude Include="core\kernels\isa_dispatch.h" />
+    <ClInclude Include="core\patterns\patterns.h" />
+    <ClInclude Include="core\patterns\access_order.h" />
+    <ClInclude Include="core\runner\step_runner.h" />
+    <ClInclude Include="core\runner\worker_pool.h" />
+    <ClInclude Include="core\runner\coverage_counter.h" />
+    <ClInclude Include="core\errors\error_collector.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="core\session.cpp" />
+    <ClCompile Include="core\system_info.cpp" />
+    <ClCompile Include="core\memory\memory_region.cpp" />
+    <ClCompile Include="core\memory\real_memory_access.cpp" />
+    <!--
+      isa_dispatch.cpp and every unit except the two below stay at the x64 SSE2 baseline, so no
+      instruction above SSE2 can execute before dispatch has selected a kernel set. The /arch
+      overrides apply in both configurations, to these two files only.
+    -->
+    <ClCompile Include="core\kernels\isa_dispatch.cpp" />
+    <ClCompile Include="core\kernels\kernels_sse2.cpp" />
+    <ClCompile Include="core\kernels\kernels_avx2.cpp">
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+    </ClCompile>
+    <ClCompile Include="core\kernels\kernels_avx512.cpp">
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions512</EnableEnhancedInstructionSet>
+    </ClCompile>
+    <ClCompile Include="core\patterns\patterns.cpp" />
+    <ClCompile Include="core\patterns\access_order.cpp" />
+    <ClCompile Include="core\runner\step_runner.cpp" />
+    <ClCompile Include="core\runner\worker_pool.cpp" />
+    <ClCompile Include="core\errors\error_collector.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

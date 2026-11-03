@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    ramquick_engine: the production engine DLL that RamQuick.App and RamQuick.TestHost load.
+    It compiles only api\api.cpp, the exported rq_* functions, and links engine_core.lib, which
+    holds all engine logic. Test sources, the fault-injecting and counting layers and the
+    rq_test_* exports never belong here: they live in
+    tests\engine.tests\test_dll\ramquick_engine_test.vcxproj, which is never published.
+    Toolset, SDK, compiler, CRT and output settings all come from engine.props.
+  -->
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{CE24E0D8-4D34-4891-8FA6-5A5FB83CB6EA}</ProjectGuid>
+    <RootNamespace>ramquick_engine</RootNamespace>
+    <ProjectName>ramquick_engine</ProjectName>
+    <!-- Production engine code uses no vcpkg packages; only the test projects use vcpkg.json. -->
+    <VcpkgEnabled>false</VcpkgEnabled>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="engine.props" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <!--
+      Fixed name: NativeMethods.cs imports from "ramquick_engine.dll", and EngineLibrary binds
+      that name when no other binding is registered.
+    -->
+    <TargetName>ramquick_engine</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <!--
+      NoEntryPoint stays unset, so the CRT's DLL entry point initialises the static CRT. No
+      ModuleDefinitionFile: RQ_API (__declspec(dllexport)) on the extern "C" declarations in
+      ramquick_engine.h exports the API under undecorated names.
+    -->
+    <Link>
+      <SubSystem>Windows</SubSystem>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="include\ramquick_engine.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="api\api.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Links engine_core.lib; it is a native library, not a managed assembly. -->
+    <ProjectReference Include="engine_core.vcxproj">
+      <Project>{6CD894C1-5893-41D4-AE2C-C04C2DC31951}</Project>
+      <LinkLibraryDependencies>true</LinkLibraryDependencies>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

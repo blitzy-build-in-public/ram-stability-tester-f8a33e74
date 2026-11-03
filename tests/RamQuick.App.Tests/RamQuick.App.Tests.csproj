@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    xUnit v3 tests for RamQuick.App: run state machine and terminal precedence, view-model bindings and
+    update rate, window layout, RunController edge cases, memory sizing and platform policy.
+    Language, nullable, analyzer, x64 platform and lock-file settings come from Directory.Build.props;
+    package versions come only from Directory.Packages.props.
+  -->
+  <PropertyGroup>
+    <TargetFramework>$(RamQuickTargetFramework)</TargetFramework>
+    <!-- xunit.v3 test projects are executables: the package generates the entry point. -->
+    <OutputType>Exe</OutputType>
+    <!-- MainWindowLayoutTests instantiate MainWindow on a hand-made STA thread and measure it. -->
+    <UseWPF>true</UseWPF>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- Must match InternalsVisibleTo in RamQuick.App.csproj. -->
+    <AssemblyName>RamQuick.App.Tests</AssemblyName>
+    <RootNamespace>RamQuick.App.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <!-- Test host for vstest.console; its bundled Microsoft.CodeCoverage collector yields the Cobertura report. -->
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <!-- FakeTimeProvider drives the sensor timer, progress ticks and release/publication deadlines. -->
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
+  </ItemGroup>
+
+  <!--
+    The App brings Core, Interop, Plans, Analysis, Sensors, Logging and CommunityToolkit.Mvvm transitively.
+    No native engine is referenced: FakeEngine replaces it in every test here.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RamQuick.App\RamQuick.App.csproj" />
+  </ItemGroup>
+
+  <!-- Owned by RamQuick.Logging.Tests; RunControllerTests inject it to stall or fail journal writes. -->
+  <ItemGroup>
+    <Compile Include="..\RamQuick.Logging.Tests\StalledJournalStorage.cs" Link="Linked\StalledJournalStorage.cs" />
+  </ItemGroup>
+
+</Project>
